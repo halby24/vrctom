@@ -13,6 +13,12 @@ mod native;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::Workspace;
 
+#[cfg(target_arch = "wasm32")]
+mod web;
+
+#[cfg(target_arch = "wasm32")]
+pub use web::Workspace;
+
 /// 作業領域内のエントリ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -42,8 +48,7 @@ pub struct WorkspaceError {
 }
 
 // バックエンド実装が使う共有契約の生成子を含むため、
-// Web 実装（`workspace/web.rs`）でも再利用する。
-// `Workspace` を持たないターゲットでは未使用になる。
+// バックエンド間で共有する。対象外ターゲットでは未使用になり得る。
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 impl WorkspaceError {
     /// エラーの種別を返す。
@@ -134,8 +139,7 @@ pub enum WorkspaceErrorKind {
 ///
 /// OS の `Path::components` だけに任せず、全ターゲットで同じ判定にする。
 /// 拡張子より前（最初の `.` より前）の部分を ASCII 大文字小文字を区別せずに照合する。
-// バックエンド間で共有する検証表で、Web 実装でも再利用する。
-// `Workspace` を持たないターゲットでは未使用になる。
+// バックエンド間で共有する検証表であるため、対象外ターゲットでは未使用になり得る。
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 const RESERVED_FILE_STEMS: &[&str] = &[
     "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
@@ -149,8 +153,7 @@ const RESERVED_FILE_STEMS: &[&str] = &[
 /// 正規化や補正はしない。不正な入力はストレージ操作の開始前に
 /// [`WorkspaceErrorKind::InvalidPath`] で拒否する。
 /// `allow_empty` が真の場合だけ、空文字列 `""` をルート指定として受け付ける。
-// バックエンド間で共有する検証で、Web 実装でも再利用する。
-// `Workspace` を持たないターゲットでは未使用になる。
+// バックエンド間で共有する検証であるため、対象外ターゲットでは未使用になり得る。
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 pub(crate) fn validate_path(path: &str, allow_empty: bool) -> Result<(), WorkspaceError> {
     if path.is_empty() {
