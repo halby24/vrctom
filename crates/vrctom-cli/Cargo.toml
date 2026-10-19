@@ -1,0 +1,11 @@
+[package]
+name = "vrctom-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "vrctom"
+path = "src/main.rs"
+
+[dependencies]
+vrctom.workspace = true

@@ -1,0 +1,15 @@
+# このプロジェクトで使うツールチェーンを固定する
+[tools]
+# Rustはバージョンだけここで固定し、targets/componentsはrustup側の機構に委譲する
+rust = { version = "1.96.0", targets = ["wasm32-unknown-unknown"], components = ["rustfmt", "clippy"] }
+"cargo:cargo-nextest" = "latest"
+node = "lts"
+pnpm = "latest"
+
+[tasks.check]
+description = "fmtとclippyでワークスペース全体を静的検査する"
+run = ["cargo fmt --all --check", "cargo clippy --workspace --all-targets -- -D warnings"]
+
+[tasks.test]
+description = "nextestでワークスペースのテストを実行する"
+run = "cargo nextest run --workspace"
