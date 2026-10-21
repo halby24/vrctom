@@ -9,3 +9,10 @@ path = "src/main.rs"
 
 [dependencies]
 vrctom.workspace = true
+clap = { version = "4", features = ["derive"] }
+
+# 結合テストが使う分だけを、wasm向けの依存ツリーに混ざらない形で置く。
+# tarは結合テストで使わないため置かない。
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+flate2 = "1"
+tempfile = "3"
