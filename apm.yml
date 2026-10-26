@@ -1,9 +1,6 @@
 name: vrctom
 version: 0.1.0
 
-targets:
-  - opencode
-
 devDependencies:
   apm:
     - git: git@github.com:halby24/agent-common-package.git
