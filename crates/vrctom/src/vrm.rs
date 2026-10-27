@@ -17,12 +17,16 @@
 //! ```
 
 mod error;
+mod export;
+mod humanoid;
 mod matrix;
 mod mesh;
 
 pub use error::{VrmError, VrmErrorKind};
+pub use export::{VrmExportError, VrmExportErrorKind, VrmExportOptions, VrmMeta};
+pub use humanoid::{HumanoidBone, HumanoidBones};
 use matrix::IDENTITY;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::fbx::{Axis, FbxErrorKind, FbxFile, ObjectId};
 
@@ -220,7 +224,9 @@ impl VrmModel {
         check_axis_system(file)?;
         let root = check_unit_scale(file)?;
         let bind = bind_world_matrices(file)?;
-        let nodes = build_nodes(file, &bind)?;
+        // 関節の集合を先に求め、非関節ルートの正規化判定に使う。
+        let joints = joint_model_ids(file);
+        let nodes = build_nodes(file, &bind, &joints)?;
         let skins = build_skins(file, &bind)?;
         let (meshes, report) = build_meshes(file, options, &bind)?;
         let model = Self {
@@ -309,7 +315,16 @@ fn bind_world_matrices(file: &FbxFile<'_>) -> Result<Vec<[f64; 16]>, VrmError> {
         .collect()
 }
 
-/// ノード列を作る。`bind` は `models()` 順のバインド世界行列である。
+/// 全スキンのクラスタが指す関節モデルのID集合を返す。
+fn joint_model_ids(file: &FbxFile<'_>) -> HashSet<i64> {
+    file.skins()
+        .iter()
+        .flat_map(|skin| skin.clusters.iter().map(|cluster| cluster.joint.value()))
+        .collect()
+}
+
+/// ノード列を作る。`bind` は `models()` 順のバインド世界行列、
+/// `joints` は関節モデルのID集合である。
 ///
 /// メッシュを持つモデルは元の親子を使わず、親なし・子なし・単位行列の
 /// ルートとして出す。頂点は所有モデルのバインド世界行列でベイク済みの
@@ -317,7 +332,16 @@ fn bind_world_matrices(file: &FbxFile<'_>) -> Result<Vec<[f64; 16]>, VrmError> {
 /// モデルの `children` からはメッシュを持つモデルを除外し、双方向整合
 /// （子の `parent` が自分・親ありの `parent` の `children` に自分）を保つ。
 /// 子モデルを持つメッシュモデルは前提が崩れるため失敗する。
-fn build_nodes(file: &FbxFile<'_>, bind: &[[f64; 16]]) -> Result<Vec<VrmNode>, VrmError> {
+///
+/// 一般的なインポータはスケルトンルートに単位行列を想定するため、
+/// 関節でないルート（FBXの `Armature` など）はバインド世界行列を使わず
+/// 単位行列に正規化する。関節のワールド行列はバインド世界行列のままにし、
+/// 逆バインド行列との積が単位行列になる関係を保つ。
+fn build_nodes(
+    file: &FbxFile<'_>,
+    bind: &[[f64; 16]],
+    joints: &HashSet<i64>,
+) -> Result<Vec<VrmNode>, VrmError> {
     let at: HashMap<i64, usize> = file
         .models()
         .iter()
@@ -330,69 +354,118 @@ fn build_nodes(file: &FbxFile<'_>, bind: &[[f64; 16]]) -> Result<Vec<VrmNode>, V
         .iter()
         .map(|model| model.mesh.is_some())
         .collect();
-    file.models()
+    let is_joint: Vec<bool> = file
+        .models()
+        .iter()
+        .map(|model| joints.contains(&model.id.value()))
+        .collect();
+    let mut parents: Vec<Option<usize>> = Vec::with_capacity(file.models().len());
+    let mut children_list: Vec<Vec<usize>> = Vec::with_capacity(file.models().len());
+    for model in file.models() {
+        let children = model
+            .children
+            .iter()
+            .map(|id| {
+                at.get(&id.value()).copied().ok_or_else(|| {
+                    VrmError::new(VrmErrorKind::InvalidStructure, "子モデルが一覧にない")
+                        .with_object(model.id)
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            // 頂点はベイク済みのため、メッシュ所有モデルは親階層から外す。
+            .filter(|child| !has_mesh[*child])
+            .collect::<Vec<_>>();
+        if model.mesh.is_some() {
+            if !model.children.is_empty() {
+                return Err(VrmError::new(
+                    VrmErrorKind::MeshModelHasChildren,
+                    "メッシュを持つモデルに子モデルがある",
+                )
+                .with_object(model.id));
+            }
+            parents.push(None);
+            children_list.push(Vec::new());
+            continue;
+        }
+        let parent = model
+            .parent
+            .map(|id| {
+                at.get(&id.value()).copied().ok_or_else(|| {
+                    VrmError::new(VrmErrorKind::InvalidStructure, "親モデルが一覧にない")
+                        .with_object(model.id)
+                })
+            })
+            .transpose()?;
+        parents.push(parent);
+        children_list.push(children);
+    }
+    // 出力側の世界行列を根から順に確定させ、ローカル行列を逆算する。
+    // 親より子が先に並ぶ場合もあるため、根へ遡る鎖を作ってから根向きに処理する。
+    let mut locals: Vec<[f64; 16]> = vec![IDENTITY; file.models().len()];
+    let mut worlds: Vec<[f64; 16]> = vec![IDENTITY; file.models().len()];
+    let mut done = vec![false; file.models().len()];
+    for start in 0..file.models().len() {
+        let mut chain = Vec::new();
+        // 同一鎖内の多重走査を避けるため、所属判定を O(1) にする。
+        // `done` は確定済み節での打ち切り、`seen` は鎖内の循環検出であり、
+        // 循環は `InvalidStructure`、完了済み到達は正常打ち切りのまま保つ。
+        let mut seen = HashSet::new();
+        let mut current = start;
+        loop {
+            if done[current] {
+                break;
+            }
+            if !seen.insert(current) {
+                return Err(VrmError::new(
+                    VrmErrorKind::InvalidStructure,
+                    "モデルの親子に循環がある",
+                )
+                .with_object(file.models()[current].id));
+            }
+            chain.push(current);
+            match parents[current] {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+        for &node in chain.iter().rev() {
+            if file.models()[node].mesh.is_some() {
+                locals[node] = IDENTITY;
+                worlds[node] = IDENTITY;
+            } else if let Some(parent) = parents[node] {
+                let inverse = matrix::inverse(&worlds[parent]).ok_or_else(|| {
+                    VrmError::new(
+                        VrmErrorKind::InvalidStructure,
+                        "親の出力世界行列が特異である",
+                    )
+                    .with_object(file.models()[parent].id)
+                })?;
+                locals[node] = matrix::mul(&inverse, &bind[node]);
+                worlds[node] = matrix::mul(&worlds[parent], &locals[node]);
+            } else if is_joint[node] {
+                locals[node] = bind[node];
+                worlds[node] = bind[node];
+            } else {
+                // 関節でないルートは単位行列に正規化する。
+                // 子の世界行列は `単位行列 * バインド世界行列` で保たれる。
+                locals[node] = IDENTITY;
+                worlds[node] = IDENTITY;
+            }
+            done[node] = true;
+        }
+    }
+    Ok(file
+        .models()
         .iter()
         .enumerate()
-        .map(|(index, model)| {
-            let children = model
-                .children
-                .iter()
-                .map(|id| {
-                    at.get(&id.value()).copied().ok_or_else(|| {
-                        VrmError::new(VrmErrorKind::InvalidStructure, "子モデルが一覧にない")
-                            .with_object(model.id)
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                // 頂点はベイク済みのため、メッシュ所有モデルは親階層から外す。
-                .filter(|child| !has_mesh[*child])
-                .collect::<Vec<_>>();
-            if model.mesh.is_some() {
-                if !model.children.is_empty() {
-                    return Err(VrmError::new(
-                        VrmErrorKind::MeshModelHasChildren,
-                        "メッシュを持つモデルに子モデルがある",
-                    )
-                    .with_object(model.id));
-                }
-                return Ok(VrmNode {
-                    name: model.name.clone(),
-                    parent: None,
-                    children: Vec::new(),
-                    local: IDENTITY,
-                });
-            }
-            let parent = model
-                .parent
-                .map(|id| {
-                    at.get(&id.value()).copied().ok_or_else(|| {
-                        VrmError::new(VrmErrorKind::InvalidStructure, "親モデルが一覧にない")
-                            .with_object(model.id)
-                    })
-                })
-                .transpose()?;
-            let local = match parent {
-                Some(parent_index) => {
-                    let inv = matrix::inverse(&bind[parent_index]).ok_or_else(|| {
-                        VrmError::new(
-                            VrmErrorKind::InvalidStructure,
-                            "親のバインド行列が特異である",
-                        )
-                        .with_object(file.models()[parent_index].id)
-                    })?;
-                    matrix::mul(&inv, &bind[index])
-                }
-                None => bind[index],
-            };
-            Ok(VrmNode {
-                name: model.name.clone(),
-                parent,
-                children,
-                local,
-            })
+        .map(|(index, model)| VrmNode {
+            name: model.name.clone(),
+            parent: parents[index],
+            children: children_list[index].clone(),
+            local: locals[index],
         })
-        .collect()
+        .collect())
 }
 
 /// スキン列を作る。`bind` は `models()` 順のバインド世界行列である。

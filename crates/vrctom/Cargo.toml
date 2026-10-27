@@ -5,6 +5,9 @@ edition.workspace = true
 
 [dependencies]
 serde = "1"
+serde_json = "1"
+# glTF JSON型とシリアライズだけを使い、import機能（画像デコーダ）は入れない。
+gltf = { version = "1.4", default-features = false, features = ["extensions", "names"] }
 yaml_serde = "0.10"
 # wasmでも使う純粋パーサのため、zlib展開はrust_backendで共通依存にする。
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

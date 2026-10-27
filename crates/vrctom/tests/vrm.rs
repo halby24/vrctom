@@ -468,6 +468,43 @@ fn ノード双方向整合を確かめる(model: &VrmModel) {
     }
 }
 
+/// 指定ノードの世界行列を、根から掛け合わせて求める。
+fn ノードの世界行列(model: &VrmModel, mut index: usize) -> [f64; 16] {
+    let mut lineage = vec![index];
+    while let Some(parent) = model.nodes[index].parent {
+        lineage.push(parent);
+        index = parent;
+    }
+    let mut world = [
+        1.0, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 1.0, 0.0, //
+        0.0, 0.0, 0.0, 1.0, //
+    ];
+    for node in lineage.iter().rev() {
+        world = mul4(&world, &model.nodes[*node].local);
+    }
+    world
+}
+
+/// 行列の差の絶対値の最大値を返す。
+fn 行列の差(a: &[f64; 16], b: &[f64; 16]) -> f64 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f64::max)
+}
+
+/// X軸まわり-90度回転のバインド行列を組み立てる。
+fn 回転バインド() -> [f64; 16] {
+    [
+        1.0, 0.0, 0.0, 0.0, //
+        0.0, 0.0, -1.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 0.0, 1.0, //
+    ]
+}
+
 #[test]
 fn 三角形1枚のメッシュを読みノードと頂点と報告が期待どおりになる() {
     let bytes = 最小成功ファイル(
@@ -814,6 +851,125 @@ fn スキンがあると関節と重みが正規化される() {
 }
 
 #[test]
+fn 非関節ルートは単位行列になり関節のワールドはバインドと一致する() {
+    // 非関節ルート（Null）の下に関節（Hips）がある構成である。
+    // ルートのバインド行列はX軸-90度回転であり、正規化で消える。
+    let root_bind = 回転バインド();
+    let hips_bind = mul4(&root_bind, &bind_matrix(0.0, 1.0, 0.0));
+    let bytes = assemble(
+        None,
+        vec![
+            model(1, b"Armature\x00\x01Model", "Null"),
+            model(2, b"Hips\x00\x01Model", "LimbNode"),
+            model(3, b"Owner\x00\x01Model", "Mesh"),
+            triangle_geometry(10, b"Tri\x00\x01Geometry", vec![]),
+            deformer(20, b"Skin\x00\x01Deformer", "Skin", vec![]),
+            deformer(
+                21,
+                b"Cluster\x00\x01Deformer",
+                "Cluster",
+                vec![indexes_node(&[0]), weights_node(&[1.0])],
+            ),
+            bind_pose(
+                100,
+                &[
+                    (1, root_bind),
+                    (2, hips_bind),
+                    (3, bind_matrix(0.0, 0.0, 0.0)),
+                ],
+            ),
+        ],
+        vec![
+            conn(2, 1),
+            conn(3, 1),
+            conn(10, 3),
+            conn(20, 10),
+            conn(21, 20),
+            conn(2, 21),
+            conn(1, 0),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("親子構成は読める");
+    let (model, _) = VrmModel::from_fbx(&parsed, &VrmOptions::new()).expect("親子構成は変換できる");
+    assert_eq!(model.nodes.len(), 3);
+    // 非関節ルートは単位行列に正規化される。
+    assert_eq!(model.nodes[0].name, "Armature");
+    assert_eq!(model.nodes[0].parent, None);
+    assert_eq!(
+        model.nodes[0].local,
+        [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0, //
+        ]
+    );
+    // メッシュ所有モデルは除外されるため、子はHipsだけである。
+    assert_eq!(model.nodes[0].children, vec![1]);
+    // Hipsの親はArmatureであり、親の出力世界行列が単位行列のため
+    // ローカル行列はバインド世界行列そのものになる。
+    assert_eq!(model.nodes[1].parent, Some(0));
+    assert!(
+        行列の差(&model.nodes[1].local, &hips_bind) < 1e-9,
+        "関節でないルートの子はバインド世界行列を保つ"
+    );
+    // Hipsのワールド行列はバインド世界行列と一致する。
+    let world = ノードの世界行列(&model, 1);
+    assert!(
+        行列の差(&world, &hips_bind) < 1e-9,
+        "関節のワールド行列はバインド世界行列と一致する"
+    );
+    // 逆バインド行列との積は単位行列になる。
+    let skin = &model.skins[0];
+    let product = mul4(&skin.inverse_bind_matrices[0], &world);
+    assert!(
+        identity_distance(&product) < 1e-6,
+        "逆バインド行列とワールド行列の積は単位行列になる"
+    );
+    ノード双方向整合を確かめる(&model);
+}
+
+#[test]
+fn 関節であるルートはバインド行列を保つ() {
+    // ルート自体が関節（親なしのHips）の構成である。
+    let hips_bind = bind_matrix(1.0, 2.0, 3.0);
+    let bytes = assemble(
+        None,
+        vec![
+            model(1, b"Hips\x00\x01Model", "LimbNode"),
+            model(2, b"Owner\x00\x01Model", "Mesh"),
+            triangle_geometry(10, b"Tri\x00\x01Geometry", vec![]),
+            deformer(20, b"Skin\x00\x01Deformer", "Skin", vec![]),
+            deformer(
+                21,
+                b"Cluster\x00\x01Deformer",
+                "Cluster",
+                vec![indexes_node(&[0]), weights_node(&[1.0])],
+            ),
+            bind_pose(100, &[(1, hips_bind), (2, bind_matrix(0.0, 0.0, 0.0))]),
+        ],
+        vec![
+            conn(1, 0),
+            conn(2, 0),
+            conn(10, 2),
+            conn(20, 10),
+            conn(21, 20),
+            conn(1, 21),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("関節ルートは読める");
+    let (model, _) =
+        VrmModel::from_fbx(&parsed, &VrmOptions::new()).expect("関節ルートは変換できる");
+    assert_eq!(model.nodes[0].name, "Hips");
+    assert_eq!(model.nodes[0].parent, None);
+    assert_eq!(
+        model.nodes[0].local, hips_bind,
+        "関節であるルートはバインド世界行列のままである"
+    );
+    ノード双方向整合を確かめる(&model);
+}
+
+#[test]
 fn 五つの影響は四つに切り捨てられ正規化される() {
     let mut objs = vec![
         model(1, b"Root\x00\x01Model", "Null"),
@@ -1151,6 +1307,45 @@ fn 上限を超えると失敗する() {
 }
 
 #[test]
+fn 長い鎖でも現実的な時間で変換できる() {
+    // 子を先に並べた数千ノードの鎖であり、最初の走査で根まで遡る配置である。
+    // 鎖内の所属判定が線形走査の場合は二乗時間になるため、
+    // O(1) 判定であることを成功と双方向整合で確かめる。
+    const N: i64 = 6000;
+    let mut objs = Vec::new();
+    for id in (1..=N).rev() {
+        let label = format!("Node{id}\x00\x01Model");
+        objs.push(model(id, label.as_bytes(), "Null"));
+    }
+    let mut binds = Vec::with_capacity(N as usize);
+    for id in 1..=N {
+        binds.push((id, bind_matrix(0.0, 0.0, 0.0)));
+    }
+    // モデルIDと重ならないPose IDを使う（1..=N がモデルで埋まるため）。
+    objs.push(bind_pose(7_000_001, &binds));
+    let mut conns = Vec::with_capacity(N as usize);
+    for id in 2..=N {
+        conns.push(conn(id, id - 1));
+    }
+    conns.push(conn(1, 0));
+    let bytes = assemble(None, objs, conns);
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("長い鎖は読める");
+    let (model, report) =
+        VrmModel::from_fbx(&parsed, &VrmOptions::new()).expect("長い鎖は変換できる");
+    assert_eq!(model.nodes.len(), N as usize);
+    assert_eq!(report.node_count, N as usize);
+    // 葉から根への一本鎖であり、末尾が根である。
+    for (index, node) in model.nodes.iter().enumerate() {
+        if index + 1 < N as usize {
+            assert_eq!(node.parent, Some(index + 1), "鎖は後方へつながる");
+        } else {
+            assert_eq!(node.parent, None, "末尾が根である");
+        }
+    }
+    ノード双方向整合を確かめる(&model);
+}
+
+#[test]
 fn ルートは単位換算だけを含む() {
     // 係数100は等倍、係数1は0.01倍である。
     for (unit, scale) in [(100.0, 1.0), (1.0, 0.01)] {
@@ -1362,6 +1557,35 @@ fn 実fixtureから中間モデルを作り不変条件を満たす() {
         (0.5..=3.0).contains(&height_metres),
         "全体の高さが0.5〜3.0メートル程度である: {height_metres}"
     );
+
+    // 非関節ルート `Armature` は単位行列に正規化される。
+    // 存在しないfixtureでは何も確かめない。
+    if let Some(armature) = model.nodes.iter().position(|node| node.name == "Armature") {
+        assert_eq!(
+            model.nodes[armature].local,
+            [
+                1.0, 0.0, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0, //
+                0.0, 0.0, 0.0, 1.0, //
+            ],
+            "非関節ルートArmatureのローカルは単位行列である"
+        );
+        // 子のHipsのワールド行列はバインド世界行列と一致する。
+        if let Some(&hips) = model.nodes[armature]
+            .children
+            .iter()
+            .find(|&&child| model.nodes[child].name == "Hips")
+        {
+            let world = ノードの世界行列(&model, hips);
+            let model_id = parsed.models()[hips].id.value();
+            let bind = &by_model[&model_id];
+            assert!(
+                行列の差(&world, bind) < 1e-6,
+                "Hipsのワールド行列はバインド世界行列と一致する"
+            );
+        }
+    }
 
     eprintln!(
         "vrm_report node_count={} skin_count={} mesh_count={} skipped_meshes={} primitive_count={} vertex_count={} triangle_count={} truncated_influence_vertices={} unweighted_vertices={} non_triangle_polygons={} mirrored_meshes={} height_metres={height_metres:.3}",
