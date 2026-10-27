@@ -1778,3 +1778,791 @@ fn 実fixtureの全メッシュで不変条件を満たす() {
     eprintln!("mesh_shapes={shapes:?}");
     assert!(meshes > 0, "メッシュを1件以上検証する");
 }
+
+/// `Deformer` ノードを組み立てる。
+fn deformer(id: i64, name: &[u8], subtype: &str, children: Vec<TNode>) -> TNode {
+    let mut props = Props::default();
+    props.l(id);
+    props.s(name);
+    props.s(subtype.as_bytes());
+    TNode::branch(b"Deformer", props, children)
+}
+
+/// `Indexes` ノードを組み立てる。
+fn indexes_node(values: &[i32]) -> TNode {
+    let mut props = Props::default();
+    props.i_raw(values);
+    TNode::leaf(b"Indexes", props)
+}
+
+/// `Weights` ノードを組み立てる。
+fn weights_node(values: &[f64]) -> TNode {
+    let mut props = Props::default();
+    props.d_raw(values);
+    TNode::leaf(b"Weights", props)
+}
+
+/// `Pose` ノードを組み立てる。
+fn pose(id: i64, name: &[u8], subtype: &str, children: Vec<TNode>) -> TNode {
+    let mut props = Props::default();
+    props.l(id);
+    props.s(name);
+    props.s(subtype.as_bytes());
+    TNode::branch(b"Pose", props, children)
+}
+
+/// `PoseNode` を行列プロパティ指定で組み立てる。要素数や値の破損確認に使う。
+fn pose_node_raw(model: i64, matrix: Props) -> TNode {
+    let mut node_props = Props::default();
+    node_props.l(model);
+    TNode::branch(
+        b"PoseNode",
+        Props::default(),
+        vec![
+            TNode::leaf(b"Node", node_props),
+            TNode::leaf(b"Matrix", matrix),
+        ],
+    )
+}
+
+/// `PoseNode` を組み立てる。行列は16値の `d` 配列である。
+fn pose_node(model: i64, matrix: &[f64; 16]) -> TNode {
+    let mut props = Props::default();
+    props.d_raw(matrix);
+    pose_node_raw(model, props)
+}
+
+/// 平行移動だけが異なる行優先のバインド行列を組み立てる。
+fn bind_matrix(x: f64, y: f64, z: f64) -> [f64; 16] {
+    [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, x, y, z, 1.0,
+    ]
+}
+
+/// スキン1件の基本形を組み立てる。
+///
+/// 所有モデル2（Mesh）・幾何10（四角形）・スキン20・結合モデル3と4・
+/// クラスタ21（結合3・索引[0,2]と重み[0.7,0.3]）・クラスタ22
+/// （結合4・重みなし）を持つ。追加の `Objects` と `Connections` を足せる。
+fn スキン付きファイル(
+    extra_objects: Vec<TNode>,
+    extra_connections: Vec<TNode>,
+) -> Vec<u8> {
+    let mut objs = vec![
+        model(1, b"Root\x00\x01Model", "Null", None),
+        model(2, b"Owner\x00\x01Model", "Mesh", None),
+        model(3, b"JointA\x00\x01Model", "LimbNode", None),
+        model(4, b"JointB\x00\x01Model", "LimbNode", None),
+        quad_geometry(10, false),
+        deformer(20, b"Skin\x00\x01Deformer", "Skin", vec![]),
+        deformer(
+            21,
+            b"ClusterA\x00\x01Deformer",
+            "Cluster",
+            vec![indexes_node(&[0, 2]), weights_node(&[0.7, 0.3])],
+        ),
+        deformer(22, b"ClusterB\x00\x01Deformer", "Cluster", vec![]),
+    ];
+    objs.extend(extra_objects);
+    let mut conns = vec![
+        conn(2, 1),
+        conn(10, 2),
+        conn(20, 10),
+        conn(21, 20),
+        conn(22, 20),
+        conn(3, 21),
+        conn(4, 22),
+    ];
+    conns.extend(extra_connections);
+    file(7400, vec![objects(objs), connections(conns)])
+}
+
+/// クラスタ1件の土台を組み立てる。クラスタ21の子は呼び出し側が決める。
+fn クラスタ単体ファイル(
+    cluster_children: Vec<TNode>,
+    extra_connections: Vec<TNode>,
+) -> Vec<u8> {
+    let mut conns = vec![
+        conn(2, 1),
+        conn(10, 2),
+        conn(20, 10),
+        conn(21, 20),
+        conn(3, 21),
+    ];
+    conns.extend(extra_connections);
+    file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"Root\x00\x01Model", "Null", None),
+                model(2, b"Owner\x00\x01Model", "Mesh", None),
+                model(3, b"JointA\x00\x01Model", "LimbNode", None),
+                quad_geometry(10, false),
+                deformer(20, b"Skin\x00\x01Deformer", "Skin", vec![]),
+                deformer(21, b"ClusterA\x00\x01Deformer", "Cluster", cluster_children),
+            ]),
+            connections(conns),
+        ],
+    )
+}
+
+#[test]
+fn スキンとクラスタを読み重み付きと重みなしを展開できる() {
+    let bytes = スキン付きファイル(vec![], vec![]);
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("スキン付きは読める");
+    assert_eq!(parsed.skins().len(), 1);
+    let skin = parsed.skin(ObjectId::new(20)).expect("スキンがある");
+    // 名前は `\x00` 以降のクラス名を落とす。
+    assert_eq!(skin.name, "Skin");
+    assert_eq!(skin.geometry, ObjectId::new(10));
+    assert_eq!(skin.model, ObjectId::new(2));
+    assert!(parsed.skin(ObjectId::new(999)).is_none());
+    // joint・influence_count・順序が一致する。順序は接続順である。
+    assert_eq!(skin.clusters.len(), 2);
+    assert_eq!(skin.clusters[0].id, ObjectId::new(21));
+    assert_eq!(skin.clusters[0].joint, ObjectId::new(3));
+    assert_eq!(skin.clusters[0].influence_count, 2);
+    assert_eq!(skin.clusters[1].id, ObjectId::new(22));
+    assert_eq!(skin.clusters[1].joint, ObjectId::new(4));
+    assert_eq!(skin.clusters[1].influence_count, 0);
+    let data = parsed
+        .skin_data(ObjectId::new(20))
+        .expect("重みは展開できる");
+    assert_eq!(data.clusters.len(), 2);
+    // 索引と重みが一致する。
+    assert_eq!(data.clusters[0].joint, ObjectId::new(3));
+    assert_eq!(data.clusters[0].vertex_indices, vec![0, 2]);
+    assert_eq!(data.clusters[0].weights, vec![0.7, 0.3]);
+    // 重みなしクラスタは空の重みとして返す。
+    assert_eq!(data.clusters[1].joint, ObjectId::new(4));
+    assert!(data.clusters[1].vertex_indices.is_empty());
+    assert!(data.clusters[1].weights.is_empty());
+    // 未知IDの重み要求は見つからずに失敗する。
+    assert_eq!(
+        parsed.skin_data(ObjectId::new(999)).unwrap_err().kind(),
+        FbxErrorKind::NotFound
+    );
+}
+
+#[test]
+fn 複数スキンで対象の配列だけを返す() {
+    // 2つ目のスキン（所有30・幾何40・クラスタ51）は別対象であり、
+    // 対象の展開が対象外に影響されないことを確かめる。
+    // クラスタ51の索引9は頂点数4を超えるが、対象外のため展開しない。
+    let extra_objects = vec![
+        model(30, b"Owner2\x00\x01Model", "Mesh", None),
+        model(31, b"JointC\x00\x01Model", "LimbNode", None),
+        quad_geometry(40, false),
+        deformer(50, b"Skin2\x00\x01Deformer", "Skin", vec![]),
+        deformer(
+            51,
+            b"ClusterC\x00\x01Deformer",
+            "Cluster",
+            vec![indexes_node(&[9]), weights_node(&[1.0])],
+        ),
+    ];
+    let extra_connections = vec![conn(40, 30), conn(50, 40), conn(51, 50), conn(31, 51)];
+    let bytes = スキン付きファイル(extra_objects, extra_connections);
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("複数スキンは読める");
+    assert_eq!(parsed.skins().len(), 2);
+    // 探索順は `Objects` の出現順である。
+    assert_eq!(parsed.skins()[0].id, ObjectId::new(20));
+    assert_eq!(parsed.skins()[1].id, ObjectId::new(50));
+    let data = parsed
+        .skin_data(ObjectId::new(20))
+        .expect("対象の展開は対象外に影響されない");
+    assert_eq!(data.clusters.len(), 2);
+    // 対象外の破損は対象外を要求したときに失敗する。
+    let error = parsed
+        .skin_data(ObjectId::new(50))
+        .expect_err("対象外の破損は対象外の要求で失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(51)));
+}
+
+#[test]
+fn クラスタの索引と重みの不備は展開時に失敗する() {
+    // 範囲外の索引（四角形の頂点は0〜3）は不正である。
+    let bytes = クラスタ単体ファイル(
+        vec![indexes_node(&[0, 4]), weights_node(&[0.5, 0.5])],
+        vec![],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("要約は読める");
+    let error = parsed
+        .skin_data(ObjectId::new(20))
+        .expect_err("範囲外索引は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(21)));
+
+    // IndexesとWeightsの長さ不一致は不正である。
+    let bytes =
+        クラスタ単体ファイル(vec![indexes_node(&[0, 1]), weights_node(&[0.5])], vec![]);
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("要約は読める");
+    let error = parsed
+        .skin_data(ObjectId::new(20))
+        .expect_err("長さ不一致は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(21)));
+
+    // 同一クラスタ内の索引重複は不正である。
+    let bytes = クラスタ単体ファイル(
+        vec![indexes_node(&[1, 1]), weights_node(&[0.5, 0.25])],
+        vec![],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("要約は読める");
+    let error = parsed
+        .skin_data(ObjectId::new(20))
+        .expect_err("索引重複は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(21)));
+
+    // NaNと無限大の重みは不正である。範囲と総和は検査しないが、有限性は保つ。
+    for weight in [f64::NAN, f64::INFINITY] {
+        let bytes = クラスタ単体ファイル(
+            vec![indexes_node(&[0, 1]), weights_node(&[0.5, weight])],
+            vec![],
+        );
+        let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("要約は読める");
+        let error = parsed
+            .skin_data(ObjectId::new(20))
+            .expect_err("非有限な重みは失敗する");
+        assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+        assert_eq!(error.object_id(), Some(ObjectId::new(21)));
+    }
+
+    // 負値と総和が1でない重みは入力の性質であり、通す。
+    let bytes = クラスタ単体ファイル(
+        vec![indexes_node(&[0, 1]), weights_node(&[-0.5, 2.0])],
+        vec![],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("要約は読める");
+    let data = parsed
+        .skin_data(ObjectId::new(20))
+        .expect("負値と総和不一致は通す");
+    assert_eq!(data.clusters[0].weights, vec![-0.5, 2.0]);
+}
+
+#[test]
+fn スキンの変形対象とクラスタの結合の不備は失敗する() {
+    let 土台 = |conns: Vec<TNode>| {
+        file(
+            7400,
+            vec![
+                objects(vec![
+                    model(1, b"Root\x00\x01Model", "Null", None),
+                    model(2, b"Owner\x00\x01Model", "Mesh", None),
+                    model(3, b"JointA\x00\x01Model", "LimbNode", None),
+                    model(4, b"JointB\x00\x01Model", "LimbNode", None),
+                    quad_geometry(10, false),
+                    quad_geometry(11, false),
+                    deformer(20, b"Skin\x00\x01Deformer", "Skin", vec![]),
+                    deformer(21, b"ClusterA\x00\x01Deformer", "Cluster", vec![]),
+                    deformer(22, b"ClusterB\x00\x01Deformer", "Cluster", vec![]),
+                ]),
+                connections(conns),
+            ],
+        )
+    };
+    // 変形対象が0個のスキンは不正である。
+    let bytes = 土台(vec![conn(2, 1), conn(10, 2), conn(21, 20), conn(3, 21)]);
+    let error = FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("変形対象0個は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(20)));
+
+    // 変形対象が2個のスキンは不正である。
+    let bytes = 土台(vec![
+        conn(2, 1),
+        conn(10, 2),
+        conn(20, 10),
+        conn(20, 11),
+        conn(21, 20),
+        conn(3, 21),
+    ]);
+    let error = FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("変形対象2個は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(20)));
+
+    // 未知のGeometryへの接続は変形対象なしとみなし、不正として失敗する。
+    let bytes = 土台(vec![
+        conn(2, 1),
+        conn(10, 2),
+        conn(20, 9999),
+        conn(21, 20),
+        conn(3, 21),
+    ]);
+    let error = FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("未知Geometryは失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(20)));
+
+    // 変形対象を所有するモデルがない場合は不正である。
+    let bytes = 土台(vec![conn(2, 1), conn(20, 10), conn(21, 20), conn(3, 21)]);
+    let error = FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("所有者なしは失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(20)));
+
+    // 結合モデルが0個のクラスタは不正である。
+    let bytes = 土台(vec![conn(2, 1), conn(10, 2), conn(20, 10), conn(21, 20)]);
+    let error = FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("結合モデル0個は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(21)));
+
+    // 結合モデルが2個のクラスタは不正である。
+    let bytes = 土台(vec![
+        conn(2, 1),
+        conn(10, 2),
+        conn(20, 10),
+        conn(21, 20),
+        conn(3, 21),
+        conn(4, 21),
+    ]);
+    let error = FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("結合モデル2個は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(21)));
+
+    // 1つのスキン内で結合モデルが重複する場合は不正である。
+    let bytes = 土台(vec![
+        conn(2, 1),
+        conn(10, 2),
+        conn(20, 10),
+        conn(21, 20),
+        conn(22, 20),
+        conn(3, 21),
+        conn(3, 22),
+    ]);
+    let error = FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("結合モデル重複は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(22)));
+
+    // スキンに属さないクラスタは無視し、失敗にしない。
+    let bytes = 土台(vec![
+        conn(2, 1),
+        conn(10, 2),
+        conn(20, 10),
+        conn(21, 20),
+        conn(3, 21),
+        conn(4, 22),
+    ]);
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("所属なしは無視する");
+    assert_eq!(parsed.skins()[0].clusters.len(), 1);
+}
+
+#[test]
+fn 同一接続の重複は無視して読める() {
+    // 同一の `Skin→Geometry` と `Model→Cluster` と `Cluster→Skin` が
+    // 二重に現れても、異なる対象への接続とはみなさず成功する。
+    // 異なる対象への接続が失敗することは既存の不備条件で担保する。
+    let bytes = スキン付きファイル(
+        vec![],
+        vec![conn(20, 10), conn(21, 20), conn(3, 21), conn(4, 22)],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("同一接続の重複は通る");
+    let skin = parsed.skin(ObjectId::new(20)).expect("スキンがある");
+    assert_eq!(skin.geometry, ObjectId::new(10));
+    assert_eq!(skin.model, ObjectId::new(2));
+    assert_eq!(skin.clusters.len(), 2);
+    assert_eq!(skin.clusters[0].joint, ObjectId::new(3));
+    assert_eq!(skin.clusters[1].joint, ObjectId::new(4));
+}
+
+#[test]
+fn スキンとクラスタの識別子衝突は失敗する() {
+    // スキンIDの重複は不正である。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"Root\x00\x01Model", "Null", None),
+                model(2, b"Owner\x00\x01Model", "Mesh", None),
+                quad_geometry(10, false),
+                deformer(20, b"SkinA\x00\x01Deformer", "Skin", vec![]),
+                deformer(20, b"SkinB\x00\x01Deformer", "Skin", vec![]),
+            ]),
+            connections(vec![conn(1, 0)]),
+        ],
+    );
+    let error = FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("スキンID重複は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(20)));
+
+    // クラスタIDの重複は不正である。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"Root\x00\x01Model", "Null", None),
+                model(2, b"Owner\x00\x01Model", "Mesh", None),
+                quad_geometry(10, false),
+                deformer(20, b"Skin\x00\x01Deformer", "Skin", vec![]),
+                deformer(21, b"ClusterA\x00\x01Deformer", "Cluster", vec![]),
+                deformer(21, b"ClusterB\x00\x01Deformer", "Cluster", vec![]),
+            ]),
+            connections(vec![conn(1, 0)]),
+        ],
+    );
+    let error = FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("クラスタID重複は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(21)));
+
+    // スキンとクラスタの衝突は不正である。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"Root\x00\x01Model", "Null", None),
+                model(2, b"Owner\x00\x01Model", "Mesh", None),
+                quad_geometry(10, false),
+                deformer(20, b"Skin\x00\x01Deformer", "Skin", vec![]),
+                deformer(20, b"Cluster\x00\x01Deformer", "Cluster", vec![]),
+            ]),
+            connections(vec![conn(1, 0)]),
+        ],
+    );
+    let error =
+        FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("スキンとクラスタの衝突は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(20)));
+
+    // Modelとの衝突は不正である。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"Root\x00\x01Model", "Null", None),
+                model(2, b"Owner\x00\x01Model", "Mesh", None),
+                quad_geometry(10, false),
+                deformer(2, b"Skin\x00\x01Deformer", "Skin", vec![]),
+            ]),
+            connections(vec![conn(1, 0)]),
+        ],
+    );
+    let error = FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("Modelとの衝突は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(2)));
+
+    // Geometryとの衝突は不正である。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"Root\x00\x01Model", "Null", None),
+                model(2, b"Owner\x00\x01Model", "Mesh", None),
+                quad_geometry(10, false),
+                deformer(10, b"Cluster\x00\x01Deformer", "Cluster", vec![]),
+            ]),
+            connections(vec![conn(1, 0)]),
+        ],
+    );
+    let error = FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("Geometryとの衝突は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(10)));
+}
+
+#[test]
+fn バインドポーズをモデルごとに統合できる() {
+    let 行列3 = bind_matrix(1.0, 2.0, 3.0);
+    let 行列4 = bind_matrix(4.0, 5.0, 6.0);
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"Root\x00\x01Model", "Null", None),
+                model(3, b"JointA\x00\x01Model", "LimbNode", None),
+                model(4, b"JointB\x00\x01Model", "LimbNode", None),
+                // 接続順と逆に並べ、出力がモデルID昇順であることを確かめる。
+                pose(
+                    100,
+                    b"P1\x00\x01Pose",
+                    "BindPose",
+                    vec![pose_node(4, &行列4), pose_node(3, &行列3)],
+                ),
+                // 同じモデルの同じ行列は1つに統合し、未知モデルは無視する。
+                pose(
+                    101,
+                    b"P2\x00\x01Pose",
+                    "BindPose",
+                    vec![pose_node(3, &行列3), pose_node(9999, &行列4)],
+                ),
+            ]),
+            connections(vec![conn(1, 0)]),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("BindPoseは読める");
+    let nodes = parsed.bind_pose_nodes().expect("統合できる");
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(nodes[0].model, ObjectId::new(3));
+    assert_eq!(nodes[0].matrix, 行列3);
+    assert_eq!(nodes[1].model, ObjectId::new(4));
+    assert_eq!(nodes[1].matrix, 行列4);
+}
+
+#[test]
+fn poseの識別子重複と衝突は失敗する() {
+    // 同一IDの `Pose` が二重に現れる場合は不正である。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"Root\x00\x01Model", "Null", None),
+                model(3, b"JointA\x00\x01Model", "LimbNode", None),
+                pose(
+                    100,
+                    b"P1\x00\x01Pose",
+                    "BindPose",
+                    vec![pose_node(3, &bind_matrix(1.0, 2.0, 3.0))],
+                ),
+                pose(
+                    100,
+                    b"P2\x00\x01Pose",
+                    "BindPose",
+                    vec![pose_node(3, &bind_matrix(1.0, 2.0, 3.0))],
+                ),
+            ]),
+            connections(vec![conn(1, 0)]),
+        ],
+    );
+    let error = FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("PoseのID重複は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(100)));
+
+    // `Pose` のIDが `Model` と衝突する場合は不正である。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(100, b"Root\x00\x01Model", "Null", None),
+                model(3, b"JointA\x00\x01Model", "LimbNode", None),
+                pose(
+                    100,
+                    b"P1\x00\x01Pose",
+                    "BindPose",
+                    vec![pose_node(3, &bind_matrix(1.0, 2.0, 3.0))],
+                ),
+            ]),
+            connections(vec![conn(100, 0)]),
+        ],
+    );
+    let error =
+        FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("PoseとModelの衝突は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(100)));
+}
+
+#[test]
+fn 不正なバインド行列は失敗し対象外は空になる() {
+    // 同一モデルの不一致な行列は、どちらを正とするか決められないため不正である。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"Root\x00\x01Model", "Null", None),
+                model(3, b"JointA\x00\x01Model", "LimbNode", None),
+                pose(
+                    100,
+                    b"P1\x00\x01Pose",
+                    "BindPose",
+                    vec![pose_node(3, &bind_matrix(1.0, 0.0, 0.0))],
+                ),
+                pose(
+                    101,
+                    b"P2\x00\x01Pose",
+                    "BindPose",
+                    vec![pose_node(3, &bind_matrix(0.0, 1.0, 0.0))],
+                ),
+            ]),
+            connections(vec![conn(1, 0)]),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("要約は読める");
+    let error = parsed
+        .bind_pose_nodes()
+        .expect_err("不一致な行列は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(3)));
+
+    // 16要素でない行列は不正である。
+    let mut 短い = Props::default();
+    短い.d_raw(&[0.0; 15]);
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"Root\x00\x01Model", "Null", None),
+                model(3, b"JointA\x00\x01Model", "LimbNode", None),
+                pose(
+                    100,
+                    b"P1\x00\x01Pose",
+                    "BindPose",
+                    vec![pose_node_raw(3, 短い)],
+                ),
+            ]),
+            connections(vec![conn(1, 0)]),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("要約は読める");
+    let error = parsed
+        .bind_pose_nodes()
+        .expect_err("15要素の行列は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(3)));
+
+    // 有限でない行列は不正である。
+    let mut 非有限 = bind_matrix(0.0, 0.0, 0.0);
+    非有限[12] = f64::INFINITY;
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"Root\x00\x01Model", "Null", None),
+                model(3, b"JointA\x00\x01Model", "LimbNode", None),
+                pose(
+                    100,
+                    b"P1\x00\x01Pose",
+                    "BindPose",
+                    vec![pose_node(3, &非有限)],
+                ),
+            ]),
+            connections(vec![conn(1, 0)]),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("要約は読める");
+    let error = parsed
+        .bind_pose_nodes()
+        .expect_err("非有限な行列は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(3)));
+
+    // BindPose以外（RestPose）は読まず、対象外だけの場合は空になる。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"Root\x00\x01Model", "Null", None),
+                model(3, b"JointA\x00\x01Model", "LimbNode", None),
+                pose(
+                    100,
+                    b"P1\x00\x01Pose",
+                    "RestPose",
+                    vec![pose_node(9999, &bind_matrix(1.0, 2.0, 3.0))],
+                ),
+            ]),
+            connections(vec![conn(1, 0)]),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("対象外は読める");
+    assert!(
+        parsed
+            .bind_pose_nodes()
+            .expect("対象外は空になる")
+            .is_empty()
+    );
+
+    // 未知モデルだけのBindPoseは無視し、空になる。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"Root\x00\x01Model", "Null", None),
+                pose(
+                    100,
+                    b"P1\x00\x01Pose",
+                    "BindPose",
+                    vec![pose_node(9999, &bind_matrix(1.0, 2.0, 3.0))],
+                ),
+            ]),
+            connections(vec![conn(1, 0)]),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("未知モデルは読める");
+    assert!(
+        parsed
+            .bind_pose_nodes()
+            .expect("未知モデルは空になる")
+            .is_empty()
+    );
+
+    // BindPoseがない場合は空になる。
+    let bytes = 最小構成ファイル(7400);
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("最小構成は読める");
+    assert!(
+        parsed
+            .bind_pose_nodes()
+            .expect("BindPoseなしは空になる")
+            .is_empty()
+    );
+}
+
+/// 実fixtureの全スキンで重みとバインドポーズの不変条件を確かめる。
+///
+/// 固定件数に依存せず、索引範囲・重みの有限性・結合モデルの実在・
+/// 全結合モデルのBindPose保有を検証する。件数と形状を標準エラーに記録する。
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn 実fixtureのスキンとバインドポーズを検証する() {
+    let Ok(path) = std::env::var("VRCTOM_FBX_FIXTURE") else {
+        eprintln!("VRCTOM_FBX_FIXTUREが未設定のため跳ばす");
+        return;
+    };
+    let bytes = std::fs::read(&path).expect("実fixtureは読める");
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("実fixtureは読める");
+    let bind_pose = parsed
+        .bind_pose_nodes()
+        .expect("実fixtureのBindPoseは統合できる");
+    let pose_models: std::collections::HashSet<i64> =
+        bind_pose.iter().map(|node| node.model.value()).collect();
+    let mut stats: Vec<(String, usize, usize, usize, usize, f64)> = Vec::new();
+    let mut all_joints: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    for skin in parsed.skins() {
+        let data = parsed
+            .skin_data(skin.id)
+            .expect("実fixtureの重みは展開できる");
+        assert_eq!(data.clusters.len(), skin.clusters.len());
+        let mesh = parsed.mesh(skin.geometry).expect("変形対象がある");
+        let owner = parsed.model(skin.model).expect("所有モデルがある");
+        let mut weighted_clusters = 0;
+        let mut influenced: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut weight_sum = 0.0;
+        for (summary, expanded) in skin.clusters.iter().zip(data.clusters.iter()) {
+            assert_eq!(expanded.joint, summary.joint);
+            assert!(parsed.model(expanded.joint).is_some(), "結合モデルがある");
+            assert_eq!(summary.influence_count, expanded.vertex_indices.len());
+            if !expanded.vertex_indices.is_empty() {
+                weighted_clusters += 1;
+            }
+            for (index, weight) in expanded.vertex_indices.iter().zip(expanded.weights.iter()) {
+                // 索引は変形対象の頂点数未満であり、重みは有限である。
+                assert!((*index as usize) < mesh.vertex_count);
+                assert!(weight.is_finite());
+                influenced.insert(*index);
+                weight_sum += weight;
+            }
+            all_joints.insert(expanded.joint.value());
+        }
+        stats.push((
+            owner.name.clone(),
+            mesh.vertex_count,
+            skin.clusters.len(),
+            weighted_clusters,
+            influenced.len(),
+            (weight_sum * 1_000_000.0).round() / 1_000_000.0,
+        ));
+    }
+    // 全結合モデルにBindPoseがある。
+    for joint in &all_joints {
+        assert!(
+            pose_models.contains(joint),
+            "結合モデル {joint} にBindPoseがある"
+        );
+    }
+    // モデル名昇順で1行に出す。件数は固定しない。
+    stats.sort_by(|a, b| a.0.cmp(&b.0));
+    eprintln!("skin_stats={stats:?}");
+    let covered = all_joints
+        .iter()
+        .filter(|joint| pose_models.contains(joint))
+        .count();
+    eprintln!(
+        "bind_pose_nodes={} bind_pose_covered_joints={covered}",
+        bind_pose.len()
+    );
+    assert!(!parsed.skins().is_empty(), "スキンを1件以上検証する");
+}

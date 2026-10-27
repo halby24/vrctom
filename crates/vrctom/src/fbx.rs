@@ -1,28 +1,32 @@
-//! バイナリFBXからメッシュ幾何とモデル階層を読み取る層。
+//! バイナリFBXからメッシュ幾何・モデル階層・スキン・バインドポーズを読み取る層。
 //!
-//! 担当するのは、展開済みバイト列の借用による一度の走査と、メッシュ単位の
+//! 担当するのは、展開済みバイト列の借用による一度の走査と、メッシュ・スキン単位の
 //! オンデマンド展開までである。VRM生成・三角形化・座標系変換・スキニングの
 //! 解決は行わない。
 //!
 //! 入口は [`FbxFile::parse`](crate::fbx::FbxFile::parse)（走査）、
-//! [`FbxFile::mesh_data`](crate::fbx::FbxFile::mesh_data)（対象配列の展開）
-//! である。座標値と変換値はファイルの数値のまま返し、軸や単位は値として返す。
+//! [`FbxFile::mesh_data`](crate::fbx::FbxFile::mesh_data)（対象配列の展開）、
+//! [`FbxFile::skin_data`](crate::fbx::FbxFile::skin_data)（対象配列の展開）、
+//! [`FbxFile::bind_pose_nodes`](crate::fbx::FbxFile::bind_pose_nodes)
+//! （BindPoseの統合）である。座標値と変換値はファイルの数値のまま返し、軸や単位は値として返す。
 //!
 //! ```mermaid
 //! flowchart LR
 //!     bytes[入力バイト列<br/>借用] --> header[ヘッダ検証<br/>magicとversion]
 //!     header --> walk[ノード走査<br/>深さ・件数・境界の検査]
-//!     walk --> objects[Objects<br/>ModelとGeometry Mesh]
+//!     walk --> objects[Objects<br/>ModelとGeometry Mesh<br/>DeformerとPose]
 //!     walk --> conn[Connections<br/>OOの子→親]
-//!     objects --> file[FbxFile<br/>階層・メッシュ要約・配列位置]
+//!     objects --> file[FbxFile<br/>階層・スキン要約・配列位置]
 //!     conn --> file
-//!     file --> decode[mesh_data<br/>対象配列だけzlib展開]
-//!     decode --> data[MeshData<br/>座標・面・法線・UV・材質番号]
+//!     file --> decode[mesh_data / skin_data<br/>対象配列だけzlib展開]
+//!     file --> pose[bind_pose_nodes<br/>BindPoseの統合]
+//!     decode --> data[MeshData / SkinData<br/>座標・面・法線・UV・材質番号・重み]
+//!     pose --> matrices[モデルごとのバインド行列]
 //! ```
 //!
 //! 配列は解析時には展開せず、絶対位置・要素数・要素型・圧縮方式だけを保持する。
-//! `mesh_data` は要求されたメッシュの配列だけを境界検査付きで展開するため、
-//! 確保するメモリは対象メッシュの大きさに比例し、ファイル全体には比例しない。
+//! `mesh_data` と `skin_data` は要求された対象の配列だけを境界検査付きで展開するため、
+//! 確保するメモリは対象の大きさに比例し、ファイル全体には比例しない。
 
 mod error;
 mod mesh;
@@ -308,10 +312,78 @@ pub struct MeshData {
     pub material_indices: Vec<u32>,
 }
 
+/// スキン1件の要約。
+///
+/// 変形対象のメッシュとそれを所有するモデル、結合モデルの一覧を持つ。
+/// 索引と重みの配列は持たず、[`skin_data`](FbxFile::skin_data) が対象分だけ展開する。
+#[derive(Debug, Clone)]
+pub struct Skin {
+    /// オブジェクトID。
+    pub id: ObjectId,
+    /// スキン名。`Name\x00Class` 形式の場合は最初の `\x00` で切る。
+    pub name: String,
+    /// 変形対象のメッシュGeometry。
+    pub geometry: ObjectId,
+    /// そのGeometryを所有するModel。
+    pub model: ObjectId,
+    /// 結合モデルの一覧。`Connections` の出現順を保つ。
+    pub clusters: Vec<Cluster>,
+}
+
+/// クラスタ1件の要約。
+///
+/// 結合モデルと重み付き頂点数を持ち、索引と重みの配列位置は非公開で保持する。
+/// 配列の中身は [`skin_data`](FbxFile::skin_data) が対象分だけ展開する。
+#[derive(Debug, Clone)]
+pub struct Cluster {
+    /// オブジェクトID。
+    pub id: ObjectId,
+    /// 結合モデル。
+    pub joint: ObjectId,
+    /// 重み付き頂点数。`Indexes`/`Weights` を持たない場合は0である。
+    pub influence_count: usize,
+    /// 頂点索引の配列位置。無い場合は `None` である。
+    pub(crate) indexes: Option<ArrayDesc>,
+    /// 重みの配列位置。無い場合は `None` である。
+    pub(crate) weights: Option<ArrayDesc>,
+}
+
+/// スキン1件の重みの展開結果。
+///
+/// 重みは書かれた値をそのまま返し、正規化しない。実データには総和が1でない
+/// 頂点や微小な負値が含まれ、これらは破損ではなく入力の性質であるため、
+/// 正規化と影響数の制限は生成側が担う。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SkinData {
+    /// クラスタごとの重み。`Skin::clusters` と同じ順序である。
+    pub clusters: Vec<ClusterData>,
+}
+
+/// クラスタ1件の重みの展開結果。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterData {
+    /// 結合モデル。
+    pub joint: ObjectId,
+    /// 変形対象の制御点番号。重みなしの場合は空である。
+    pub vertex_indices: Vec<u32>,
+    /// 頂点ごとの重み。`vertex_indices` と同じ長さである。
+    pub weights: Vec<f64>,
+}
+
+/// バインドポーズ1件の統合結果。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BindPoseNode {
+    /// 対象モデル。
+    pub model: ObjectId,
+    /// 16値の行優先。平行移動は12〜14番である。
+    pub matrix: [f64; 16],
+}
+
 /// 読み取り済みのFBX。
 ///
 /// 入力バイト列を借用し、階層・要約・配列位置だけを保持する。
-/// 幾何の中身は [`mesh_data`](Self::mesh_data) が対象分だけ展開する。
+/// 幾何と重みの中身は [`mesh_data`](Self::mesh_data) と
+/// [`skin_data`](Self::skin_data) が対象分だけ展開する。
 #[derive(Debug)]
 pub struct FbxFile<'a> {
     bytes: &'a [u8],
@@ -322,6 +394,50 @@ pub struct FbxFile<'a> {
     model_at: HashMap<i64, usize>,
     meshes: Vec<Mesh>,
     mesh_at: HashMap<i64, usize>,
+    skins: Vec<Skin>,
+    skin_at: HashMap<i64, usize>,
+    pose_nodes: Vec<StoredPoseNode>,
+}
+
+/// `BindPose` の `PoseNode` 1件の位置情報。
+///
+/// モデルIDと行列配列の位置だけを保持し、行列の中身は
+/// [`bind_pose_nodes`](FbxFile::bind_pose_nodes) が対象分だけ展開する。
+#[derive(Debug, Clone, Copy)]
+struct StoredPoseNode {
+    /// `PoseNode/Node` が指すモデルID。
+    model: i64,
+    /// `PoseNode/Matrix` の配列位置。
+    matrix: ArrayDesc,
+}
+
+/// `Deformer` の種別。`Skin` と `Cluster` だけを読み、それ以外は読み飛ばす。
+///
+/// ブレンドシェイプの対応付けは別の作業単位であり、この層では扱わない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeformerKind {
+    /// 変形対象と結合モデルの対応付け。
+    Skin,
+    /// 結合モデルごとの頂点索引と重み。
+    Cluster,
+}
+
+/// `Deformer`（`Skin`/`Cluster`）1件の読み取り結果。
+///
+/// 索引と重みの配列は展開せず位置だけを残し、
+/// [`skin_data`](FbxFile::skin_data) が対象分だけ展開する。
+#[derive(Debug, Clone)]
+struct DeformerRec {
+    /// オブジェクトID。
+    id: ObjectId,
+    /// 名前。`Name\x00Class` 形式の場合は最初の `\x00` で切る。
+    name: Box<str>,
+    /// 種別。
+    kind: DeformerKind,
+    /// `Cluster/Indexes` の位置。無い場合は `None` である。
+    indexes: Option<ArrayDesc>,
+    /// `Cluster/Weights` の位置。無い場合は `None` である。
+    weights: Option<ArrayDesc>,
 }
 
 impl<'a> FbxFile<'a> {
@@ -340,11 +456,13 @@ impl<'a> FbxFile<'a> {
         let unit_scale_factor = read_unit_scale(&top)?;
         let mut models = read_models(&top)?;
         let mut meshes = read_meshes(bytes, &top)?;
-        // FBXのオブジェクトIDは全体で一意であり、ModelとGeometryの衝突は
+        let deformers = read_deformers(&top)?;
+        let (pose_nodes, pose_ids) = read_pose_nodes(&top)?;
+        // FBXのオブジェクトIDは全体で一意であり、衝突は
         // `apply_connections` の分類を曖昧にするため、接続解決の前に破損として拒否する。
-        let model_ids: HashSet<i64> = models.iter().map(|model| model.id.value()).collect();
+        let mut used_ids: HashSet<i64> = models.iter().map(|model| model.id.value()).collect();
         for mesh in &meshes {
-            if model_ids.contains(&mesh.id.value()) {
+            if !used_ids.insert(mesh.id.value()) {
                 return Err(FbxError::new(
                     FbxErrorKind::InvalidStructure,
                     "ModelとGeometryのIDが重複している",
@@ -352,7 +470,27 @@ impl<'a> FbxFile<'a> {
                 .with_object(mesh.id));
             }
         }
+        for rec in &deformers {
+            if !used_ids.insert(rec.id.value()) {
+                return Err(FbxError::new(
+                    FbxErrorKind::InvalidStructure,
+                    "Skin/ClusterのIDが重複している",
+                )
+                .with_object(rec.id));
+            }
+        }
+        // PoseのIDも全体で一意であり、重複と他オブジェクトとの衝突を拒否する。
+        for &pose_id in &pose_ids {
+            if !used_ids.insert(pose_id) {
+                return Err(FbxError::new(
+                    FbxErrorKind::InvalidStructure,
+                    "PoseのIDが重複している",
+                )
+                .with_object(ObjectId(pose_id)));
+            }
+        }
         apply_connections(&top, &mut models, &mut meshes)?;
+        let skins = wire_skins(&top, &models, &meshes, &deformers)?;
         let model_at = models
             .iter()
             .enumerate()
@@ -363,6 +501,11 @@ impl<'a> FbxFile<'a> {
             .enumerate()
             .map(|(index, mesh)| (mesh.id.value(), index))
             .collect();
+        let skin_at = skins
+            .iter()
+            .enumerate()
+            .map(|(index, skin)| (skin.id.value(), index))
+            .collect();
         Ok(Self {
             bytes,
             version,
@@ -372,6 +515,9 @@ impl<'a> FbxFile<'a> {
             model_at,
             meshes,
             mesh_at,
+            skins,
+            skin_at,
+            pose_nodes,
         })
     }
 
@@ -460,6 +606,123 @@ impl<'a> FbxFile<'a> {
             uv_sets,
             material_indices,
         })
+    }
+
+    /// スキンの一覧を返す。順序は `Objects` の出現順である。
+    pub fn skins(&self) -> &[Skin] {
+        &self.skins
+    }
+
+    /// 指定IDのスキンを返す。
+    pub fn skin(&self, id: ObjectId) -> Option<&Skin> {
+        self.skin_at
+            .get(&id.value())
+            .map(|&index| &self.skins[index])
+    }
+
+    /// 指定IDのスキンの重みを展開する。
+    ///
+    /// 対象スキンの配列だけを境界検査付きで展開するため、確保するメモリは
+    /// 対象スキンの大きさに比例する。重みは書かれた値のまま返し、
+    /// 正規化は行わない。
+    ///
+    /// # Errors
+    ///
+    /// 未知ID・索引と重みの長さ不一致・範囲外の索引・重複する索引・
+    /// 片方だけある索引と重み・有限でない重みなどの場合に返す。
+    pub fn skin_data(&self, id: ObjectId) -> Result<SkinData, FbxError> {
+        let skin = self
+            .skin(id)
+            .ok_or_else(|| FbxError::new(FbxErrorKind::NotFound, "スキンがない").with_object(id))?;
+        let mesh = self.mesh(skin.geometry).ok_or_else(|| {
+            FbxError::new(FbxErrorKind::InvalidStructure, "変形対象のメッシュがない")
+                .with_object(skin.id)
+        })?;
+        let vertex_count = mesh.vertex_count;
+        let mut clusters = Vec::with_capacity(skin.clusters.len());
+        for cluster in &skin.clusters {
+            let (vertex_indices, weights) = match (cluster.indexes, cluster.weights) {
+                (None, None) => (Vec::new(), Vec::new()),
+                (Some(indexes), Some(weights)) => {
+                    read_cluster_weights(self.bytes, cluster.id, vertex_count, indexes, weights)?
+                }
+                _ => {
+                    return Err(FbxError::new(
+                        FbxErrorKind::InvalidStructure,
+                        "クラスタのIndexesとWeightsが片方だけある",
+                    )
+                    .with_object(cluster.id));
+                }
+            };
+            clusters.push(ClusterData {
+                joint: cluster.joint,
+                vertex_indices,
+                weights,
+            });
+        }
+        Ok(SkinData { clusters })
+    }
+
+    /// `BindPose` をモデルごとに統合して返す。
+    ///
+    /// 同じモデルが複数の `BindPose` に現れる場合は、行列が一致することを
+    /// 確かめて1つにまとめる。`BindPose` が無い場合は空を返す。
+    /// 順序はモデルIDの昇順である。未知のモデルを指す `PoseNode` は無視する。
+    ///
+    /// # Errors
+    ///
+    /// 行列の要素数が16でない・有限でない・同じモデルで一致しない場合に返す。
+    pub fn bind_pose_nodes(&self) -> Result<Vec<BindPoseNode>, FbxError> {
+        let mut by_model: HashMap<i64, [f64; 16]> = HashMap::with_capacity(self.pose_nodes.len());
+        for node in &self.pose_nodes {
+            if !self.model_at.contains_key(&node.model) {
+                continue;
+            }
+            let object = ObjectId(node.model);
+            let plain = expand(self.bytes, node.matrix, object)?;
+            let values = mesh::as_f64s(plain.as_slice(), node.matrix.kind, object)?;
+            if values.len() != 16 {
+                return Err(FbxError::new(
+                    FbxErrorKind::InvalidStructure,
+                    "バインド行列が16要素でない",
+                )
+                .with_object(object));
+            }
+            if !values.iter().all(|v| v.is_finite()) {
+                return Err(FbxError::new(
+                    FbxErrorKind::InvalidStructure,
+                    "有限でないバインド行列がある",
+                )
+                .with_object(object));
+            }
+            let matrix: [f64; 16] = values.try_into().map_err(|_| {
+                FbxError::new(FbxErrorKind::InvalidStructure, "バインド行列が16要素でない")
+                    .with_object(object)
+            })?;
+            match by_model.get(&node.model) {
+                Some(&prev) if prev != matrix => {
+                    return Err(FbxError::new(
+                        FbxErrorKind::InvalidStructure,
+                        "同じモデルのバインド行列が一致しない",
+                    )
+                    .with_object(object));
+                }
+                Some(_) => {}
+                None => {
+                    by_model.insert(node.model, matrix);
+                }
+            }
+        }
+        let mut nodes: Vec<BindPoseNode> = by_model
+            .into_iter()
+            .map(|(model, matrix)| BindPoseNode {
+                model: ObjectId(model),
+                matrix,
+            })
+            .collect();
+        // モデルIDの昇順で返す。
+        nodes.sort_by_key(|node| node.model.value());
+        Ok(nodes)
     }
 }
 
@@ -867,6 +1130,144 @@ fn read_meshes(bytes: &[u8], top: &[RawNode]) -> Result<Vec<Mesh>, FbxError> {
     }
 }
 
+/// `Objects` 直下の `Deformer`（`Skin`/`Cluster`）を読む。
+///
+/// IDが0以下や重複の場合は破損として失敗する。後勝ちで黙って上書きすると
+/// 接続の対応付けがずれるためである。`Skin`と`Cluster`以外
+/// （ブレンドシェイプなど）はこの層で読まないため読み飛ばす。
+fn read_deformers(top: &[RawNode]) -> Result<Vec<DeformerRec>, FbxError> {
+    let mut deformers = Vec::new();
+    let mut seen: HashSet<i64> = HashSet::new();
+    let Some(objects) = top.iter().find(|node| node.name.as_ref() == "Objects") else {
+        return Ok(deformers);
+    };
+    for node in objects.children_by("Deformer") {
+        let id = node
+            .props
+            .first()
+            .and_then(RawProp::as_int)
+            .ok_or_else(|| {
+                FbxError::new(
+                    FbxErrorKind::InvalidStructure,
+                    "DeformerのID形状が壊れている",
+                )
+            })?;
+        if id <= 0 {
+            return Err(
+                FbxError::new(FbxErrorKind::InvalidStructure, "DeformerのIDが0以下である")
+                    .with_object(ObjectId(id)),
+            );
+        }
+        if !seen.insert(id) {
+            return Err(FbxError::new(
+                FbxErrorKind::InvalidStructure,
+                "DeformerのIDが重複している",
+            )
+            .with_object(ObjectId(id)));
+        }
+        let head = node
+            .props
+            .get(2)
+            .and_then(RawProp::as_bytes)
+            .map(|bytes| bytes.split(|b| *b == 0).next().unwrap_or_default());
+        let kind = if head == Some(b"Skin".as_slice()) {
+            DeformerKind::Skin
+        } else if head == Some(b"Cluster".as_slice()) {
+            DeformerKind::Cluster
+        } else {
+            continue;
+        };
+        let object = ObjectId(id);
+        let name = split_class_name(node.props.get(1).and_then(RawProp::as_bytes), object)?
+            .into_boxed_str();
+        let indexes = node
+            .child("Indexes")
+            .and_then(|child| child.props.first())
+            .and_then(RawProp::as_array);
+        let weights = node
+            .child("Weights")
+            .and_then(|child| child.props.first())
+            .and_then(RawProp::as_array);
+        deformers.push(DeformerRec {
+            id: object,
+            name,
+            kind,
+            indexes,
+            weights,
+        });
+    }
+    Ok(deformers)
+}
+
+/// `Objects` 直下の `Pose`（`BindPose`）から `PoseNode` を読む。
+///
+/// `BindPose` 以外はこの層で読まないため読み飛ばす。行列は展開せず位置だけを残す。
+/// `Node` が指すモデルIDの実在は展開時に確かめ、未知のモデルは無視する。
+fn read_pose_nodes(top: &[RawNode]) -> Result<(Vec<StoredPoseNode>, Vec<i64>), FbxError> {
+    let mut out = Vec::new();
+    let mut ids = Vec::new();
+    // 同一IDの `Pose` が二重に現れた場合は後勝ちにせず破損とする。
+    let mut seen: HashSet<i64> = HashSet::new();
+    let Some(objects) = top.iter().find(|node| node.name.as_ref() == "Objects") else {
+        return Ok((out, ids));
+    };
+    for node in objects.children_by("Pose") {
+        let id = node
+            .props
+            .first()
+            .and_then(RawProp::as_int)
+            .ok_or_else(|| {
+                FbxError::new(FbxErrorKind::InvalidStructure, "PoseのID形状が壊れている")
+            })?;
+        if id <= 0 {
+            return Err(
+                FbxError::new(FbxErrorKind::InvalidStructure, "PoseのIDが0以下である")
+                    .with_object(ObjectId(id)),
+            );
+        }
+        if !seen.insert(id) {
+            return Err(
+                FbxError::new(FbxErrorKind::InvalidStructure, "PoseのIDが重複している")
+                    .with_object(ObjectId(id)),
+            );
+        }
+        ids.push(id);
+        let object = ObjectId(id);
+        let is_bind = node
+            .props
+            .get(2)
+            .and_then(RawProp::as_bytes)
+            .map(|bytes| bytes.split(|b| *b == 0).next() == Some(b"BindPose".as_slice()))
+            .unwrap_or(false);
+        if !is_bind {
+            continue;
+        }
+        for pose_node in node.children_by("PoseNode") {
+            let model = pose_node
+                .child("Node")
+                .and_then(|child| child.props.first())
+                .and_then(RawProp::as_int)
+                .ok_or_else(|| {
+                    FbxError::new(
+                        FbxErrorKind::InvalidStructure,
+                        "PoseNodeの対象形状が壊れている",
+                    )
+                    .with_object(object)
+                })?;
+            let matrix = pose_node
+                .child("Matrix")
+                .and_then(|child| child.props.first())
+                .and_then(RawProp::as_array)
+                .ok_or_else(|| {
+                    FbxError::new(FbxErrorKind::InvalidStructure, "PoseNodeの行列がない")
+                        .with_object(object)
+                })?;
+            out.push(StoredPoseNode { model, matrix });
+        }
+    }
+    Ok((out, ids))
+}
+
 /// 索引配列を展開し、多角形数とcorner数を数える。
 ///
 /// 負値が多角形の終端を表し、絶対値は `!v` で復元する。
@@ -1100,6 +1501,157 @@ fn apply_connections(
         }
     }
     Ok(())
+}
+
+/// `Connections` の `OO`（子→親）からスキンとクラスタの対応を組み立てる。
+///
+/// 読むのは `Skin`→`Geometry`・`Cluster`→`Skin`・`Model`→`Cluster` だけである。
+/// 未知IDへの接続は無視する。スキンに属さないクラスタは無視する。
+/// クラスタの順序は接続順を保つ。変形対象が0個・複数のスキン、
+/// 所有者のない変形対象、結合モデルが0個・複数のクラスタ、
+/// 結合モデルが重複するスキンは不正として失敗する。
+fn wire_skins(
+    top: &[RawNode],
+    models: &[Model],
+    meshes: &[Mesh],
+    deformers: &[DeformerRec],
+) -> Result<Vec<Skin>, FbxError> {
+    let known_models: HashSet<i64> = models.iter().map(|model| model.id.value()).collect();
+    let known_meshes: HashSet<i64> = meshes.iter().map(|mesh| mesh.id.value()).collect();
+    let mut skin_ids: HashSet<i64> = HashSet::new();
+    let mut cluster_of: HashMap<i64, &DeformerRec> = HashMap::new();
+    for rec in deformers {
+        match rec.kind {
+            DeformerKind::Skin => {
+                skin_ids.insert(rec.id.value());
+            }
+            DeformerKind::Cluster => {
+                cluster_of.insert(rec.id.value(), rec);
+            }
+        }
+    }
+    // Geometryから所有モデルへの対応。複数所有は `apply_connections` で先に拒否するため、
+    // ここでは1対1である。
+    let mut geometry_owner: HashMap<i64, i64> = HashMap::new();
+    for model in models {
+        if let Some(mesh) = model.mesh {
+            geometry_owner.insert(mesh.value(), model.id.value());
+        }
+    }
+    // 対応付けと順序記録を一度の走査で行い、O(n^2)を避ける。
+    let mut skin_geometry: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut cluster_skin: HashMap<i64, i64> = HashMap::new();
+    let mut cluster_joints: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut skin_clusters: HashMap<i64, Vec<i64>> = HashMap::new();
+    if let Some(connections) = top.iter().find(|node| node.name.as_ref() == "Connections") {
+        for node in &connections.children {
+            if node.props.first().and_then(RawProp::as_bytes) != Some(b"OO".as_slice()) {
+                continue;
+            }
+            let (Some(child), Some(parent)) = (
+                node.props.get(1).and_then(RawProp::as_int),
+                node.props.get(2).and_then(RawProp::as_int),
+            ) else {
+                continue;
+            };
+            if skin_ids.contains(&child) && known_meshes.contains(&parent) {
+                // 同一対応の重複は無視し、異なる対象だけを残して後段で拒否する。
+                let targets = skin_geometry.entry(child).or_default();
+                if !targets.contains(&parent) {
+                    targets.push(parent);
+                }
+            } else if cluster_of.contains_key(&child) && skin_ids.contains(&parent) {
+                match cluster_skin.get(&child) {
+                    Some(&prev) if prev != parent => {
+                        return Err(FbxError::new(
+                            FbxErrorKind::InvalidStructure,
+                            "クラスタが複数のスキンに接続する",
+                        )
+                        .with_object(ObjectId(child)));
+                    }
+                    Some(_) => {}
+                    None => {
+                        cluster_skin.insert(child, parent);
+                        skin_clusters.entry(parent).or_default().push(child);
+                    }
+                }
+            } else if known_models.contains(&child) && cluster_of.contains_key(&parent) {
+                // 同一対応の重複は無視し、異なる結合だけを残して後段で拒否する。
+                // `Cluster→Skin` と同じ方針である。
+                let joints = cluster_joints.entry(parent).or_default();
+                if !joints.contains(&child) {
+                    joints.push(child);
+                }
+            }
+        }
+    }
+    let mut skins = Vec::new();
+    for rec in deformers {
+        if rec.kind != DeformerKind::Skin {
+            continue;
+        }
+        let geometry = match skin_geometry.get(&rec.id.value()).map(Vec::as_slice) {
+            Some(&[geometry]) => geometry,
+            _ => {
+                return Err(FbxError::new(
+                    FbxErrorKind::InvalidStructure,
+                    "スキンの変形対象が1つでない",
+                )
+                .with_object(rec.id));
+            }
+        };
+        let Some(&owner) = geometry_owner.get(&geometry) else {
+            return Err(FbxError::new(
+                FbxErrorKind::InvalidStructure,
+                "変形対象を所有するモデルがない",
+            )
+            .with_object(rec.id));
+        };
+        let mut seen_joints: HashSet<i64> = HashSet::new();
+        let mut clusters = Vec::new();
+        // クラスタの順序は接続順を保つ。
+        if let Some(ordered) = skin_clusters.get(&rec.id.value()) {
+            for &cluster_id in ordered {
+                let cluster = cluster_of[&cluster_id];
+                let joint = match cluster_joints.get(&cluster_id).map(Vec::as_slice) {
+                    Some(&[joint]) => joint,
+                    _ => {
+                        return Err(FbxError::new(
+                            FbxErrorKind::InvalidStructure,
+                            "クラスタの結合モデルが1つでない",
+                        )
+                        .with_object(cluster.id));
+                    }
+                };
+                if !seen_joints.insert(joint) {
+                    return Err(FbxError::new(
+                        FbxErrorKind::InvalidStructure,
+                        "1つのスキン内で結合モデルが重複する",
+                    )
+                    .with_object(cluster.id));
+                }
+                let influence_count = match (cluster.indexes, cluster.weights) {
+                    (Some(indexes), Some(_)) => indexes.count,
+                    _ => 0,
+                };
+                clusters.push(Cluster {
+                    id: cluster.id,
+                    joint: ObjectId(joint),
+                    influence_count,
+                    indexes: cluster.indexes,
+                    weights: cluster.weights,
+                });
+            }
+        }
+        skins.push(Skin {
+            id: rec.id,
+            name: rec.name.to_string(),
+            geometry: ObjectId(geometry),
+            model: ObjectId(owner),
+            clusters,
+        });
+    }
+    Ok(skins)
 }
 
 /// 頂点配列を展開して座標列で返す。
@@ -1366,6 +1918,55 @@ fn to_material_index(value: i64, object: ObjectId) -> Result<u32, FbxError> {
     u32::try_from(value).map_err(|_| {
         FbxError::new(FbxErrorKind::InvalidStructure, "材質番号が範囲外である").with_object(object)
     })
+}
+
+/// クラスタの索引と重みを展開し、範囲・重複・有限性を確かめる。
+///
+/// 索引は変形対象Geometryの制御点番号であり、頂点数未満であることを確かめる。
+/// 重みの範囲と総和は検査しない。実データに負値や総和が1でない頂点が含まれ、
+/// これらは破損ではなく入力の性質であるため、生成側が正規化する。
+fn read_cluster_weights(
+    bytes: &[u8],
+    id: ObjectId,
+    vertex_count: usize,
+    indexes: ArrayDesc,
+    weights: ArrayDesc,
+) -> Result<(Vec<u32>, Vec<f64>), FbxError> {
+    let raw_indexes = expand_integers(bytes, indexes, id)?;
+    let plain = expand(bytes, weights, id)?;
+    let raw_weights = mesh::as_f64s(plain.as_slice(), weights.kind, id)?;
+    if raw_indexes.len() != raw_weights.len() {
+        return Err(FbxError::new(
+            FbxErrorKind::InvalidStructure,
+            "IndexesとWeightsの長さが一致しない",
+        )
+        .with_object(id));
+    }
+    if !raw_weights.iter().all(|v| v.is_finite()) {
+        return Err(
+            FbxError::new(FbxErrorKind::InvalidStructure, "有限でない重みがある").with_object(id),
+        );
+    }
+    let mut seen: HashSet<u32> = HashSet::with_capacity(raw_indexes.len());
+    let mut vertex_indices = Vec::with_capacity(raw_indexes.len());
+    for &index in &raw_indexes {
+        if index < 0 || index as usize >= vertex_count {
+            return Err(
+                FbxError::new(FbxErrorKind::InvalidStructure, "頂点番号が範囲外である")
+                    .with_object(id),
+            );
+        }
+        let index = index as u32;
+        if !seen.insert(index) {
+            return Err(FbxError::new(
+                FbxErrorKind::InvalidStructure,
+                "クラスタ内で頂点索引が重複する",
+            )
+            .with_object(id));
+        }
+        vertex_indices.push(index);
+    }
+    Ok((vertex_indices, raw_weights))
 }
 
 /// 整数配列を展開して `i64` 列で返す。
