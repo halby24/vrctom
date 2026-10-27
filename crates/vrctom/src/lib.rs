@@ -52,6 +52,9 @@ pub mod workspace;
 /// Unityの保存データを参照関係を壊さず読み取る層。
 pub mod unity;
 
+/// バイナリFBXからメッシュ幾何とモデル階層を読み取る層。
+pub mod fbx;
+
 /// UnityPackageの展開。
 #[cfg(not(target_arch = "wasm32"))]
 pub mod unitypackage;

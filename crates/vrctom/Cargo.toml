@@ -6,11 +6,12 @@ edition.workspace = true
 [dependencies]
 serde = "1"
 yaml_serde = "0.10"
+# wasmでも使う純粋パーサのため、zlib展開はrust_backendで共通依存にする。
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tempfile = "3"
 tar = "0.4"
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 opfs = "0.3"
@@ -20,7 +21,8 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["Crypto"] }
 
-# tar/flate2/tempfileは通常のnative依存としてhostテストから使えるため、
+# tar/tempfileは通常のnative依存としてhostテストから使えるため、
 # ここには置かない。wasm向けの依存ツリーに混ざらないようにする。
+# flate2は共通依存に移したため、テストでも直接使える。
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 futures = "0.3"
