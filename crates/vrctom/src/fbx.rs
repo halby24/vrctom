@@ -232,10 +232,24 @@ pub struct Model {
     pub children: Vec<ObjectId>,
     /// 所属するメッシュ（`Geometry`）。持たない場合は `None` である。
     pub mesh: Option<ObjectId>,
+    /// 材質スロット。接続順を保つ。
+    pub materials: Vec<ObjectId>,
     /// ローカル変換。未指定の成分は既定値（移動0・回転0・倍率1）である。
     pub transform: LocalTransform,
     /// 継承方式。未指定の場合は1である。合成規則の解釈は生成側に残す。
     pub inherit_type: i32,
+}
+
+/// 材質1件の識別子。
+///
+/// 色・テクスチャ・シェーダは読まず、IDと名前だけを保持する。
+/// 面の材質番号とスロット順の対応付けに使う。
+#[derive(Debug, Clone)]
+pub struct Material {
+    /// オブジェクトID。
+    pub id: ObjectId,
+    /// 材質名。`Name\x00Class` 形式の場合は最初の `\x00` で切る。
+    pub name: String,
 }
 
 /// メッシュ1件の要約。
@@ -394,6 +408,10 @@ pub struct FbxFile<'a> {
     model_at: HashMap<i64, usize>,
     meshes: Vec<Mesh>,
     mesh_at: HashMap<i64, usize>,
+    materials: Vec<Material>,
+    material_at: HashMap<i64, usize>,
+    /// メッシュIDから所有モデルIDへの対応。スロット範囲検査に使う。
+    mesh_owner: HashMap<i64, i64>,
     skins: Vec<Skin>,
     skin_at: HashMap<i64, usize>,
     pose_nodes: Vec<StoredPoseNode>,
@@ -456,6 +474,7 @@ impl<'a> FbxFile<'a> {
         let unit_scale_factor = read_unit_scale(&top)?;
         let mut models = read_models(&top)?;
         let mut meshes = read_meshes(bytes, &top)?;
+        let materials = read_material_objects(&top)?;
         let deformers = read_deformers(&top)?;
         let (pose_nodes, pose_ids) = read_pose_nodes(&top)?;
         // FBXのオブジェクトIDは全体で一意であり、衝突は
@@ -468,6 +487,15 @@ impl<'a> FbxFile<'a> {
                     "ModelとGeometryのIDが重複している",
                 )
                 .with_object(mesh.id));
+            }
+        }
+        for material in &materials {
+            if !used_ids.insert(material.id.value()) {
+                return Err(FbxError::new(
+                    FbxErrorKind::InvalidStructure,
+                    "MaterialのIDが重複している",
+                )
+                .with_object(material.id));
             }
         }
         for rec in &deformers {
@@ -489,7 +517,7 @@ impl<'a> FbxFile<'a> {
                 .with_object(ObjectId(pose_id)));
             }
         }
-        apply_connections(&top, &mut models, &mut meshes)?;
+        apply_connections(&top, &mut models, &mut meshes, &materials)?;
         let skins = wire_skins(&top, &models, &meshes, &deformers)?;
         let model_at = models
             .iter()
@@ -506,6 +534,15 @@ impl<'a> FbxFile<'a> {
             .enumerate()
             .map(|(index, skin)| (skin.id.value(), index))
             .collect();
+        let material_at = materials
+            .iter()
+            .enumerate()
+            .map(|(index, material)| (material.id.value(), index))
+            .collect();
+        let mesh_owner: HashMap<i64, i64> = models
+            .iter()
+            .filter_map(|model| model.mesh.map(|mesh| (mesh.value(), model.id.value())))
+            .collect();
         Ok(Self {
             bytes,
             version,
@@ -515,6 +552,9 @@ impl<'a> FbxFile<'a> {
             model_at,
             meshes,
             mesh_at,
+            materials,
+            material_at,
+            mesh_owner,
             skins,
             skin_at,
             pose_nodes,
@@ -565,14 +605,27 @@ impl<'a> FbxFile<'a> {
             .map(|&index| &self.meshes[index])
     }
 
+    /// 材質の一覧を返す。順序は `Objects` の出現順である。
+    pub fn materials(&self) -> &[Material] {
+        &self.materials
+    }
+
+    /// 指定IDの材質を返す。
+    pub fn material(&self, id: ObjectId) -> Option<&Material> {
+        self.material_at
+            .get(&id.value())
+            .map(|&index| &self.materials[index])
+    }
+
     /// 指定IDのメッシュ幾何を展開する。
     ///
     /// 対象メッシュの配列だけを境界検査付きで展開するため、確保するメモリは
     /// 対象メッシュの大きさに比例する。
+    /// 面の材質番号は所有モデルのスロット数に対して範囲検査する。
     ///
     /// # Errors
     ///
-    /// 未知ID・索引範囲外・属性長不一致・非有限値などの場合に返す。
+    /// 未知ID・索引範囲外・属性長不一致・非有限値・スロット範囲外の材質番号などの場合に返す。
     pub fn mesh_data(&self, id: ObjectId) -> Result<MeshData, FbxError> {
         let mesh = self.mesh(id).ok_or_else(|| {
             FbxError::new(FbxErrorKind::NotFound, "メッシュがない").with_object(id)
@@ -598,6 +651,29 @@ impl<'a> FbxFile<'a> {
             Some(layer) => read_materials(self.bytes, mesh, layer, polygon_count)?,
             None => Vec::new(),
         };
+        // 面の材質番号は所有モデルのスロット数に対して範囲検査する。
+        // 所有モデルが無い場合は材質スロットが決まらないため検査しない。
+        // 材質層が無い場合は `material_indices` が空であり検査対象がない。
+        if !material_indices.is_empty()
+            && let Some(&owner) = self.mesh_owner.get(&id.value())
+            && let Some(model) = self.model(ObjectId::new(owner))
+        {
+            let slots = model.materials.len();
+            for &index in &material_indices {
+                let out_of_range = if slots == 0 {
+                    index != 0
+                } else {
+                    (index as usize) >= slots
+                };
+                if out_of_range {
+                    return Err(FbxError::new(
+                        FbxErrorKind::InvalidStructure,
+                        "材質番号がスロット範囲外である",
+                    )
+                    .with_object(mesh.id));
+                }
+            }
+        }
         Ok(MeshData {
             positions,
             polygon_corner_counts,
@@ -902,6 +978,7 @@ fn read_models(top: &[RawNode]) -> Result<Vec<Model>, FbxError> {
             parent: None,
             children: Vec::new(),
             mesh: None,
+            materials: Vec::new(),
             transform,
             inherit_type,
         });
@@ -1128,6 +1205,47 @@ fn read_meshes(bytes: &[u8], top: &[RawNode]) -> Result<Vec<Mesh>, FbxError> {
                 FbxError::new(FbxErrorKind::InvalidStructure, "幾何配列がない").with_object(object)
             })
     }
+}
+
+/// `Objects` 直下の `Material` を読む。
+///
+/// IDと名前だけを保持し、色・テクスチャ・シェーダは読まない。
+/// IDが0以下や重複の場合は破損として失敗する。
+fn read_material_objects(top: &[RawNode]) -> Result<Vec<Material>, FbxError> {
+    let mut materials = Vec::new();
+    let mut seen: HashSet<i64> = HashSet::new();
+    let Some(objects) = top.iter().find(|node| node.name.as_ref() == "Objects") else {
+        return Ok(materials);
+    };
+    for node in objects.children_by("Material") {
+        let id = node
+            .props
+            .first()
+            .and_then(RawProp::as_int)
+            .ok_or_else(|| {
+                FbxError::new(
+                    FbxErrorKind::InvalidStructure,
+                    "MaterialのID形状が壊れている",
+                )
+            })?;
+        if id <= 0 {
+            return Err(
+                FbxError::new(FbxErrorKind::InvalidStructure, "MaterialのIDが0以下である")
+                    .with_object(ObjectId(id)),
+            );
+        }
+        if !seen.insert(id) {
+            return Err(FbxError::new(
+                FbxErrorKind::InvalidStructure,
+                "MaterialのIDが重複している",
+            )
+            .with_object(ObjectId(id)));
+        }
+        let object = ObjectId(id);
+        let name = split_class_name(node.props.get(1).and_then(RawProp::as_bytes), object)?;
+        materials.push(Material { id: object, name });
+    }
+    Ok(materials)
 }
 
 /// `Objects` 直下の `Deformer`（`Skin`/`Cluster`）を読む。
@@ -1396,10 +1514,13 @@ fn read_layer(
 /// 先頭プロパティが `OO` の接続だけを読み、`OP` などは読まない。
 /// 未知IDへの接続は無視する。Model同士の多重親と循環、
 /// 1つの `Geometry` の多重所有は不正として失敗する。
+/// 子=`Material`・親=`Model` の接続は材質スロットとして接続順に保持し、
+/// 同一接続の重複は無視する。材質は複数Modelに共有されてよい。
 fn apply_connections(
     top: &[RawNode],
     models: &mut [Model],
     meshes: &mut [Mesh],
+    materials: &[Material],
 ) -> Result<(), FbxError> {
     let Some(connections) = top.iter().find(|node| node.name.as_ref() == "Connections") else {
         return Ok(());
@@ -1414,6 +1535,13 @@ fn apply_connections(
         .collect();
     // メッシュIDから所有モデルIDへの対応。重複する同一対応の無視と多重所有の検出に使う。
     let mut mesh_owner: HashMap<i64, i64> = HashMap::new();
+    let known_materials: HashSet<i64> = materials
+        .iter()
+        .map(|material| material.id.value())
+        .collect();
+    // モデルIDと材質IDの対応をO(1)で重複判定するための集合。順序は `Model::materials` が保つ。
+    // `Model::materials` の線形走査では接続数に対してO(n^2)になるためである。
+    let mut material_seen: HashSet<(i64, i64)> = HashSet::new();
     // 親子と所属は接続順に積み、重複する同一対応は無視する。
     for node in &connections.children {
         if node.props.first().and_then(RawProp::as_bytes) != Some(b"OO".as_slice()) {
@@ -1463,6 +1591,14 @@ fn apply_connections(
             }
             models[parent_at].mesh = Some(ObjectId(child));
             mesh_owner.insert(child, parent);
+        } else if known_materials.contains(&child) && known_models.contains(&parent) {
+            // 材質スロットは接続順に積み、同一接続の重複は無視する。
+            // 判定は対応集合で行い、順序は `Model::materials` が保つ。
+            // 材質は複数Modelに共有されてよく、多重所有として扱わない。
+            if material_seen.insert((parent, child)) {
+                let parent_at = at_model[&parent];
+                models[parent_at].materials.push(ObjectId(child));
+            }
         }
     }
     // 親を辿って循環を検出する。各節点の親は高々1つのため、

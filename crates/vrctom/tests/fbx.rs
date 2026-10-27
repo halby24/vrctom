@@ -182,6 +182,15 @@ fn model(id: i64, name: &[u8], subtype: &str, props70: Option<Vec<TNode>>) -> TN
     TNode::branch(b"Model", props, children)
 }
 
+/// `Material` ノードを組み立てる。色・テクスチャは持たずIDと名前だけである。
+fn material(id: i64, name: &[u8]) -> TNode {
+    let mut props = Props::default();
+    props.l(id);
+    props.s(name);
+    props.s(b"");
+    TNode::branch(b"Material", props, Vec::new())
+}
+
 /// `P` ノードを組み立てる。値は呼び出し側が詰める。
 fn p_node(name: &str, typ: &str, values: Props) -> TNode {
     let mut props = Props::default();
@@ -724,14 +733,30 @@ fn two_triangle_geometry(id: i64, material: TNode) -> TNode {
 #[test]
 fn 材質の全同一と面ごとを面番号で解決できる() {
     // AllSame は全要素同一であり、1件の値を全面へ広げる。
+    // 値5を範囲内にするため、6スロットを用意する。
     let bytes = file(
         7400,
         vec![
             objects(vec![
                 model(1, b"M\x00\x01Model", "Mesh", None),
                 two_triangle_geometry(2, material_layer(b"AllSame", b"IndexToDirect", &[5])),
+                material(10, b"Mat0\x00\x01Material"),
+                material(11, b"Mat1\x00\x01Material"),
+                material(12, b"Mat2\x00\x01Material"),
+                material(13, b"Mat3\x00\x01Material"),
+                material(14, b"Mat4\x00\x01Material"),
+                material(15, b"Mat5\x00\x01Material"),
             ]),
-            connections(vec![conn(1, 0), conn(2, 1)]),
+            connections(vec![
+                conn(1, 0),
+                conn(2, 1),
+                conn(10, 1),
+                conn(11, 1),
+                conn(12, 1),
+                conn(13, 1),
+                conn(14, 1),
+                conn(15, 1),
+            ]),
         ],
     );
     let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("材質層は読める");
@@ -741,15 +766,24 @@ fn 材質の全同一と面ごとを面番号で解決できる() {
     assert_eq!(data.polygon_corner_counts, vec![3, 3]);
     assert_eq!(data.material_indices, vec![5, 5]);
 
-    // ByPolygon は面ごとの番号をそのまま返す。
+    // ByPolygon は面ごとの番号をそのまま返す。値1・2を範囲内にするため3スロットを用意する。
     let bytes = file(
         7400,
         vec![
             objects(vec![
                 model(1, b"M\x00\x01Model", "Mesh", None),
                 two_triangle_geometry(2, material_layer(b"ByPolygon", b"IndexToDirect", &[1, 2])),
+                material(10, b"Mat0\x00\x01Material"),
+                material(11, b"Mat1\x00\x01Material"),
+                material(12, b"Mat2\x00\x01Material"),
             ]),
-            connections(vec![conn(1, 0), conn(2, 1)]),
+            connections(vec![
+                conn(1, 0),
+                conn(2, 1),
+                conn(10, 1),
+                conn(11, 1),
+                conn(12, 1),
+            ]),
         ],
     );
     let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("材質層は読める");
@@ -2565,4 +2599,487 @@ fn 実fixtureのスキンとバインドポーズを検証する() {
         bind_pose.len()
     );
     assert!(!parsed.skins().is_empty(), "スキンを1件以上検証する");
+}
+
+#[test]
+fn 材質スロットは接続順に保持される() {
+    // 接続順と逆のID順で接続し、スロットが接続順になることを確かめる。
+    // Meshを持たないモデルへの接続も保持される。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"M\x00\x01Model", "Mesh", None),
+                model(3, b"Bone\x00\x01Model", "Null", None),
+                two_triangle_geometry(2, material_layer(b"ByPolygon", b"IndexToDirect", &[1, 0])),
+                material(10, b"MatA\x00\x01Material"),
+                material(11, b"MatB\x00\x01Material"),
+                material(12, b"MatC\x00\x01Material"),
+            ]),
+            connections(vec![
+                conn(1, 0),
+                conn(3, 0),
+                conn(2, 1),
+                conn(11, 1),
+                conn(10, 1),
+                conn(12, 3),
+            ]),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("材質接続は読める");
+    // 一覧は `Objects` の出現順である。
+    assert_eq!(parsed.materials().len(), 3);
+    assert_eq!(parsed.materials()[0].id, ObjectId::new(10));
+    assert_eq!(parsed.materials()[0].name, "MatA");
+    assert!(parsed.material(ObjectId::new(999)).is_none());
+    let slot11 = parsed.material(ObjectId::new(11)).expect("材質がある");
+    assert_eq!(slot11.name, "MatB");
+    // スロットは接続順を保つ。
+    let owner = parsed.model(ObjectId::new(1)).expect("モデルがある");
+    assert_eq!(owner.materials, vec![ObjectId::new(11), ObjectId::new(10)]);
+    // Meshを持たないモデルへの接続も保持される。
+    let bone = parsed.model(ObjectId::new(3)).expect("ボーンがある");
+    assert_eq!(bone.materials, vec![ObjectId::new(12)]);
+    // 番号1・0は2スロットの範囲内であり、展開できる。
+    let data = parsed
+        .mesh_data(ObjectId::new(2))
+        .expect("範囲内は展開できる");
+    assert_eq!(data.material_indices, vec![1, 0]);
+}
+
+#[test]
+fn 一つの材質を複数モデルが共有できる() {
+    // 同じ材質を2つの所有モデルに接続しても、多重所有として扱わず成功する。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"A\x00\x01Model", "Mesh", None),
+                model(2, b"B\x00\x01Model", "Mesh", None),
+                two_triangle_geometry(3, material_layer(b"ByPolygon", b"IndexToDirect", &[0, 0])),
+                two_triangle_geometry(4, material_layer(b"ByPolygon", b"IndexToDirect", &[0, 0])),
+                material(10, b"Shared\x00\x01Material"),
+            ]),
+            connections(vec![
+                conn(1, 0),
+                conn(2, 0),
+                conn(3, 1),
+                conn(4, 2),
+                conn(10, 1),
+                conn(10, 2),
+            ]),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("共有は読める");
+    assert_eq!(
+        parsed
+            .model(ObjectId::new(1))
+            .expect("モデルがある")
+            .materials,
+        vec![ObjectId::new(10)]
+    );
+    assert_eq!(
+        parsed
+            .model(ObjectId::new(2))
+            .expect("モデルがある")
+            .materials,
+        vec![ObjectId::new(10)]
+    );
+    parsed
+        .mesh_data(ObjectId::new(3))
+        .expect("共有先は展開できる");
+    parsed
+        .mesh_data(ObjectId::new(4))
+        .expect("共有先は展開できる");
+}
+
+#[test]
+fn 接続されない材質も一覧に現れる() {
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"M\x00\x01Model", "Mesh", None),
+                quad_geometry(2, false),
+                material(10, b"Used\x00\x01Material"),
+                material(11, b"Orphan\x00\x01Material"),
+            ]),
+            connections(vec![conn(1, 0), conn(2, 1), conn(10, 1)]),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("未接続は読める");
+    assert_eq!(parsed.materials().len(), 2);
+    let orphan = parsed.material(ObjectId::new(11)).expect("未接続がある");
+    assert_eq!(orphan.name, "Orphan");
+    assert_eq!(
+        parsed
+            .model(ObjectId::new(1))
+            .expect("モデルがある")
+            .materials,
+        vec![ObjectId::new(10)]
+    );
+}
+
+#[test]
+fn 同一の材質接続の重複は無視される() {
+    // 同一の `Material→Model` が二重に現れても成功する。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"M\x00\x01Model", "Mesh", None),
+                quad_geometry(2, false),
+                material(10, b"Mat\x00\x01Material"),
+            ]),
+            connections(vec![conn(1, 0), conn(2, 1), conn(10, 1), conn(10, 1)]),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("重複は通る");
+    assert_eq!(
+        parsed
+            .model(ObjectId::new(1))
+            .expect("モデルがある")
+            .materials,
+        vec![ObjectId::new(10)]
+    );
+}
+
+#[test]
+fn 同一の材質接続が多数あってもスロットは重複しない() {
+    // 同一の `Material→Model` が多数回現れても、スロットは初出順の1件ずつになる。
+    // 順序の保持と重複の無視を両立することを確かめる。
+    let mut conns = vec![conn(1, 0), conn(2, 1), conn(11, 1), conn(10, 1)];
+    for _ in 0..20 {
+        conns.push(conn(10, 1));
+        conns.push(conn(11, 1));
+    }
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"M\x00\x01Model", "Mesh", None),
+                quad_geometry(2, false),
+                material(10, b"MatA\x00\x01Material"),
+                material(11, b"MatB\x00\x01Material"),
+            ]),
+            connections(conns),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("多数の重複は通る");
+    assert_eq!(
+        parsed
+            .model(ObjectId::new(1))
+            .expect("モデルがある")
+            .materials,
+        vec![ObjectId::new(11), ObjectId::new(10)]
+    );
+}
+
+#[test]
+fn 材質の識別子の不備は失敗する() {
+    // IDが0以下は破損である。
+    for bad in [0, -3] {
+        let bytes = file(
+            7400,
+            vec![
+                objects(vec![material(bad, b"Mat\x00\x01Material")]),
+                connections(vec![conn(bad, 0)]),
+            ],
+        );
+        let error =
+            FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("IDが0以下の材質は失敗する");
+        assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+        assert_eq!(error.object_id(), Some(ObjectId::new(bad)));
+    }
+
+    // ID重複は破損である。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                material(10, b"MatA\x00\x01Material"),
+                material(10, b"MatB\x00\x01Material"),
+            ]),
+            connections(vec![conn(10, 0)]),
+        ],
+    );
+    let error = FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("材質のID重複は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(10)));
+
+    // Modelとの衝突は破損である。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"M\x00\x01Model", "Null", None),
+                material(1, b"Mat\x00\x01Material"),
+            ]),
+            connections(vec![conn(1, 0)]),
+        ],
+    );
+    let error = FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("Modelとの衝突は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(1)));
+
+    // Geometryとの衝突は破損である。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"M\x00\x01Model", "Mesh", None),
+                quad_geometry(2, false),
+                material(2, b"Mat\x00\x01Material"),
+            ]),
+            connections(vec![conn(1, 0), conn(2, 1)]),
+        ],
+    );
+    let error = FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("Geometryとの衝突は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(2)));
+
+    // Deformerとの衝突は破損である。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"Root\x00\x01Model", "Null", None),
+                model(2, b"Owner\x00\x01Model", "Mesh", None),
+                quad_geometry(10, false),
+                deformer(20, b"Skin\x00\x01Deformer", "Skin", vec![]),
+                material(20, b"Mat\x00\x01Material"),
+            ]),
+            connections(vec![conn(1, 0), conn(2, 1), conn(10, 2)]),
+        ],
+    );
+    let error = FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("Deformerとの衝突は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(20)));
+
+    // Poseとの衝突は破損である。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"Root\x00\x01Model", "Null", None),
+                pose(100, b"P1\x00\x01Pose", "BindPose", vec![]),
+                material(100, b"Mat\x00\x01Material"),
+            ]),
+            connections(vec![conn(1, 0)]),
+        ],
+    );
+    let error = FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("Poseとの衝突は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(100)));
+
+    // 非UTF-8の材質名は破損であり、対象IDを付ける。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![material(7, b"\xff\xfe")]),
+            connections(vec![conn(7, 0)]),
+        ],
+    );
+    let error = FbxFile::parse(&bytes, &FbxOptions::new()).expect_err("非UTF-8の材質名は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(7)));
+}
+
+#[test]
+fn 材質番号の範囲外は失敗し既定と層なしは通る() {
+    // 1スロットで範囲内(0)のみは通る。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"M\x00\x01Model", "Mesh", None),
+                two_triangle_geometry(2, material_layer(b"ByPolygon", b"IndexToDirect", &[0, 0])),
+                material(10, b"Mat\x00\x01Material"),
+            ]),
+            connections(vec![conn(1, 0), conn(2, 1), conn(10, 1)]),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("範囲内は読める");
+    let data = parsed
+        .mesh_data(ObjectId::new(2))
+        .expect("範囲内は展開できる");
+    assert_eq!(data.material_indices, vec![0, 0]);
+
+    // 1スロットで範囲外(1)は失敗する。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"M\x00\x01Model", "Mesh", None),
+                two_triangle_geometry(2, material_layer(b"ByPolygon", b"IndexToDirect", &[0, 1])),
+                material(10, b"Mat\x00\x01Material"),
+            ]),
+            connections(vec![conn(1, 0), conn(2, 1), conn(10, 1)]),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("要約は読める");
+    let error = parsed
+        .mesh_data(ObjectId::new(2))
+        .expect_err("スロット数以上は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(2)));
+
+    // スロット0で0のみは通る（既定材質として扱える）。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"M\x00\x01Model", "Mesh", None),
+                two_triangle_geometry(2, material_layer(b"AllSame", b"IndexToDirect", &[0])),
+            ]),
+            connections(vec![conn(1, 0), conn(2, 1)]),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("要約は読める");
+    let data = parsed
+        .mesh_data(ObjectId::new(2))
+        .expect("スロット0の0は通る");
+    assert_eq!(data.material_indices, vec![0, 0]);
+
+    // スロット0で1は失敗する。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"M\x00\x01Model", "Mesh", None),
+                two_triangle_geometry(2, material_layer(b"AllSame", b"IndexToDirect", &[1])),
+            ]),
+            connections(vec![conn(1, 0), conn(2, 1)]),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("要約は読める");
+    let error = parsed
+        .mesh_data(ObjectId::new(2))
+        .expect_err("スロット0の1は失敗する");
+    assert_eq!(error.kind(), FbxErrorKind::InvalidStructure);
+    assert_eq!(error.object_id(), Some(ObjectId::new(2)));
+
+    // 材質層がないメッシュはスロットがあっても通る。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"M\x00\x01Model", "Mesh", None),
+                quad_geometry(2, false),
+                material(10, b"Mat\x00\x01Material"),
+            ]),
+            connections(vec![conn(1, 0), conn(2, 1), conn(10, 1)]),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("層なしは読める");
+    let data = parsed.mesh_data(ObjectId::new(2)).expect("層なしは通る");
+    assert!(data.material_indices.is_empty());
+
+    // 所有モデルがないメッシュは範囲検査をしない。
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                model(1, b"M\x00\x01Model", "Mesh", None),
+                two_triangle_geometry(2, material_layer(b"ByPolygon", b"IndexToDirect", &[3, 4])),
+            ]),
+            connections(vec![conn(1, 0)]),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("所有者なしは読める");
+    let data = parsed
+        .mesh_data(ObjectId::new(2))
+        .expect("所有者なしは範囲検査しない");
+    assert_eq!(data.material_indices, vec![3, 4]);
+}
+
+/// 実fixtureの材質スロットと置換表を検証する。
+///
+/// 固定件数に依存せず、面の材質番号の範囲・番号ごとの面数の合計・
+/// スロット名と `.meta` の置換表の名前一致を確かめる。
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn 実fixtureの材質スロットと置換表を検証する() {
+    use std::collections::BTreeMap;
+    use std::collections::HashSet;
+
+    use vrctom::unity::AssetMeta;
+
+    let Ok(path) = std::env::var("VRCTOM_FBX_FIXTURE") else {
+        eprintln!("VRCTOM_FBX_FIXTUREが未設定のため跳ばす");
+        return;
+    };
+    let bytes = std::fs::read(&path).expect("実fixtureは読める");
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("実fixtureは読める");
+    /// モデル名・スロット名列・材質番号ごとの面数。
+    type SlotRow = (String, Vec<String>, Vec<(u32, usize)>);
+    let mut rows: Vec<SlotRow> = Vec::new();
+    for model in parsed.models() {
+        let Some(mesh_id) = model.mesh else {
+            continue;
+        };
+        let mesh = parsed.mesh(mesh_id).expect("所有メッシュがある");
+        let data = parsed
+            .mesh_data(mesh_id)
+            .expect("実fixtureの幾何は展開できる");
+        let slots = model.materials.len();
+        // 面の材質番号はスロット数未満であり、スロット0では0のみである。
+        for index in &data.material_indices {
+            if slots == 0 {
+                assert_eq!(*index, 0, "スロット0の材質番号は0である");
+            } else {
+                assert!((*index as usize) < slots, "材質番号がスロット数未満である",);
+            }
+        }
+        // 材質番号ごとの面数の合計は面数と一致する。層がない場合は空である。
+        let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
+        for index in &data.material_indices {
+            *counts.entry(*index).or_default() += 1;
+        }
+        if mesh.has_materials {
+            assert_eq!(data.material_indices.len(), mesh.polygon_count);
+            let total: usize = counts.values().sum();
+            assert_eq!(total, mesh.polygon_count);
+        } else {
+            assert!(data.material_indices.is_empty());
+        }
+        // スロット名は材質IDから引ける。
+        let names: Vec<String> = model
+            .materials
+            .iter()
+            .map(|id| {
+                parsed
+                    .material(*id)
+                    .expect("スロットの材質がある")
+                    .name
+                    .clone()
+            })
+            .collect();
+        let histogram: Vec<(u32, usize)> = counts.into_iter().collect();
+        rows.push((model.name.clone(), names, histogram));
+    }
+    // モデル名昇順で1行に出す。件数は固定しない。
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    eprintln!("material_slots={rows:?}");
+    assert!(!rows.is_empty(), "メッシュモデルを1件以上検証する");
+
+    // 置換表の `first` 名に空でないスロット名がすべて含まれる。
+    let meta_bytes = std::fs::read(format!("{path}.meta")).expect("実fixtureのmetaは読める");
+    let meta = AssetMeta::parse(&meta_bytes).expect("実fixtureのmetaは読める");
+    let remaps = meta.external_object_remaps().expect("置換表は読める");
+    let first_names: HashSet<&str> = remaps
+        .iter()
+        .map(|entry| entry.original_name.as_str())
+        .collect();
+    for (model_name, slot_names, _) in &rows {
+        for slot in slot_names {
+            if slot.is_empty() {
+                continue;
+            }
+            assert!(
+                first_names.contains(slot.as_str()),
+                "スロット名 {slot}（モデル {model_name}）が置換表にある",
+            );
+        }
+    }
 }
