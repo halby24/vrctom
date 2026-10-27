@@ -1,20 +1,23 @@
-//! UnityPackageの展開などを行う補助CLI。
+//! UnityPackageの展開やVRMの書き出しを行う補助CLI。
 //!
 //! 標準出力には何も出さず、結果の要約や失敗の診断は標準エラーに出す。
 //! 終了コードは成功で0、実行失敗で1、引数不正で2とする。
 //! 引数不正の2は[`clap`]のエラーを可視エスケープして返す。
 
 use std::fs::File;
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use vrctom::fbx::{FbxFile, FbxOptions};
 use vrctom::unitypackage::{UnpackOptions, unpack_to};
+use vrctom::vrm::{VrmExportOptions, VrmMeta, VrmModel, VrmOptions};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "vrctom",
     version,
-    about = "UnityPackageの展開などを行う補助CLI"
+    about = "UnityPackageの展開やVRMの書き出しを行う補助CLI"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -30,6 +33,20 @@ enum Command {
         /// 出力先ディレクトリ。既存の場所は指定できない。
         #[arg(short, long, value_name = "DIR")]
         output: Option<PathBuf>,
+    },
+    /// FBXからVRM 1.0を書き出す。
+    Export {
+        /// 読み取る `.fbx` ファイル。
+        input: PathBuf,
+        /// 出力先。既定は入力の拡張子を `vrm` に変えたパス。
+        #[arg(short, long, value_name = "OUT")]
+        output: Option<PathBuf>,
+        /// VRMのmeta.name。既定は入力ファイルのstem。空は受け付けない。
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// VRMのmeta.authors。繰り返し指定可。既定は `unknown` 1件。
+        #[arg(long, value_name = "AUTHOR")]
+        author: Vec<String>,
     },
 }
 
@@ -54,6 +71,12 @@ fn main() {
     };
     let code = match cli.command {
         Command::Unpack { package, output } => unpack(package, output),
+        Command::Export {
+            input,
+            output,
+            name,
+            author,
+        } => export(input, output, name, author),
     };
     std::process::exit(code);
 }
@@ -141,7 +164,7 @@ fn unpack(package: PathBuf, output: Option<PathBuf>) -> i32 {
     let report = match unpack_to(input, &destination, &UnpackOptions::default()) {
         Ok(report) => report,
         Err(error) => {
-            // 診断文面は可視エスケープしてから出し、端末制御や行偽装を防ぐ。
+            // 診断文面は可視エスケープしてから出す。端末制御や行偽装を防ぐ。
             // 逃がし済みの文面への再適用は変えない。
             eprintln!(
                 "展開に失敗した: {}: {}",
@@ -177,6 +200,128 @@ fn unpack(package: PathBuf, output: Option<PathBuf>) -> i32 {
         escape_diag(&format!("{destination:?}"))
     );
     0
+}
+
+/// FBXからVRM 1.0を書き出す。
+///
+/// 終了コードは成功で0、実行失敗で1とする。引数不正の2は[`clap`]のエラーを
+/// 可視エスケープして返す（[`main`] が扱う）。
+/// 標準出力には何も出さず、要約と診断は標準エラーに出す。
+/// 既存の出力先は上書きせず、作成の競合も失敗として1を返す。
+fn export(
+    input: PathBuf,
+    output: Option<PathBuf>,
+    name: Option<String>,
+    authors: Vec<String>,
+) -> i32 {
+    // 既定出力先は入力の拡張子を `vrm` に変えたパスとする。
+    let destination = match output {
+        Some(out) => out,
+        None => input.with_extension("vrm"),
+    };
+    // 既定の作品名は入力ファイルのstemとする。空は受け付けない。
+    let meta_name = match name {
+        Some(name) => name,
+        None => input
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    };
+    if meta_name.is_empty() {
+        eprintln!("作品名が空である: {}", escape_diag(&format!("{input:?}")));
+        return 1;
+    }
+    // 作者の既定は `unknown` 1件とする。空文字だけの指定は書き出し層の
+    // 検証に任せ、ここでは素通しする。
+    let meta_authors = if authors.is_empty() {
+        vec!["unknown".to_owned()]
+    } else {
+        authors
+    };
+    // 大きなバイト列を保持するが、上限の判断は読み取り層に任せる。
+    let bytes = match std::fs::read(&input) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!(
+                "入力を読み込めない: {}: {}",
+                escape_diag(&format!("{input:?}")),
+                escape_diag(&error.to_string())
+            );
+            return 1;
+        }
+    };
+    let file = match FbxFile::parse(&bytes, &FbxOptions::default()) {
+        Ok(file) => file,
+        Err(error) => {
+            diagnose_stage("FBXの解析に失敗した", &error);
+            return 1;
+        }
+    };
+    let (model, report) = match VrmModel::from_fbx(&file, &VrmOptions::default()) {
+        Ok(built) => built,
+        Err(error) => {
+            diagnose_stage("中間モデルの生成に失敗した", &error);
+            return 1;
+        }
+    };
+    let meta = VrmMeta::new(meta_name, meta_authors);
+    let vrm_bytes = match model.to_vrm(&VrmExportOptions::new(meta)) {
+        Ok(vrm_bytes) => vrm_bytes,
+        Err(error) => {
+            diagnose_stage("VRMの書き出しに失敗した", &error);
+            return 1;
+        }
+    };
+    // 既存ファイルは上書きしない。競合も失敗として1を返す。
+    let mut out = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+    {
+        Ok(out) => out,
+        Err(error) => {
+            eprintln!(
+                "出力先を作成できない: {}: {}",
+                escape_diag(&format!("{destination:?}")),
+                escape_diag(&error.to_string())
+            );
+            return 1;
+        }
+    };
+    if let Err(error) = out.write_all(&vrm_bytes) {
+        eprintln!(
+            "書き込みに失敗した: {}: {}",
+            escape_diag(&format!("{destination:?}")),
+            escape_diag(&error.to_string())
+        );
+        return 1;
+    }
+    eprintln!(
+        "書き出しが完了した: ノード{}件 メッシュ{}件 スキン{}件 {}バイト: {}",
+        report.node_count,
+        report.mesh_count,
+        report.skin_count,
+        vrm_bytes.len(),
+        escape_diag(&format!("{destination:?}"))
+    );
+    0
+}
+
+/// 書き出し各段階の失敗を1行にまとめて診断に出す。
+///
+/// 本体は可視エスケープし、`source` がある場合は原因も併記する。
+fn diagnose_stage<E>(stage: &str, error: &E)
+where
+    E: std::error::Error,
+{
+    eprintln!(
+        "{stage}: {}: {}",
+        escape_diag(&format!("{error:?}")),
+        escape_diag(&format!("{error}"))
+    );
+    if let Some(source) = std::error::Error::source(error) {
+        eprintln!("原因: {}", escape_diag(&source.to_string()));
+    }
 }
 
 #[cfg(test)]
