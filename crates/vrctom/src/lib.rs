@@ -55,6 +55,9 @@ pub mod unity;
 /// バイナリFBXからメッシュ幾何とモデル階層を読み取る層。
 pub mod fbx;
 
+/// FBX読み取り結果からVRM 1.0へ書き出す前の中間モデル。
+pub mod vrm;
+
 /// UnityPackageの展開。
 #[cfg(not(target_arch = "wasm32"))]
 pub mod unitypackage;
