@@ -94,3 +94,197 @@ fn 実fbxがあればvrmを書き出せる() {
         "バイト数を出す: {stderr}"
     );
 }
+
+/// GLBのJSON塊に指定の断片が含まれるかどうかを返す。
+fn json塊に含まれるか(バイト列: &[u8], 断片: &str) -> bool {
+    if バイト列.len() < 20 {
+        return false;
+    }
+    let json長 =
+        u32::from_le_bytes(バイト列[12..16].try_into().expect("塊長は4バイトである")) as usize;
+    let json = &バイト列[20..20 + json長];
+    let json終端 = json
+        .iter()
+        .rposition(|b| *b != b' ')
+        .map(|位置| 位置 + 1)
+        .unwrap_or(0);
+    String::from_utf8_lossy(&json[..json終端]).contains(断片)
+}
+
+#[test]
+fn 資材指定と自動検出で材質入りvrmを書き出せる() {
+    let fixture = match std::env::var("VRCTOM_FBX_FIXTURE") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            eprintln!("skip: VRCTOM_FBX_FIXTURE 未設定のため読み飛ばす");
+            return;
+        }
+    };
+    let fbx = Path::new(&fixture);
+    let mut 資材親 = None;
+    for 祖先 in fbx.ancestors() {
+        if 祖先.join("Assets").is_dir() {
+            資材親 = Some(祖先.to_path_buf());
+            break;
+        }
+    }
+    let Some(資材親) = 資材親 else {
+        eprintln!("skip: 実fixtureの祖先にAssetsが無い");
+        return;
+    };
+    // 明示指定では `Assets` 自体を渡し、親を使う分岐を通す。
+    let 資材 = 資材親.join("Assets");
+    for (名, 資材指定) in [
+        ("明示", Some(資材.to_string_lossy().into_owned())),
+        ("自動", None),
+    ] {
+        let work = tempfile::TempDir::new().expect("作業場所は作れる");
+        let destination = work.path().join("out.vrm");
+        let destination_arg = destination.to_string_lossy().into_owned();
+        let mut 引数 = vec!["export", &fixture, "-o", &destination_arg];
+        let 資材所有;
+        if let Some(指定) = &資材指定 {
+            資材所有 = 指定.clone();
+            引数.push("--assets");
+            引数.push(&資材所有);
+        }
+        let output = run(&引数, work.path());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{名}: stderr: {stderr}");
+        assert!(output.stdout.is_empty(), "{名}: 標準出力は空である");
+        assert!(stderr.contains("材質"), "{名}: 材質数を出す: {stderr}");
+        let bytes = fs::read(&destination).expect("出力は読める");
+        assert_eq!(&bytes[..4], b"glTF", "{名}: GLBである");
+        assert!(json塊に含まれるか(&bytes, "\"images\""), "{名}: 画像が入る");
+    }
+}
+
+#[test]
+fn 存在しない資材指定は終了コード1になる() {
+    let fixture = match std::env::var("VRCTOM_FBX_FIXTURE") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            eprintln!("skip: VRCTOM_FBX_FIXTURE 未設定のため読み飛ばす");
+            return;
+        }
+    };
+    let work = tempfile::TempDir::new().expect("作業場所は作れる");
+    let destination = work.path().join("out.vrm");
+    let destination_arg = destination.to_string_lossy().into_owned();
+    let missing = work.path().join("存在しない資材");
+    let missing_arg = missing.to_string_lossy().into_owned();
+    let output = run(
+        &[
+            "export",
+            &fixture,
+            "-o",
+            &destination_arg,
+            "--assets",
+            &missing_arg,
+        ],
+        work.path(),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+}
+
+#[test]
+fn 相対パス入力でも自動検出で材質入りvrmを書き出せる() {
+    // プロジェクトルートをcwdにしてFBXを相対パスで渡す使い方で、
+    // 空パスの祖先をカレントとして解決できることを確かめる。
+    let fixture = match std::env::var("VRCTOM_FBX_FIXTURE") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            eprintln!("skip: VRCTOM_FBX_FIXTURE 未設定のため読み飛ばす");
+            return;
+        }
+    };
+    let fbx = Path::new(&fixture);
+    let mut 計画親 = None;
+    for 祖先 in fbx.ancestors() {
+        if 祖先.join("Assets").is_dir() {
+            計画親 = Some(祖先.to_path_buf());
+            break;
+        }
+    }
+    let Some(計画親) = 計画親 else {
+        eprintln!("skip: 実fixtureの祖先にAssetsが無い");
+        return;
+    };
+    // 区切りはOSに任せ、接頭辞の除去でルートからの相対パスを作る。
+    let 相対 = match fbx.strip_prefix(&計画親) {
+        Ok(相対) => 相対.to_string_lossy().into_owned(),
+        Err(_) => {
+            eprintln!("skip: 実fixtureが計画親の配下に無い");
+            return;
+        }
+    };
+    // 出力先は一時場所の絶対パスにし、プロジェクト直下を汚さない。
+    // cwdは計画親のままにし、相対パス入力の解決を確かめる。
+    let work = tempfile::TempDir::new().expect("作業場所は作れる");
+    let destination = work.path().join("out.vrm");
+    let destination_arg = destination.to_string_lossy().into_owned();
+    let output = run(&["export", &相対, "-o", &destination_arg], &計画親);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(output.stdout.is_empty(), "標準出力は空である");
+    assert!(stderr.contains("材質"), "材質数を出す: {stderr}");
+    let bytes = fs::read(&destination).expect("出力は読める");
+    assert_eq!(&bytes[..4], b"glTF", "GLBである");
+    assert!(json塊に含まれるか(&bytes, "\"images\""), "画像が入る");
+}
+
+#[test]
+fn 相対の資材指定でも材質入りvrmを書き出せる() {
+    // プロジェクトルートをcwdにして `--assets Assets` と相対で渡す使い方で、
+    // 末尾 `Assets` の親が空パスになる場合でもカレントを走査元として
+    // 材質を読み込めることを確かめる。
+    let fixture = match std::env::var("VRCTOM_FBX_FIXTURE") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            eprintln!("skip: VRCTOM_FBX_FIXTURE 未設定のため読み飛ばす");
+            return;
+        }
+    };
+    let fbx = Path::new(&fixture);
+    let mut 計画親 = None;
+    for 祖先 in fbx.ancestors() {
+        if 祖先.join("Assets").is_dir() {
+            計画親 = Some(祖先.to_path_buf());
+            break;
+        }
+    }
+    let Some(計画親) = 計画親 else {
+        eprintln!("skip: 実fixtureの祖先にAssetsが無い");
+        return;
+    };
+    let 相対 = match fbx.strip_prefix(&計画親) {
+        Ok(相対) => 相対.to_string_lossy().into_owned(),
+        Err(_) => {
+            eprintln!("skip: 実fixtureが計画親の配下に無い");
+            return;
+        }
+    };
+    let work = tempfile::TempDir::new().expect("作業場所は作れる");
+    let destination = work.path().join("out.vrm");
+    let destination_arg = destination.to_string_lossy().into_owned();
+    let output = run(
+        &[
+            "export",
+            &相対,
+            "-o",
+            &destination_arg,
+            "--assets",
+            "Assets",
+        ],
+        &計画親,
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(output.stdout.is_empty(), "標準出力は空である");
+    assert!(stderr.contains("材質"), "材質数を出す: {stderr}");
+    let bytes = fs::read(&destination).expect("出力は読める");
+    assert_eq!(&bytes[..4], b"glTF", "GLBである");
+    assert!(json塊に含まれるか(&bytes, "\"images\""), "画像が入る");
+}

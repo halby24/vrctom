@@ -6,12 +6,12 @@
 
 use std::fs::File;
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use vrctom::fbx::{FbxFile, FbxOptions};
 use vrctom::unitypackage::{UnpackOptions, unpack_to};
-use vrctom::vrm::{VrmExportOptions, VrmMeta, VrmModel, VrmOptions};
+use vrctom::vrm::{MaterialOptions, VrmExportOptions, VrmMaterials, VrmMeta, VrmModel, VrmOptions};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -47,6 +47,9 @@ enum Command {
         /// VRMのmeta.authors。繰り返し指定可。既定は `unknown` 1件。
         #[arg(long, value_name = "AUTHOR")]
         author: Vec<String>,
+        /// `Assets` を含むUnityプロジェクトのルート。省略時はFBXの祖先から探す。
+        #[arg(long, value_name = "DIR")]
+        assets: Option<PathBuf>,
     },
 }
 
@@ -76,7 +79,8 @@ fn main() {
             output,
             name,
             author,
-        } => export(input, output, name, author),
+            assets,
+        } => export(input, output, name, author, assets),
     };
     std::process::exit(code);
 }
@@ -213,6 +217,7 @@ fn export(
     output: Option<PathBuf>,
     name: Option<String>,
     authors: Vec<String>,
+    assets: Option<PathBuf>,
 ) -> i32 {
     // 既定出力先は入力の拡張子を `vrm` に変えたパスとする。
     let destination = match output {
@@ -265,7 +270,41 @@ fn export(
         }
     };
     let meta = VrmMeta::new(meta_name, meta_authors);
-    let vrm_bytes = match model.to_vrm(&VrmExportOptions::new(meta)) {
+    // 材質の読み取り。指定時はその配置、省略時はFBXの祖先の `Assets` から求める。
+    let explicit_assets = assets.is_some();
+    let assets_root = match assets {
+        Some(dir) => Some(assets_root_of(&dir)),
+        None => assets_root_from_ancestors(&input),
+    };
+    let mut export_options = VrmExportOptions::new(meta);
+    let mut material_count = 0usize;
+    if let Some(root) = assets_root {
+        match VrmMaterials::load(&root, &input, &MaterialOptions::new()) {
+            Ok((Some(materials), report)) => {
+                for warning in report.warnings() {
+                    eprintln!("材質の警告: {}", escape_diag(warning));
+                }
+                material_count = materials.entries().len();
+                export_options = export_options.with_materials(materials);
+            }
+            Ok((None, report)) => {
+                for warning in report.warnings() {
+                    eprintln!("材質の警告: {}", escape_diag(warning));
+                }
+            }
+            Err(error) => {
+                if explicit_assets {
+                    diagnose_stage("材質の読み取りに失敗した", &error);
+                    return 1;
+                }
+                eprintln!(
+                    "材質の警告: {}",
+                    escape_diag(&format!("自動検出の配置では材質を読まずに続ける: {error}"))
+                );
+            }
+        }
+    }
+    let vrm_bytes = match model.to_vrm(&export_options) {
         Ok(vrm_bytes) => vrm_bytes,
         Err(error) => {
             diagnose_stage("VRMの書き出しに失敗した", &error);
@@ -297,14 +336,48 @@ fn export(
         return 1;
     }
     eprintln!(
-        "書き出しが完了した: ノード{}件 メッシュ{}件 スキン{}件 {}バイト: {}",
+        "書き出しが完了した: ノード{}件 メッシュ{}件 スキン{}件 材質{}件 {}バイト: {}",
         report.node_count,
         report.mesh_count,
         report.skin_count,
+        material_count,
         vrm_bytes.len(),
         escape_diag(&format!("{destination:?}"))
     );
     0
+}
+
+/// 明示指定の材質配置から走査元を求める。末尾が `Assets` ならその親を使う。
+fn assets_root_of(dir: &Path) -> PathBuf {
+    if dir.file_name().is_some_and(|name| name == "Assets") {
+        match dir.parent() {
+            // `Path::new("Assets").parent()` は空パスを返すため、そのまま返すと
+            // 後段の正規化に失敗する。カレントディレクトリを指すものとして扱う。
+            Some(parent) if parent.as_os_str().is_empty() => PathBuf::from("."),
+            Some(parent) => parent.to_path_buf(),
+            None => dir.to_path_buf(),
+        }
+    } else {
+        dir.to_path_buf()
+    }
+}
+
+/// FBXの祖先で最初に見つかった `Assets` の親を求める。無ければ `None` である。
+fn assets_root_from_ancestors(input: &Path) -> Option<PathBuf> {
+    input.ancestors().find_map(|ancestor| {
+        // 相対パスの末端の祖先は空パスになり、そのまま返すと材質読み取りの
+        // 正規化に失敗するため、カレントディレクトリを基準にする。
+        if ancestor.as_os_str().is_empty() {
+            return std::env::current_dir()
+                .ok()
+                .filter(|current| current.join("Assets").is_dir());
+        }
+        if ancestor.join("Assets").is_dir() {
+            Some(ancestor.to_path_buf())
+        } else {
+            None
+        }
+    })
 }
 
 /// 書き出し各段階の失敗を1行にまとめて診断に出す。
