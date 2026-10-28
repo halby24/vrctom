@@ -1099,19 +1099,12 @@ fn 不正な材質値は灰色材質に落ちる() {
     .expect("読める");
     let material = materials.expect("ある").get("Body").expect("ある").clone();
     assert!(material.mtoon.is_none(), "灰色PBRへ落ちる");
+    // 非有限は写像前の検査で落とすため、写像後の文面ではなく先行検査の文面になる。
     assert!(
         report
             .warnings()
             .iter()
-            .any(|警告| 警告.contains("材質値が不正")),
-        "警告: {:?}",
-        report.warnings()
-    );
-    assert!(
-        report
-            .warnings()
-            .iter()
-            .any(|警告| 警告.contains("base_color_factor")),
+            .any(|警告| 警告.contains("非有限値")),
         "警告: {:?}",
         report.warnings()
     );
@@ -1161,6 +1154,141 @@ fn 不正な材質値は灰色材質に落ちる() {
             .warnings()
             .iter()
             .any(|警告| 警告.contains("outline_width_factor")),
+        "警告: {:?}",
+        report.warnings()
+    );
+}
+
+/// 色の無限値は写像前の検査で灰色材質に落ちる。
+#[test]
+fn 色の無限値は灰色材質に落ちる() {
+    // 写像時の `clamp01` が無限を1に潰す前に検出し、灰色材質へ落とす。
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[],
+        &基本浮動小数(),
+        &[("_Color", [f64::INFINITY, 1.0, 1.0, 1.0])],
+    );
+    // Rustの `Display` は `inf` と書くが、Unity YAMLの無限は `.inf` である。
+    // そのままでは文字列扱いで材質文書が読めないため、置き換える。
+    let mat_path = root.join("Assets/Materials/Body.mat");
+    let 本文 = fs::read_to_string(&mat_path).expect("matは読める");
+    let 本文 = 本文.replace(": inf", ": .inf");
+    fs::write(&mat_path, 本文.as_bytes()).expect("matは書ける");
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let material = materials.expect("ある").get("Body").expect("ある").clone();
+    assert_eq!(material.base_color_factor, [0.8, 0.8, 0.8, 1.0]);
+    assert!(material.mtoon.is_none(), "灰色PBRへ落ちる");
+    assert!(
+        report
+            .warnings()
+            .iter()
+            .any(|警告| 警告.contains("非有限値")),
+        "警告: {:?}",
+        report.warnings()
+    );
+}
+
+/// 影強度の無限値は写像前の検査で灰色材質に落ちる。
+#[test]
+fn 影強度の無限値は灰色材質に落ちる() {
+    // 写像時の `clamp01` が無限を1に潰す前に検出し、灰色材質へ落とす。
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    let mut 浮動 = 基本浮動小数();
+    for (名, 値) in &mut 浮動 {
+        if *名 == "_ShadowStrength" {
+            *値 = f64::INFINITY;
+        }
+    }
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[],
+        &浮動,
+        &基本色(),
+    );
+    let mat_path = root.join("Assets/Materials/Body.mat");
+    let 本文 = fs::read_to_string(&mat_path).expect("matは読める");
+    let 本文 = 本文.replace(": inf", ": .inf");
+    fs::write(&mat_path, 本文.as_bytes()).expect("matは書ける");
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let material = materials.expect("ある").get("Body").expect("ある").clone();
+    assert!(material.mtoon.is_none(), "灰色PBRへ落ちる");
+    assert!(
+        report
+            .warnings()
+            .iter()
+            .any(|警告| 警告.contains("非有限値")),
+        "警告: {:?}",
+        report.warnings()
+    );
+}
+
+/// アウトライン幅の非数は写像前の検査で灰色材質に落ちる。
+#[test]
+fn アウトライン幅の非数は灰色材質に落ちる() {
+    // 写像時の `.max(0.0)` が非数をそのまま通す前に検出し、灰色材質へ落とす。
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    let mut 浮動 = 基本浮動小数();
+    for (名, 値) in &mut 浮動 {
+        if *名 == "_UseOutline" {
+            *値 = 1.0;
+        }
+        if *名 == "_OutlineWidth" {
+            *値 = f64::NAN;
+        }
+    }
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[],
+        &浮動,
+        &基本色(),
+    );
+    let mat_path = root.join("Assets/Materials/Body.mat");
+    let 本文 = fs::read_to_string(&mat_path).expect("matは読める");
+    let 本文 = 本文.replace("NaN", ".nan");
+    fs::write(&mat_path, 本文.as_bytes()).expect("matは書ける");
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let material = materials.expect("ある").get("Body").expect("ある").clone();
+    assert!(material.mtoon.is_none(), "灰色PBRへ落ちる");
+    assert!(
+        report
+            .warnings()
+            .iter()
+            .any(|警告| 警告.contains("非有限値")),
         "警告: {:?}",
         report.warnings()
     );

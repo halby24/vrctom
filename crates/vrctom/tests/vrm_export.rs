@@ -484,6 +484,60 @@ fn 頂点属性の長さ不一致で失敗する() {
 }
 
 #[test]
+fn 非有限の基準色で失敗する() {
+    // 公開APIから渡された非有限値は書き出し時に拒否する。
+    let モデル = 合成モデルを作る();
+    let 材質 = VrmMaterials::new(
+        vec![VrmMaterialEntry {
+            slot: "Body".to_string(),
+            material: VrmMaterial {
+                name: "Body".to_string(),
+                alpha_mode: VrmAlphaMode::Opaque,
+                alpha_cutoff: 0.5,
+                double_sided: false,
+                base_color_factor: [f32::NAN, 1.0, 1.0, 1.0],
+                base_color_image: None,
+                emissive_factor: [0.0, 0.0, 0.0],
+                emissive_image: None,
+                mtoon: None,
+            },
+        }],
+        vec![],
+    );
+    let 設定 = 書き出し設定を作る().with_materials(材質);
+    let 失敗 = モデル.to_vrm(&設定).expect_err("非有限の基準色は失敗する");
+    assert_eq!(失敗.kind(), VrmExportErrorKind::InvalidStructure);
+}
+
+#[test]
+fn 範囲外のカットオフで失敗する() {
+    // 有限でも範囲外の値は書き出し時に拒否する。
+    let モデル = 合成モデルを作る();
+    let 材質 = VrmMaterials::new(
+        vec![VrmMaterialEntry {
+            slot: "Body".to_string(),
+            material: VrmMaterial {
+                name: "Body".to_string(),
+                alpha_mode: VrmAlphaMode::Mask,
+                alpha_cutoff: 2.0,
+                double_sided: false,
+                base_color_factor: [1.0, 1.0, 1.0, 1.0],
+                base_color_image: None,
+                emissive_factor: [0.0, 0.0, 0.0],
+                emissive_image: None,
+                mtoon: None,
+            },
+        }],
+        vec![],
+    );
+    let 設定 = 書き出し設定を作る().with_materials(材質);
+    let 失敗 = モデル
+        .to_vrm(&設定)
+        .expect_err("範囲外のカットオフは失敗する");
+    assert_eq!(失敗.kind(), VrmExportErrorKind::InvalidStructure);
+}
+
+#[test]
 fn metaの必須項目の欠落で失敗する() {
     let モデル = 合成モデルを作る();
     // nameが空の場合は失敗する。

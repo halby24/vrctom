@@ -758,6 +758,12 @@ impl<'a> LoadContext<'a> {
             self.warn(format!("材質文書がないため灰色材質にする: {slot}: {path}"));
             return Ok(placeholder(slot));
         };
+        // 写像時の `clamp01` や `.max(0.0)` が非有限を正常値に潰す前に検出する。
+        // 写像後の `validate_material` は有限の範囲外だけを拾う役割に残す。
+        if has_non_finite(&material) {
+            self.warn(format!("材質に非有限値があるため灰色材質にする: {slot}"));
+            return Ok(placeholder(slot));
+        }
         let Some(series) = self.shader_series(&material, slot) else {
             self.warn(format!(
                 "未対応シェーダのため灰色材質にする: {slot}: {}",
@@ -1268,6 +1274,33 @@ pub(crate) fn validate_material(material: &VrmMaterial) -> Result<(), &'static s
         return Err("render_queue_offset");
     }
     Ok(())
+}
+
+/// 数値プロパティに非有限値があるかを返す。
+///
+/// 写像時の `clamp01` や `.max(0.0)` が非有限を正常値に潰す前に検出する。
+/// `floats` の値・`colors` の各成分・`tex_envs` の `scale`/`offset` を見る。
+/// 整数プロパティは非有限を取り得ないため対象外である。
+#[cfg(not(target_arch = "wasm32"))]
+fn has_non_finite(material: &crate::unity::Material) -> bool {
+    if material.floats.iter().any(|entry| !entry.value.is_finite()) {
+        return true;
+    }
+    if material
+        .colors
+        .iter()
+        .any(|entry| entry.value.iter().any(|value| !value.is_finite()))
+    {
+        return true;
+    }
+    material.tex_envs.iter().any(|entry| {
+        entry
+            .value
+            .scale
+            .iter()
+            .chain(entry.value.offset.iter())
+            .any(|value| !value.is_finite())
+    })
 }
 
 /// 浮動小数点プロパティの有無を返す。
