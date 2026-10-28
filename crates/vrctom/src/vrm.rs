@@ -19,12 +19,18 @@
 mod error;
 mod export;
 mod humanoid;
+mod material;
 mod matrix;
 mod mesh;
 
 pub use error::{VrmError, VrmErrorKind};
 pub use export::{VrmExportError, VrmExportErrorKind, VrmExportOptions, VrmMeta};
 pub use humanoid::{HumanoidBone, HumanoidBones};
+pub use material::{
+    MaterialError, MaterialErrorKind, MaterialOptions, MaterialReport, VrmAlphaMode, VrmFilter,
+    VrmImage, VrmImageMime, VrmMaterial, VrmMaterialEntry, VrmMaterials, VrmMtoonParameters,
+    VrmOutlineWidthMode, VrmSampler, VrmWrap,
+};
 use matrix::IDENTITY;
 use std::collections::{HashMap, HashSet};
 

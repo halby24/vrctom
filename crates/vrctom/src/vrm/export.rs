@@ -5,10 +5,14 @@
 //! glTF JSON（`VRMC_vrm` 拡張付き）と単一バッファを組み立て、GLBの容器は自前で書く。
 //! `gltf` クレートのimport機能は使わない（画像デコーダを依存に入れないため）。
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::VrmModel;
 use super::humanoid::{HumanoidBone, HumanoidBones, allowed_parents_for};
+use super::material::{
+    VrmAlphaMode, VrmFilter, VrmMaterial, VrmMaterials, VrmMtoonParameters, VrmSampler, VrmWrap,
+    placeholder,
+};
 use super::matrix;
 use crate::escape_diag;
 
@@ -88,17 +92,26 @@ pub struct VrmExportOptions {
     pub meta: VrmMeta,
     /// humanoidの対応付け。`None` の場合は名前検出を使う。
     pub humanoid: Option<HumanoidBones>,
+    /// Unityの `.mat` から作った材質。`None` の場合は灰色PBR材質を書く。
+    pub materials: Option<VrmMaterials>,
     max_output_bytes: usize,
 }
 
 impl VrmExportOptions {
-    /// 設定を作る。humanoidは名前検出になり、出力上限は既定値になる。
+    /// 設定を作る。humanoidは名前検出、材質は灰色PBR、出力上限は既定値になる。
     pub fn new(meta: VrmMeta) -> Self {
         Self {
             meta,
             humanoid: None,
+            materials: None,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         }
+    }
+
+    /// Unityから読み取った材質を使う。
+    pub fn with_materials(mut self, materials: VrmMaterials) -> Self {
+        self.materials = Some(materials);
+        self
     }
 
     /// 出力バイト数の上限を変更する。
@@ -217,7 +230,7 @@ impl VrmModel {
     /// # Errors
     ///
     /// metaの必須項目の欠落・humanoidの欠落や重複・親子不一致・非正の拡大率・
-    /// 構造の不整合・出力上限の超過の場合に返す。
+    /// 構造の不整合・材質値の不正・出力上限の超過の場合に返す。
     pub fn to_vrm(&self, options: &VrmExportOptions) -> Result<Vec<u8>, VrmExportError> {
         options.meta.validate()?;
         let humanoid = match &options.humanoid {
@@ -367,6 +380,10 @@ struct GlbWriter<'a> {
     mesh_indices: Vec<usize>,
     skin_indices: Vec<usize>,
     material_of_slot: HashMap<String, usize>,
+    /// 画像索引からテクスチャ索引への対応表。画像順に詰める。
+    image_textures: Vec<gltf::json::Index<gltf::json::texture::Texture>>,
+    /// MToon材質を1件でも書いたかどうか。`extensionsUsed` に反映する。
+    wrote_mtoon: bool,
 }
 
 impl<'a> GlbWriter<'a> {
@@ -380,11 +397,14 @@ impl<'a> GlbWriter<'a> {
             mesh_indices: Vec::new(),
             skin_indices: Vec::new(),
             material_of_slot: HashMap::new(),
+            image_textures: Vec::new(),
+            wrote_mtoon: false,
         }
     }
 
     /// GLBバイト列を組み立てる。
     fn build(&mut self) -> Result<Vec<u8>, VrmExportError> {
+        self.build_images()?;
         self.build_materials()?;
         self.build_meshes()?;
         self.build_skins()?;
@@ -401,40 +421,187 @@ impl<'a> GlbWriter<'a> {
         self.assemble_glb(json.as_bytes())
     }
 
-    /// スロット名ごとに一意な材質を作る。
-    fn build_materials(&mut self) -> Result<(), VrmExportError> {
-        for mesh in &self.model.meshes {
-            for slot in &mesh.material_slots {
-                if self.material_of_slot.contains_key(slot) {
-                    continue;
+    /// 材質の画像・サンプラ・テクスチャを作る。
+    ///
+    /// 画像は単一バッファへ4バイト境界で詰め、サンプラは値の組で重複排除し、
+    /// テクスチャは画像ごとに1件作る。材質が無い場合は何もしない。
+    fn build_images(&mut self) -> Result<(), VrmExportError> {
+        // `options` は `&'a` の共有参照のため、参照だけを複写して借用を切り離し、
+        // 後続の `bin`・`root` への可変借用と競合させない。
+        let options: &'a VrmExportOptions = self.options;
+        let Some(materials) = options.materials.as_ref() else {
+            return Ok(());
+        };
+        let images = materials.images();
+        let max_output_bytes = options.max_output_bytes;
+        // フィールド単位で借用し、`self` 全体の可変借用を作らない。
+        let bin = &mut self.bin;
+        let root = &mut self.root;
+        let image_textures = &mut self.image_textures;
+        // サンプラ値とサンプラ索引の対応表。件数が少ないため線形探索で足る。
+        let mut sampler_of: Vec<(VrmSampler, usize)> = Vec::new();
+        for source in images {
+            let view = push_view_into(bin, root, max_output_bytes, &source.data, None)?;
+            let mime_type = match source.mime {
+                super::material::VrmImageMime::Png => "image/png",
+                super::material::VrmImageMime::Jpeg => "image/jpeg",
+            };
+            let image = gltf::json::image::Image {
+                buffer_view: Some(view),
+                mime_type: Some(gltf::json::image::MimeType(mime_type.to_string())),
+                name: Some(source.name.clone()),
+                uri: None,
+                extensions: None,
+                extras: Default::default(),
+            };
+            let image_at = u32::try_from(root.images.len()).map_err(|_| {
+                VrmExportError::new(
+                    VrmExportErrorKind::InvalidStructure,
+                    "画像数がu32の範囲を超えた",
+                )
+            })?;
+            root.images.push(image);
+            let sampler_at = match sampler_of
+                .iter()
+                .find(|(known, _)| *known == source.sampler)
+            {
+                Some((_, index)) => *index,
+                None => {
+                    let index = root.samplers.len();
+                    root.samplers.push(sampler_json(&source.sampler));
+                    sampler_of.push((source.sampler, index));
+                    index
                 }
-                let name = if slot.is_empty() {
-                    "Material".to_string()
-                } else {
-                    slot.clone()
-                };
-                let material = gltf::json::Material {
-                    alpha_mode: gltf::json::validation::Checked::Valid(
-                        gltf::json::material::AlphaMode::Opaque,
-                    ),
-                    double_sided: false,
-                    name: Some(name),
-                    pbr_metallic_roughness: gltf::json::material::PbrMetallicRoughness {
-                        base_color_factor: gltf::json::material::PbrBaseColorFactor([
-                            0.8, 0.8, 0.8, 1.0,
-                        ]),
-                        metallic_factor: gltf::json::material::StrengthFactor(0.0),
-                        roughness_factor: gltf::json::material::StrengthFactor(1.0),
-                        ..Default::default()
+            };
+            let texture = gltf::json::texture::Texture {
+                name: None,
+                sampler: Some(gltf::json::Index::new(u32::try_from(sampler_at).map_err(
+                    |_| {
+                        VrmExportError::new(
+                            VrmExportErrorKind::InvalidStructure,
+                            "サンプラ数がu32の範囲を超えた",
+                        )
                     },
-                    ..Default::default()
-                };
-                let index = self.root.materials.len();
-                self.root.materials.push(material);
-                self.material_of_slot.insert(slot.clone(), index);
-            }
+                )?)),
+                source: gltf::json::Index::new(image_at),
+                extensions: None,
+                extras: Default::default(),
+            };
+            let texture_at = u32::try_from(root.textures.len()).map_err(|_| {
+                VrmExportError::new(
+                    VrmExportErrorKind::InvalidStructure,
+                    "テクスチャ数がu32の範囲を超えた",
+                )
+            })?;
+            root.textures.push(texture);
+            image_textures.push(gltf::json::Index::new(texture_at));
         }
         Ok(())
+    }
+
+    /// スロット名ごとに一意な材質を作る。
+    ///
+    /// 材質があるスロットは読み取り結果から、無いスロットは従来どおり
+    /// スロット名だけを持つ灰色のPBR材質を書く。
+    fn build_materials(&mut self) -> Result<(), VrmExportError> {
+        // スロットの初出順を保ちつつ、存在判定は `HashSet` でO(1)にする。
+        let mut seen = HashSet::new();
+        let mut slots = Vec::new();
+        for mesh in &self.model.meshes {
+            for slot in &mesh.material_slots {
+                if !seen.contains(slot) {
+                    seen.insert(slot.clone());
+                    slots.push(slot.clone());
+                }
+            }
+        }
+        for slot in slots {
+            let resolved = self
+                .options
+                .materials
+                .as_ref()
+                .and_then(|materials| materials.get(&slot))
+                .cloned();
+            let material = match resolved {
+                Some(vrm) => self.build_vrm_material(&vrm)?,
+                None => gray_material(&slot),
+            };
+            let index = self.root.materials.len();
+            self.root.materials.push(material);
+            self.material_of_slot.insert(slot, index);
+        }
+        Ok(())
+    }
+
+    /// 読み取り済み材質からglTF材質を作る。
+    fn build_vrm_material(
+        &mut self,
+        vrm: &VrmMaterial,
+    ) -> Result<gltf::json::Material, VrmExportError> {
+        if let Err(field) = super::material::validate_material(vrm) {
+            return Err(VrmExportError::new(
+                VrmExportErrorKind::InvalidStructure,
+                format!("材質値が不正である: {field}"),
+            ));
+        }
+        let alpha_mode = match vrm.alpha_mode {
+            VrmAlphaMode::Opaque => gltf::json::material::AlphaMode::Opaque,
+            VrmAlphaMode::Mask => gltf::json::material::AlphaMode::Mask,
+            VrmAlphaMode::Blend => gltf::json::material::AlphaMode::Blend,
+        };
+        // `alphaCutoff` はカットアウトのときだけ書く。
+        let alpha_cutoff = match vrm.alpha_mode {
+            VrmAlphaMode::Mask => Some(gltf::json::material::AlphaCutoff(vrm.alpha_cutoff)),
+            VrmAlphaMode::Opaque | VrmAlphaMode::Blend => None,
+        };
+        let base_color_texture = vrm
+            .base_color_image
+            .map(|image| self.texture_info(image))
+            .transpose()?;
+        let emissive_texture = vrm
+            .emissive_image
+            .map(|image| self.texture_info(image))
+            .transpose()?;
+        let extensions = match &vrm.mtoon {
+            Some(parameters) => {
+                self.wrote_mtoon = true;
+                Some(mtoon_extension(parameters, &self.image_textures)?)
+            }
+            None => None,
+        };
+        Ok(gltf::json::Material {
+            alpha_mode: gltf::json::validation::Checked::Valid(alpha_mode),
+            alpha_cutoff,
+            double_sided: vrm.double_sided,
+            name: Some(vrm.name.clone()),
+            pbr_metallic_roughness: gltf::json::material::PbrMetallicRoughness {
+                base_color_factor: gltf::json::material::PbrBaseColorFactor(vrm.base_color_factor),
+                base_color_texture,
+                metallic_factor: gltf::json::material::StrengthFactor(0.0),
+                roughness_factor: gltf::json::material::StrengthFactor(1.0),
+                ..Default::default()
+            },
+            emissive_factor: gltf::json::material::EmissiveFactor(vrm.emissive_factor),
+            emissive_texture,
+            extensions,
+            ..Default::default()
+        })
+    }
+
+    /// 画像索引からテクスチャ参照を作る。
+    fn texture_info(&self, image: usize) -> Result<gltf::json::texture::Info, VrmExportError> {
+        let texture = self.image_textures.get(image).ok_or_else(|| {
+            VrmExportError::new(
+                VrmExportErrorKind::InvalidStructure,
+                "材質の画像索引が範囲外である",
+            )
+        })?;
+        Ok(gltf::json::texture::Info {
+            index: *texture,
+            tex_coord: 0,
+            extensions: None,
+            extras: Default::default(),
+        })
     }
 
     /// メッシュと頂点アクセサを作る。
@@ -488,12 +655,7 @@ impl<'a> GlbWriter<'a> {
                     })?;
                 attributes.insert(
                     gltf::json::validation::Checked::Valid(semantic),
-                    self.push_float_accessor(
-                        uvs,
-                        gltf::json::accessor::Type::Vec2,
-                        None,
-                        gltf::json::buffer::Target::ArrayBuffer,
-                    )?,
+                    self.push_uv_accessor(uvs)?,
                 );
             }
             match (&mesh.vertices.joints, &mesh.vertices.weights) {
@@ -846,7 +1008,11 @@ impl<'a> GlbWriter<'a> {
         let mut others = serde_json::Map::new();
         others.insert("VRMC_vrm".to_string(), serde_json::Value::Object(vrmc));
         self.root.extensions = Some(gltf::json::extensions::root::Root { others });
-        self.root.extensions_used = vec!["VRMC_vrm".to_string()];
+        let mut used = vec!["VRMC_vrm".to_string()];
+        if self.wrote_mtoon {
+            used.push("VRMC_materials_mtoon".to_string());
+        }
+        self.root.extensions_used = used;
     }
 
     /// バッファ定義を作る。BINが空の場合は定義を置かない。
@@ -903,33 +1069,9 @@ impl<'a> GlbWriter<'a> {
         data: &[u8],
         spec: AccessorSpec,
     ) -> Result<gltf::json::Index<gltf::json::Accessor>, VrmExportError> {
-        self.check_bin_capacity(data.len())?;
-        let offset = align4(self.bin.len());
-        self.bin
-            .extend(std::iter::repeat_n(0, offset - self.bin.len()));
-        self.bin.extend_from_slice(data);
-        let view = gltf::json::buffer::View {
-            buffer: gltf::json::Index::new(0),
-            byte_length: gltf::json::validation::USize64(data.len() as u64),
-            byte_offset: if offset == 0 {
-                None
-            } else {
-                Some(gltf::json::validation::USize64(offset as u64))
-            },
-            byte_stride: None,
-            name: None,
-            target: spec.target.map(gltf::json::validation::Checked::Valid),
-            extensions: None,
-            extras: Default::default(),
-        };
-        let view_index = self.root.buffer_views.len() as u32;
-        self.root.buffer_views.push(view);
-        // 後続のアクセサが4バイト境界に来るよう詰める。
-        let padded = align4(self.bin.len());
-        self.bin
-            .extend(std::iter::repeat_n(0, padded - self.bin.len()));
+        let view = self.push_view(data, spec.target)?;
         let accessor = gltf::json::Accessor {
-            buffer_view: Some(gltf::json::Index::new(view_index)),
+            buffer_view: Some(view),
             byte_offset: None,
             count: gltf::json::validation::USize64(spec.count as u64),
             component_type: gltf::json::validation::Checked::Valid(
@@ -949,25 +1091,23 @@ impl<'a> GlbWriter<'a> {
         Ok(gltf::json::Index::new(accessor_index))
     }
 
-    /// 次に追加するデータでBINが上限を超える場合に、追加前に打ち切る。
+    /// バッファへ4バイト境界で詰めて書き、ビューを作る。
     ///
-    /// 比較対象はBIN単体であり、JSONと容器分の超過は最終段の検査に残す。
-    /// BIN単体で上限を超える場合は全体も必ず超えるため、誤って拒まない。
-    fn check_bin_capacity(&self, data_len: usize) -> Result<(), VrmExportError> {
-        let offset = align4(self.bin.len());
-        let Some(end) = offset.checked_add(data_len) else {
-            return Err(VrmExportError::new(
-                VrmExportErrorKind::LimitExceeded,
-                "出力バイト数が上限を超えた",
-            ));
-        };
-        if align4(end) > self.options.max_output_bytes {
-            return Err(VrmExportError::new(
-                VrmExportErrorKind::LimitExceeded,
-                "出力バイト数が上限を超えた",
-            ));
-        }
-        Ok(())
+    /// 画像などアクセサを持たない用途で使う。容量検査はアクセサと同じく
+    /// BIN単体で行い、超過は追加前に打ち切る。
+    fn push_view(
+        &mut self,
+        data: &[u8],
+        target: Option<gltf::json::buffer::Target>,
+    ) -> Result<gltf::json::Index<gltf::json::buffer::View>, VrmExportError> {
+        let max_output_bytes = self.options.max_output_bytes;
+        push_view_into(
+            &mut self.bin,
+            &mut self.root,
+            max_output_bytes,
+            data,
+            target,
+        )
     }
 
     /// f32配列のアクセサを作る。min/maxは位置だけに付ける。
@@ -1002,6 +1142,23 @@ impl<'a> GlbWriter<'a> {
                 max,
                 target: Some(target),
             },
+        )
+    }
+
+    /// UVのアクセサを作る。FBXとUnityの左下原点からglTFの左上原点へ合わせる。
+    ///
+    /// 中間モデルはUVをそのまま持ち、書き出し時に全UVセットのVを `1 - v` にする。
+    /// 画像自体は上下反転しない。位置・法線は変えない。
+    fn push_uv_accessor(
+        &mut self,
+        values: &[[f32; 2]],
+    ) -> Result<gltf::json::Index<gltf::json::Accessor>, VrmExportError> {
+        let flipped: Vec<[f32; 2]> = values.iter().map(|[u, v]| [*u, 1.0 - *v]).collect();
+        self.push_float_accessor(
+            &flipped,
+            gltf::json::accessor::Type::Vec2,
+            None,
+            gltf::json::buffer::Target::ArrayBuffer,
         )
     }
 
@@ -1086,6 +1243,211 @@ struct AccessorSpec {
     min: Option<serde_json::Value>,
     max: Option<serde_json::Value>,
     target: Option<gltf::json::buffer::Target>,
+}
+
+/// バッファへ4バイト境界で詰めて書き、ビューを作る。
+///
+/// `GlbWriter::push_view` の本体であり、`build_images` では画像バイト列の複製を
+/// 避けるため、`options` からの借用を保ったまま `bin` と `root` だけを渡して呼ぶ。
+/// 容量検査はBIN単体で行い、超過は追加前に打ち切る。4バイト境界の詰め方と
+/// 上限検査の挙動は従来どおりである。
+fn push_view_into(
+    bin: &mut Vec<u8>,
+    root: &mut gltf::json::Root,
+    max_output_bytes: usize,
+    data: &[u8],
+    target: Option<gltf::json::buffer::Target>,
+) -> Result<gltf::json::Index<gltf::json::buffer::View>, VrmExportError> {
+    check_bin_capacity(bin.len(), max_output_bytes, data.len())?;
+    let offset = align4(bin.len());
+    bin.extend(std::iter::repeat_n(0, offset - bin.len()));
+    bin.extend_from_slice(data);
+    let view = gltf::json::buffer::View {
+        buffer: gltf::json::Index::new(0),
+        byte_length: gltf::json::validation::USize64(data.len() as u64),
+        byte_offset: if offset == 0 {
+            None
+        } else {
+            Some(gltf::json::validation::USize64(offset as u64))
+        },
+        byte_stride: None,
+        name: None,
+        target: target.map(gltf::json::validation::Checked::Valid),
+        extensions: None,
+        extras: Default::default(),
+    };
+    let view_index = root.buffer_views.len() as u32;
+    root.buffer_views.push(view);
+    // 後続のデータが4バイト境界に来るよう詰める。
+    let padded = align4(bin.len());
+    bin.extend(std::iter::repeat_n(0, padded - bin.len()));
+    Ok(gltf::json::Index::new(view_index))
+}
+
+/// 次に追加するデータでBINが上限を超える場合に、追加前に打ち切る。
+///
+/// 比較対象はBIN単体であり、JSONと容器分の超過は最終段の検査に残す。
+/// BIN単体で上限を超える場合は全体も必ず超えるため、誤って拒まない。
+fn check_bin_capacity(
+    bin_len: usize,
+    max_output_bytes: usize,
+    data_len: usize,
+) -> Result<(), VrmExportError> {
+    let offset = align4(bin_len);
+    let Some(end) = offset.checked_add(data_len) else {
+        return Err(VrmExportError::new(
+            VrmExportErrorKind::LimitExceeded,
+            "出力バイト数が上限を超えた",
+        ));
+    };
+    if align4(end) > max_output_bytes {
+        return Err(VrmExportError::new(
+            VrmExportErrorKind::LimitExceeded,
+            "出力バイト数が上限を超えた",
+        ));
+    }
+    Ok(())
+}
+
+/// 材質が無いスロットの灰色PBR材質を作る。
+///
+/// 材質名はスロット名（空なら `Material`）、不透明、片面、
+/// 金属度0・粗さ1の中間調の灰色である。
+fn gray_material(slot: &str) -> gltf::json::Material {
+    gltf::json::Material {
+        alpha_mode: gltf::json::validation::Checked::Valid(gltf::json::material::AlphaMode::Opaque),
+        double_sided: false,
+        name: Some(placeholder(slot).name),
+        pbr_metallic_roughness: gltf::json::material::PbrMetallicRoughness {
+            base_color_factor: gltf::json::material::PbrBaseColorFactor([0.8, 0.8, 0.8, 1.0]),
+            metallic_factor: gltf::json::material::StrengthFactor(0.0),
+            roughness_factor: gltf::json::material::StrengthFactor(1.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// サンプラ値からglTFサンプラを作る。
+///
+/// 拡大は点補間かそれ以外かだけを区別し、縮小はmipmapの有無と組み合わせる。
+fn sampler_json(sampler: &VrmSampler) -> gltf::json::texture::Sampler {
+    let wrap = |wrap: VrmWrap| match wrap {
+        VrmWrap::Repeat => gltf::json::texture::WrappingMode::Repeat,
+        VrmWrap::ClampToEdge => gltf::json::texture::WrappingMode::ClampToEdge,
+        VrmWrap::MirroredRepeat => gltf::json::texture::WrappingMode::MirroredRepeat,
+    };
+    let mag = match sampler.filter {
+        VrmFilter::Nearest => gltf::json::texture::MagFilter::Nearest,
+        VrmFilter::Linear | VrmFilter::Trilinear => gltf::json::texture::MagFilter::Linear,
+    };
+    let min = match (sampler.filter, sampler.mipmaps) {
+        (VrmFilter::Nearest, true) => gltf::json::texture::MinFilter::NearestMipmapNearest,
+        (VrmFilter::Nearest, false) => gltf::json::texture::MinFilter::Nearest,
+        (VrmFilter::Linear, true) => gltf::json::texture::MinFilter::LinearMipmapNearest,
+        (VrmFilter::Linear, false) => gltf::json::texture::MinFilter::Linear,
+        (VrmFilter::Trilinear, true) => gltf::json::texture::MinFilter::LinearMipmapLinear,
+        (VrmFilter::Trilinear, false) => gltf::json::texture::MinFilter::Linear,
+    };
+    gltf::json::texture::Sampler {
+        mag_filter: Some(gltf::json::validation::Checked::Valid(mag)),
+        min_filter: Some(gltf::json::validation::Checked::Valid(min)),
+        name: None,
+        wrap_s: gltf::json::validation::Checked::Valid(wrap(sampler.wrap_u)),
+        wrap_t: gltf::json::validation::Checked::Valid(wrap(sampler.wrap_v)),
+        extensions: None,
+        extras: Default::default(),
+    }
+}
+
+/// MToon値から `VRMC_materials_mtoon` 1.0の拡張を作る。
+///
+/// テクスチャは `None` の項目を省き、`outlineWidthMode` は
+/// `none` か `worldCoordinates` を書く。
+fn mtoon_extension(
+    parameters: &VrmMtoonParameters,
+    textures: &[gltf::json::Index<gltf::json::texture::Texture>],
+) -> Result<gltf::json::extensions::material::Material, VrmExportError> {
+    let texture_of = |image: Option<usize>| -> Result<Option<serde_json::Value>, VrmExportError> {
+        image
+            .map(|index| {
+                textures
+                    .get(index)
+                    .map(|texture| serde_json::json!({ "index": texture.value() }))
+                    .ok_or_else(|| {
+                        VrmExportError::new(
+                            VrmExportErrorKind::InvalidStructure,
+                            "MToonの画像索引が範囲外である",
+                        )
+                    })
+            })
+            .transpose()
+    };
+    let mut mtoon = serde_json::Map::new();
+    mtoon.insert("specVersion".to_string(), serde_json::json!("1.0"));
+    mtoon.insert(
+        "transparentWithZWrite".to_string(),
+        serde_json::json!(parameters.transparent_with_z_write),
+    );
+    mtoon.insert(
+        "renderQueueOffsetNumber".to_string(),
+        serde_json::json!(parameters.render_queue_offset),
+    );
+    mtoon.insert(
+        "shadeColorFactor".to_string(),
+        serde_json::json!(parameters.shade_color_factor),
+    );
+    if let Some(texture) = texture_of(parameters.shade_multiply_image)? {
+        mtoon.insert("shadeMultiplyTexture".to_string(), texture);
+    }
+    mtoon.insert(
+        "shadingShiftFactor".to_string(),
+        serde_json::json!(parameters.shading_shift_factor),
+    );
+    mtoon.insert(
+        "shadingToonyFactor".to_string(),
+        serde_json::json!(parameters.shading_toony_factor),
+    );
+    mtoon.insert(
+        "giEqualizationFactor".to_string(),
+        serde_json::json!(parameters.gi_equalization_factor),
+    );
+    mtoon.insert(
+        "matcapFactor".to_string(),
+        serde_json::json!(parameters.matcap_factor),
+    );
+    if let Some(texture) = texture_of(parameters.matcap_image)? {
+        mtoon.insert("matcapTexture".to_string(), texture);
+    }
+    let outline_width_mode = match parameters.outline_width_mode {
+        super::material::VrmOutlineWidthMode::None => "none",
+        super::material::VrmOutlineWidthMode::WorldCoordinates => "worldCoordinates",
+    };
+    mtoon.insert(
+        "outlineWidthMode".to_string(),
+        serde_json::json!(outline_width_mode),
+    );
+    mtoon.insert(
+        "outlineWidthFactor".to_string(),
+        serde_json::json!(parameters.outline_width_factor),
+    );
+    if let Some(texture) = texture_of(parameters.outline_width_multiply_image)? {
+        mtoon.insert("outlineWidthMultiplyTexture".to_string(), texture);
+    }
+    mtoon.insert(
+        "outlineColorFactor".to_string(),
+        serde_json::json!(parameters.outline_color_factor),
+    );
+    mtoon.insert(
+        "outlineLightingMixFactor".to_string(),
+        serde_json::json!(parameters.outline_lighting_mix_factor),
+    );
+    let mut others = serde_json::Map::new();
+    others.insert(
+        "VRMC_materials_mtoon".to_string(),
+        serde_json::Value::Object(mtoon),
+    );
+    Ok(gltf::json::extensions::material::Material { others })
 }
 /// 4バイト境界へ切り上げる。
 fn align4(length: usize) -> usize {

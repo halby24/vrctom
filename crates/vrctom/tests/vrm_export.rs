@@ -6,8 +6,10 @@
 
 use vrctom::fbx::{FbxFile, FbxOptions, ObjectId};
 use vrctom::vrm::{
-    HumanoidBone, HumanoidBones, VrmExportErrorKind, VrmExportOptions, VrmMesh, VrmMeta, VrmModel,
-    VrmNode, VrmPrimitive, VrmSkin, VrmVertices,
+    HumanoidBone, HumanoidBones, MaterialOptions, VrmAlphaMode, VrmExportErrorKind,
+    VrmExportOptions, VrmImage, VrmImageMime, VrmMaterial, VrmMaterialEntry, VrmMaterials, VrmMesh,
+    VrmMeta, VrmModel, VrmMtoonParameters, VrmNode, VrmOutlineWidthMode, VrmPrimitive, VrmSampler,
+    VrmSkin, VrmVertices,
 };
 
 // テスト名は日本語で書く（テストは仕様・契約であるため）。
@@ -822,6 +824,398 @@ fn 親なしノードはrootとlocalの積を持つ() {
         節ら[1].get("matrix").is_none(),
         "local単位行列の非ルートにmatrixは無い"
     );
+}
+
+/// 1x1のPNGバイト列。GLBへそのまま埋め込む。
+const PNG_1X1: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0xDA, 0x63, 0x64, 0x60, 0xF8, 0x5F,
+    0x0F, 0x00, 0x02, 0x87, 0x01, 0x80, 0xEB, 0x47, 0xBA, 0x92, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
+/// 手組みのMToon材質1件を作る。画像は1x1のPNG1件を共有する。
+fn mtoon材質を作る(
+    スロット: &str,
+    方式: VrmAlphaMode,
+    閾値: f32,
+    mtoon: VrmMtoonParameters,
+) -> VrmMaterials {
+    VrmMaterials::new(
+        vec![VrmMaterialEntry {
+            slot: スロット.to_string(),
+            material: VrmMaterial {
+                name: format!("{スロット}の材質"),
+                alpha_mode: 方式,
+                alpha_cutoff: 閾値,
+                double_sided: true,
+                base_color_factor: [1.0, 0.0, 0.0, 1.0],
+                base_color_image: Some(0),
+                emissive_factor: [0.0, 1.0, 0.0],
+                emissive_image: Some(0),
+                mtoon: Some(mtoon),
+            },
+        }],
+        vec![VrmImage {
+            name: "Body".to_string(),
+            mime: VrmImageMime::Png,
+            data: PNG_1X1.to_vec(),
+            sampler: VrmSampler::default(),
+        }],
+    )
+}
+
+#[test]
+fn mtoon材質を書き出せる() {
+    let モデル = 合成モデルを作る();
+    let mtoon = VrmMtoonParameters {
+        shade_color_factor: [0.5, 0.5, 0.5],
+        outline_width_mode: VrmOutlineWidthMode::WorldCoordinates,
+        outline_width_factor: 0.02,
+        ..Default::default()
+    };
+    let 材質 = mtoon材質を作る("Body", VrmAlphaMode::Mask, 0.5, mtoon);
+    let 設定 = 書き出し設定を作る().with_materials(材質);
+    let バイト列 = モデル.to_vrm(&設定).expect("MToon材質は書き出せる");
+    let (値, bin) = glbを分解する(&バイト列);
+    検証報告が空であることを確かめる(&json塊を取り出す(&バイト列));
+    // 拡張一覧にMToonが入る。
+    let 使用拡張 = 値
+        .get("extensionsUsed")
+        .and_then(serde_json::Value::as_array)
+        .expect("extensionsUsedがある");
+    assert!(
+        使用拡張
+            .iter()
+            .any(|値| 値.as_str() == Some("VRMC_materials_mtoon")),
+        "VRMC_materials_mtoonを使う"
+    );
+    // 画像・テクスチャ・サンプラが入る。
+    let 画像 = 値
+        .get("images")
+        .and_then(serde_json::Value::as_array)
+        .expect("imagesがある");
+    assert_eq!(画像.len(), 1, "画像は1件である");
+    assert_eq!(
+        画像[0].get("mimeType").and_then(serde_json::Value::as_str),
+        Some("image/png"),
+        "MIMEはPNGである"
+    );
+    let テクスチャ = 値
+        .get("textures")
+        .and_then(serde_json::Value::as_array)
+        .expect("texturesがある");
+    assert_eq!(テクスチャ.len(), 1, "テクスチャは画像ごとに1件である");
+    assert_eq!(
+        テクスチャ[0]
+            .get("source")
+            .and_then(serde_json::Value::as_u64),
+        Some(0),
+        "テクスチャは画像0を指す"
+    );
+    let サンプラ = 値
+        .get("samplers")
+        .and_then(serde_json::Value::as_array)
+        .expect("samplersがある");
+    assert_eq!(サンプラ.len(), 1, "サンプラは値の組で重複排除する");
+    assert_eq!(
+        サンプラ[0].get("wrapS").and_then(serde_json::Value::as_u64),
+        Some(10497),
+        "wrapSはREPEATである"
+    );
+    assert_eq!(
+        サンプラ[0].get("wrapT").and_then(serde_json::Value::as_u64),
+        Some(10497),
+        "wrapTはREPEATである"
+    );
+    assert_eq!(
+        サンプラ[0]
+            .get("magFilter")
+            .and_then(serde_json::Value::as_u64),
+        Some(9729),
+        "magFilterはLINEARである"
+    );
+    assert_eq!(
+        サンプラ[0]
+            .get("minFilter")
+            .and_then(serde_json::Value::as_u64),
+        Some(9985),
+        "minFilterはmipmapありのLINEAR_MIPMAP_NEARESTである"
+    );
+    // 材質の主要値を確認する。
+    let 材質 = 値
+        .get("materials")
+        .and_then(serde_json::Value::as_array)
+        .expect("materialsがある");
+    assert_eq!(材質.len(), 1);
+    assert_eq!(
+        材質[0].get("name").and_then(serde_json::Value::as_str),
+        Some("Bodyの材質"),
+        "材質名は読み取り結果である"
+    );
+    assert_eq!(
+        材質[0].get("alphaMode").and_then(serde_json::Value::as_str),
+        Some("MASK"),
+        "透過方式はカットアウトである"
+    );
+    assert_eq!(
+        材質[0]
+            .get("alphaCutoff")
+            .and_then(serde_json::Value::as_f64),
+        Some(0.5),
+        "カットアウトの閾値が入る"
+    );
+    assert_eq!(
+        材質[0]
+            .get("doubleSided")
+            .and_then(serde_json::Value::as_bool),
+        Some(true),
+        "両面である"
+    );
+    let 基本色 = 材質[0]
+        .get("pbrMetallicRoughness")
+        .and_then(|値| 値.get("baseColorFactor"))
+        .expect("baseColorFactorがある");
+    assert_eq!(基本色, &serde_json::json!([1.0, 0.0, 0.0, 1.0]));
+    assert_eq!(
+        材質[0]
+            .get("pbrMetallicRoughness")
+            .and_then(|値| 値.get("baseColorTexture"))
+            .and_then(|値| 値.get("index"))
+            .and_then(serde_json::Value::as_u64),
+        Some(0),
+        "基準色テクスチャが入る"
+    );
+    assert_eq!(
+        材質[0]
+            .get("emissiveTexture")
+            .and_then(|値| 値.get("index"))
+            .and_then(serde_json::Value::as_u64),
+        Some(0),
+        "発光テクスチャは同じ画像を共有する"
+    );
+    let 拡張 = 材質[0]
+        .get("extensions")
+        .and_then(|値| 値.get("VRMC_materials_mtoon"))
+        .expect("MToon拡張がある");
+    assert_eq!(
+        拡張.get("specVersion").and_then(serde_json::Value::as_str),
+        Some("1.0")
+    );
+    assert_eq!(
+        拡張.get("shadeColorFactor"),
+        Some(&serde_json::json!([0.5, 0.5, 0.5]))
+    );
+    assert_eq!(
+        拡張
+            .get("outlineWidthMode")
+            .and_then(serde_json::Value::as_str),
+        Some("worldCoordinates")
+    );
+    let 幅 = 拡張
+        .get("outlineWidthFactor")
+        .and_then(serde_json::Value::as_f64)
+        .expect("outlineWidthFactorがある");
+    assert!(
+        (幅 - 0.02).abs() < 1e-6,
+        "outlineWidthFactorは0.02である: {幅}"
+    );
+    // 画像のbufferViewにtargetが無い。
+    let 根: gltf::json::Root =
+        gltf::json::Root::from_slice(&json塊を取り出す(&バイト列)).expect("JSONは読める");
+    let ビュー = &根.buffer_views[根.images[0]
+        .buffer_view
+        .expect("画像はビューを持つ")
+        .value()];
+    assert!(ビュー.target.is_none(), "画像のビューにtargetは無い");
+    assert!(!bin.is_empty());
+}
+
+#[test]
+fn 半透明材質はカットオフを書かず透過z書き込みする() {
+    let モデル = 合成モデルを作る();
+    let mtoon = VrmMtoonParameters {
+        transparent_with_z_write: true,
+        ..Default::default()
+    };
+    let 材質 = mtoon材質を作る("Body", VrmAlphaMode::Blend, 0.7, mtoon);
+    let 設定 = 書き出し設定を作る().with_materials(材質);
+    let バイト列 = モデル.to_vrm(&設定).expect("半透明材質は書き出せる");
+    let (値, _) = glbを分解する(&バイト列);
+    検証報告が空であることを確かめる(&json塊を取り出す(&バイト列));
+    let 材質 = 値
+        .get("materials")
+        .and_then(serde_json::Value::as_array)
+        .expect("materialsがある");
+    assert_eq!(
+        材質[0].get("alphaMode").and_then(serde_json::Value::as_str),
+        Some("BLEND")
+    );
+    assert!(
+        材質[0].get("alphaCutoff").is_none(),
+        "半透明にalphaCutoffは無い"
+    );
+    let 拡張 = 材質[0]
+        .get("extensions")
+        .and_then(|値| 値.get("VRMC_materials_mtoon"))
+        .expect("MToon拡張がある");
+    assert_eq!(
+        拡張
+            .get("transparentWithZWrite")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+}
+
+#[test]
+fn uvの向きをgltfに合わせて反転する() {
+    // 合成モデルは左下原点のUV `[[0,0],[1,0],[0,1]]` を持つ。
+    let モデル = 合成モデルを作る();
+    let バイト列 = モデル
+        .to_vrm(&書き出し設定を作る())
+        .expect("合成モデルは書き出せる");
+    let json塊 = json塊を取り出す(&バイト列);
+    検証報告が空であることを確かめる(&json塊);
+    let 根: gltf::json::Root = gltf::json::Root::from_slice(&json塊).expect("JSONは読める");
+    let (_, bin) = glbを分解する(&バイト列);
+    let 属性 = &根.meshes[0].primitives[0].attributes;
+    let 索引 = 属性
+        .get(&gltf::json::validation::Checked::Valid(
+            gltf::json::mesh::Semantic::TexCoords(0),
+        ))
+        .expect("TEXCOORD_0がある");
+    let アクセサ = &根.accessors[索引.value()];
+    let ビュー = &根.buffer_views[アクセサ.buffer_view.expect("ビューがある").value()];
+    let 開始 = ビュー
+        .byte_offset
+        .as_ref()
+        .map(|値| 値.0 as usize)
+        .unwrap_or(0);
+    let mut 値 = Vec::new();
+    for 番号 in 0..アクセサ.count.0 as usize {
+        let 位置 = 開始 + 番号 * 8;
+        let u = f32::from_le_bytes(bin[位置..位置 + 4].try_into().expect("4バイトある"));
+        let v = f32::from_le_bytes(bin[位置 + 4..位置 + 8].try_into().expect("4バイトある"));
+        値.push([u, v]);
+    }
+    // Vだけが反転し、Uは変わらない。
+    assert_eq!(値, vec![[0.0, 1.0], [1.0, 1.0], [0.0, 0.0]]);
+}
+
+#[test]
+fn 材質が無い場合は灰色pbrでmtoon拡張は無い() {
+    let モデル = 合成モデルを作る();
+    let バイト列 = モデル
+        .to_vrm(&書き出し設定を作る())
+        .expect("合成モデルは書き出せる");
+    let (値, _) = glbを分解する(&バイト列);
+    let 使用拡張 = 値
+        .get("extensionsUsed")
+        .and_then(serde_json::Value::as_array)
+        .expect("extensionsUsedがある");
+    assert!(
+        !使用拡張
+            .iter()
+            .any(|値| 値.as_str() == Some("VRMC_materials_mtoon")),
+        "MToon材質が無いため拡張一覧に入らない"
+    );
+    let 材質 = 値
+        .get("materials")
+        .and_then(serde_json::Value::as_array)
+        .expect("materialsがある");
+    assert!(
+        材質[0].get("extensions").is_none(),
+        "灰色PBRに材質拡張は無い"
+    );
+    let 基本色 = 材質[0]
+        .get("pbrMetallicRoughness")
+        .and_then(|値| 値.get("baseColorFactor"))
+        .expect("baseColorFactorがある");
+    assert_eq!(基本色, &serde_json::json!([0.8, 0.8, 0.8, 1.0]));
+}
+
+/// 実fixtureの材質を読み書き出しに含める。
+///
+/// 祖先の `Assets` から配置を求め、`load` で読んだ材質でGLBを組み立てる。
+/// 固定件数には依存せず、画像とMToon材質の存在と検証報告の空を確かめる。
+/// バイト数・材質数・画像数を標準エラーに出す。
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn 実fixtureの材質を読み書き出しに含める() {
+    let Ok(パス) = std::env::var("VRCTOM_FBX_FIXTURE") else {
+        eprintln!("VRCTOM_FBX_FIXTUREが未設定のため跳ばす");
+        return;
+    };
+    let fbx = std::path::PathBuf::from(パス);
+    let mut root = None;
+    for 祖先 in fbx.ancestors() {
+        if 祖先.join("Assets").is_dir() {
+            root = Some(祖先.to_path_buf());
+            break;
+        }
+    }
+    let Some(root) = root else {
+        panic!("実fixtureの祖先にAssetsが無い");
+    };
+    let (materials, report) =
+        VrmMaterials::load(&root, &fbx, &MaterialOptions::new()).expect("実fixtureは読める");
+    for 警告 in report.warnings() {
+        eprintln!("実fixture材質警告: {警告}");
+    }
+    let materials = materials.expect("置換表があるため材質がある");
+    let バイト列 = std::fs::read(&fbx).expect("実fixtureは読める");
+    let 読み取り = FbxFile::parse(&バイト列, &FbxOptions::new()).expect("実fixtureは読める");
+    let (モデル, _) = VrmModel::from_fbx(&読み取り, &vrctom::vrm::VrmOptions::new())
+        .expect("実fixtureは変換できる");
+    let 設定 = VrmExportOptions::new(VrmMeta::new("Milfy", vec!["PLUSONE".to_string()]))
+        .with_materials(materials.clone());
+    let 出力 = モデル.to_vrm(&設定).expect("実fixtureは書き出せる");
+    eprintln!(
+        "実fixture材質書き出し: {}バイト 材質{}件 画像{}件",
+        出力.len(),
+        materials.entries().len(),
+        materials.images().len()
+    );
+    let (値, _) = glbを分解する(&出力);
+    let json塊 = json塊を取り出す(&出力);
+    検証報告が空であることを確かめる(&json塊);
+    assert!(
+        値.get("images")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|画像| !画像.is_empty()),
+        "画像が入る"
+    );
+    let 使用拡張 = 値
+        .get("extensionsUsed")
+        .and_then(serde_json::Value::as_array)
+        .expect("extensionsUsedがある");
+    assert!(
+        使用拡張
+            .iter()
+            .any(|値| 値.as_str() == Some("VRMC_materials_mtoon")),
+        "MToon材質があるため拡張一覧に入る"
+    );
+    let 材質 = 値
+        .get("materials")
+        .and_then(serde_json::Value::as_array)
+        .expect("materialsがある");
+    assert!(
+        材質.iter().any(|材質| 材質
+            .get("extensions")
+            .and_then(|拡張| 拡張.get("VRMC_materials_mtoon"))
+            .is_some()),
+        "MToon材質が1件以上ある"
+    );
+
+    // 外部の検証用に一時ディレクトリへ書き出す。
+    let 作業 = tempfile::TempDir::new().expect("一時ディレクトリは作れる");
+    let 書き出し先 = 作業.path().join("milfy-material.vrm");
+    std::fs::write(&書き出し先, &出力).expect("一時ファイルに書ける");
+    eprintln!("vrm_material_export_path={}", 書き出し先.display());
+    // `作業` をここで落とすと一時ファイルが消える。パスだけを知らせる運用であり、
+    // 検証中に消えないよう明示的に保持する。
+    std::mem::forget(作業);
 }
 
 /// 実fixtureからVRMを書き出し、中間モデルと一致することを確かめる。
