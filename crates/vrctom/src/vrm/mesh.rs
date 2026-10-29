@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use super::error::{VrmError, VrmErrorKind};
 use super::matrix;
-use super::{VrmMesh, VrmPrimitive, VrmVertices};
+use super::{VrmMesh, VrmMorphTarget, VrmPrimitive, VrmVertices};
 use crate::fbx::{FbxFile, Mesh as FbxMesh, MeshData, Model as FbxModel, ObjectId, SkinData};
 
 /// メッシュ1件の変換結果と集計。
@@ -40,11 +40,33 @@ struct VertexKey {
     uvs: Vec<u32>,
 }
 
+/// 選択済みのモーフチャンネル。対象メッシュにだけ渡す。
+pub(crate) struct SelectedMorph<'a> {
+    /// 選択順のチャンネル。名前と形状デルタを持つ。
+    pub channels: &'a [SelectedMorphChannel<'a>],
+    /// モーフ全体のバイト数上限。確保前に検査する。
+    pub max_morph_bytes: usize,
+    /// 1メッシュのターゲット数上限。確保前に検査する。
+    pub max_morph_targets: usize,
+}
+
+/// 選択済みのモーフチャンネル1件。
+pub(crate) struct SelectedMorphChannel<'a> {
+    /// チャンネル名。ターゲット名になる。
+    pub name: &'a str,
+    /// 形状デルタ。
+    pub data: &'a crate::fbx::ShapeData,
+}
+
 /// メッシュ1件を変換する。
 ///
 /// `bind` は所有モデルのバインド世界行列であり、頂点のベイクに使う。
 /// `skin` は対応するスキンの索引とその展開結果であり、無い場合は重みを載せない。
 /// `node` は所有モデルのノード索引である。
+/// `morph` は対象メッシュの選択済みチャンネルであり、ある場合は位置の差分を
+/// 出力頂点へ配ってターゲットを作る。対象外のメッシュには `None` を渡す。
+// 入力の構成要素が多く、構造体へまとめると呼び出し側で同じ値を組み直すだけになる。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn convert_mesh(
     file: &FbxFile<'_>,
     mesh: &FbxMesh,
@@ -53,6 +75,7 @@ pub(crate) fn convert_mesh(
     node: usize,
     bind: &[f64; 16],
     skin: Option<(usize, &SkinData)>,
+    morph: Option<SelectedMorph<'_>>,
 ) -> Result<MeshOutcome, VrmError> {
     if matrix::det3(bind) == 0.0 {
         return Err(VrmError::new(
@@ -69,6 +92,10 @@ pub(crate) fn convert_mesh(
 
     let mut key_to_vertex: HashMap<VertexKey, u32> = HashMap::new();
     let mut positions: Vec<[f32; 3]> = Vec::new();
+    // モーフ対象のメッシュだけ、出力頂点ごとの制御点番号を残す。
+    // 差分は制御点単位で書かれるため、UVや法線の継ぎ目で複製された頂点へ
+    // 配る写像として使う。対象外では確保しない。
+    let mut control_points: Option<Vec<u32>> = morph.as_ref().map(|_| Vec::new());
     let mut normals: Option<Vec<[f32; 3]>> = data.normals.as_ref().map(|_| Vec::new());
     let mut uv_sets: Vec<Vec<[f32; 2]>> = data.uv_sets.iter().map(|_| Vec::new()).collect();
     let mut joints_out: Option<Vec<[u16; 4]>> = influences.as_ref().map(|_| Vec::new());
@@ -127,6 +154,7 @@ pub(crate) fn convert_mesh(
                         &mut truncated,
                         &mut unweighted,
                         influences.as_ref(),
+                        control_points.as_mut(),
                     )?;
                     key_to_vertex.insert(key, vertex);
                     vertex
@@ -162,6 +190,12 @@ pub(crate) fn convert_mesh(
         })
         .collect::<Vec<_>>();
     let triangles = primitives.iter().map(|p| p.indices.len() / 3).sum();
+    let targets = match (morph, control_points) {
+        (Some(selected), Some(control_points)) => {
+            build_morph_targets(mesh.id, &positions, &control_points, bind, &selected)?
+        }
+        _ => Vec::new(),
+    };
     let material_slots = owner
         .materials
         .iter()
@@ -191,6 +225,7 @@ pub(crate) fn convert_mesh(
                 weights: weights_out,
             },
             primitives,
+            targets,
         },
         triangles,
         truncated,
@@ -198,6 +233,76 @@ pub(crate) fn convert_mesh(
         non_triangles,
         mirrored,
     })
+}
+
+/// 選択済みチャンネルからモーフターゲット列を作る。
+///
+/// 差分の確保の前に、ターゲット数と総バイト数を上限検査する。
+/// 差分は制御点番号から出力頂点への写像で配り、継ぎ目の複製すべてに同じ差分を載せる。
+/// 差分の変換は線形部分だけを使い、平行移動は掛けない。
+fn build_morph_targets(
+    mesh_id: ObjectId,
+    positions: &[[f32; 3]],
+    control_points: &[u32],
+    bind: &[f64; 16],
+    selected: &SelectedMorph<'_>,
+) -> Result<Vec<VrmMorphTarget>, VrmError> {
+    if selected.channels.len() > selected.max_morph_targets {
+        return Err(VrmError::new(
+            VrmErrorKind::LimitExceeded,
+            "モーフターゲット数が上限を超えた",
+        )
+        .with_object(mesh_id));
+    }
+    let bytes = selected
+        .channels
+        .len()
+        .checked_mul(positions.len())
+        .and_then(|count| count.checked_mul(12))
+        .unwrap_or(usize::MAX);
+    if bytes > selected.max_morph_bytes {
+        return Err(VrmError::new(
+            VrmErrorKind::LimitExceeded,
+            "モーフターゲットの量が上限を超えた",
+        )
+        .with_object(mesh_id));
+    }
+    let mut targets = Vec::with_capacity(selected.channels.len());
+    for channel in selected.channels {
+        // 差分は出力前にf32へ寄せ、非有限は破損として失敗する。
+        let mut deltas: HashMap<u32, [f32; 3]> =
+            HashMap::with_capacity(channel.data.control_point_indices.len());
+        for (control_point, delta) in channel
+            .data
+            .control_point_indices
+            .iter()
+            .zip(channel.data.position_deltas.iter())
+        {
+            let moved = matrix::transform_vector(bind, *delta).ok_or_else(|| {
+                VrmError::new(VrmErrorKind::InvalidStructure, "差分の変換に失敗した")
+                    .with_object(mesh_id)
+            })?;
+            let moved32 = [moved[0] as f32, moved[1] as f32, moved[2] as f32];
+            if !moved32.iter().all(|v| v.is_finite()) {
+                return Err(
+                    VrmError::new(VrmErrorKind::InvalidStructure, "有限でない差分がある")
+                        .with_object(mesh_id),
+                );
+            }
+            deltas.insert(*control_point, moved32);
+        }
+        let mut out = vec![[0.0f32; 3]; positions.len()];
+        for (vertex, control_point) in control_points.iter().enumerate() {
+            if let Some(delta) = deltas.get(control_point) {
+                out[vertex] = *delta;
+            }
+        }
+        targets.push(VrmMorphTarget {
+            name: channel.name.to_owned(),
+            positions: out,
+        });
+    }
+    Ok(targets)
 }
 
 /// cornerから頂点統合の鍵を作る。
@@ -247,6 +352,7 @@ fn push_vertex(
     truncated: &mut usize,
     unweighted: &mut usize,
     influences: Option<&PerPoint>,
+    control_points: Option<&mut Vec<u32>>,
 ) -> Result<u32, VrmError> {
     let pos_index = data.corner_positions[corner] as usize;
     let raw = data.positions.get(pos_index).ok_or_else(|| {
@@ -269,6 +375,16 @@ fn push_vertex(
         );
     }
     positions.push(baked32);
+    if let Some(control_points) = control_points {
+        let index = u32::try_from(pos_index).map_err(|_| {
+            VrmError::new(
+                VrmErrorKind::InvalidStructure,
+                "制御点番号がu32の範囲を超えた",
+            )
+            .with_object(mesh_id)
+        })?;
+        control_points.push(index);
+    }
 
     if let (Some(layer), Some(out)) = (data.normals.as_ref(), normals) {
         let normal_index = layer.corner_indices[corner] as usize;

@@ -1,12 +1,14 @@
-//! バイナリFBXからメッシュ幾何・モデル階層・スキン・バインドポーズを読み取る層。
+//! バイナリFBXからメッシュ幾何・モデル階層・スキン・バインドポーズ・
+//! ブレンドシェイプを読み取る層。
 //!
-//! 担当するのは、展開済みバイト列の借用による一度の走査と、メッシュ・スキン単位の
+//! 担当するのは、展開済みバイト列の借用による一度の走査と、メッシュ・スキン・形状単位の
 //! オンデマンド展開までである。VRM生成・三角形化・座標系変換・スキニングの
 //! 解決は行わない。
 //!
 //! 入口は [`FbxFile::parse`](crate::fbx::FbxFile::parse)（走査）、
 //! [`FbxFile::mesh_data`](crate::fbx::FbxFile::mesh_data)（対象配列の展開）、
 //! [`FbxFile::skin_data`](crate::fbx::FbxFile::skin_data)（対象配列の展開）、
+//! [`FbxFile::shape_data`](crate::fbx::FbxFile::shape_data)（対象配列の展開）、
 //! [`FbxFile::bind_pose_nodes`](crate::fbx::FbxFile::bind_pose_nodes)
 //! （BindPoseの統合）である。座標値と変換値はファイルの数値のまま返し、軸や単位は値として返す。
 //!
@@ -14,18 +16,18 @@
 //! flowchart LR
 //!     bytes[入力バイト列<br/>借用] --> header[ヘッダ検証<br/>magicとversion]
 //!     header --> walk[ノード走査<br/>深さ・件数・境界の検査]
-//!     walk --> objects[Objects<br/>ModelとGeometry Mesh<br/>DeformerとPose]
+//!     walk --> objects[Objects<br/>ModelとGeometry MeshとShape<br/>DeformerとPose]
 //!     walk --> conn[Connections<br/>OOの子→親]
-//!     objects --> file[FbxFile<br/>階層・スキン要約・配列位置]
+//!     objects --> file[FbxFile<br/>階層・スキンとブレンドシェイプ要約・配列位置]
 //!     conn --> file
-//!     file --> decode[mesh_data / skin_data<br/>対象配列だけzlib展開]
+//!     file --> decode[mesh_data / skin_data / shape_data<br/>対象配列だけzlib展開]
 //!     file --> pose[bind_pose_nodes<br/>BindPoseの統合]
-//!     decode --> data[MeshData / SkinData<br/>座標・面・法線・UV・材質番号・重み]
+//!     decode --> data[MeshData / SkinData / ShapeData<br/>座標・面・法線・UV・材質番号・重み・差分]
 //!     pose --> matrices[モデルごとのバインド行列]
 //! ```
 //!
 //! 配列は解析時には展開せず、絶対位置・要素数・要素型・圧縮方式だけを保持する。
-//! `mesh_data` と `skin_data` は要求された対象の配列だけを境界検査付きで展開するため、
+//! `mesh_data` と `skin_data` と `shape_data` は要求された対象の配列だけを境界検査付きで展開するため、
 //! 確保するメモリは対象の大きさに比例し、ファイル全体には比例しない。
 
 mod error;
@@ -384,6 +386,61 @@ pub struct ClusterData {
     pub weights: Vec<f64>,
 }
 
+/// ブレンドシェイプ1件の要約。
+///
+/// 変形対象のメッシュとチャンネルの一覧を持ち、形状のデルタは持たない。
+/// デルタの中身は [`shape_data`](FbxFile::shape_data) が対象分だけ展開する。
+#[derive(Debug, Clone)]
+pub struct BlendShape {
+    /// オブジェクトID。
+    pub id: ObjectId,
+    /// ブレンドシェイプ名。`Name\x00Class` 形式の場合は最初の `\x00` で切る。
+    pub name: String,
+    /// 変形対象のメッシュGeometry。
+    pub geometry: ObjectId,
+    /// チャンネルの一覧。`Connections` の出現順を保つ。
+    pub channels: Vec<ObjectId>,
+}
+
+/// ブレンドシェイプチャンネル1件の要約。
+///
+/// 接続する形状の一覧を持ち、デルタと重み率の中身は持たない。
+/// デルタは [`shape_data`](FbxFile::shape_data)、重み率は
+/// [`blend_channel_weights`](FbxFile::blend_channel_weights) が対象分だけ展開する。
+#[derive(Debug, Clone)]
+pub struct BlendShapeChannel {
+    /// オブジェクトID。
+    pub id: ObjectId,
+    /// チャンネル名。`Name\x00Class` 形式の場合は最初の `\x00` で切る。
+    pub name: String,
+    /// `DeformPercent` の値。無い場合は `None` である。
+    pub deform_percent: Option<f64>,
+    /// `FullWeights` の有無。ある場合は [`blend_channel_weights`](FbxFile::blend_channel_weights) で展開する。
+    pub has_full_weights: bool,
+    /// 接続する形状。`Connections` の出現順を保つ。
+    pub shapes: Vec<BlendShapeFrame>,
+}
+
+/// チャンネルに接続する形状1件。
+#[derive(Debug, Clone)]
+pub struct BlendShapeFrame {
+    /// 形状のオブジェクトID。
+    pub shape: ObjectId,
+    /// 形状名。`Name\x00Class` 形式の場合は最初の `\x00` で切る。
+    pub name: String,
+}
+
+/// 形状1件のデルタの展開結果。
+///
+/// 位置の差分だけを返し、法線の差分は読まない。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShapeData {
+    /// 差分の対象の制御点番号。
+    pub control_point_indices: Vec<u32>,
+    /// 制御点ごとの位置の差分。`control_point_indices` と同じ長さである。
+    pub position_deltas: Vec<[f64; 3]>,
+}
+
 /// バインドポーズ1件の統合結果。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BindPoseNode {
@@ -414,6 +471,24 @@ pub struct FbxFile<'a> {
     mesh_owner: HashMap<i64, i64>,
     skins: Vec<Skin>,
     skin_at: HashMap<i64, usize>,
+    /// ブレンドシェイプ1件の要約。順序は `Objects` の出現順である。
+    blend_shapes: Vec<BlendShape>,
+    /// ブレンドシェイプIDから `blend_shapes` への位置。
+    blend_shape_at: HashMap<i64, usize>,
+    /// チャンネルの要約。順序は `Objects` の出現順である。
+    blend_channels: Vec<BlendChannelRec>,
+    /// チャンネルIDから `blend_channels` への位置。
+    blend_channel_at: HashMap<i64, usize>,
+    /// チャンネルIDから接続する形状ID列への対応。`Connections` の出現順を保つ。
+    channel_shapes: HashMap<i64, Vec<ObjectId>>,
+    /// 形状IDから形状名への対応。
+    shape_names: HashMap<i64, String>,
+    /// 形状IDから `Indexes` 配列位置への対応。
+    shape_indexes: HashMap<i64, ArrayDesc>,
+    /// 形状IDから `Vertices` 配列位置への対応。
+    shape_vertices: HashMap<i64, ArrayDesc>,
+    /// 形状IDから対象メッシュIDへの対応。
+    shape_mesh: HashMap<i64, ObjectId>,
     pose_nodes: Vec<StoredPoseNode>,
 }
 
@@ -429,21 +504,28 @@ struct StoredPoseNode {
     matrix: ArrayDesc,
 }
 
-/// `Deformer` の種別。`Skin` と `Cluster` だけを読み、それ以外は読み飛ばす。
+/// `Deformer` の種別。`Skin`・`Cluster`・`BlendShape`・`BlendShapeChannel` を読む。
 ///
-/// ブレンドシェイプの対応付けは別の作業単位であり、この層では扱わない。
+/// ブレンドシェイプの重み合成は別の作業単位であり、この層では単一フレームの
+/// 接続とデルタの読み取りまでを扱う。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DeformerKind {
     /// 変形対象と結合モデルの対応付け。
     Skin,
     /// 結合モデルごとの頂点索引と重み。
     Cluster,
+    /// ブレンドシェイプの束ね。チャンネルと対象メッシュを結ぶ。
+    BlendShape,
+    /// ブレンドシェイプの1チャンネル。形状と重み率を持つ。
+    BlendShapeChannel,
 }
 
-/// `Deformer`（`Skin`/`Cluster`）1件の読み取り結果。
+/// `Deformer`（`Skin`/`Cluster`/`BlendShape`/`BlendShapeChannel`）1件の読み取り結果。
 ///
 /// 索引と重みの配列は展開せず位置だけを残し、
-/// [`skin_data`](FbxFile::skin_data) が対象分だけ展開する。
+/// [`skin_data`](FbxFile::skin_data) と [`shape_data`](FbxFile::shape_data) が
+/// 対象分だけ展開する。ブレンドシェイプ系は形状の接続だけを保持し、
+/// 重み率の解釈は呼び出し側に残す。
 #[derive(Debug, Clone)]
 struct DeformerRec {
     /// オブジェクトID。
@@ -456,6 +538,25 @@ struct DeformerRec {
     indexes: Option<ArrayDesc>,
     /// `Cluster/Weights` の位置。無い場合は `None` である。
     weights: Option<ArrayDesc>,
+    /// `BlendShapeChannel/DeformPercent`。チャンネル以外では `None` である。
+    deform_percent: Option<f64>,
+    /// `BlendShapeChannel/FullWeights` の位置。無い場合は `None` である。
+    full_weights: Option<ArrayDesc>,
+}
+
+/// ブレンドシェイプチャンネル1件の内部要約。
+///
+/// 重み率の配列は展開せず位置だけを残す。
+#[derive(Debug, Clone)]
+struct BlendChannelRec {
+    /// オブジェクトID。
+    id: ObjectId,
+    /// チャンネル名。
+    name: String,
+    /// `DeformPercent` の値。無い場合は `None` である。
+    deform_percent: Option<f64>,
+    /// `FullWeights` の位置。無い場合は `None` である。
+    full_weights: Option<ArrayDesc>,
 }
 
 impl<'a> FbxFile<'a> {
@@ -502,7 +603,7 @@ impl<'a> FbxFile<'a> {
             if !used_ids.insert(rec.id.value()) {
                 return Err(FbxError::new(
                     FbxErrorKind::InvalidStructure,
-                    "Skin/ClusterのIDが重複している",
+                    "DeformerのIDが重複している",
                 )
                 .with_object(rec.id));
             }
@@ -519,6 +620,19 @@ impl<'a> FbxFile<'a> {
         }
         apply_connections(&top, &mut models, &mut meshes, &materials)?;
         let skins = wire_skins(&top, &models, &meshes, &deformers)?;
+        let (blend_shapes, blend_channels, channel_shapes) =
+            wire_blend_shapes(&top, &meshes, &deformers)?;
+        let shapes = read_shapes(bytes, &top)?;
+        // 形状IDも全体で一意であり、重複と他オブジェクトとの衝突を拒否する。
+        for shape in &shapes {
+            if !used_ids.insert(shape.id.value()) {
+                return Err(FbxError::new(
+                    FbxErrorKind::InvalidStructure,
+                    "GeometryのIDが重複している",
+                )
+                .with_object(shape.id));
+            }
+        }
         let model_at = models
             .iter()
             .enumerate()
@@ -543,6 +657,25 @@ impl<'a> FbxFile<'a> {
             .iter()
             .filter_map(|model| model.mesh.map(|mesh| (mesh.value(), model.id.value())))
             .collect();
+        let blend_shape_at = blend_shapes
+            .iter()
+            .enumerate()
+            .map(|(index, shape)| (shape.id.value(), index))
+            .collect();
+        let blend_channel_at = blend_channels
+            .iter()
+            .enumerate()
+            .map(|(index, channel)| (channel.id.value(), index))
+            .collect();
+        let mut shape_names = HashMap::with_capacity(shapes.len());
+        let mut shape_indexes = HashMap::with_capacity(shapes.len());
+        let mut shape_vertices = HashMap::with_capacity(shapes.len());
+        for shape in &shapes {
+            shape_names.insert(shape.id.value(), shape.name.clone());
+            shape_indexes.insert(shape.id.value(), shape.indexes);
+            shape_vertices.insert(shape.id.value(), shape.vertices);
+        }
+        let shape_mesh = build_shape_meshes(&channel_shapes, &blend_shapes)?;
         Ok(Self {
             bytes,
             version,
@@ -557,6 +690,15 @@ impl<'a> FbxFile<'a> {
             mesh_owner,
             skins,
             skin_at,
+            blend_shapes,
+            blend_shape_at,
+            blend_channels,
+            blend_channel_at,
+            channel_shapes,
+            shape_names,
+            shape_indexes,
+            shape_vertices,
+            shape_mesh,
             pose_nodes,
         })
     }
@@ -682,6 +824,163 @@ impl<'a> FbxFile<'a> {
             uv_sets,
             material_indices,
         })
+    }
+
+    /// ブレンドシェイプの一覧を返す。順序は `Objects` の出現順である。
+    pub fn blend_shapes(&self) -> &[BlendShape] {
+        &self.blend_shapes
+    }
+
+    /// 指定IDのブレンドシェイプを返す。
+    pub fn blend_shape(&self, id: ObjectId) -> Option<&BlendShape> {
+        self.blend_shape_at
+            .get(&id.value())
+            .map(|&index| &self.blend_shapes[index])
+    }
+
+    /// 指定メッシュのブレンドシェイプチャンネルを返す。
+    ///
+    /// 順序は `Connections` の出現順であり、チャンネル名の重複は許す。
+    /// 選択と単一フレーム条件の検証は呼び出し側が行い、ここでは接続の列挙に留める。
+    /// 対応する `BlendShape` が無いチャンネルは無視する。
+    pub fn blend_shape_channels(&self, geometry: ObjectId) -> Vec<BlendShapeChannel> {
+        let mut out = Vec::new();
+        for shape in &self.blend_shapes {
+            if shape.geometry != geometry {
+                continue;
+            }
+            for &channel_id in &shape.channels {
+                let Some(&index) = self.blend_channel_at.get(&channel_id.value()) else {
+                    continue;
+                };
+                let Some(channel) = self.blend_channels.get(index) else {
+                    continue;
+                };
+                let mut shapes = Vec::new();
+                if let Some(shape_ids) = self.channel_shapes.get(&channel_id.value()) {
+                    for &shape_id in shape_ids {
+                        let name = self
+                            .shape_names
+                            .get(&shape_id.value())
+                            .cloned()
+                            .unwrap_or_default();
+                        shapes.push(BlendShapeFrame {
+                            shape: shape_id,
+                            name,
+                        });
+                    }
+                }
+                out.push(BlendShapeChannel {
+                    id: channel.id,
+                    name: channel.name.clone(),
+                    deform_percent: channel.deform_percent,
+                    has_full_weights: channel.full_weights.is_some(),
+                    shapes,
+                });
+            }
+        }
+        out
+    }
+
+    /// 指定IDの形状（ブレンドシェイプの1フレーム）のデルタを展開する。
+    ///
+    /// 対象形状の配列だけを境界検査付きで展開するため、確保するメモリは
+    /// 対象形状の大きさに比例する。デルタは制御点番号と3成分の組で返し、
+    /// 法線の差分は読まない。
+    ///
+    /// # Errors
+    ///
+    /// 未知ID・配列長不整合・範囲外の制御点番号・重複する制御点番号・
+    /// 有限でないデルタなどの場合に返す。
+    pub fn shape_data(&self, id: ObjectId) -> Result<ShapeData, FbxError> {
+        let indexes_desc = self
+            .shape_indexes
+            .get(&id.value())
+            .copied()
+            .ok_or_else(|| FbxError::new(FbxErrorKind::NotFound, "形状がない").with_object(id))?;
+        let vertices_desc = self
+            .shape_vertices
+            .get(&id.value())
+            .copied()
+            .ok_or_else(|| FbxError::new(FbxErrorKind::NotFound, "形状がない").with_object(id))?;
+        let mesh_id = self.shape_mesh.get(&id.value()).copied().ok_or_else(|| {
+            FbxError::new(
+                FbxErrorKind::InvalidStructure,
+                "形状の対象メッシュが決まらない",
+            )
+            .with_object(id)
+        })?;
+        let mesh = self.mesh(mesh_id).ok_or_else(|| {
+            FbxError::new(FbxErrorKind::InvalidStructure, "形状の対象メッシュがない")
+                .with_object(id)
+        })?;
+        let raw_indexes = expand_integers(self.bytes, indexes_desc, id)?;
+        let plain = expand(self.bytes, vertices_desc, id)?;
+        let raw_deltas = mesh::as_f64s(plain.as_slice(), vertices_desc.kind, id)?;
+        mesh::ensure_finite(&raw_deltas, id)?;
+        if raw_deltas.len() % 3 != 0 {
+            return Err(FbxError::new(
+                FbxErrorKind::InvalidStructure,
+                "形状のデルタ配列が3の倍数でない",
+            )
+            .with_object(id));
+        }
+        if raw_deltas.len() / 3 != raw_indexes.len() {
+            return Err(FbxError::new(
+                FbxErrorKind::InvalidStructure,
+                "形状の索引数とデルタ数が一致しない",
+            )
+            .with_object(id));
+        }
+        let mut seen: HashSet<u32> = HashSet::with_capacity(raw_indexes.len());
+        let mut control_point_indices = Vec::with_capacity(raw_indexes.len());
+        let mut position_deltas = Vec::with_capacity(raw_indexes.len());
+        for (index, delta) in raw_indexes.iter().zip(raw_deltas.chunks_exact(3)) {
+            if *index < 0 || *index as usize >= mesh.vertex_count {
+                return Err(FbxError::new(
+                    FbxErrorKind::InvalidStructure,
+                    "形状の制御点番号が範囲外である",
+                )
+                .with_object(id));
+            }
+            let index = *index as u32;
+            if !seen.insert(index) {
+                return Err(FbxError::new(
+                    FbxErrorKind::InvalidStructure,
+                    "形状内で制御点番号が重複する",
+                )
+                .with_object(id));
+            }
+            control_point_indices.push(index);
+            position_deltas.push([delta[0], delta[1], delta[2]]);
+        }
+        Ok(ShapeData {
+            control_point_indices,
+            position_deltas,
+        })
+    }
+
+    /// 指定チャンネルの `FullWeights` を展開して返す。
+    ///
+    /// 対象チャンネルの配列だけを境界検査付きで展開するため、確保するメモリは
+    /// 対象の大きさに比例する。値の解釈（単一フレーム条件の判定）は呼び出し側が行う。
+    ///
+    /// # Errors
+    ///
+    /// 未知ID・有限でない重みの場合に返す。
+    pub fn blend_channel_weights(&self, id: ObjectId) -> Result<Vec<f64>, FbxError> {
+        let desc = self
+            .blend_channel_at
+            .get(&id.value())
+            .and_then(|&index| self.blend_channels.get(index))
+            .and_then(|channel| channel.full_weights)
+            .ok_or_else(|| {
+                FbxError::new(FbxErrorKind::NotFound, "チャンネルがない").with_object(id)
+            })?;
+        let plain = expand(self.bytes, desc, id)?;
+        let values = mesh::as_f64s(plain.as_slice(), desc.kind, id)?;
+        mesh::ensure_finite(&values, id)?;
+        Ok(values)
     }
 
     /// スキンの一覧を返す。順序は `Objects` の出現順である。
@@ -1248,11 +1547,10 @@ fn read_material_objects(top: &[RawNode]) -> Result<Vec<Material>, FbxError> {
     Ok(materials)
 }
 
-/// `Objects` 直下の `Deformer`（`Skin`/`Cluster`）を読む。
+/// `Objects` 直下の `Deformer`（`Skin`/`Cluster`/`BlendShape`/`BlendShapeChannel`）を読む。
 ///
 /// IDが0以下や重複の場合は破損として失敗する。後勝ちで黙って上書きすると
-/// 接続の対応付けがずれるためである。`Skin`と`Cluster`以外
-/// （ブレンドシェイプなど）はこの層で読まないため読み飛ばす。
+/// 接続の対応付けがずれるためである。上記4種以外はこの層で読まないため読み飛ばす。
 fn read_deformers(top: &[RawNode]) -> Result<Vec<DeformerRec>, FbxError> {
     let mut deformers = Vec::new();
     let mut seen: HashSet<i64> = HashSet::new();
@@ -1292,6 +1590,10 @@ fn read_deformers(top: &[RawNode]) -> Result<Vec<DeformerRec>, FbxError> {
             DeformerKind::Skin
         } else if head == Some(b"Cluster".as_slice()) {
             DeformerKind::Cluster
+        } else if head == Some(b"BlendShape".as_slice()) {
+            DeformerKind::BlendShape
+        } else if head == Some(b"BlendShapeChannel".as_slice()) {
+            DeformerKind::BlendShapeChannel
         } else {
             continue;
         };
@@ -1306,15 +1608,299 @@ fn read_deformers(top: &[RawNode]) -> Result<Vec<DeformerRec>, FbxError> {
             .child("Weights")
             .and_then(|child| child.props.first())
             .and_then(RawProp::as_array);
+        // ブレンドシェイプ系は `Skin`/`Cluster` の配列を持たず、
+        // チャンネルの `DeformPercent` と `FullWeights` だけを保持する。
+        // 値の解釈（単一フレーム条件）は呼び出し側に残す。
+        // `DeformPercent` は `D` 型の数値だけを受け付け、型違いは黙って落とさず
+        // 存在しないものとして扱う。非有限の値はここでは拒否し、
+        // 選択時に理由を明示して失敗させる。
+        let deform_percent = if kind == DeformerKind::BlendShapeChannel {
+            node.child("DeformPercent")
+                .and_then(|child| child.props.first())
+                .and_then(RawProp::as_number)
+        } else {
+            None
+        };
+        let full_weights = if kind == DeformerKind::BlendShapeChannel {
+            node.child("FullWeights")
+                .and_then(|child| child.props.first())
+                .and_then(RawProp::as_array)
+        } else {
+            None
+        };
         deformers.push(DeformerRec {
             id: object,
             name,
             kind,
             indexes,
             weights,
+            deform_percent,
+            full_weights,
         });
     }
     Ok(deformers)
+}
+
+/// `Geometry`（`Shape`）1件の読み取り結果。
+///
+/// 形状のデルタ配列は展開せず位置だけを残し、
+/// [`shape_data`](FbxFile::shape_data) が対象分だけ展開する。
+/// 法線の差分は読まない。
+#[derive(Debug, Clone)]
+struct ShapeRec {
+    /// オブジェクトID。
+    id: ObjectId,
+    /// 形状名。
+    name: String,
+    /// `Indexes` の位置。
+    indexes: ArrayDesc,
+    /// `Vertices` の位置。
+    vertices: ArrayDesc,
+}
+
+/// `Objects` 直下の `Geometry`（`Shape`）を読む。
+///
+/// `Vertices`（差分）と `Indexes`（制御点番号）を持ち、両方が無い形状は
+/// 破損として失敗する。IDが0以下や重複の場合も破損として失敗する。
+fn read_shapes(bytes: &[u8], top: &[RawNode]) -> Result<Vec<ShapeRec>, FbxError> {
+    let _ = bytes;
+    let mut shapes = Vec::new();
+    let mut seen: HashSet<i64> = HashSet::new();
+    let Some(objects) = top.iter().find(|node| node.name.as_ref() == "Objects") else {
+        return Ok(shapes);
+    };
+    for node in objects.children_by("Geometry") {
+        // `Shape` 以外は読まない。比較はバイト列で行い、名前のUTF-8検証は後段で行う。
+        let is_shape = node
+            .props
+            .get(2)
+            .and_then(RawProp::as_bytes)
+            .map(|bytes| bytes.split(|b| *b == 0).next() == Some(b"Shape".as_slice()))
+            .unwrap_or(false);
+        if !is_shape {
+            continue;
+        }
+        let id = node
+            .props
+            .first()
+            .and_then(RawProp::as_int)
+            .ok_or_else(|| {
+                FbxError::new(
+                    FbxErrorKind::InvalidStructure,
+                    "GeometryのID形状が壊れている",
+                )
+            })?;
+        if id <= 0 {
+            return Err(
+                FbxError::new(FbxErrorKind::InvalidStructure, "GeometryのIDが0以下である")
+                    .with_object(ObjectId(id)),
+            );
+        }
+        if !seen.insert(id) {
+            return Err(FbxError::new(
+                FbxErrorKind::InvalidStructure,
+                "GeometryのIDが重複している",
+            )
+            .with_object(ObjectId(id)));
+        }
+        let object = ObjectId(id);
+        let name = split_class_name(node.props.get(1).and_then(RawProp::as_bytes), object)?;
+        let indexes = node
+            .child("Indexes")
+            .and_then(|child| child.props.first())
+            .and_then(RawProp::as_array)
+            .ok_or_else(|| {
+                FbxError::new(FbxErrorKind::InvalidStructure, "形状の索引配列がない")
+                    .with_object(object)
+            })?;
+        let vertices = node
+            .child("Vertices")
+            .and_then(|child| child.props.first())
+            .and_then(RawProp::as_array)
+            .ok_or_else(|| {
+                FbxError::new(FbxErrorKind::InvalidStructure, "形状の差分配列がない")
+                    .with_object(object)
+            })?;
+        shapes.push(ShapeRec {
+            id: object,
+            name,
+            indexes,
+            vertices,
+        });
+    }
+    Ok(shapes)
+}
+
+/// `Connections` の `OO`（子→親）からブレンドシェイプの対応を組み立てる。
+///
+/// 読むのは `Shape`→`BlendShapeChannel`・`BlendShapeChannel`→`BlendShape`・
+/// `BlendShape`→`Geometry(Mesh)` だけであり、出現順を保つ。
+/// 未知IDへの接続は無視する。1つの `BlendShape` が複数のメッシュに接続する場合は
+/// 変形対象が決まらないため不正として失敗する。
+/// 1つのチャンネルへの複数形状の接続は許し、単一フレーム条件の検証は
+/// 形状の選択時に呼び出し側が行う。
+/// ブレンドシェイプの接続解決結果。`BlendShape` 一覧、チャンネル一覧、
+/// チャンネルごとの形状ID列（出現順）を返す。
+type WiredBlendShapes = (
+    Vec<BlendShape>,
+    Vec<BlendChannelRec>,
+    HashMap<i64, Vec<ObjectId>>,
+);
+
+/// 形状IDから変形対象メッシュへの対応を作る。
+///
+/// 1つの形状は1つのチャンネルにだけ接続できる。同じ形状が複数チャンネルへ
+/// 接続する場合や、1つのチャンネルが異なるメッシュの `BlendShape` に属する場合は、
+/// 対象メッシュが一意に決まらないため破損として失敗する。
+fn build_shape_meshes(
+    channel_shapes: &HashMap<i64, Vec<ObjectId>>,
+    blend_shapes: &[BlendShape],
+) -> Result<HashMap<i64, ObjectId>, FbxError> {
+    let mut channel_geometry: HashMap<i64, ObjectId> = HashMap::new();
+    for blend in blend_shapes {
+        for channel in &blend.channels {
+            match channel_geometry.get(&channel.value()) {
+                Some(previous) if *previous != blend.geometry => {
+                    return Err(FbxError::new(
+                        FbxErrorKind::InvalidStructure,
+                        "チャンネルが複数のメッシュに接続する",
+                    )
+                    .with_object(*channel));
+                }
+                Some(_) => {}
+                None => {
+                    channel_geometry.insert(channel.value(), blend.geometry);
+                }
+            }
+        }
+    }
+    let mut shape_channel: HashMap<i64, i64> = HashMap::new();
+    for (channel, shapes) in channel_shapes {
+        for shape in shapes {
+            match shape_channel.get(&shape.value()) {
+                Some(previous) if *previous != *channel => {
+                    return Err(FbxError::new(
+                        FbxErrorKind::InvalidStructure,
+                        "形状が複数のチャンネルに接続する",
+                    )
+                    .with_object(*shape));
+                }
+                Some(_) => {}
+                None => {
+                    shape_channel.insert(shape.value(), *channel);
+                }
+            }
+        }
+    }
+    let mut shape_mesh = HashMap::with_capacity(shape_channel.len());
+    for (shape, channel) in shape_channel {
+        if let Some(geometry) = channel_geometry.get(&channel) {
+            shape_mesh.insert(shape, *geometry);
+        }
+    }
+    Ok(shape_mesh)
+}
+
+fn wire_blend_shapes(
+    top: &[RawNode],
+    meshes: &[Mesh],
+    deformers: &[DeformerRec],
+) -> Result<WiredBlendShapes, FbxError> {
+    let known_meshes: HashSet<i64> = meshes.iter().map(|mesh| mesh.id.value()).collect();
+    let mut blend_ids: HashSet<i64> = HashSet::new();
+    let mut channel_of: HashMap<i64, &DeformerRec> = HashMap::new();
+    for rec in deformers {
+        match rec.kind {
+            DeformerKind::BlendShape => {
+                blend_ids.insert(rec.id.value());
+            }
+            DeformerKind::BlendShapeChannel => {
+                channel_of.insert(rec.id.value(), rec);
+            }
+            DeformerKind::Skin | DeformerKind::Cluster => {}
+        }
+    }
+    // 対応付けと順序記録を一度の走査で行う。同一対応の重複は無視し、
+    // 異なる対象が複数ある場合だけ後段で拒否する。
+    let mut channel_shapes: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut blend_channels: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut blend_geometry: HashMap<i64, Vec<i64>> = HashMap::new();
+    if let Some(connections) = top.iter().find(|node| node.name.as_ref() == "Connections") {
+        for node in &connections.children {
+            if node.props.first().and_then(RawProp::as_bytes) != Some(b"OO".as_slice()) {
+                continue;
+            }
+            let (Some(child), Some(parent)) = (
+                node.props.get(1).and_then(RawProp::as_int),
+                node.props.get(2).and_then(RawProp::as_int),
+            ) else {
+                continue;
+            };
+            if channel_of.contains_key(&parent) {
+                // 子は形状のはずだが、未知IDへの接続は無視するため種類を問わず記録し、
+                // 実在の形状かは後段の `read_shapes` との突合せで決める。
+                let frames = channel_shapes.entry(parent).or_default();
+                if !frames.contains(&child) {
+                    frames.push(child);
+                }
+            } else if blend_ids.contains(&parent) && channel_of.contains_key(&child) {
+                let channels = blend_channels.entry(parent).or_default();
+                if !channels.contains(&child) {
+                    channels.push(child);
+                }
+            } else if known_meshes.contains(&parent) && blend_ids.contains(&child) {
+                let targets = blend_geometry.entry(child).or_default();
+                if !targets.contains(&parent) {
+                    targets.push(parent);
+                }
+            }
+        }
+    }
+    let mut summaries = Vec::new();
+    for rec in deformers {
+        if rec.kind != DeformerKind::BlendShape {
+            continue;
+        }
+        let geometry = match blend_geometry.get(&rec.id.value()).map(Vec::as_slice) {
+            Some(&[geometry]) => geometry,
+            _ => {
+                return Err(FbxError::new(
+                    FbxErrorKind::InvalidStructure,
+                    "ブレンドシェイプの変形対象が1つでない",
+                )
+                .with_object(rec.id));
+            }
+        };
+        let mut channels = Vec::new();
+        if let Some(ordered) = blend_channels.get(&rec.id.value()) {
+            for &channel_id in ordered {
+                channels.push(ObjectId(channel_id));
+            }
+        }
+        summaries.push(BlendShape {
+            id: rec.id,
+            name: rec.name.to_string(),
+            geometry: ObjectId(geometry),
+            channels,
+        });
+    }
+    let mut channels_out = Vec::new();
+    for rec in deformers {
+        if rec.kind != DeformerKind::BlendShapeChannel {
+            continue;
+        }
+        channels_out.push(BlendChannelRec {
+            id: rec.id,
+            name: rec.name.to_string(),
+            deform_percent: rec.deform_percent,
+            full_weights: rec.full_weights,
+        });
+    }
+    let mut frames_out: HashMap<i64, Vec<ObjectId>> = HashMap::new();
+    for (channel, frames) in channel_shapes {
+        frames_out.insert(channel, frames.into_iter().map(ObjectId).collect());
+    }
+    Ok((summaries, channels_out, frames_out))
 }
 
 /// `Objects` 直下の `Pose`（`BindPose`）から `PoseNode` を読む。
@@ -1664,6 +2250,8 @@ fn wire_skins(
             DeformerKind::Cluster => {
                 cluster_of.insert(rec.id.value(), rec);
             }
+            // ブレンドシェイプ系はスキンの配線では扱わない。
+            DeformerKind::BlendShape | DeformerKind::BlendShapeChannel => {}
         }
     }
     // Geometryから所有モデルへの対応。複数所有は `apply_connections` で先に拒否するため、
@@ -2114,4 +2702,38 @@ fn expand_integers(bytes: &[u8], desc: ArrayDesc, object: ObjectId) -> Result<Ve
     }
     let plain = expand(bytes, desc, object)?;
     mesh::as_i64s(plain.as_slice(), desc.kind, object)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn 束ね(id: i64, geometry: i64, channels: &[i64]) -> BlendShape {
+        BlendShape {
+            id: ObjectId::new(id),
+            name: format!("b{id}"),
+            geometry: ObjectId::new(geometry),
+            channels: channels
+                .iter()
+                .map(|channel| ObjectId::new(*channel))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn 形状が複数チャンネルに接続すると失敗する() {
+        let mut channel_shapes = HashMap::new();
+        channel_shapes.insert(30, vec![ObjectId::new(20)]);
+        channel_shapes.insert(31, vec![ObjectId::new(20)]);
+        let blend_shapes = vec![束ね(40, 10, &[30]), 束ね(41, 11, &[31])];
+        assert!(build_shape_meshes(&channel_shapes, &blend_shapes).is_err());
+    }
+
+    #[test]
+    fn チャンネルが複数メッシュに接続すると失敗する() {
+        let mut channel_shapes = HashMap::new();
+        channel_shapes.insert(30, vec![ObjectId::new(20)]);
+        let blend_shapes = vec![束ね(40, 10, &[30]), 束ね(41, 11, &[30])];
+        assert!(build_shape_meshes(&channel_shapes, &blend_shapes).is_err());
+    }
 }

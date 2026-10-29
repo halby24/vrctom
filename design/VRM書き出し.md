@@ -3,18 +3,20 @@
 ## 担当責務
 
 この文書は、VRM中間モデルからVRM 1.0のGLBバイト列を作る設計を担当する。
-glTFのノード・メッシュ・スキン・材質と、`VRMC_vrm` 拡張のmeta・humanoidを書き出す。
-材質の内容（Unityの `.mat` からの写像）は [`VRM材質`](VRM材質.md) が担当する。
-ファイルシステムへの保存、表情、スプリングボーン、
+glTFのノード・メッシュ・スキン・材質・モーフターゲットと、
+`VRMC_vrm` 拡張のmeta・humanoid・expressionsを書き出す。
+材質の内容（Unityの `.mat` からの写像）は [`VRM材質`](VRM材質.md) が担当し、
+表情の選択と差分の作り方は [`VRM表情`](VRM表情.md) が担当する。
+ファイルシステムへの保存、スプリングボーン、
 ライセンス内容の妥当性判断は担当しない。
 
 ## 設計概要
 
 ```mermaid
 flowchart LR
-    model[VrmModel<br/>ノード・スキン・メッシュ] --> validate[humanoidとmetaの検証]
+    model[VrmModel<br/>ノード・スキン・メッシュ<br/>モーフ・表情] --> validate[humanoidとmetaと表情の検証]
     options[VrmExportOptions<br/>meta・humanoid] --> validate
-    validate --> accessors[バッファとアクセサ]
+    validate --> accessors[バッファとアクセサ<br/>モーフ差分を含む]
     accessors --> json[glTF JSON<br/>VRMC_vrm拡張]
     json --> glb[GLB<br/>JSONチャンク＋BINチャンク]
 ```
@@ -71,6 +73,25 @@ nameが空、authorsが空、licenseUrlが空の場合は失敗する。
 UVはFBXとUnityの左下原点からglTFの左上原点へ合わせるため、全UVセットのVを
 `1 - v` にして書く。画像は反転しない。
 
+## モーフターゲットと表情
+
+`VrmMesh.targets` がある場合、各プリミティブの `targets` に位置差分のアクセサを載せる。
+全プリミティブが同じ順序で同じアクセサを参照する。法線の差分は書かない。
+メッシュの `weights` にはターゲット数と同じ長さのゼロ列を書き、初期値をここに任せる。
+`node.weights` は書かない。ターゲット名はメッシュの `extras.targetNames` に書く。
+`gltf` の `extras` 機能を使う。
+
+`VrmModel.expressions.preset` が空でない場合、`VRMC_vrm.expressions.preset` に式を書く。
+式ごとに `morphTargetBinds`（中間メッシュ索引をノード索引へ写したもの・ターゲット索引・重み）・
+`isBinary`・`overrideBlink`・`overrideLookAt`・`overrideMouth` を持つ。
+現在の生成では `isBinary` は偽、上書きはすべて `none` である。
+
+書き出す前に次を検証する。詳細な条件は [`VRM表情`](VRM表情.md) に譲る。
+
+- 束ねの重みは0〜1の有限値である。
+- 式名はVRM 1.0のプリセット18種のいずれかであり、重複も空もない。
+- 束ねのメッシュ索引・ターゲット索引は範囲内であり、ターゲットの長さは出力頂点数と一致する。
+
 ## アクセサ
 
 - 位置はVEC3/F32で、min/maxを付ける。
@@ -95,7 +116,7 @@ UVはFBXとUnityの左下原点からglTFの左上原点へ合わせるため、
   仕様の必須項目と参照整合を満たす範囲に留める。
 - 材質の見た目を完全に再現することは保証しない。材質の解釈は [`VRM材質`](VRM材質.md)
   の近似に従う。
-- 表情・スプリングボーン・揺れ物は出力しない。
+- スプリングボーン・揺れ物は出力しない。
 - ライセンス内容の妥当性や、利用条件の適法性は判断しない。
 - 凹多角形の三角形化品質は中間モデルの前提を引き継ぐ。
 

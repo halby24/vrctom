@@ -3083,3 +3083,341 @@ fn 実fixtureの材質スロットと置換表を検証する() {
         }
     }
 }
+
+/// `Geometry`（Shape）ノードを組み立てる。差分と索引を持つ。
+fn shape_geometry(id: i64, name: &[u8], children: Vec<TNode>) -> TNode {
+    let mut props = Props::default();
+    props.l(id);
+    props.s(name);
+    props.s(b"Shape");
+    TNode::branch(b"Geometry", props, children)
+}
+
+/// `DeformPercent` ノードを組み立てる。
+fn deform_percent_node(value: f64) -> TNode {
+    let mut props = Props::default();
+    props.d(value);
+    TNode::leaf(b"DeformPercent", props)
+}
+
+/// `FullWeights` ノードを組み立てる。
+fn full_weights_node(values: &[f64]) -> TNode {
+    let mut props = Props::default();
+    props.d_raw(values);
+    TNode::leaf(b"FullWeights", props)
+}
+
+/// ブレンドシェイプ付きの最小ファイル（四角形・形状1・チャンネル1・束ね1）を組み立てる。
+///
+/// 形状の索引・差分・重み率・初期値は引数で変え、失敗条件を確認できる。
+#[allow(clippy::too_many_arguments)]
+fn ブレンドシェイプ最小ファイル(
+    shape_indexes: Option<&[i32]>,
+    shape_vertices: Option<&[f64]>,
+    deform_percent: Option<f64>,
+    full_weights: Option<&[f64]>,
+    extra_objects: Vec<TNode>,
+    extra_connections: Vec<TNode>,
+) -> Vec<u8> {
+    let mut shape_children = Vec::new();
+    if let Some(indexes) = shape_indexes {
+        let mut props = Props::default();
+        props.i_raw(indexes);
+        shape_children.push(TNode::leaf(b"Indexes", props));
+    }
+    if let Some(vertices) = shape_vertices {
+        let mut props = Props::default();
+        props.d_raw(vertices);
+        shape_children.push(TNode::leaf(b"Vertices", props));
+    }
+    let mut channel_children = Vec::new();
+    if let Some(value) = deform_percent {
+        channel_children.push(deform_percent_node(value));
+    }
+    if let Some(weights) = full_weights {
+        channel_children.push(full_weights_node(weights));
+    }
+    let mut objs = vec![
+        model(1, b"Root\x00\x01Model", "Null", None),
+        model(
+            2,
+            b"Owner\x00\x01Model",
+            "Mesh",
+            Some(vec![p_triplet("Lcl Translation", [0.0, 0.0, 0.0])]),
+        ),
+        quad_geometry(10, false),
+        shape_geometry(20, b"aa-target\x00\x01Shape", shape_children),
+        deformer(
+            30,
+            b"aa\x00\x01SubDeformer",
+            "BlendShapeChannel",
+            channel_children,
+        ),
+        deformer(40, b"Body\x00\x01Deformer", "BlendShape", vec![]),
+    ];
+    objs.extend(extra_objects);
+    let mut conns = vec![
+        conn(2, 1),
+        conn(10, 2),
+        conn(20, 30),
+        conn(30, 40),
+        conn(40, 10),
+        conn(1, 0),
+    ];
+    conns.extend(extra_connections);
+    file(7400, vec![objects(objs), connections(conns)])
+}
+
+#[test]
+fn ブレンドシェイプの接続と名前と単一フレームを読める() {
+    let bytes = ブレンドシェイプ最小ファイル(
+        Some(&[0, 2]),
+        Some(&[0.1, 0.0, 0.0, 0.0, 0.2, 0.0]),
+        Some(0.0),
+        Some(&[100.0, 100.0]),
+        vec![],
+        vec![],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("最小構成は読める");
+    // 束ねはメッシュとチャンネルを結ぶ。
+    assert_eq!(parsed.blend_shapes().len(), 1);
+    let blend = parsed.blend_shape(ObjectId::new(40)).expect("束ねがある");
+    assert_eq!(blend.id, ObjectId::new(40));
+    assert_eq!(blend.geometry, ObjectId::new(10));
+    assert_eq!(blend.channels, vec![ObjectId::new(30)]);
+    // チャンネルは名前・初期値・重み率の有無・形状を持つ。
+    let channels = parsed.blend_shape_channels(ObjectId::new(10));
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0].id, ObjectId::new(30));
+    assert_eq!(channels[0].name, "aa");
+    assert_eq!(channels[0].deform_percent, Some(0.0));
+    assert!(channels[0].has_full_weights);
+    assert_eq!(channels[0].shapes.len(), 1);
+    assert_eq!(channels[0].shapes[0].shape, ObjectId::new(20));
+    assert_eq!(channels[0].shapes[0].name, "aa-target");
+    // 形状のデルタは制御点番号と3成分の組で返る。
+    let data = parsed
+        .shape_data(ObjectId::new(20))
+        .expect("形状は展開できる");
+    assert_eq!(data.control_point_indices, vec![0, 2]);
+    assert_eq!(data.position_deltas, vec![[0.1, 0.0, 0.0], [0.0, 0.2, 0.0]]);
+    // 重み率は書かれた値のまま返す。
+    assert_eq!(
+        parsed
+            .blend_channel_weights(ObjectId::new(30))
+            .expect("重み率は展開できる"),
+        vec![100.0, 100.0]
+    );
+    // 対象外のメッシュにはチャンネルが無い。
+    assert!(parsed.blend_shape_channels(ObjectId::new(999)).is_empty());
+    // 未知IDの参照は見つからないものとして失敗する。
+    assert!(parsed.blend_shape(ObjectId::new(999)).is_none());
+    assert_eq!(
+        parsed.shape_data(ObjectId::new(999)).unwrap_err().kind(),
+        FbxErrorKind::NotFound
+    );
+    assert_eq!(
+        parsed
+            .blend_channel_weights(ObjectId::new(999))
+            .unwrap_err()
+            .kind(),
+        FbxErrorKind::NotFound
+    );
+}
+
+#[test]
+fn 重み率と初期値を持たないチャンネルを読める() {
+    // `DeformPercent` と `FullWeights` が無い場合は欠損として読む。
+    // 単一フレーム条件の判定は呼び出し側に残す。
+    let bytes = ブレンドシェイプ最小ファイル(
+        Some(&[0]),
+        Some(&[0.0, 0.0, 0.0]),
+        None,
+        None,
+        vec![],
+        vec![],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("欠損があっても読める");
+    let channels = parsed.blend_shape_channels(ObjectId::new(10));
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0].deform_percent, None);
+    assert!(!channels[0].has_full_weights);
+    // 重み率の無いチャンネルの展開は見つからないものとして失敗する。
+    assert_eq!(
+        parsed
+            .blend_channel_weights(ObjectId::new(30))
+            .unwrap_err()
+            .kind(),
+        FbxErrorKind::NotFound
+    );
+}
+
+#[test]
+fn チャンネルの複数形状は読み取りでは許す() {
+    // 複数フレームの可否は選択時に決めるため、読み取り層では列挙に留める。
+    let bytes = ブレンドシェイプ最小ファイル(
+        Some(&[0]),
+        Some(&[0.0, 0.0, 0.0]),
+        Some(0.0),
+        Some(&[100.0]),
+        vec![shape_geometry(
+            21,
+            b"aa-second\x00\x01Shape",
+            vec![indexes_node(&[1]), {
+                let mut props = Props::default();
+                props.d_raw(&[0.0, 0.0, 0.1]);
+                TNode::leaf(b"Vertices", props)
+            }],
+        )],
+        vec![conn(21, 30)],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("複数形状でも読める");
+    let channels = parsed.blend_shape_channels(ObjectId::new(10));
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0].shapes.len(), 2);
+}
+
+#[test]
+fn 形状の破損は対象の展開時に失敗する() {
+    // 索引数とデルタ数の不一致。
+    let bytes = ブレンドシェイプ最小ファイル(
+        Some(&[0, 1]),
+        Some(&[0.0, 0.0, 0.0]),
+        Some(0.0),
+        Some(&[100.0, 100.0]),
+        vec![],
+        vec![],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("解析自体は通る");
+    assert_eq!(
+        parsed.shape_data(ObjectId::new(20)).unwrap_err().kind(),
+        FbxErrorKind::InvalidStructure
+    );
+    // 制御点番号の範囲外。
+    let bytes = ブレンドシェイプ最小ファイル(
+        Some(&[99]),
+        Some(&[0.0, 0.0, 0.0]),
+        Some(0.0),
+        Some(&[100.0]),
+        vec![],
+        vec![],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("解析自体は通る");
+    assert_eq!(
+        parsed.shape_data(ObjectId::new(20)).unwrap_err().kind(),
+        FbxErrorKind::InvalidStructure
+    );
+    // 制御点番号の重複。
+    let bytes = ブレンドシェイプ最小ファイル(
+        Some(&[0, 0]),
+        Some(&[0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        Some(0.0),
+        Some(&[100.0, 100.0]),
+        vec![],
+        vec![],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("解析自体は通る");
+    assert_eq!(
+        parsed.shape_data(ObjectId::new(20)).unwrap_err().kind(),
+        FbxErrorKind::InvalidStructure
+    );
+    // 非有限のデルタ。
+    let bytes = ブレンドシェイプ最小ファイル(
+        Some(&[0]),
+        Some(&[f64::NAN, 0.0, 0.0]),
+        Some(0.0),
+        Some(&[100.0]),
+        vec![],
+        vec![],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("解析自体は通る");
+    assert_eq!(
+        parsed.shape_data(ObjectId::new(20)).unwrap_err().kind(),
+        FbxErrorKind::InvalidStructure
+    );
+    // 差分配列が3の倍数でない。
+    let bytes = ブレンドシェイプ最小ファイル(
+        Some(&[0]),
+        Some(&[0.0, 0.0]),
+        Some(0.0),
+        Some(&[100.0]),
+        vec![],
+        vec![],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("解析自体は通る");
+    assert_eq!(
+        parsed.shape_data(ObjectId::new(20)).unwrap_err().kind(),
+        FbxErrorKind::InvalidStructure
+    );
+}
+
+#[test]
+fn 形状の配列欠損と対象不整合は解析時に失敗する() {
+    // `Indexes` が無い形状は解析時に失敗する。
+    let bytes = ブレンドシェイプ最小ファイル(
+        None,
+        Some(&[0.0, 0.0, 0.0]),
+        Some(0.0),
+        None,
+        vec![],
+        vec![],
+    );
+    assert_eq!(
+        FbxFile::parse(&bytes, &FbxOptions::new())
+            .unwrap_err()
+            .kind(),
+        FbxErrorKind::InvalidStructure
+    );
+    // `Vertices` が無い形状は解析時に失敗する。
+    let bytes = ブレンドシェイプ最小ファイル(
+        Some(&[0]),
+        None,
+        Some(0.0),
+        None,
+        vec![],
+        vec![],
+    );
+    assert_eq!(
+        FbxFile::parse(&bytes, &FbxOptions::new())
+            .unwrap_err()
+            .kind(),
+        FbxErrorKind::InvalidStructure
+    );
+    // 束ねが複数のメッシュに接続する場合は解析時に失敗する。
+    let bytes = ブレンドシェイプ最小ファイル(
+        Some(&[0]),
+        Some(&[0.0, 0.0, 0.0]),
+        Some(0.0),
+        None,
+        vec![
+            model(3, b"Owner2\x00\x01Model", "Mesh", None),
+            quad_geometry(11, false),
+        ],
+        vec![conn(3, 1), conn(11, 3), conn(40, 11)],
+    );
+    assert_eq!(
+        FbxFile::parse(&bytes, &FbxOptions::new())
+            .unwrap_err()
+            .kind(),
+        FbxErrorKind::InvalidStructure
+    );
+    // 形状IDが他オブジェクトと重複する場合は解析時に失敗する。
+    let bytes = ブレンドシェイプ最小ファイル(
+        Some(&[0]),
+        Some(&[0.0, 0.0, 0.0]),
+        Some(0.0),
+        None,
+        vec![shape_geometry(
+            10,
+            b"dup\x00\x01Shape",
+            vec![indexes_node(&[0])],
+        )],
+        vec![],
+    );
+    assert_eq!(
+        FbxFile::parse(&bytes, &FbxOptions::new())
+            .unwrap_err()
+            .kind(),
+        FbxErrorKind::InvalidStructure
+    );
+}

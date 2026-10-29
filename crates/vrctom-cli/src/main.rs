@@ -8,10 +8,13 @@ use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use vrctom::fbx::{FbxFile, FbxOptions};
 use vrctom::unitypackage::{UnpackOptions, unpack_to};
-use vrctom::vrm::{MaterialOptions, VrmExportOptions, VrmMaterials, VrmMeta, VrmModel, VrmOptions};
+use vrctom::vrm::{
+    MaterialOptions, VrmExportOptions, VrmExpressionProfile, VrmMaterials, VrmMeta, VrmModel,
+    VrmOptions,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -50,7 +53,17 @@ enum Command {
         /// `Assets` を含むUnityプロジェクトのルート。省略時はFBXの祖先から探す。
         #[arg(long, value_name = "DIR")]
         assets: Option<PathBuf>,
+        /// 表情の選択指定。`vrc` はVRChat向けの8件（あいうえお・瞬き・視線上下）を使う。
+        #[arg(long, value_name = "PROFILE")]
+        expressions: Option<ExpressionProfile>,
     },
+}
+
+/// 表情の選択指定。現在はVRChat向けの8件だけを受け付ける。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ExpressionProfile {
+    /// VRChat向けの8件（あいうえお・瞬き・視線上下）。
+    Vrc,
 }
 
 fn main() {
@@ -80,7 +93,8 @@ fn main() {
             name,
             author,
             assets,
-        } => export(input, output, name, author, assets),
+            expressions,
+        } => export(input, output, name, author, assets, expressions),
     };
     std::process::exit(code);
 }
@@ -218,6 +232,7 @@ fn export(
     name: Option<String>,
     authors: Vec<String>,
     assets: Option<PathBuf>,
+    expressions: Option<ExpressionProfile>,
 ) -> i32 {
     // 既定出力先は入力の拡張子を `vrm` に変えたパスとする。
     let destination = match output {
@@ -262,7 +277,11 @@ fn export(
             return 1;
         }
     };
-    let (model, report) = match VrmModel::from_fbx(&file, &VrmOptions::default()) {
+    let mut vrm_options = VrmOptions::new();
+    if expressions == Some(ExpressionProfile::Vrc) {
+        vrm_options = vrm_options.with_expressions(VrmExpressionProfile::vrchat());
+    }
+    let (model, report) = match VrmModel::from_fbx(&file, &vrm_options) {
         Ok(built) => built,
         Err(error) => {
             diagnose_stage("中間モデルの生成に失敗した", &error);

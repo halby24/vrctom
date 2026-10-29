@@ -72,6 +72,13 @@ pub enum VrmErrorKind {
     MeshModelHasChildren,
     /// 座標・索引・材質番号などの破損や、行列の特異など構造として成立しない場合。
     InvalidStructure,
-    /// メッシュ・頂点・三角形の件数が上限を超える場合。
+    /// 要求した表情ターゲットが見つからない場合。
+    MissingExpressionTarget,
+    /// 要求した表情ターゲットを含むメッシュが複数ある場合。
+    AmbiguousExpressionTarget,
+    /// ブレンドシェイプが単一フレーム条件（形状1件・全100の重み率・ゼロの初期値）を
+    /// 満たさない場合。
+    UnsupportedBlendShape,
+    /// メッシュ・頂点・三角形・モーフターゲットの件数や量が上限を超える場合。
     LimitExceeded,
 }

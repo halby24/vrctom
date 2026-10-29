@@ -42,19 +42,23 @@ flowchart LR
   すべての `LayerElementUV`・先頭の `LayerElementMaterial` を読む。
 - `LayerElement` の対応方式は `ByVertice`・`ByPolygonVertex`・`ByPolygon`・`AllSame` と
   `Direct`・`IndexToDirect` の組み合わせを受け付ける。材質は `AllSame` と `ByPolygon` だけを扱う。
-- `Connections` は `OO` の子→親だけを読み、Modelの親子・Model→Geometryの所属・
-  Skin→Geometry・Cluster→Skin・Model→Clusterの対応に使う。
 - `Deformer` のうち `Skin` と `Cluster` を読み、スキンごとの結合モデルと、
   頂点索引・重みを持つクラスタを要約する。
+- `Deformer` のうち `BlendShape` と `BlendShapeChannel` を読み、形状ごとの要約と
+  チャンネルごとの接続（形状列・`DeformPercent`・`FullWeights` の有無）を返す。
+  形状のデルタ（`Vertices` の差分・`Indexes` の制御点番号）・チャンネルの重み率
+  （`FullWeights`）の中身は、呼び出し側が対象を要求した時点で展開する。
+- `Connections` は `OO` の子→親だけを読み、Modelの親子・Model→Geometryの所属・
+  Skin→Geometry・Cluster→Skin・Model→Clusterの対応に加え、
+  `Shape→BlendShapeChannel→BlendShape→Geometry(Mesh)` の解決にも使う。
 - `Pose` のうち `BindPose` を読み、PoseNodeが指すモデルごとのバインド行列を統合する。
   複数のBindPoseに同じモデルが現れる場合は、行列が一致することを確かめて1つにまとめる。
 - `Material` はIDと名前だけを読み、Modelへの接続順を材質スロットとして保持する。
 
-`Shape`（ブレンドシェイプ）・クラスタの `Transform`/`TransformLink`・
+`Shape` の法線差分・クラスタの `Transform`/`TransformLink`・
 BindPose以外のPose・材質の色やテクスチャ・シェーダはこの層では読まない。
 材質の見た目はUnityの `.mat` を正とし、FBX側の材質は
 「どの面がどのスロットか」を決める識別子としてだけ扱う。
-ブレンドシェイプは別の作業単位で追加する。
 `LayerElementColor`・接線・スムージングは読まない。
 
 ## 座標系・単位・変換
@@ -98,6 +102,22 @@ FBX側の材質値を別に解釈すると、どちらが正か決められな�
 行列が一致することを検証して1つに統合する。一致しない場合は、どの姿勢を正とするか
 読み取り層では決められないため不正として失敗する。
 
+## ブレンドシェイプ
+
+`Geometry/Shape`（`Vertices` のデルタ・`Indexes` の制御点番号）と
+`Deformer/BlendShape`・`BlendShapeChannel` を読む。
+`Shape→BlendShapeChannel→BlendShape→Geometry(Mesh)` の `Connections OO` を解決し、
+呼び出し側に `blend_shape_channels`・`shape_data`・`blend_channel_weights` を返す。
+
+要約にはデルタと重み率の中身を持たない。形状のデルタも重み率も、対象を指定された時点で
+配列位置から境界検査付きで展開する。ファイル全体を常駐させない方針は幾何・スキンと同じである。
+
+単一フレーム条件の判断は生成側（[`VRM表情`](VRM表情.md)）が行う。
+読み取り層は `DeformPercent` と `FullWeights` の値をそのまま返し、可否を決めない。
+`DeformPercent` が無いチャンネルは欠落として返し、ゼロに読み替えない。
+`FullWeights` が無いチャンネルは「持たない」として返し、空の重み率に読み替えない。
+`FullWeights` の配列長は制約しない。
+
 ## 三角形化しない理由
 
 `PolygonVertexIndex` は多角形の境界を負値で表す。この層は多角形のまま返し、
@@ -125,8 +145,14 @@ panicは使わず、失敗は種別付きのエラーで返す。
 - クラスタの `Indexes` と `Weights` の長さ不一致、変形対象の頂点数を超える索引、
   バインド行列の要素数不一致、同じモデルに対する不一致なバインド行列は不正として失敗する。
 - 座標と属性値の有限性を確認し、NaNや無限大は不正として失敗する。
+- 形状の `Indexes` と `Vertices` の対応、制御点番号の範囲、チャンネルと形状の接続の
+  参照先が無い場合は不正として失敗する。
+- 同じ形状が複数のチャンネルへ接続する場合、または1つのチャンネルが異なるメッシュの
+  複数の `BlendShape` に属する場合は、対象メッシュが一意に決まらないため不正として失敗する。
 - 重みの範囲（負値・1超）と総和は検査しない。実データに微小な負値と1でない総和があり、
   これらは破損ではなく入力の性質であるため、生成側が正規化する。
+- ブレンドシェイプの可否（形状数・`DeformPercent`・`FullWeights` の値）は判断しない。
+  単一フレーム条件の検査は生成側が行い、読み取り層は値をそのまま返す。
 
 ## 検証
 
@@ -146,9 +172,9 @@ panicは使わず、失敗は種別付きのエラーで返す。
   別形式の字句解析を追加する維持費が見合わない。
 - FBX全体を汎用DOMとして公開しない。必要な情報はメッシュと階層に限られ、
   汎用ツリーを公開すると利用側の依存が形式の細部へ広がる。
-- スキンとブレンドシェイプを同時に読まない。形状の合成は別の検証単位に分けたほうが、
-  失敗の切り分けと検証が単純になる。クラスタのTransform/TransformLinkも読まず、
-  バインド姿勢はBindPoseから取る。
+- スキンとブレンドシェイプの合成判断を読み取り層に置かない。形状の可否と合成は
+  生成側（[`VRM表情`](VRM表情.md)）が行い、読み取り層は接続とデルタの読み取りまでに留める。
+  クラスタのTransform/TransformLinkも読まず、バインド姿勢はBindPoseから取る。
 - FBXの材質値を読まない。Unityの `.mat` が描画の正であり、FBX側の色やテクスチャを
   別に解釈すると、どちらを採用するかの判断が読み取り層へ漏れる。
 - 座標系変換・単位変換・三角形化は行わない。VRM生成側の判断であり、

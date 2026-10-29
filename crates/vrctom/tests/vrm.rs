@@ -5,7 +5,7 @@
 //! ファイルだけを読み、未設定なら跳ばす。
 
 use vrctom::fbx::{FbxFile, FbxOptions, ObjectId};
-use vrctom::vrm::{VrmErrorKind, VrmModel, VrmOptions};
+use vrctom::vrm::{VrmErrorKind, VrmExpressionProfile, VrmModel, VrmOptions};
 
 // テスト名は日本語で書く（テストは仕様・契約であるため）。
 
@@ -1752,4 +1752,495 @@ fn 実fixtureの幾何法線と頂点法線の向きが一致する() {
     }
     assert!(checked > 0, "法線付き三角形を1件以上確かめる");
     eprintln!("normal_orientation_checked={checked}");
+}
+
+/// 式とターゲットの対応付け1件を組み立てる。
+fn 束ね(profile_expression: &str, target: &str) -> vrctom::vrm::VrmExpressionBinding {
+    vrctom::vrm::VrmExpressionBinding {
+        expression: profile_expression.to_string(),
+        target: target.to_string(),
+    }
+}
+
+/// `Geometry`（Shape）ノードを組み立てる。
+fn 形状(id: i64, name: &[u8], indexes: &[i32], deltas: &[f64]) -> TNode {
+    let mut index_props = Props::default();
+    index_props.i_raw(indexes);
+    let mut delta_props = Props::default();
+    delta_props.d_raw(deltas);
+    let mut props = Props::default();
+    props.l(id);
+    props.s(name);
+    props.s(b"Shape");
+    TNode::branch(
+        b"Geometry",
+        props,
+        vec![
+            TNode::leaf(b"Indexes", index_props),
+            TNode::leaf(b"Vertices", delta_props),
+        ],
+    )
+}
+
+/// `Deformer`（BlendShapeChannel）ノードを組み立てる。
+fn 伝達子(id: i64, name: &[u8], deform: Option<f64>, weights: Option<&[f64]>) -> TNode {
+    let mut children = Vec::new();
+    if let Some(value) = deform {
+        let mut props = Props::default();
+        props.d(value);
+        children.push(TNode::leaf(b"DeformPercent", props));
+    }
+    if let Some(values) = weights {
+        let mut props = Props::default();
+        props.d_raw(values);
+        children.push(TNode::leaf(b"FullWeights", props));
+    }
+    deformer(id, name, "BlendShapeChannel", children)
+}
+
+/// `Deformer`（BlendShape）ノードを組み立てる。
+fn 束ねノード(id: i64, name: &[u8]) -> TNode {
+    deformer(id, name, "BlendShape", vec![])
+}
+
+#[test]
+fn 表情つきの中間モデルはターゲットと束ねを選択順に持つ() {
+    let bytes = 表情最小ファイル(
+        &[
+            ("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None),
+            (
+                "t2",
+                "t2-shape",
+                &[1],
+                &[0.0, 0.5, 0.0],
+                Some(0.0),
+                Some(&[100.0]),
+            ),
+        ],
+        vec![],
+        vec![],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("表情付きは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1"), 束ね("blink", "t2")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    let (model, report) = VrmModel::from_fbx(&parsed, &options).expect("表情付きは変換できる");
+    // ターゲットは選択順であり、名前はチャンネル名である。
+    assert_eq!(model.meshes.len(), 1);
+    let mesh = &model.meshes[0];
+    assert_eq!(mesh.targets.len(), 2);
+    assert_eq!(mesh.targets[0].name, "t1");
+    assert_eq!(mesh.targets[1].name, "t2");
+    // 所有モデルのバインドは平行移動だけのため、線形部分は単位行列であり差分は変わらない。
+    // 頂点は所有モデルの平行移動 (1,2,3) でベイク済みである。
+    assert_eq!(mesh.vertices.positions[0], [1.0, 2.0, 3.0]);
+    assert_eq!(mesh.targets[0].positions.len(), 3);
+    assert_eq!(mesh.targets[0].positions[0], [0.5, 0.0, 0.0]);
+    assert_eq!(mesh.targets[0].positions[1], [0.0, 0.0, 0.0]);
+    assert_eq!(mesh.targets[1].positions[1], [0.0, 0.5, 0.0]);
+    assert_eq!(mesh.targets[1].positions[0], [0.0, 0.0, 0.0]);
+    // 束ねはプロファイル順であり、重み1・非二値・上書きなしである。
+    assert_eq!(model.expressions.preset.len(), 2);
+    assert_eq!(model.expressions.preset[0].name, "aa");
+    assert_eq!(model.expressions.preset[0].morph_target_binds.len(), 1);
+    let bind = &model.expressions.preset[0].morph_target_binds[0];
+    assert_eq!(bind.mesh, 0);
+    assert_eq!(bind.target, 0);
+    assert_eq!(bind.weight, 1.0);
+    assert!(!model.expressions.preset[0].is_binary);
+    assert_eq!(
+        model.expressions.preset[0].override_blink,
+        vrctom::vrm::VrmExpressionOverride::None
+    );
+    assert_eq!(
+        model.expressions.preset[0].override_look_at,
+        vrctom::vrm::VrmExpressionOverride::None
+    );
+    assert_eq!(
+        model.expressions.preset[0].override_mouth,
+        vrctom::vrm::VrmExpressionOverride::None
+    );
+    assert_eq!(model.expressions.preset[1].name, "blink");
+    assert_eq!(model.expressions.preset[1].morph_target_binds[0].target, 1);
+    assert_eq!(report.morph_target_count, 2);
+    assert_eq!(report.expression_count, 2);
+}
+
+#[test]
+fn 表情の要求が無い場合は従来どおり作らない() {
+    let bytes = 表情最小ファイル(
+        &[("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None)],
+        vec![],
+        vec![],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("表情付きは読める");
+    let (model, report) =
+        VrmModel::from_fbx(&parsed, &VrmOptions::new()).expect("要求なしは変換できる");
+    assert!(model.meshes[0].targets.is_empty());
+    assert!(model.expressions.preset.is_empty());
+    assert_eq!(report.morph_target_count, 0);
+    assert_eq!(report.expression_count, 0);
+}
+
+/// 表情チャンネル1件分の入力（名前、形状名、制御点、差分、初期値、重み率）。
+type 表情チャンネル<'a> = (
+    &'a str,
+    &'a str,
+    &'a [i32],
+    &'a [f64],
+    Option<f64>,
+    Option<&'a [f64]>,
+);
+
+/// 表情付きの最小ファイル（三角形・所有モデル・束ね1組）を組み立てる。
+///
+/// チャンネルごとの形状・初期値・重み率を引数で変える。
+/// 追加の `Objects` と `Connections` とバインド行列を足せる。
+#[allow(clippy::too_many_arguments)]
+fn 表情最小ファイル(
+    channels: &[表情チャンネル<'_>],
+    extra_objects: Vec<TNode>,
+    extra_connections: Vec<TNode>,
+    extra_binds: &[(i64, [f64; 16])],
+) -> Vec<u8> {
+    let mut objs = vec![
+        model(1, b"Root\x00\x01Model", "Null"),
+        model(2, b"Owner\x00\x01Model", "Mesh"),
+        triangle_geometry(10, b"Tri\x00\x01Geometry", vec![]),
+    ];
+    let mut conns = vec![conn(2, 1), conn(10, 2), conn(1, 0)];
+    let mut binds = vec![
+        (1, bind_matrix(0.0, 0.0, 0.0)),
+        (2, bind_matrix(1.0, 2.0, 3.0)),
+    ];
+    binds.extend_from_slice(extra_binds);
+    objs.push(束ねノード(40, b"Blend\x00\x01Deformer"));
+    for (offset, (channel_name, shape_name, indexes, deltas, deform, weights)) in
+        channels.iter().enumerate()
+    {
+        let shape_id = 20 + offset as i64;
+        let channel_id = 30 + offset as i64;
+        let mut channel_full = channel_name.as_bytes().to_vec();
+        channel_full.extend_from_slice(b"\x00\x01SubDeformer");
+        let mut shape_full = shape_name.as_bytes().to_vec();
+        shape_full.extend_from_slice(b"\x00\x01Shape");
+        objs.push(形状(shape_id, &shape_full, indexes, deltas));
+        objs.push(伝達子(channel_id, &channel_full, *deform, *weights));
+        conns.push(conn(shape_id, channel_id));
+        conns.push(conn(channel_id, 40));
+        conns.push(conn(40, 10));
+    }
+    objs.extend(extra_objects);
+    conns.extend(extra_connections);
+    objs.push(bind_pose(100, &binds));
+    assemble(None, objs, conns)
+}
+
+#[test]
+fn 見つからない表情ターゲットは失敗する() {
+    let bytes = 表情最小ファイル(
+        &[("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None)],
+        vec![],
+        vec![],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("表情付きは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "無い名前")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    assert_eq!(
+        VrmModel::from_fbx(&parsed, &options).unwrap_err().kind(),
+        VrmErrorKind::MissingExpressionTarget
+    );
+}
+
+#[test]
+fn 全要求を含むメッシュが複数ある場合は失敗する() {
+    // 2件目のメッシュにも同じターゲット名を持たせ、曖昧さを確かめる。
+    let bytes = 表情最小ファイル(
+        &[("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None)],
+        vec![
+            model(3, b"Owner2\x00\x01Model", "Mesh"),
+            triangle_geometry(11, b"Second\x00\x01Geometry", vec![]),
+            形状(50, b"t1-copy\x00\x01Shape", &[0], &[0.0, 0.5, 0.0]),
+            伝達子(60, b"t1\x00\x01SubDeformer", Some(0.0), None),
+            束ねノード(70, b"SecondBlend\x00\x01Deformer"),
+        ],
+        vec![
+            conn(3, 1),
+            conn(11, 3),
+            conn(50, 60),
+            conn(60, 70),
+            conn(70, 11),
+        ],
+        &[(3, bind_matrix(0.0, 0.0, 0.0))],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("2メッシュは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    assert_eq!(
+        VrmModel::from_fbx(&parsed, &options).unwrap_err().kind(),
+        VrmErrorKind::AmbiguousExpressionTarget
+    );
+}
+
+#[test]
+fn 同名ターゲットの重複は失敗する() {
+    // 同一メッシュに同名チャンネルを2件繋ぎ、重複を確かめる。
+    let bytes = 表情最小ファイル(
+        &[("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None)],
+        vec![
+            形状(50, b"t1-dup\x00\x01Shape", &[1], &[0.0, 0.5, 0.0]),
+            伝達子(60, b"t1\x00\x01SubDeformer", Some(0.0), None),
+        ],
+        vec![conn(50, 60), conn(60, 40)],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("重複があっても読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    assert_eq!(
+        VrmModel::from_fbx(&parsed, &options).unwrap_err().kind(),
+        VrmErrorKind::AmbiguousExpressionTarget
+    );
+}
+
+#[test]
+fn 単一フレームでないチャンネルは失敗する() {
+    // 1チャンネルに形状を2件繋ぐ。
+    let bytes = 表情最小ファイル(
+        &[("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None)],
+        vec![形状(
+            50,
+            b"t1-second\x00\x01Shape",
+            &[1],
+            &[0.0, 0.5, 0.0],
+        )],
+        vec![conn(50, 30)],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("複数形状でも読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    assert_eq!(
+        VrmModel::from_fbx(&parsed, &options).unwrap_err().kind(),
+        VrmErrorKind::UnsupportedBlendShape
+    );
+}
+
+#[test]
+fn 非100の重み率と非ゼロの初期値は失敗する() {
+    for (重み率, 初期値, 期待) in [
+        (
+            Some(&[100.0, 50.0][..]),
+            Some(0.0),
+            VrmErrorKind::UnsupportedBlendShape,
+        ),
+        // 非有限の重み率は読み取り層で破損として失敗する。
+        (
+            Some(&[100.0, f64::NAN][..]),
+            Some(0.0),
+            VrmErrorKind::InvalidStructure,
+        ),
+        (
+            Some(&[100.0][..]),
+            Some(0.5),
+            VrmErrorKind::UnsupportedBlendShape,
+        ),
+        (
+            Some(&[100.0][..]),
+            Some(f64::INFINITY),
+            VrmErrorKind::UnsupportedBlendShape,
+        ),
+        (
+            Some(&[100.0][..]),
+            None,
+            VrmErrorKind::UnsupportedBlendShape,
+        ),
+    ] {
+        let bytes = 表情最小ファイル(
+            &[(
+                "t1",
+                "t1-shape",
+                &[0, 1],
+                &[0.5, 0.0, 0.0, 0.0, 0.0, 0.5],
+                初期値,
+                重み率,
+            )],
+            vec![],
+            vec![],
+            &[],
+        );
+        let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("破損値は読める");
+        let profile = VrmExpressionProfile {
+            bindings: vec![束ね("aa", "t1")],
+        };
+        let options = VrmOptions::new().with_expressions(profile);
+        assert_eq!(
+            VrmModel::from_fbx(&parsed, &options).unwrap_err().kind(),
+            期待,
+            "重み率={重み率:?} 初期値={初期値:?} は失敗する"
+        );
+    }
+}
+
+#[test]
+fn 空と100と長い全100の重み率は受理する() {
+    // 空・単一100・形状数と同じ長さの全100を受け付ける。
+    let bytes = 表情最小ファイル(
+        &[
+            ("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None),
+            (
+                "t2",
+                "t2-shape",
+                &[1],
+                &[0.0, 0.5, 0.0],
+                Some(0.0),
+                Some(&[100.0]),
+            ),
+            (
+                "t3",
+                "t3-shape",
+                &[0, 1, 2],
+                &[0.1, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.1],
+                Some(0.0),
+                Some(&[100.0, 100.0, 100.0]),
+            ),
+        ],
+        vec![],
+        vec![],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("全100は読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("a", "t1"), 束ね("b", "t2"), 束ね("c", "t3")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    let (model, _) = VrmModel::from_fbx(&parsed, &options).expect("全100は受理する");
+    assert_eq!(model.meshes[0].targets.len(), 3);
+}
+
+#[test]
+fn 表情の上限は確保前に発動する() {
+    let bytes = 表情最小ファイル(
+        &[
+            ("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None),
+            ("t2", "t2-shape", &[1], &[0.0, 0.5, 0.0], Some(0.0), None),
+        ],
+        vec![],
+        vec![],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("表情付きは読める");
+    let profile = || VrmExpressionProfile {
+        bindings: vec![束ね("a", "t1"), 束ね("b", "t2")],
+    };
+    // ターゲット数上限。
+    let options = VrmOptions::new()
+        .with_expressions(profile())
+        .with_max_morph_targets(1);
+    assert_eq!(
+        VrmModel::from_fbx(&parsed, &options).unwrap_err().kind(),
+        VrmErrorKind::LimitExceeded
+    );
+    // 総バイト数上限。差分を展開する前の検査で0バイトは失敗する。
+    let options = VrmOptions::new()
+        .with_expressions(profile())
+        .with_max_morph_bytes(0);
+    assert_eq!(
+        VrmModel::from_fbx(&parsed, &options).unwrap_err().kind(),
+        VrmErrorKind::LimitExceeded
+    );
+    // 総バイト数上限。3頂点×2件×12バイト=72バイトのため、71バイトでは足りない。
+    let options = VrmOptions::new()
+        .with_expressions(profile())
+        .with_max_morph_bytes(71);
+    assert_eq!(
+        VrmModel::from_fbx(&parsed, &options).unwrap_err().kind(),
+        VrmErrorKind::LimitExceeded
+    );
+    // 72バイトちょうどは通る。
+    let options = VrmOptions::new()
+        .with_expressions(profile())
+        .with_max_morph_bytes(72);
+    let (model, _) = VrmModel::from_fbx(&parsed, &options).expect("上限ちょうどは通る");
+    assert_eq!(model.meshes[0].targets.len(), 2);
+}
+
+/// 四角形の角0を2回使い、UVを変えて4頂点に分けるファイルを組み立てる。
+/// `!0 == -1` が最終角の終端を表す。
+fn 表情四角形ファイル() -> Vec<u8> {
+    let quad = geometry(
+        10,
+        b"Quad\x00\x01Geometry",
+        vec![
+            vertices_node(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0]),
+            pvi_node(&[0, 1, 2, -1]),
+            uv_layer(
+                b"map1",
+                b"ByPolygonVertex",
+                b"IndexToDirect",
+                &[0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0],
+                Some(&[0, 1, 2, 3]),
+            ),
+        ],
+    );
+    let mut objs = vec![
+        model(1, b"Root\x00\x01Model", "Null"),
+        model(2, b"Owner\x00\x01Model", "Mesh"),
+        quad,
+        束ねノード(40, b"Blend\x00\x01Deformer"),
+        形状(20, b"t1-shape\x00\x01Shape", &[0], &[0.5, 0.0, 0.0]),
+        伝達子(30, b"t1\x00\x01SubDeformer", Some(0.0), None),
+    ];
+    let conns = vec![
+        conn(2, 1),
+        conn(10, 2),
+        conn(1, 0),
+        conn(20, 30),
+        conn(30, 40),
+        conn(40, 10),
+    ];
+    let binds = vec![
+        (1, bind_matrix(0.0, 0.0, 0.0)),
+        (2, bind_matrix(1.0, 2.0, 3.0)),
+    ];
+    objs.push(bind_pose(100, &binds));
+    assemble(None, objs, conns)
+}
+
+#[test]
+fn 継ぎ目で複製された頂点すべてに差分が配られる() {
+    let bytes = 表情四角形ファイル();
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("四角形は読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    let (model, _) = VrmModel::from_fbx(&parsed, &options).expect("表情付き四角形は変換できる");
+    let mesh = &model.meshes[0];
+    // 角0がUV違いで2頂点になり、角1・角2と合わせて4頂点になる。
+    assert_eq!(mesh.vertices.positions.len(), 4);
+    let target = &mesh.targets[0];
+    assert_eq!(target.name, "t1");
+    let mut seam_vertices = 0;
+    for (position, delta) in mesh.vertices.positions.iter().zip(&target.positions) {
+        if position == &[1.0, 2.0, 3.0] {
+            seam_vertices += 1;
+            assert_eq!(*delta, [0.5, 0.0, 0.0], "継ぎ目の複製にも差分が要る");
+        } else {
+            assert_eq!(*delta, [0.0, 0.0, 0.0]);
+        }
+    }
+    assert_eq!(seam_vertices, 2, "角0はUV違いで2頂点になる");
 }

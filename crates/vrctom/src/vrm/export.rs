@@ -410,7 +410,7 @@ impl<'a> GlbWriter<'a> {
         self.build_skins()?;
         self.build_nodes()?;
         self.build_scene()?;
-        self.build_vrm_extension();
+        self.build_vrm_extension()?;
         self.build_buffer();
         let json = gltf::json::serialize::to_string(&self.root).map_err(|error| {
             VrmExportError::new(
@@ -687,6 +687,31 @@ impl<'a> GlbWriter<'a> {
                 }
             }
             let mut primitives = Vec::with_capacity(mesh.primitives.len());
+            // モーフターゲットは位置の差分だけを持ち、全プリミティブが同じ順序で参照する。
+            // 材質分割とターゲット参照は直交するため、アクセサはメッシュ単位で1回だけ作る。
+            let mut morph_accessors = Vec::with_capacity(mesh.targets.len());
+            for target in &mesh.targets {
+                morph_accessors.push(self.push_float_accessor(
+                    &target.positions,
+                    gltf::json::accessor::Type::Vec3,
+                    Some(position_min_max(&target.positions)),
+                    gltf::json::buffer::Target::ArrayBuffer,
+                )?);
+            }
+            let morph_targets = if morph_accessors.is_empty() {
+                None
+            } else {
+                Some(
+                    morph_accessors
+                        .into_iter()
+                        .map(|accessor| gltf::json::mesh::MorphTarget {
+                            positions: Some(accessor),
+                            normals: None,
+                            tangents: None,
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            };
             for primitive in &mesh.primitives {
                 let material = if mesh.material_slots.is_empty() {
                     None
@@ -718,18 +743,42 @@ impl<'a> GlbWriter<'a> {
                     indices: Some(indices),
                     material,
                     mode: gltf::json::validation::Checked::Valid(gltf::json::mesh::Mode::Triangles),
-                    targets: None,
+                    targets: morph_targets.clone(),
                     extensions: None,
                     extras: Default::default(),
                 });
             }
+            let target_names: Vec<String> = mesh
+                .targets
+                .iter()
+                .map(|target| target.name.clone())
+                .collect();
+            let extras = if target_names.is_empty() {
+                Default::default()
+            } else {
+                let raw = serde_json::value::to_raw_value(&serde_json::json!({
+                    "targetNames": target_names,
+                }))
+                .map_err(|error| {
+                    VrmExportError::new(
+                        VrmExportErrorKind::InvalidStructure,
+                        format!("targetNamesのシリアライズに失敗した: {error}"),
+                    )
+                })?;
+                Some(raw)
+            };
+            let weights = if target_names.is_empty() {
+                None
+            } else {
+                Some(vec![0.0f32; target_names.len()])
+            };
             let index = self.root.meshes.len();
             self.root.meshes.push(gltf::json::Mesh {
                 primitives,
                 name: Some(mesh.name.clone()),
-                weights: None,
+                weights,
                 extensions: None,
-                extras: Default::default(),
+                extras,
             });
             self.mesh_indices.push(index);
         }
@@ -935,8 +984,8 @@ impl<'a> GlbWriter<'a> {
         Ok(())
     }
 
-    /// `VRMC_vrm` 拡張（meta・humanoid）を書く。
-    fn build_vrm_extension(&mut self) {
+    /// `VRMC_vrm` 拡張（meta・humanoid・expressions）を書く。
+    fn build_vrm_extension(&mut self) -> Result<(), VrmExportError> {
         let meta = &self.options.meta;
         let mut meta_value = serde_json::Map::new();
         meta_value.insert(
@@ -1005,6 +1054,10 @@ impl<'a> GlbWriter<'a> {
             "humanoid".to_string(),
             serde_json::json!({ "humanBones": human_bones }),
         );
+        if !self.model.expressions.preset.is_empty() {
+            let preset = self.build_expressions_json()?;
+            vrmc.insert("expressions".to_string(), serde_json::Value::Object(preset));
+        }
         let mut others = serde_json::Map::new();
         others.insert("VRMC_vrm".to_string(), serde_json::Value::Object(vrmc));
         self.root.extensions = Some(gltf::json::extensions::root::Root { others });
@@ -1013,6 +1066,104 @@ impl<'a> GlbWriter<'a> {
             used.push("VRMC_materials_mtoon".to_string());
         }
         self.root.extensions_used = used;
+        Ok(())
+    }
+
+    /// VRM 1.0 のプリセット表情名かどうか。
+    fn is_preset_expression_name(name: &str) -> bool {
+        matches!(
+            name,
+            "happy"
+                | "angry"
+                | "sad"
+                | "relaxed"
+                | "surprised"
+                | "aa"
+                | "ih"
+                | "ou"
+                | "ee"
+                | "oh"
+                | "blink"
+                | "blinkLeft"
+                | "blinkRight"
+                | "lookUp"
+                | "lookDown"
+                | "lookLeft"
+                | "lookRight"
+                | "neutral"
+        )
+    }
+
+    /// 表情（プリセット式）のJSONを作る。
+    ///
+    /// 束ねのメッシュ・ターゲット・名前・重みを検証し、中間メッシュ索引から
+    /// ノード索引へ写して `morphTargetBinds` を作る。`node.weights` は書かず、
+    /// 初期値は `mesh.weights` のゼロ列に任せる。
+    fn build_expressions_json(
+        &self,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, VrmExportError> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut preset = serde_json::Map::new();
+        for expression in &self.model.expressions.preset {
+            if expression.name.is_empty() {
+                return Err(VrmExportError::new(
+                    VrmExportErrorKind::InvalidStructure,
+                    "表情の名前が空である",
+                ));
+            }
+            if !seen.insert(expression.name.as_str()) {
+                return Err(VrmExportError::new(
+                    VrmExportErrorKind::InvalidStructure,
+                    "表情の名前が重複する",
+                ));
+            }
+            if !Self::is_preset_expression_name(&expression.name) {
+                return Err(VrmExportError::new(
+                    VrmExportErrorKind::InvalidStructure,
+                    format!("表情名がVRM 1.0のプリセット名でない: {}", expression.name),
+                ));
+            }
+            let mut binds = Vec::with_capacity(expression.morph_target_binds.len());
+            for bind in &expression.morph_target_binds {
+                let mesh = self.model.meshes.get(bind.mesh).ok_or_else(|| {
+                    VrmExportError::new(
+                        VrmExportErrorKind::InvalidStructure,
+                        "表情束ねのメッシュ索引が範囲外である",
+                    )
+                })?;
+                let target = mesh.targets.get(bind.target).ok_or_else(|| {
+                    VrmExportError::new(
+                        VrmExportErrorKind::InvalidStructure,
+                        "表情束ねのターゲット索引が範囲外である",
+                    )
+                })?;
+                if !bind.weight.is_finite() || !(0.0..=1.0).contains(&bind.weight) {
+                    return Err(VrmExportError::new(
+                        VrmExportErrorKind::InvalidStructure,
+                        "表情束ねの重みが0〜1の有限値でない",
+                    ));
+                }
+                let _ = target;
+                binds.push(serde_json::json!({
+                    "node": mesh.node,
+                    "index": bind.target,
+                    "weight": bind.weight,
+                }));
+            }
+            preset.insert(
+                expression.name.clone(),
+                serde_json::json!({
+                    "morphTargetBinds": binds,
+                    "isBinary": expression.is_binary,
+                    "overrideBlink": override_name(expression.override_blink),
+                    "overrideLookAt": override_name(expression.override_look_at),
+                    "overrideMouth": override_name(expression.override_mouth),
+                }),
+            );
+        }
+        let mut out = serde_json::Map::new();
+        out.insert("preset".to_string(), serde_json::Value::Object(preset));
+        Ok(out)
     }
 
     /// バッファ定義を作る。BINが空の場合は定義を置かない。
@@ -1449,6 +1600,15 @@ fn mtoon_extension(
     );
     Ok(gltf::json::extensions::material::Material { others })
 }
+/// 式の上書き指定をJSON名へ写す。
+fn override_name(value: super::VrmExpressionOverride) -> &'static str {
+    match value {
+        super::VrmExpressionOverride::None => "none",
+        super::VrmExpressionOverride::Block => "block",
+        super::VrmExpressionOverride::Blend => "blend",
+    }
+}
+
 /// 4バイト境界へ切り上げる。
 fn align4(length: usize) -> usize {
     length.next_multiple_of(4)
@@ -1509,6 +1669,30 @@ fn check_vertex_lengths(mesh: &super::VrmMesh, count: usize) -> Result<(), VrmEx
             VrmExportErrorKind::InvalidStructure,
             "重みの長さが位置と一致しない",
         ));
+    }
+    for target in &mesh.targets {
+        if target.name.is_empty() {
+            return Err(VrmExportError::new(
+                VrmExportErrorKind::InvalidStructure,
+                "モーフターゲットの名前が空である",
+            ));
+        }
+        if target.positions.len() != count {
+            return Err(VrmExportError::new(
+                VrmExportErrorKind::InvalidStructure,
+                "モーフターゲットの長さが位置と一致しない",
+            ));
+        }
+        if target
+            .positions
+            .iter()
+            .any(|position| position.iter().any(|value| !value.is_finite()))
+        {
+            return Err(VrmExportError::new(
+                VrmExportErrorKind::InvalidStructure,
+                "モーフターゲットに有限でない値がある",
+            ));
+        }
     }
     Ok(())
 }

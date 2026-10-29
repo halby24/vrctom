@@ -7,8 +7,9 @@
 use vrctom::fbx::{FbxFile, FbxOptions, ObjectId};
 use vrctom::vrm::{
     HumanoidBone, HumanoidBones, MaterialOptions, VrmAlphaMode, VrmExportErrorKind,
-    VrmExportOptions, VrmImage, VrmImageMime, VrmMaterial, VrmMaterialEntry, VrmMaterials, VrmMesh,
-    VrmMeta, VrmModel, VrmMtoonParameters, VrmNode, VrmOutlineWidthMode, VrmPrimitive, VrmSampler,
+    VrmExportOptions, VrmExpression, VrmExpressionOverride, VrmExpressions, VrmImage, VrmImageMime,
+    VrmMaterial, VrmMaterialEntry, VrmMaterials, VrmMesh, VrmMeta, VrmModel, VrmMorphTarget,
+    VrmMorphTargetBind, VrmMtoonParameters, VrmNode, VrmOutlineWidthMode, VrmPrimitive, VrmSampler,
     VrmSkin, VrmVertices,
 };
 
@@ -144,12 +145,14 @@ fn 合成モデルを作る() -> VrmModel {
             material: 0,
             indices: vec![0, 1, 2],
         }],
+        targets: Vec::new(),
     };
     VrmModel {
         root: 単位行列(),
         nodes: ノード,
         skins: vec![スキン],
         meshes: vec![メッシュ],
+        expressions: VrmExpressions::default(),
     }
 }
 
@@ -1374,4 +1377,193 @@ fn 実fixtureをvrmに書き出し中間モデルと一致する() {
     // `作業` をここで落とすと一時ファイルが消える。パスだけを知らせる運用であり、
     // 検証中に消えないよう明示的に保持する。
     std::mem::forget(作業);
+}
+
+/// 表情とモーフターゲットをGLBのJSONへ書き出す。
+#[test]
+fn 表情とモーフターゲットを書き出す() {
+    let mut model = 合成モデルを作る();
+    let node = model.meshes[0].node;
+    model.meshes[0].targets = vec![VrmMorphTarget {
+        name: "vrc.v_aa".to_owned(),
+        positions: vec![[0.01, 0.0, 0.0]; 3],
+    }];
+    model.expressions = VrmExpressions {
+        preset: vec![VrmExpression {
+            name: "aa".to_owned(),
+            morph_target_binds: vec![VrmMorphTargetBind {
+                mesh: 0,
+                target: 0,
+                weight: 1.0,
+            }],
+            is_binary: false,
+            override_blink: VrmExpressionOverride::None,
+            override_look_at: VrmExpressionOverride::None,
+            override_mouth: VrmExpressionOverride::None,
+        }],
+    };
+
+    let bytes = model
+        .to_vrm(&書き出し設定を作る())
+        .expect("表情付きモデルは書き出せる");
+    let (json, _) = glbを分解する(&bytes);
+
+    let mesh = &json["meshes"][0];
+    assert_eq!(mesh["weights"], serde_json::json!([0.0]));
+    assert_eq!(
+        mesh["extras"]["targetNames"],
+        serde_json::json!(["vrc.v_aa"])
+    );
+    let target = &mesh["primitives"][0]["targets"][0]["POSITION"];
+    let accessor = target.as_u64().expect("POSITIONアクセサがある") as usize;
+    assert_eq!(json["accessors"][accessor]["count"], serde_json::json!(3));
+    assert_eq!(
+        json["accessors"][accessor]["type"],
+        serde_json::json!("VEC3")
+    );
+    let min = json["accessors"][accessor]["min"][0]
+        .as_f64()
+        .expect("minがある");
+    assert!((min - 0.01).abs() < 1e-6, "min={min}");
+
+    let preset = &json["extensions"]["VRMC_vrm"]["expressions"]["preset"]["aa"];
+    assert_eq!(
+        preset["morphTargetBinds"],
+        serde_json::json!([{"node": node, "index": 0, "weight": 1.0}])
+    );
+    assert_eq!(preset["isBinary"], serde_json::json!(false));
+    assert_eq!(preset["overrideBlink"], serde_json::json!("none"));
+}
+
+/// 表情の重みとプリセット名の不正を拒否する。
+#[test]
+fn 表情の重みと名前の不正を拒否する() {
+    for (name, weight) in [("aa", 1.5), ("not-a-preset", 1.0)] {
+        let mut model = 合成モデルを作る();
+        model.meshes[0].targets = vec![VrmMorphTarget {
+            name: "vrc.v_aa".to_owned(),
+            positions: vec![[0.0, 0.0, 0.0]; 3],
+        }];
+        model.expressions = VrmExpressions {
+            preset: vec![VrmExpression {
+                name: name.to_owned(),
+                morph_target_binds: vec![VrmMorphTargetBind {
+                    mesh: 0,
+                    target: 0,
+                    weight,
+                }],
+                is_binary: false,
+                override_blink: VrmExpressionOverride::None,
+                override_look_at: VrmExpressionOverride::None,
+                override_mouth: VrmExpressionOverride::None,
+            }],
+        };
+        assert_eq!(
+            model
+                .to_vrm(&書き出し設定を作る())
+                .expect_err("不正な表情は拒否する")
+                .kind(),
+            VrmExportErrorKind::InvalidStructure,
+            "name={name} weight={weight}"
+        );
+    }
+}
+
+/// モーフターゲットの非有限値を拒否する。
+#[test]
+fn モーフターゲットの非有限値を拒否する() {
+    let mut model = 合成モデルを作る();
+    model.meshes[0].targets = vec![VrmMorphTarget {
+        name: "vrc.v_aa".to_owned(),
+        positions: vec![[f32::NAN, 0.0, 0.0]; 3],
+    }];
+    assert_eq!(
+        model
+            .to_vrm(&書き出し設定を作る())
+            .expect_err("非有限のモーフは拒否する")
+            .kind(),
+        VrmExportErrorKind::InvalidStructure
+    );
+}
+
+/// モーフターゲットの長さ不一致を拒否する。
+#[test]
+fn モーフターゲットの長さ不一致を拒否する() {
+    let mut model = 合成モデルを作る();
+    model.meshes[0].targets = vec![VrmMorphTarget {
+        name: "vrc.v_aa".to_owned(),
+        positions: vec![[0.0, 0.0, 0.0]; 2],
+    }];
+    assert_eq!(
+        model
+            .to_vrm(&書き出し設定を作る())
+            .expect_err("長さ不一致は拒否する")
+            .kind(),
+        VrmExportErrorKind::InvalidStructure
+    );
+}
+
+/// 表情束ねのメッシュ索引・ターゲット索引の範囲外を拒否する。
+#[test]
+fn 表情束ねの索引範囲外を拒否する() {
+    for (mesh, target) in [(1usize, 0usize), (0, 1)] {
+        let mut model = 合成モデルを作る();
+        model.meshes[0].targets = vec![VrmMorphTarget {
+            name: "vrc.v_aa".to_owned(),
+            positions: vec![[0.0, 0.0, 0.0]; 3],
+        }];
+        model.expressions = VrmExpressions {
+            preset: vec![VrmExpression {
+                name: "aa".to_owned(),
+                morph_target_binds: vec![VrmMorphTargetBind {
+                    mesh,
+                    target,
+                    weight: 1.0,
+                }],
+                is_binary: false,
+                override_blink: VrmExpressionOverride::None,
+                override_look_at: VrmExpressionOverride::None,
+                override_mouth: VrmExpressionOverride::None,
+            }],
+        };
+        assert_eq!(
+            model
+                .to_vrm(&書き出し設定を作る())
+                .expect_err("範囲外は拒否する")
+                .kind(),
+            VrmExportErrorKind::InvalidStructure,
+            "mesh={mesh} target={target}"
+        );
+    }
+}
+
+/// 表情名の空と重複を拒否する。
+#[test]
+fn 表情名の空と重複を拒否する() {
+    for names in [["", "aa"], ["aa", "aa"]] {
+        let model = VrmModel {
+            expressions: VrmExpressions {
+                preset: names
+                    .iter()
+                    .map(|name| VrmExpression {
+                        name: (*name).to_owned(),
+                        morph_target_binds: Vec::new(),
+                        is_binary: false,
+                        override_blink: VrmExpressionOverride::None,
+                        override_look_at: VrmExpressionOverride::None,
+                        override_mouth: VrmExpressionOverride::None,
+                    })
+                    .collect(),
+            },
+            ..合成モデルを作る()
+        };
+        assert_eq!(
+            model
+                .to_vrm(&書き出し設定を作る())
+                .expect_err("空・重複は拒否する")
+                .kind(),
+            VrmExportErrorKind::InvalidStructure,
+            "names={names:?}"
+        );
+    }
 }
