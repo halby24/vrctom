@@ -277,7 +277,7 @@ fn 髪sidecarを作る(fbxバイト列: &[u8], モデル: &VrmModel) -> String {
             "ignoreNodeIds": [],
             "ignoreOtherPhysBones": false,
             "endpointPosition": [0.0, 0.0, 0.0],
-            "multiChildType": "Ignore",
+            "multiChildType": "First",
             "pull": {"value": 0.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
             "spring": {"value": 0.3, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
             "stiffness": {"value": 0.5, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
@@ -385,9 +385,9 @@ fn 文から解決してコンパイルする(
     (sidecar, 解決, コンパイル済み)
 }
 
-/// 線形チェーンを作り、分岐を記録する。最初の子だけを採用する。
+/// 線形チェーンを作り、分岐を分割する。Firstでは最初の子を辿る。
 #[test]
-fn 線形チェーンを作り分岐を記録する() {
+fn 線形チェーンを作り分岐を分割する() {
     let fbxバイト列 = b"fake-fbx";
     let モデル = 書き出し可能モデルを作る();
     let (_, _, コンパイル済み) = 解決してコンパイルする(fbxバイト列, &モデル);
@@ -395,15 +395,16 @@ fn 線形チェーンを作り分岐を記録する() {
     assert_eq!(報告.spring_count, 1, "springは1本である");
     assert_eq!(報告.joint_count, 2, "関節はHairA・HairBの2件である");
     let spring = &コンパイル済み.bones.springs[0];
-    assert_eq!(spring.name, "pb:0", "spring名はPhysBone IDである");
+    assert_eq!(spring.name, "HairA", "spring名は先頭関節のノード名である");
     assert!(spring.center.is_none(), "centerは今回付けない");
     let 関節: Vec<usize> = spring.joints.iter().map(|関節| 関節.node).collect();
     assert_eq!(関節, vec![3, 4], "HairAから最初の子HairBだけを辿る");
-    // 分岐HairCは捨て、記録に残す。
-    assert_eq!(報告.skipped_branches.len(), 1, "分岐は1件記録する");
-    assert_eq!(報告.skipped_branches[0].spring, "pb:0");
-    assert_eq!(報告.skipped_branches[0].node, 3);
-    assert_eq!(報告.skipped_branches[0].skipped, vec![5]);
+    // 分岐HairCは別springのheadになり得る。AimはHairBである。
+    assert_eq!(報告.branch_splits.len(), 1, "分岐は1件記録する");
+    assert_eq!(報告.branch_splits[0].bone, "pb:0");
+    assert_eq!(報告.branch_splits[0].node, "n:3");
+    assert_eq!(報告.branch_splits[0].aimed, Some("n:4".to_string()));
+    assert_eq!(報告.branch_splits[0].heads, vec!["n:5".to_string()]);
     // 第一近似の値を確かめる。
     for 関節 in &spring.joints {
         assert_eq!(関節.hit_radius, 0.02, "hit_radiusはbase値である");
@@ -413,6 +414,11 @@ fn 線形チェーンを作り分岐を記録する() {
         assert_eq!(関節.drag_force, 0.7, "dragは1-springである");
     }
     assert!(報告.curve_base_used.is_empty(), "空曲線では記録しない");
+    // 所有記録を確かめる。
+    assert_eq!(報告.owned_springs.len(), 1);
+    assert_eq!(報告.owned_springs[0].bone, "pb:0");
+    assert_eq!(報告.owned_springs[0].name, "HairA");
+    assert_eq!(報告.owned_springs[0].joints, 2);
 }
 
 /// colliderを変換し、グループを共有する。
@@ -739,16 +745,18 @@ fn 実fixtureと実sidecarでvrmを生成する() {
         .map(|s| s.joints.len())
         .sum();
     eprintln!(
-        "実sidecar生成: {} {}バイト spring{}件 関節{}件 collider{}件 group{}件 分岐{}件 曲線近似{}件 平面落下{}件",
+        "実sidecar生成: {} {}バイト spring{}件 関節{}件 collider{}件 group{}件 分岐{}件 共有{}件 曲線近似{}件 平面落下{}件 スキップ{}件",
         出力先.display(),
         バイト列.len(),
         コンパイル済み.report.spring_count,
         関節数,
         コンパイル済み.report.collider_count,
         コンパイル済み.report.group_count,
-        コンパイル済み.report.skipped_branches.len(),
+        コンパイル済み.report.branch_splits.len(),
+        コンパイル済み.report.lost_nodes.len(),
         コンパイル済み.report.curve_base_used.len(),
         コンパイル済み.report.plane_colliders_dropped.len(),
+        コンパイル済み.report.skipped_bones.len(),
     );
 }
 
@@ -835,50 +843,20 @@ fn colliderの姿勢はrootローカルでありcomponentに影響されない()
     }
 }
 
-/// 同じ集合の順序違いはグループを共有し、他rootで切断する。
+/// 同じ集合の順序・重複違いはグループを共有する。
+/// `ignoreOtherPhysBones` が偽なら他rootを切らず、所有権で奪い合う。
 #[test]
 fn 順序違いの参照集合はグループを共有する() {
     let fbxバイト列 = b"fake-fbx";
     let モデル = 書き出し可能モデルを作る();
     let mut 値: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    // pb:1はSpine(n:1)を起点にし、Head(n:2)で終わる。HairA(n:3)は
+    // pb:0のrootのため切断する。参照集合は順序・重複違いで同じである。
     let 追加 = serde_json::json!({
         "id": "pb:1",
-        "componentNodeId": "n:5",
-        "rootNodeId": "n:5",
-        "enabled": true,
-        "version": "1.1",
-        "integrationType": "Simplified",
-        "ignoreNodeIds": [],
-        "ignoreOtherPhysBones": false,
-        "endpointPosition": [0.0, 0.0, 0.0],
-        "multiChildType": "First",
-        "pull": {"value": 0.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
-        "spring": {"value": 0.3, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
-        "stiffness": {"value": 0.5, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
-        "gravity": {"value": 0.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
-        "gravityFalloff": {"value": 0.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
-        "immobileType": "AllMotion",
-        "immobile": {"value": 0.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
-        "radius": {"value": 0.02, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
-        "allowCollision": true,
-        "colliderIds": ["c:1", "c:0"],
-        "limitType": "None",
-        "maxAngleX": {"value": 0.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
-        "maxAngleZ": {"value": 0.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
-        "limitRotation": [0.0, 0.0, 0.0],
-        "isAnimated": false,
-    });
-    値["physBones"]
-        .as_array_mut()
-        .expect("physBonesは配列である")
-        .push(追加);
-    // 重複IDを含む3本目はHead(n:2)を起点にし、他rootで止まる。
-    // 集合としては同じため、新しいグループは作らない。
-    let 重複分 = serde_json::json!({
-        "id": "pb:2",
-        "componentNodeId": "n:2",
-        "rootNodeId": "n:2",
+        "componentNodeId": "n:1",
+        "rootNodeId": "n:1",
         "enabled": true,
         "version": "1.1",
         "integrationType": "Simplified",
@@ -895,7 +873,7 @@ fn 順序違いの参照集合はグループを共有する() {
         "immobile": {"value": 0.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
         "radius": {"value": 0.02, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
         "allowCollision": true,
-        "colliderIds": ["c:0", "c:0", "c:1"],
+        "colliderIds": ["c:1", "c:0", "c:0"],
         "limitType": "None",
         "maxAngleX": {"value": 0.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
         "maxAngleZ": {"value": 0.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
@@ -905,13 +883,15 @@ fn 順序違いの参照集合はグループを共有する() {
     値["physBones"]
         .as_array_mut()
         .expect("physBonesは配列である")
-        .push(重複分);
+        .push(追加);
     let (_, _, コンパイル済み) =
         文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
-    assert_eq!(コンパイル済み.report.spring_count, 3);
+    // pb:1はSpine起点でHeadまで伸びる。springはHairAとSpine-Headの2本である。
+    // sidecarに腕ノードは無いため、腕には伸びない。
+    assert_eq!(コンパイル済み.report.spring_count, 2);
     assert_eq!(
         コンパイル済み.report.group_count, 1,
-        "順序違い・重複つきでも共有する"
+        "順序・重複違いでも共有する"
     );
     for spring in &コンパイル済み.bones.springs {
         assert_eq!(spring.collider_groups, vec![0]);
@@ -921,39 +901,172 @@ fn 順序違いの参照集合はグループを共有する() {
         vec![0, 1],
         "重複は除いて正準化する"
     );
-    // pb:0の鎖は他root(n:5)で切れ、分岐記録ではなく切断記録になる。
-    // pb:2の鎖も他root(n:3)で切れる。
-    assert!(コンパイル済み.report.skipped_branches.is_empty());
-    assert_eq!(コンパイル済み.report.cut_at_other_roots.len(), 2);
-    assert_eq!(コンパイル済み.report.cut_at_other_roots[0].spring, "pb:0");
-    assert_eq!(コンパイル済み.report.cut_at_other_roots[0].node, 5);
+    // `ignoreOtherPhysBones` が偽なら他rootで切らず、所有権で奪い合う。
+    assert!(コンパイル済み.report.cut_at_other_roots.is_empty());
+    assert_eq!(コンパイル済み.report.lost_nodes.len(), 3);
+    assert_eq!(コンパイル済み.report.shared_nodes.len(), 3);
+    assert_eq!(コンパイル済み.report.shared_nodes[0].node, "n:3");
+    assert_eq!(コンパイル済み.report.shared_nodes[0].owner, "pb:0");
     assert_eq!(
-        コンパイル済み.report.cut_at_other_roots[0].other_bone,
-        "pb:1"
+        コンパイル済み.report.shared_nodes[0].lost_by,
+        vec!["pb:1".to_string()]
     );
-    assert_eq!(コンパイル済み.report.cut_at_other_roots[1].spring, "pb:2");
-    assert_eq!(コンパイル済み.report.cut_at_other_roots[1].node, 3);
+    assert_eq!(コンパイル済み.report.branch_splits.len(), 2);
+    assert_eq!(コンパイル済み.report.branch_splits[0].bone, "pb:0");
     assert_eq!(
-        コンパイル済み.report.cut_at_other_roots[1].other_bone,
-        "pb:0"
+        コンパイル済み.report.branch_splits[0].aimed,
+        Some("n:4".to_string())
+    );
+    assert_eq!(
+        コンパイル済み.report.branch_splits[0].heads,
+        vec!["n:5".to_string()]
+    );
+    assert_eq!(コンパイル済み.report.branch_splits[1].bone, "pb:1");
+    assert_eq!(コンパイル済み.report.branch_splits[1].aimed, None);
+    assert_eq!(
+        コンパイル済み.report.branch_splits[1].heads,
+        vec!["n:4".to_string(), "n:5".to_string()]
+    );
+    // pb:1の木はpb:0と重なり、n:3・n:4・n:5を奪われる。
+    assert_eq!(コンパイル済み.report.lost_nodes.len(), 3);
+    assert_eq!(コンパイル済み.report.shared_nodes.len(), 3);
+    assert_eq!(コンパイル済み.report.shared_nodes[0].node, "n:3");
+    assert_eq!(コンパイル済み.report.shared_nodes[0].owner, "pb:0");
+    assert_eq!(
+        コンパイル済み.report.shared_nodes[0].lost_by,
+        vec!["pb:1".to_string()]
     );
     // first-child化の近似はIgnore以外で記録する。
     assert_eq!(
         コンパイル済み.report.first_child_multichild,
-        vec!["pb:1".to_string()]
+        vec!["pb:0".to_string()]
     );
-    assert!(コンパイル済み.report.center_missing.len() == 3);
-    assert!(コンパイル済み.report.no_endpoint.len() == 3);
+    assert!(コンパイル済み.report.center_missing.len() == 2);
+    assert!(コンパイル済み.report.no_endpoint.len() == 2);
+    // spring名は先頭関節のノード名である。
+    let 名前: Vec<&str> = コンパイル済み
+        .bones
+        .springs
+        .iter()
+        .map(|spring| spring.name.as_str())
+        .collect();
+    assert_eq!(名前, vec!["HairA", "Spine"]);
+}
+
+/// 先行PlanにAim先を奪われたheadは単関節で落とす。
+#[test]
+fn 奪われたaim先のheadは単関節で落とす() {
+    // pb:1 はSpine(n:1)を起点にするが、Head以下はpb:0が先に確保する。
+    // pb:1 のhead SpineはAim先Headを失い、単関節になる。
+    let fbxバイト列 = b"fake-fbx";
+    let モデル = 書き出し可能モデルを作る();
+    let mut 値: serde_json::Value =
+        serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    let 追加 = serde_json::json!({
+        "id": "pb:1", "componentNodeId": "n:1", "rootNodeId": "n:1", "enabled": true,
+        "version": "1.1", "integrationType": "Simplified", "ignoreNodeIds": [],
+        "ignoreOtherPhysBones": false, "endpointPosition": [0.0, 0.0, 0.0],
+        "multiChildType": "Ignore", "allowCollision": true, "colliderIds": [],
+        "limitType": "None", "limitRotation": [0.0, 0.0, 0.0], "isAnimated": false,
+    });
+    値["physBones"]
+        .as_array_mut()
+        .expect("physBonesは配列である")
+        .push(追加);
+    // pb:0 のrootをHead(n:2)へ移し、先に下流を確保させる。
+    // pb:1 のhead Spine(n:1)はAim先Headを失い、単関節になる。
+    値["physBones"][0]["componentNodeId"] = serde_json::json!("n:2");
+    値["physBones"][0]["rootNodeId"] = serde_json::json!("n:2");
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
+    assert_eq!(コンパイル済み.report.spring_count, 1);
+    assert_eq!(コンパイル済み.bones.springs[0].name, "Head");
+    let 関節: Vec<usize> = コンパイル済み.bones.springs[0]
+        .joints
+        .iter()
+        .map(|関節| 関節.node)
+        .collect();
+    assert_eq!(関節, vec![2, 3, 4]);
+    assert_eq!(コンパイル済み.report.lost_nodes.len(), 4);
+    let 捨て = コンパイル済み
+        .report
+        .skipped_bones
+        .iter()
+        .find(|捨て| 捨て.bone == "pb:1")
+        .expect("pb:1は落とす");
+    match &捨て.reason {
+        vrctom::vrm::SkippedBoneReason::AimTargetUnowned => {}
+        他 => panic!("Aim先の喪失で落とす: {他:?}"),
+    }
+}
+
+/// Aimする所有骨が無い場合は作らず記録する。
+#[test]
+fn 所有もaimも無い場合は作らず記録する() {
+    // 単独ノードをrootにする。Aimが無いためheadにならない。
+    let fbxバイト列 = b"fake-fbx";
+    let モデル = 書き出し可能モデルを作る();
+    let mut 値: serde_json::Value =
+        serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    値["physBones"][0]["componentNodeId"] = serde_json::json!("n:4");
+    値["physBones"][0]["rootNodeId"] = serde_json::json!("n:4");
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
+    assert_eq!(コンパイル済み.report.spring_count, 0);
+    let 捨て = コンパイル済み
+        .report
+        .skipped_bones
+        .iter()
+        .find(|捨て| 捨て.bone == "pb:0")
+        .expect("pb:0は落とす");
+    match &捨て.reason {
+        vrctom::vrm::SkippedBoneReason::NoHeads => {}
+        他 => panic!("head無しで落とす: {他:?}"),
+    }
+}
+
+/// `ignoreOtherPhysBones` が真のときだけ他rootで切断する。
+#[test]
+fn 他rootの切断は無視指定があるときだけ起きる() {
+    let fbxバイト列 = b"fake-fbx";
+    let モデル = 書き出し可能モデルを作る();
+    let mut 値: serde_json::Value =
+        serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    値["physBones"]
+        .as_array_mut()
+        .expect("physBonesは配列である")
+        .push(serde_json::json!({
+            "id": "pb:1", "componentNodeId": "n:1", "rootNodeId": "n:1", "enabled": true,
+            "version": "1.1", "integrationType": "Simplified", "ignoreNodeIds": [],
+            "ignoreOtherPhysBones": false, "endpointPosition": [0.0, 0.0, 0.0],
+            "multiChildType": "Ignore", "allowCollision": true, "colliderIds": [],
+            "limitType": "None", "limitRotation": [0.0, 0.0, 0.0], "isAnimated": false,
+        }));
+    let (_, _, 偽) =
+        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
+    assert!(偽.report.cut_at_other_roots.is_empty(), "偽なら切らない");
+    assert_eq!(偽.report.spring_count, 2);
+    assert_eq!(偽.report.lost_nodes.len(), 3, "n:3・n:4・n:5を奪われる");
+    値["physBones"][1]["ignoreOtherPhysBones"] = serde_json::json!(true);
+    let (_, _, 真) =
+        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
+    assert_eq!(真.report.cut_at_other_roots.len(), 1, "真なら切る");
+    assert_eq!(真.report.cut_at_other_roots[0].bone, "pb:1");
+    assert_eq!(真.report.cut_at_other_roots[0].node, "n:3");
+    assert_eq!(真.report.cut_at_other_roots[0].other_bone, "pb:0");
+    assert!(真.report.lost_nodes.is_empty(), "切れば奪われない");
+    assert_eq!(真.report.spring_count, 2);
 }
 
 /// 無視指定の部分木には降りない。
+
 #[test]
 fn 無視指定の部分木には降りない() {
     let fbxバイト列 = b"fake-fbx";
     let モデル = 書き出し可能モデルを作る();
     let mut 値: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
-    値["physBones"][0]["ignoreNodeIds"] = serde_json::json!(["n:4", "n:5"]);
+    値["physBones"][0]["ignoreNodeIds"] = serde_json::json!(["n:5"]);
     let (_, _, コンパイル済み) =
         文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
     assert_eq!(コンパイル済み.bones.springs.len(), 1);
@@ -962,12 +1075,63 @@ fn 無視指定の部分木には降りない() {
         .iter()
         .map(|関節| 関節.node)
         .collect();
-    assert_eq!(関節, vec![3], "無視部分木には降りない");
+    assert_eq!(関節, vec![3, 4], "無視部分木には降りない");
+    // 無視で子が1件になれば分岐記録は無い。
+    assert!(コンパイル済み.report.branch_splits.is_empty());
 }
 
-/// rootを共有する2本目は空鎖で落とし、書き出しは通す。
+/// root自体を無視した場合は空の木として報告する。
 #[test]
-fn root共有の2本目は空鎖で落とす() {
+fn root自体の無視は空の木として報告する() {
+    let fbxバイト列 = b"fake-fbx";
+    let モデル = 書き出し可能モデルを作る();
+    let mut 値: serde_json::Value =
+        serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    値["physBones"][0]["ignoreNodeIds"] = serde_json::json!(["n:3"]);
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
+    assert_eq!(コンパイル済み.report.spring_count, 0);
+    assert_eq!(コンパイル済み.report.skipped_bones.len(), 1);
+    match &コンパイル済み.report.skipped_bones[0].reason {
+        vrctom::vrm::SkippedBoneReason::RootIgnored => {}
+        他 => panic!("root無視で落とす: {他:?}"),
+    }
+}
+
+/// Aimと子順はsidecarのsiblingIndex順に従い、モデルの子順は使わない。
+#[test]
+fn sibling順がモデル子順と異なる場合はsidecar順に従う() {
+    let fbxバイト列 = b"fake-fbx";
+    let モデル = 書き出し可能モデルを作る();
+    let mut 値: serde_json::Value =
+        serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    // モデル上はHairB(n:4)が先だが、siblingIndexではHairC(n:5)を先にする。
+    値["nodes"][4]["siblingIndex"] = serde_json::json!(5);
+    値["nodes"][5]["siblingIndex"] = serde_json::json!(0);
+    値["physBones"][0]["multiChildType"] = serde_json::json!("First");
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
+    assert_eq!(コンパイル済み.report.spring_count, 1);
+    let 関節: Vec<usize> = コンパイル済み.bones.springs[0]
+        .joints
+        .iter()
+        .map(|関節| 関節.node)
+        .collect();
+    assert_eq!(関節, vec![3, 5], "sibling順の最初の子を辿る");
+    assert_eq!(コンパイル済み.report.branch_splits.len(), 1);
+    assert_eq!(
+        コンパイル済み.report.branch_splits[0].aimed,
+        Some("n:5".to_string())
+    );
+    assert_eq!(
+        コンパイル済み.report.branch_splits[0].heads,
+        vec!["n:4".to_string()]
+    );
+}
+
+/// rootを共有する2本目は作らず、書き出しは通す。
+#[test]
+fn root共有の2本目は作らず書き出しは通す() {
     let fbxバイト列 = b"fake-fbx";
     let モデル = 書き出し可能モデルを作る();
     let mut 値: serde_json::Value =
@@ -984,11 +1148,25 @@ fn root共有の2本目は空鎖で落とす() {
         文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
     assert_eq!(
         コンパイル済み.report.spring_count, 1,
-        "空鎖はspringにしない"
+        "奪われたrootのboneはspringを作らない"
     );
-    assert_eq!(コンパイル済み.report.skipped_empty_chains.len(), 1);
-    assert_eq!(コンパイル済み.report.skipped_empty_chains[0].spring, "pb:1");
-    assert_eq!(コンパイル済み.report.skipped_empty_chains[0].owner, "pb:0");
+    assert_eq!(コンパイル済み.report.lost_nodes.len(), 3);
+    assert_eq!(コンパイル済み.report.shared_nodes.len(), 3);
+    assert_eq!(コンパイル済み.report.shared_nodes[0].node, "n:3");
+    assert_eq!(コンパイル済み.report.shared_nodes[0].owner, "pb:0");
+    assert_eq!(
+        コンパイル済み.report.shared_nodes[0].lost_by,
+        vec!["pb:1".to_string()]
+    );
+    assert_eq!(コンパイル済み.report.skipped_bones.len(), 1);
+    let 跳ばし = &コンパイル済み.report.skipped_bones[0];
+    assert_eq!(跳ばし.bone, "pb:1");
+    match &跳ばし.reason {
+        vrctom::vrm::SkippedBoneReason::RootShared { owner } => {
+            assert_eq!(owner, "pb:0");
+        }
+        他 => panic!("root共有で落とす: {他:?}"),
+    }
     let mut モデル = モデル;
     モデル.spring_bones = コンパイル済み.bones;
     モデル
@@ -996,24 +1174,403 @@ fn root共有の2本目は空鎖で落とす() {
         .expect("空鎖を落とせば書き出せる");
 }
 
-/// 子だけが循環する階層でも止まり、重なりで切る。
+/// 上限で切れた鎖は記録に残し、区間の無いspringは作らない。
 #[test]
-fn 子の循環でも止まって重なりで切る() {
-    // 親は直線、子だけが循環する壊れた階層。public APIでは作れる。
-    let ノード = vec![
-        VrmNode {
-            name: "A".to_string(),
-            parent: None,
-            children: vec![1],
-            local: 単位行列(),
-        },
-        VrmNode {
-            name: "B".to_string(),
-            parent: Some(0),
-            children: vec![0],
-            local: 平行移動行列([0.0, 1.0, 0.0]),
-        },
+fn 上限で切れた鎖は記録に残す() {
+    let fbxバイト列 = b"fake-fbx";
+    let モデル = 書き出し可能モデルを作る();
+    // 上限1ではheadだけになり、区間が無いためspringを作らない。
+    // 切り詰め自体は記録に残す。
+    let 文 = 髪sidecarを作る(fbxバイト列, &モデル);
+    let sidecar =
+        PhysicsSidecar::from_json(&文, &PhysicsLimits::new()).expect("合成sidecarは検証を通る");
+    let 解決 = モデル
+        .resolve_physics_sidecar(&sidecar, fbxバイト列)
+        .expect("合成対応は解決できる");
+    let 上限1 = SpringCompileOptions::new().with_max_joints(1);
+    let 制限付き =
+        compile_springs(&sidecar, &モデル, &解決, &上限1).expect("上限付きでも変換できる");
+    assert_eq!(制限付き.report.spring_count, 0);
+    assert_eq!(
+        制限付き.report.truncated_chains,
+        vec!["HairA".to_string()],
+        "切り詰めは先頭関節名で記録する"
+    );
+    // 上限2ではHairA・HairBの1本が通る。
+    let 上限2 = SpringCompileOptions::new().with_max_joints(2);
+    let 通過 = compile_springs(&sidecar, &モデル, &解決, &上限2).expect("上限ちょうどでは通る");
+    assert_eq!(通過.report.spring_count, 1);
+    assert!(通過.report.truncated_chains.is_empty());
+}
+
+/// 3分岐モデルを作る。Rの下にA・B・C、各々に子が1件ずつ付く。
+fn 三分岐モデルを作る() -> VrmModel {
+    let 名前 = ["R", "A", "A1", "B", "B1", "C", "C1"];
+    let 親: Vec<Option<usize>> = vec![None, Some(0), Some(1), Some(0), Some(3), Some(0), Some(5)];
+    let 位置 = [
+        [0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0],
     ];
+    let mut 子: Vec<Vec<usize>> = vec![Vec::new(); 名前.len()];
+    for (子索引, 親索引) in 親.iter().enumerate() {
+        if let Some(親索引) = 親索引 {
+            子[*親索引].push(子索引);
+        }
+    }
+    let ノード = 名前
+        .iter()
+        .enumerate()
+        .map(|(索引, 名)| VrmNode {
+            name: (*名).to_string(),
+            parent: 親[索引],
+            children: 子[索引].clone(),
+            local: 平行移動行列(位置[索引]),
+        })
+        .collect();
+    VrmModel {
+        root: 単位行列(),
+        nodes: ノード,
+        skins: Vec::new(),
+        meshes: Vec::new(),
+        expressions: VrmExpressions::default(),
+        spring_bones: VrmSpringBones::default(),
+    }
+}
+
+/// 3分岐モデルのsidecarを作る。分岐の扱いだけを変える。
+fn 三分岐sidecarを作る(fbxバイト列: &[u8], モデル: &VrmModel, 分岐: &str) -> String {
+    let 経路 = [
+        vec!["R"],
+        vec!["R", "A"],
+        vec!["R", "A", "A1"],
+        vec!["R", "B"],
+        vec!["R", "B", "B1"],
+        vec!["R", "C"],
+        vec!["R", "C", "C1"],
+    ];
+    let ノード: Vec<serde_json::Value> = 経路
+        .iter()
+        .enumerate()
+        .map(|(索引, 道)| {
+            let 親 = if 索引 == 0 {
+                serde_json::Value::Null
+            } else {
+                let 親索引 = モデル.nodes[索引].parent.expect("親がある");
+                serde_json::json!(format!("n:{親索引}"))
+            };
+            ノードjson(
+                モデル,
+                &format!("n:{索引}"),
+                親.as_str(),
+                索引,
+                &["Milfy"],
+                &道.to_vec(),
+            )
+        })
+        .collect();
+    serde_json::json!({
+        "format": "vrctom.physics",
+        "schemaVersion": 1,
+        "generator": {"name": "試験", "version": "0.1"},
+        "capture": {
+            "statePolicy": "edit-mode",
+            "coordinateSpace": "unity-avatar-root-local-meters",
+            "avatarRootId": "n:0",
+            "rootScale": [1.0, 1.0, 1.0],
+        },
+        "sourceModels": [{"id": "milfy", "sha256": sha256_hex(fbxバイト列)}],
+        "nodes": ノード,
+        "physBones": [{
+            "id": "pb:0",
+            "componentNodeId": "n:0",
+            "rootNodeId": "n:0",
+            "enabled": true,
+            "version": "1.1",
+            "integrationType": "Simplified",
+            "ignoreNodeIds": [],
+            "ignoreOtherPhysBones": false,
+            "endpointPosition": [0.0, 0.0, 0.0],
+            "multiChildType": 分岐,
+            "pull": {"value": 0.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
+            "spring": {"value": 0.3, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
+            "stiffness": {"value": 0.5, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
+            "gravity": {"value": 0.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
+            "gravityFalloff": {"value": 0.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
+            "immobileType": "AllMotion",
+            "immobile": {"value": 0.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
+            "radius": {"value": 0.02, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
+            "allowCollision": true,
+            "colliderIds": [],
+            "limitType": "None",
+            "maxAngleX": {"value": 0.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
+            "maxAngleZ": {"value": 0.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8},
+            "limitRotation": [0.0, 0.0, 0.0],
+            "isAnimated": false,
+        }],
+        "colliders": [],
+        "unsupportedFeatures": [],
+    })
+    .to_string()
+}
+
+/// Ignoreの3分岐は3 springに分かれ、関節は重ならない。
+#[test]
+fn 三分岐無視は三つのspringに分かれる() {
+    let fbxバイト列 = b"fake-fbx";
+    let モデル = 三分岐モデルを作る();
+    let 文 = 三分岐sidecarを作る(fbxバイト列, &モデル, "Ignore");
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&文, fbxバイト列, &モデル);
+    assert_eq!(コンパイル済み.report.spring_count, 3);
+    let 名前: Vec<&str> = コンパイル済み
+        .bones
+        .springs
+        .iter()
+        .map(|spring| spring.name.as_str())
+        .collect();
+    assert_eq!(名前, vec!["A", "B", "C"]);
+    // 関節は重ならず、親子連鎖を保つ。
+    let mut 全部 = Vec::new();
+    for spring in &コンパイル済み.bones.springs {
+        let 関節: Vec<usize> = spring.joints.iter().map(|関節| 関節.node).collect();
+        assert_eq!(関節.len(), 2);
+        for (前, 後) in 関節.iter().zip(関節.iter().skip(1)) {
+            assert!(
+                モデル.nodes[*前].children.contains(後),
+                "親子でつながる: {前} -> {後}"
+            );
+        }
+        全部.extend(関節);
+    }
+    let mut 重複なし = 全部.clone();
+    重複なし.sort_unstable();
+    重複なし.dedup();
+    assert_eq!(全部.len(), 重複なし.len(), "関節は重ならない");
+    assert_eq!(全部.len(), 6);
+    // 分岐はAimなし・head3件で記録する。
+    assert_eq!(コンパイル済み.report.branch_splits.len(), 1);
+    assert_eq!(コンパイル済み.report.branch_splits[0].bone, "pb:0");
+    assert_eq!(コンパイル済み.report.branch_splits[0].node, "n:0");
+    assert_eq!(コンパイル済み.report.branch_splits[0].aimed, None);
+    assert_eq!(
+        コンパイル済み.report.branch_splits[0].heads,
+        vec!["n:1".to_string(), "n:3".to_string(), "n:5".to_string()]
+    );
+}
+
+/// Firstの分岐は先頭の鎖だけが1 springになる。
+#[test]
+fn 先頭子だけがspringになる() {
+    // R-X-{A,B,C} の木。Xの分岐だけがFirstでAへ向かう。
+    let 名前 = ["R", "X", "A", "B", "C"];
+    let 親: Vec<Option<usize>> = vec![None, Some(0), Some(1), Some(1), Some(1)];
+    let 位置 = [
+        [0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0],
+    ];
+    let mut 子: Vec<Vec<usize>> = vec![Vec::new(); 名前.len()];
+    for (子索引, 親索引) in 親.iter().enumerate() {
+        if let Some(親索引) = 親索引 {
+            子[*親索引].push(子索引);
+        }
+    }
+    let ノード = 名前
+        .iter()
+        .enumerate()
+        .map(|(索引, 名)| VrmNode {
+            name: (*名).to_string(),
+            parent: 親[索引],
+            children: 子[索引].clone(),
+            local: 平行移動行列(位置[索引]),
+        })
+        .collect();
+    let モデル = VrmModel {
+        root: 単位行列(),
+        nodes: ノード,
+        skins: Vec::new(),
+        meshes: Vec::new(),
+        expressions: VrmExpressions::default(),
+        spring_bones: VrmSpringBones::default(),
+    };
+    let fbxバイト列 = b"fake-fbx";
+    let 道 = [
+        vec!["R"],
+        vec!["R", "X"],
+        vec!["R", "X", "A"],
+        vec!["R", "X", "B"],
+        vec!["R", "X", "C"],
+    ];
+    // 骨のrootはX(n:1)にする。avatar root(n:0)はjointにしないためである。
+    let ノードjson: Vec<serde_json::Value> = 道
+        .iter()
+        .enumerate()
+        .map(|(索引, 通)| {
+            let 親 = if 索引 == 0 {
+                serde_json::Value::Null
+            } else {
+                let 親索引 = モデル.nodes[索引].parent.expect("親がある");
+                serde_json::json!(format!("n:{親索引}"))
+            };
+            ノードjson(
+                &モデル,
+                &format!("n:{索引}"),
+                親.as_str(),
+                索引,
+                &["Milfy"],
+                &通.to_vec(),
+            )
+        })
+        .collect();
+    let mut 文: serde_json::Value = serde_json::from_str(&三分岐sidecarを作る(
+        fbxバイト列,
+        &三分岐モデルを作る(),
+        "First",
+    ))
+    .expect("合成sidecarは読める");
+    文["nodes"] = serde_json::Value::Array(ノードjson);
+    // 骨のrootはX(n:1)にする。avatar rootはjointにしないためである。
+    文["physBones"][0]["componentNodeId"] = serde_json::json!("n:1");
+    文["physBones"][0]["rootNodeId"] = serde_json::json!("n:1");
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+    assert_eq!(コンパイル済み.report.spring_count, 1);
+    let spring = &コンパイル済み.bones.springs[0];
+    assert_eq!(spring.name, "X", "先頭関節のノード名である");
+    let 関節: Vec<usize> = spring.joints.iter().map(|関節| 関節.node).collect();
+    assert_eq!(関節, vec![1, 2]);
+    assert_eq!(コンパイル済み.report.branch_splits.len(), 1);
+    assert_eq!(コンパイル済み.report.branch_splits[0].bone, "pb:0");
+    assert_eq!(コンパイル済み.report.branch_splits[0].node, "n:1");
+    assert_eq!(
+        コンパイル済み.report.branch_splits[0].aimed,
+        Some("n:2".to_string())
+    );
+    assert_eq!(
+        コンパイル済み.report.branch_splits[0].heads,
+        vec!["n:3".to_string(), "n:4".to_string()]
+    );
+}
+
+/// Averageは今回は先頭の子に畳み、近似として記録する。
+#[test]
+fn 平均指定は先頭子への近似として記録する() {
+    // Firstの試験と同じR-X-{A,B,C}の木で、multiChildTypeだけ変える。
+    let 名前 = ["R", "X", "A", "B", "C"];
+    let 親: Vec<Option<usize>> = vec![None, Some(0), Some(1), Some(1), Some(1)];
+    let 位置 = [
+        [0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0],
+    ];
+    let mut 子: Vec<Vec<usize>> = vec![Vec::new(); 名前.len()];
+    for (子索引, 親索引) in 親.iter().enumerate() {
+        if let Some(親索引) = 親索引 {
+            子[*親索引].push(子索引);
+        }
+    }
+    let ノード = 名前
+        .iter()
+        .enumerate()
+        .map(|(索引, 名)| VrmNode {
+            name: (*名).to_string(),
+            parent: 親[索引],
+            children: 子[索引].clone(),
+            local: 平行移動行列(位置[索引]),
+        })
+        .collect();
+    let モデル = VrmModel {
+        root: 単位行列(),
+        nodes: ノード,
+        skins: Vec::new(),
+        meshes: Vec::new(),
+        expressions: VrmExpressions::default(),
+        spring_bones: VrmSpringBones::default(),
+    };
+    let fbxバイト列 = b"fake-fbx";
+    let 道 = [
+        vec!["R"],
+        vec!["R", "X"],
+        vec!["R", "X", "A"],
+        vec!["R", "X", "B"],
+        vec!["R", "X", "C"],
+    ];
+    let ノードjson: Vec<serde_json::Value> = 道
+        .iter()
+        .enumerate()
+        .map(|(索引, 通)| {
+            let 親 = if 索引 == 0 {
+                serde_json::Value::Null
+            } else {
+                let 親索引 = モデル.nodes[索引].parent.expect("親がある");
+                serde_json::json!(format!("n:{親索引}"))
+            };
+            ノードjson(
+                &モデル,
+                &format!("n:{索引}"),
+                親.as_str(),
+                索引,
+                &["Milfy"],
+                &通.to_vec(),
+            )
+        })
+        .collect();
+    let mut 文: serde_json::Value = serde_json::from_str(&三分岐sidecarを作る(
+        fbxバイト列,
+        &三分岐モデルを作る(),
+        "Average",
+    ))
+    .expect("合成sidecarは読める");
+    文["nodes"] = serde_json::Value::Array(ノードjson);
+    文["physBones"][0]["componentNodeId"] = serde_json::json!("n:1");
+    文["physBones"][0]["rootNodeId"] = serde_json::json!("n:1");
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+    assert_eq!(コンパイル済み.report.spring_count, 1);
+    let 関節: Vec<usize> = コンパイル済み.bones.springs[0]
+        .joints
+        .iter()
+        .map(|関節| 関節.node)
+        .collect();
+    assert_eq!(関節, vec![1, 2], "Firstと同じく先頭の子を辿る");
+    assert_eq!(
+        コンパイル済み.report.average_approximated,
+        vec!["pb:0".to_string()]
+    );
+}
+
+/// avatar rootはjointにせず、その子からspringを開始する。
+#[test]
+fn avatarrootはjointにしない() {
+    // avatar(n:0)直下のAから鎖が始まる。avatar自体は所有しない。
+    let 名前 = ["Top", "A", "B"];
+    let 親: Vec<Option<usize>> = vec![None, Some(0), Some(1)];
+    let 位置 = [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]];
+    let mut 子: Vec<Vec<usize>> = vec![Vec::new(); 名前.len()];
+    for (子索引, 親索引) in 親.iter().enumerate() {
+        if let Some(親索引) = 親索引 {
+            子[*親索引].push(子索引);
+        }
+    }
+    let ノード = 名前
+        .iter()
+        .enumerate()
+        .map(|(索引, 名)| VrmNode {
+            name: (*名).to_string(),
+            parent: 親[索引],
+            children: 子[索引].clone(),
+            local: 平行移動行列(位置[索引]),
+        })
+        .collect();
     let モデル = VrmModel {
         root: 単位行列(),
         nodes: ノード,
@@ -1043,13 +1600,98 @@ fn 子の循環でも止まって重なりで切る() {
         },
         "sourceModels": [{"id": "milfy", "sha256": sha256_hex(fbxバイト列)}],
         "nodes": [
-            {"id": "n:0", "parentId": None::<String>, "name": "A", "siblingIndex": 0,
-             "scenePath": ["Milfy", "A"], "source": 出所(&["A"]), "referenceLocal": trs([0.0, 0.0, 0.0])},
-            {"id": "n:1", "parentId": "n:0", "name": "B", "siblingIndex": 0,
-             "scenePath": ["Milfy", "A", "B"], "source": 出所(&["A", "B"]), "referenceLocal": trs([0.0, 1.0, 0.0])},
+            {"id": "n:0", "parentId": None::<String>, "name": "Top", "siblingIndex": 0,
+             "scenePath": ["Milfy", "Top"], "source": 出所(&["Top"]), "referenceLocal": trs([0.0, 0.0, 0.0])},
+            {"id": "n:1", "parentId": "n:0", "name": "A", "siblingIndex": 0,
+             "scenePath": ["Milfy", "Top", "A"], "source": 出所(&["Top", "A"]), "referenceLocal": trs([0.0, 1.0, 0.0])},
+            {"id": "n:2", "parentId": "n:1", "name": "B", "siblingIndex": 0,
+             "scenePath": ["Milfy", "Top", "A", "B"], "source": 出所(&["Top", "A", "B"]), "referenceLocal": trs([0.0, 1.0, 0.0])},
         ],
         "physBones": [{
             "id": "pb:0", "componentNodeId": "n:0", "rootNodeId": "n:0", "enabled": true,
+            "version": "1.1", "integrationType": "Simplified", "ignoreNodeIds": [],
+            "ignoreOtherPhysBones": false, "endpointPosition": [0.0, 0.0, 0.0],
+            "multiChildType": "First", "allowCollision": true, "colliderIds": [],
+            "limitType": "None", "limitRotation": [0.0, 0.0, 0.0], "isAnimated": false,
+        }],
+        "colliders": [],
+        "unsupportedFeatures": [],
+    })
+    .to_string();
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&文, fbxバイト列, &モデル);
+    assert_eq!(コンパイル済み.report.spring_count, 1);
+    assert_eq!(コンパイル済み.bones.springs[0].name, "A");
+    let 関節: Vec<usize> = コンパイル済み.bones.springs[0]
+        .joints
+        .iter()
+        .map(|関節| 関節.node)
+        .collect();
+    assert_eq!(関節, vec![1, 2], "avatarの子から始まる");
+}
+
+/// 未マップのノードを含む鎖は落とし、飛ばして接続しない。
+#[test]
+fn 未マップを含む鎖は落とす() {
+    // Gはscene追加で未マップ。Hの下にぶら下がる。
+    let 名前 = ["Top", "H", "G"];
+    let 親: Vec<Option<usize>> = vec![None, Some(0), Some(1)];
+    let 位置 = [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]];
+    let mut 子: Vec<Vec<usize>> = vec![Vec::new(); 名前.len()];
+    for (子索引, 親索引) in 親.iter().enumerate() {
+        if let Some(親索引) = 親索引 {
+            子[*親索引].push(子索引);
+        }
+    }
+    let ノード = 名前
+        .iter()
+        .enumerate()
+        .map(|(索引, 名)| VrmNode {
+            name: (*名).to_string(),
+            parent: 親[索引],
+            children: 子[索引].clone(),
+            local: 平行移動行列(位置[索引]),
+        })
+        .collect();
+    let モデル = VrmModel {
+        root: 単位行列(),
+        nodes: ノード,
+        skins: Vec::new(),
+        meshes: Vec::new(),
+        expressions: VrmExpressions::default(),
+        spring_bones: VrmSpringBones::default(),
+    };
+    // sidecarはTopとHだけを持ち、Gは出所なし（scene追加）で残す。
+    let fbxバイト列 = b"fake-fbx";
+    let 出所 = |パス: &[&str]| serde_json::json!({"modelId": "milfy", "path": パス, "assetGuid": "g", "localId": -1});
+    let trs = |位置: [f64; 3]| {
+        serde_json::json!({
+            "position": 位置,
+            "rotation": [0.0, 0.0, 0.0, 1.0],
+            "scale": [1.0, 1.0, 1.0],
+        })
+    };
+    let 文 = serde_json::json!({
+        "format": "vrctom.physics",
+        "schemaVersion": 1,
+        "generator": {"name": "試験", "version": "0.1"},
+        "capture": {
+            "statePolicy": "edit-mode",
+            "coordinateSpace": "unity-avatar-root-local-meters",
+            "avatarRootId": "n:0",
+            "rootScale": [1.0, 1.0, 1.0],
+        },
+        "sourceModels": [{"id": "milfy", "sha256": sha256_hex(fbxバイト列)}],
+        "nodes": [
+            {"id": "n:0", "parentId": None::<String>, "name": "Top", "siblingIndex": 0,
+             "scenePath": ["Milfy", "Top"], "source": 出所(&["Top"]), "referenceLocal": trs([0.0, 0.0, 0.0])},
+            {"id": "n:1", "parentId": "n:0", "name": "H", "siblingIndex": 0,
+             "scenePath": ["Milfy", "Top", "H"], "source": 出所(&["Top", "H"]), "referenceLocal": trs([0.0, 1.0, 0.0])},
+            {"id": "n:2", "parentId": "n:1", "name": "G", "siblingIndex": 0,
+             "scenePath": ["Milfy", "Top", "H", "G"], "source": None::<serde_json::Value>, "referenceLocal": trs([0.0, 1.0, 0.0])},
+        ],
+        "physBones": [{
+            "id": "pb:0", "componentNodeId": "n:1", "rootNodeId": "n:1", "enabled": true,
             "version": "1.1", "integrationType": "Simplified", "ignoreNodeIds": [],
             "ignoreOtherPhysBones": false, "endpointPosition": [0.0, 0.0, 0.0],
             "multiChildType": "Ignore", "allowCollision": true, "colliderIds": [],
@@ -1061,11 +1703,144 @@ fn 子の循環でも止まって重なりで切る() {
     .to_string();
     let (_, _, コンパイル済み) =
         文から解決してコンパイルする(&文, fbxバイト列, &モデル);
-    let 関節: Vec<usize> = コンパイル済み.bones.springs[0]
-        .joints
+    assert_eq!(コンパイル済み.report.spring_count, 0);
+    assert_eq!(コンパイル済み.report.skipped_bones.len(), 1);
+    match &コンパイル済み.report.skipped_bones[0].reason {
+        vrctom::vrm::SkippedBoneReason::UnmappedJoint { node } => {
+            assert_eq!(node, "n:2");
+        }
+        他 => panic!("未マップで落とす: {他:?}"),
+    }
+}
+
+/// 循環するsidecarは検証で拒否する。
+#[test]
+fn 循環するsidecarは検証で拒否する() {
+    let fbxバイト列 = b"fake-fbx";
+    let mut 値: serde_json::Value = serde_json::from_str(&髪sidecarを作る(
+        fbxバイト列,
+        &書き出し可能モデルを作る(),
+    ))
+    .expect("合成sidecarは読める");
+    // n:0の親をn:1にして循環させる。
+    値["nodes"][0]["parentId"] = serde_json::json!("n:1");
+    assert_eq!(
+        PhysicsSidecar::from_json(&値.to_string(), &PhysicsLimits::new())
+            .expect_err("循環は拒否する")
+            .kind(),
+        VrmErrorKind::InvalidPhysicsSidecar
+    );
+}
+
+/// ゼロ長区間でspringを分け、関節を重ねない。
+#[test]
+fn ゼロ長区間で分割し重ねない() {
+    // Top-A-B-C-D の直鎖。BとCは同位置で区間が長さ0である。
+    // Bはheadにならず、Aのspringの端末で終わる。Cが次のspringを始める。
+    let 名前 = ["Top", "A", "B", "C", "D"];
+    let 親: Vec<Option<usize>> = vec![None, Some(0), Some(1), Some(2), Some(3)];
+    // BとCは同じ世界位置になり、区間の長さが0である。
+    // localは親からの差分のため、Cはゼロベクトルにする。
+    let 位置 = [
+        [0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ];
+    let mut 子: Vec<Vec<usize>> = vec![Vec::new(); 名前.len()];
+    for (子索引, 親索引) in 親.iter().enumerate() {
+        if let Some(親索引) = 親索引 {
+            子[*親索引].push(子索引);
+        }
+    }
+    let ノード = 名前
         .iter()
-        .map(|関節| 関節.node)
+        .enumerate()
+        .map(|(索引, 名)| VrmNode {
+            name: (*名).to_string(),
+            parent: 親[索引],
+            children: 子[索引].clone(),
+            local: 平行移動行列(位置[索引]),
+        })
         .collect();
-    assert_eq!(関節, vec![0, 1], "循環に戻らず止まる");
-    assert_eq!(コンパイル済み.report.shared_joint_cuts.len(), 1);
+    let モデル = VrmModel {
+        root: 単位行列(),
+        nodes: ノード,
+        skins: Vec::new(),
+        meshes: Vec::new(),
+        expressions: VrmExpressions::default(),
+        spring_bones: VrmSpringBones::default(),
+    };
+    let fbxバイト列 = b"fake-fbx";
+    let 道 = [
+        vec!["Top"],
+        vec!["Top", "A"],
+        vec!["Top", "A", "B"],
+        vec!["Top", "A", "B", "C"],
+        vec!["Top", "A", "B", "C", "D"],
+    ];
+    let ノードjson: Vec<serde_json::Value> = 道
+        .iter()
+        .enumerate()
+        .map(|(索引, 通)| {
+            let 親 = if 索引 == 0 {
+                serde_json::Value::Null
+            } else {
+                let 親索引 = モデル.nodes[索引].parent.expect("親がある");
+                serde_json::json!(format!("n:{親索引}"))
+            };
+            ノードjson(
+                &モデル,
+                &format!("n:{索引}"),
+                親.as_str(),
+                索引,
+                &["Milfy"],
+                &通.to_vec(),
+            )
+        })
+        .collect();
+    let mut 文: serde_json::Value = serde_json::from_str(&髪sidecarを作る(
+        fbxバイト列,
+        &書き出し可能モデルを作る(),
+    ))
+    .expect("合成sidecarは読める");
+    文["nodes"] = serde_json::Value::Array(ノードjson);
+    // 骨のrootはA(n:1)にし、avatar rootを避ける。
+    文["physBones"][0]["componentNodeId"] = serde_json::json!("n:1");
+    文["physBones"][0]["rootNodeId"] = serde_json::json!("n:1");
+    // multiChildTypeは単一子のままにする。
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+    assert_eq!(コンパイル済み.report.spring_count, 2);
+    let 名前: Vec<&str> = コンパイル済み
+        .bones
+        .springs
+        .iter()
+        .map(|spring| spring.name.as_str())
+        .collect();
+    assert_eq!(名前, vec!["A", "C"]);
+    // 関節は重ならず、ゼロ長記録が残る。
+    let mut 全部 = Vec::new();
+    for spring in &コンパイル済み.bones.springs {
+        for 関節 in &spring.joints {
+            全部.push(関節.node);
+        }
+    }
+    全部.sort_unstable();
+    let mut 重複なし = 全部.clone();
+    重複なし.dedup();
+    assert_eq!(全部, vec![1, 2, 3, 4], "A・BとC・Dに分かれる");
+    assert_eq!(全部, 重複なし, "関節は重ならない");
+    assert_eq!(コンパイル済み.report.zero_length_joints.len(), 1);
+    assert_eq!(コンパイル済み.report.zero_length_joints[0].bone, "pb:0");
+    assert_eq!(コンパイル済み.report.zero_length_joints[0].parent, "n:2");
+    assert_eq!(コンパイル済み.report.zero_length_joints[0].child, "n:3");
+    assert!(コンパイル済み.report.truncated_chains.is_empty());
+    // 書き出しは親子連鎖と一意性を満たす。
+    let mut モデル = モデル;
+    モデル.spring_bones = コンパイル済み.bones;
+    モデル
+        .to_vrm(&書き出し設定を作る())
+        .expect_err("humanoid不足は従来どおり失敗する");
 }

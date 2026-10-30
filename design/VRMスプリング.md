@@ -23,7 +23,7 @@ flowchart LR
     model[VrmModel<br/>ノード階層] --> resolve
     parse --> resolve
     resolve --> out[PhysicsResolution<br/>対応表・未解決・変換行列]
-    out --> comp[compile_springs<br/>線形チェーン・第一近似]
+    out --> comp[compile_springs<br/>分岐分割・第一近似]
     sidecar2[PhysicsSidecar<br/>値] --> comp
     comp --> bones[VrmSpringBones<br/>診断付き]
     bones --> next[次単位<br/>完全移植]
@@ -128,7 +128,7 @@ sidecarの `capture.coordinateSpace` はUnityの左手系
 
 ## 保証しないこと
 
-- スプリングチェーンの完全なコンパイルはしない。出力するのは線形チェーンと
+- スプリングチェーンの完全なコンパイルはしない。出力するのは分岐分割した鎖と
   第一近似の値だけであり、制限は [`VRMスプリング`](#出力範囲と制限) に残す。
   参照実装の完全移植は次の作業単位である。
 - シーン追加ノードの補助生成はしない。参照があれば保留として失敗する。
@@ -137,23 +137,39 @@ sidecarの `capture.coordinateSpace` はUnityの左手系
 
 ## 出力範囲と制限
 
-`compile_springs` は各解決済みPhysBoneにつき1本の線形チェーンを作る。
-rootから子を深さ優先で辿り、最初の子だけを採用する。`ignore_nodes` の
-部分木・他のPhysBoneのroot・先行springと重なる関節で切る。rootが重なって
-空鎖になったspringは作らず、理由とともに報告する。
-分岐・endpoint生成・ゼロ長の分割・joint所有権の完全再現・limit・center・
-曲線の再現はしない。近似と切り捨ては [`SpringCompileReport`] に残し、
-CLIのstderrにも主要な件数を出す。
+`compile_springs` はPhysBoneごとに木を作り、分岐を分割してspring列を作る。
+sidecarノードを `parentId` と `siblingIndex` 順に辿る深さ優先探索であり、
+VrmModel（FBX）の子順は使わない。`ignore_nodes` の部分木を除き、
+`ignoreOtherPhysBones` が真の場合だけ他のPhysBoneのrootの部分木を除く。
+分岐のAimは `multiChildType` で決める。
+所有権は解決順（sidecarのcapture順）に確定し、ノードは最初のPlanが所有する。
+avatar rootは所有せず、jointにもしない。rootの子からspringを開始する。
+springは所有しAimし、長さを持つ骨のうち、親が無い・親が所有外・
+親が自分をAimしていない・親との区間が長さ0のいずれかであるものを
+headとして始め、所有するAim先を辿る。端末の骨も関節に含み、親子連鎖を保つ。
+長さの無い骨はheadにならず、前springの端末として終わり、
+そのAim先が次のspringを始める。
+jointにできない未解決ノードが混ざる鎖は落とし、飛ばして接続はしない。
+endpoint生成・平均tail生成・ゼロ長分割・limit・center・曲線の再現はしない。
+近似と切り捨ては [`SpringCompileReport`] に残し、CLIのstderrにも主要な件数を出す。
 
 ```mermaid
 flowchart LR
-    res[PhysicsResolution<br/>対応表] --> chain[線形チェーン<br/>first child]
-    side[PhysicsSidecar<br/>値・参照] --> chain
-    model[VrmModel<br/>階層] --> chain
-    chain --> bones[VrmSpringBones<br/>springs・colliders・groups]
-    chain --> rep[SpringCompileReport<br/>分岐・近似・未出力]
+    res[PhysicsResolution<br/>対応表] --> plan[Plan<br/>所有権の確定]
+    side[PhysicsSidecar<br/>値・親子・sibling順] --> plan
+    model[VrmModel<br/>ノード名] --> plan
+    plan --> springs[ springs<br/>分岐分割・head起点]
+    springs --> bones[VrmSpringBones<br/>springs・colliders・groups]
+    springs --> rep[SpringCompileReport<br/>分岐・近似・未出力]
     bones --> glb[VRMC_springBone<br/>specVersion 1.0]
 ```
+
+分岐の扱いは次のとおりである。
+
+- 子1件または `First` は最初の子をAimする。
+- `Ignore` で子が複数の場合はAimなしとし、そのboneでspringを終了する。
+  各子は新しいspringのheadになり得る。
+- `Average` は今回は最初の子に畳み、近似として記録する。平均tail生成は次段階である。
 
 パラメータは第一近似であり、参照実装準拠ではない。
 

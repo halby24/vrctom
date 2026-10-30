@@ -326,18 +326,20 @@ fn export(
             Ok(compiled) => {
                 // 主要な近似件数も出し、文書の制限と突き合わせられるようにする。
                 let summary = format!(
-                    "スプリング{}件 関節{}件 collider{}件 グループ{}件 分岐{}件 近似(曲線base{} endpoint未生成{} gravity0関節{} first-child{} 平面落下{}) 空鎖{}件",
+                    "スプリング{}件 関節{}件 collider{}件 グループ{}件 分岐{}件 近似(曲線base{} endpoint未生成{} gravity0関節{} first-child{} 平均近似{} 平面落下{}) 共有{}件 スキップ{}件",
                     compiled.report.spring_count,
                     compiled.report.joint_count,
                     compiled.report.collider_count,
                     compiled.report.group_count,
-                    compiled.report.skipped_branches.len(),
+                    compiled.report.branch_splits.len(),
                     compiled.report.curve_base_used.len(),
                     compiled.report.no_endpoint.len(),
                     compiled.report.gravity_zero_joints,
                     compiled.report.first_child_multichild.len(),
+                    compiled.report.average_approximated.len(),
                     compiled.report.plane_colliders_dropped.len(),
-                    compiled.report.skipped_empty_chains.len(),
+                    compiled.report.lost_nodes.len(),
+                    compiled.report.skipped_bones.len(),
                 );
                 model.spring_bones = compiled.bones;
                 spring_summary = Some(summary);

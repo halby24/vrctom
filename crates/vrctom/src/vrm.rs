@@ -34,11 +34,11 @@ pub use material::{
 };
 use matrix::IDENTITY;
 pub use physics::{
-    CompiledSprings, CurveBaseUsed, PhysicsLimits, PhysicsResolution, PhysicsSidecar,
-    ResolvedCollider, ResolvedPhysBone, RootCut, SharedJointCut, SidecarCurve, SkippedBranch,
-    SkippedEmptyChain, SpringCompileOptions, SpringCompileReport, VrmSpring, VrmSpringBones,
-    VrmSpringCollider, VrmSpringColliderGroup, VrmSpringColliderShape, VrmSpringJoint,
-    ZeroLengthJoint, compile_springs,
+    BranchSplit, CompiledSprings, CurveBaseUsed, LostNode, OwnedSpring, PhysicsLimits,
+    PhysicsResolution, PhysicsSidecar, ResolvedCollider, ResolvedPhysBone, RootCut, SharedNode,
+    SidecarCurve, SkippedBone, SkippedBoneReason, SpringCompileOptions, SpringCompileReport,
+    VrmSpring, VrmSpringBones, VrmSpringCollider, VrmSpringColliderGroup, VrmSpringColliderShape,
+    VrmSpringJoint, ZeroLengthJoint, compile_springs,
 };
 use std::collections::{HashMap, HashSet};
 

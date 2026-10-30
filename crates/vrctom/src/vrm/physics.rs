@@ -3,8 +3,8 @@
 //! 入口は [`PhysicsSidecar::parse`]（バイト列の検証）と
 //! [`VrmModel::resolve_physics_sidecar`](crate::vrm::VrmModel::resolve_physics_sidecar)
 //! （`VrmModel` のノードへの対応付け）、[`compile_springs`]（`VrmSpringBones` の
-//! 生成）である。完全な参照実装一致（分岐・endpoint・limit・center・曲線の再現）は
-//! 次の作業単位であり、ここでは線形チェーンと第一近似の値を出すだけである。
+//! 生成）である。完全な参照実装一致（endpoint・limit・center・曲線の再現）は
+//! 次の作業単位であり、ここでは分岐分割した鎖と第一近似の値を出すだけである。
 
 use std::collections::{HashMap, HashSet};
 
@@ -96,7 +96,7 @@ impl Default for PhysicsLimits {
 /// VRMのスプリングボーン全体。[`compile_springs`] が作り、書き出し層が出力する。
 #[derive(Debug, Clone, Default)]
 pub struct VrmSpringBones {
-    /// スプリング列。PhysBoneごとに1件の線形チェーンである。
+    /// スプリング列。PhysBoneごとの木を分岐分割した線形鎖である。
     pub springs: Vec<VrmSpring>,
     /// collider列。参照されるsphere/capsuleだけを含む。
     pub colliders: Vec<VrmSpringCollider>,
@@ -104,10 +104,10 @@ pub struct VrmSpringBones {
     pub collider_groups: Vec<VrmSpringColliderGroup>,
 }
 
-/// スプリング1件。1本のPhysBoneに対応する線形チェーンである。
+/// スプリング1件。PhysBoneの木を分岐分割した線形鎖の1本である。
 #[derive(Debug, Clone, Default)]
 pub struct VrmSpring {
-    /// スプリング名。sidecarのPhysBone IDである。
+    /// スプリング名。先頭関節のノード名である。
     pub name: String,
     /// 関節列。親から子への順である。
     pub joints: Vec<VrmSpringJoint>,
@@ -1709,19 +1709,17 @@ pub struct SpringCompileReport {
     pub collider_count: usize,
     /// 出力したcolliderグループ数。
     pub group_count: usize,
-    /// 分岐で捨てた子。最初の子だけを採用した記録である。
-    pub skipped_branches: Vec<SkippedBranch>,
+    /// 分岐の分割記録。Aimした子とheadになり得る子を持つ。
+    pub branch_splits: Vec<BranchSplit>,
     /// 他のPhysBoneのrootで切断した記録。
     pub cut_at_other_roots: Vec<RootCut>,
-    /// 先行springと関節が重なるため切断した記録。
-    pub shared_joint_cuts: Vec<SharedJointCut>,
-    /// joint上限で切断したspringのID。
+    /// joint上限で切断したspring名（先頭関節のノード名）。
     pub truncated_chains: Vec<String>,
     /// 長さがほぼ0の区間。分割せずそのまま残した記録である。
     pub zero_length_joints: Vec<ZeroLengthJoint>,
     /// 曲線のbase値を使った記録。キー列は評価しない。
     pub curve_base_used: Vec<CurveBaseUsed>,
-    /// `1 - spring` が範囲外で丸めたspringのID。
+    /// `1 - spring` が範囲外で丸めたPhysBoneのID。
     pub drag_clamped: Vec<String>,
     /// 無効化されていたが出力したPhysBoneのID。VRMに有効無効は無い。
     pub disabled_bones: Vec<String>,
@@ -1733,76 +1731,129 @@ pub struct SpringCompileReport {
     pub plane_colliders_dropped: Vec<String>,
     /// VRMに写せない指定（`insideBounds`・`bonesAsSpheres`）を持つcolliderの記録。
     pub ignored_collider_options: Vec<String>,
-    /// 空鎖のためspringにしなかった記録。rootの重なりでのみ起こる。
-    pub skipped_empty_chains: Vec<SkippedEmptyChain>,
-    /// `center` を付けなかったspringのID。今回は全件である。
+    /// `center` を付けなかったspringのPhysBone ID。今回は全件である。
     pub center_missing: Vec<String>,
-    /// endpointを生成しなかったspringのID。今回は全件である。
+    /// endpointを生成しなかったspringのPhysBone ID。今回は全件である。
     pub no_endpoint: Vec<String>,
-    /// `multiChildType` が `Ignore` 以外で最初の子に畳んだspringのID。
+    /// `multiChildType` が `Ignore` 以外で最初の子に畳んだspringのPhysBone ID。
     pub first_child_multichild: Vec<String>,
     /// `gravity_power` に0を置いた関節数。今回は全関節である。
     pub gravity_zero_joints: usize,
+    /// springにならなかったPhysBoneの記録。
+    pub skipped_bones: Vec<SkippedBone>,
+    /// 出力したspringごとの所有PhysBoneと関節数。
+    pub owned_springs: Vec<OwnedSpring>,
+    /// 先行Planに所有権を奪われたノードの記録。
+    pub lost_nodes: Vec<LostNode>,
+    /// 複数Planが奪い合ったノードの集約。
+    pub shared_nodes: Vec<SharedNode>,
+    /// `Average` を最初の子で近似したPhysBoneのID。平均tail生成は次段階である。
+    pub average_approximated: Vec<String>,
 }
 
-/// 空鎖でspringにしなかった記録1件。
+/// 分岐の分割記録1件。ノードはsidecar IDで指す。
 #[derive(Debug, Clone)]
-pub struct SkippedEmptyChain {
-    /// spring名（PhysBone ID）。
-    pub spring: String,
-    /// rootを先に確保したspring名（PhysBone ID）。
+pub struct BranchSplit {
+    /// PhysBoneのID。
+    pub bone: String,
+    /// 分岐元のsidecarノードID。
+    pub node: String,
+    /// Aimした子。`Ignore` 分岐では `None` である。
+    pub aimed: Option<String>,
+    /// 新しいspringのheadになり得る子。Aimした子は含まない。
+    pub heads: Vec<String>,
+}
+
+/// springにならなかったPhysBone1件。
+#[derive(Debug, Clone)]
+pub struct SkippedBone {
+    /// PhysBoneのID。
+    pub bone: String,
+    /// springにしなかった理由。
+    pub reason: SkippedBoneReason,
+}
+
+/// springにしない理由。閉じた集合である。
+#[derive(Debug, Clone)]
+pub enum SkippedBoneReason {
+    /// rootが無視指定に含まれる。
+    RootIgnored,
+    /// rootの所有権を先行Planが持つ。
+    RootShared {
+        /// 先に所有したPhysBoneのID。
+        owner: String,
+    },
+    /// Aim先が所有外で区間を持たない。
+    AimTargetUnowned,
+    /// 所有したAim骨が無い。
+    NoHeads,
+    /// 関節にできないsidecarノードを含む。飛ばして接続はしない。
+    UnmappedJoint {
+        /// sidecarノードID。
+        node: String,
+    },
+}
+
+/// 出力したspring1件の所有記録。
+#[derive(Debug, Clone)]
+pub struct OwnedSpring {
+    /// 所有するPhysBoneのID。
+    pub bone: String,
+    /// spring名。先頭関節のノード名である。
+    pub name: String,
+    /// 関節数。
+    pub joints: usize,
+}
+
+/// 所有権を奪われたノード1件。ノードはsidecar IDで指す。
+#[derive(Debug, Clone)]
+pub struct LostNode {
+    /// 奪われたPlanのPhysBone ID。
+    pub bone: String,
+    /// 奪われたsidecarノードID。
+    pub node: String,
+    /// 所有するPhysBoneのID。
     pub owner: String,
 }
 
-/// 分岐で捨てた子1件。
+/// 奪い合ったノードの集約1件。ノードはsidecar IDで指す。
 #[derive(Debug, Clone)]
-pub struct SkippedBranch {
-    /// spring名（PhysBone ID）。
-    pub spring: String,
-    /// 分岐元のVrmノード索引。
-    pub node: usize,
-    /// 捨てた子のVrmノード索引列。採用した最初の子は含まない。
-    pub skipped: Vec<usize>,
+pub struct SharedNode {
+    /// 奪い合ったsidecarノードID。
+    pub node: String,
+    /// 所有するPhysBoneのID。
+    pub owner: String,
+    /// 奪われたPlanのPhysBone ID列。
+    pub lost_by: Vec<String>,
 }
 
 /// 他のPhysBoneのrootでの切断1件。
 #[derive(Debug, Clone)]
 pub struct RootCut {
-    /// spring名（PhysBone ID）。
-    pub spring: String,
-    /// 切断したVrmノード索引。他のPhysBoneのrootである。
-    pub node: usize,
+    /// 切断した側のPhysBone ID。
+    pub bone: String,
+    /// 切断したsidecarノードID。他のPhysBoneのrootである。
+    pub node: String,
     /// 他のPhysBoneのID。
     pub other_bone: String,
-}
-
-/// 関節の重なりでの切断1件。
-#[derive(Debug, Clone)]
-pub struct SharedJointCut {
-    /// spring名（PhysBone ID）。
-    pub spring: String,
-    /// 重なったVrmノード索引。ここから先は伸ばさない。
-    pub node: usize,
-    /// 先に確保したspring名（PhysBone ID）。
-    pub owner: String,
 }
 
 /// 長さがほぼ0の区間1件。
 #[derive(Debug, Clone)]
 pub struct ZeroLengthJoint {
-    /// spring名（PhysBone ID）。
-    pub spring: String,
-    /// 親のVrmノード索引。
-    pub parent: usize,
-    /// 子のVrmノード索引。
-    pub child: usize,
+    /// PhysBoneのID。
+    pub bone: String,
+    /// 親のsidecarノードID。
+    pub parent: String,
+    /// 子のsidecarノードID。
+    pub child: String,
 }
 
 /// 曲線のbase値使用1件。
 #[derive(Debug, Clone)]
 pub struct CurveBaseUsed {
-    /// spring名（PhysBone ID）。
-    pub spring: String,
+    /// PhysBoneのID。
+    pub bone: String,
     /// 曲線名（`radius`・`spring`・`stiffness`）。
     pub field: &'static str,
     /// 使わなかったキー数。
@@ -1931,12 +1982,15 @@ fn convert_collider_shape(
 
 /// `PhysicsResolution` と `PhysicsSidecar` から `VrmSpringBones` を作る。
 ///
-/// 各解決済みPhysBoneにつき1本の線形チェーンを作る。rootから子を深さ優先で辿り、
-/// 最初の子だけを採用する。`ignore_nodes` の部分木・他のPhysBoneのroot・先行springと
-/// 重なる関節で切る。rootが重なって空鎖になったspringは作らず、報告に残す。
+/// PhysBoneごとにsidecarの親子と `siblingIndex` 順の木を作り、
+/// `ignore_nodes` の部分木と（`ignoreOtherPhysBones` が真の場合だけ）
+/// 他のPhysBoneのrootの部分木を除く。分岐のAimは `multiChildType` で決め、
+/// 所有権は解決順の先勝ちで確定する。springは所有しAimする長さのある骨のうち、
+/// 親がAimしていないものをheadとして始め、所有するAim先を辿る。
+/// 長さの無い骨はheadにならず、前springの端末として終わる。
 /// colliderはroot基準で換算する。`position`・`rotation` はrootローカルの値であり、
 /// 鏡像だけを適用する。componentは追従対象の識別にだけ使う。
-/// 分岐・endpoint・limit・center・曲線の再現はしない。
+/// endpoint生成・平均tail生成・ゼロ長分割・limit・center・曲線の再現はしない。
 /// パラメータは第一近似であり、詳細は [`SpringCompileReport`] に残る。
 /// 参照実装の完全移植ではなく、近似であることを診断と文書に明記する。
 ///
@@ -1967,17 +2021,53 @@ pub fn compile_springs(
         .iter()
         .map(|collider| (collider.id.as_str(), collider))
         .collect();
-    let worlds = model_world_matrices(model)?;
-    // 他のPhysBoneのroot集合。鎖はここで切る（有効無効を問わない）。
-    let mut root_owner: HashMap<usize, &str> = HashMap::new();
+    // sidecarノードの索引付け。木・所有権・Aimはsidecarの親子と
+    // `siblingIndex` 順で行い、VrmModel（FBX）の子順は使わない。
+    let sidecar_at: HashMap<&str, usize> = sidecar
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id.as_str(), index))
+        .collect();
+    let mut children_at: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (index, node) in sidecar.nodes.iter().enumerate() {
+        if let Some(parent) = node.parent_id.as_deref()
+            && let Some(&parent_index) = sidecar_at.get(parent)
+        {
+            children_at.entry(parent_index).or_default().push(index);
+        }
+    }
+    for children in children_at.values_mut() {
+        children.sort_by_key(|&index| {
+            (
+                sidecar.nodes[index].sibling_index,
+                sidecar.nodes[index].id.as_str(),
+            )
+        });
+    }
+    // 解決表を逆引きし、Vrm索引からsidecar索引を求める。
+    // 対応は完全一致のため、写像先が複数になることはない。
+    let vrm_to_sidecar: HashMap<usize, usize> = resolution
+        .node_map
+        .iter()
+        .map(|(id, &vrm)| (vrm, sidecar_at[id.as_str()]))
+        .collect();
+    let sidecar_worlds = sidecar_world_matrices(sidecar)?;
+    // avatar rootは所有しない。rootの子から開始・所有する。
+    let avatar_root = sidecar_at.get(sidecar.capture.avatar_root_id.as_str());
+    // 他のPhysBoneのroot集合（sidecar索引）。`ignoreOtherPhysBones` が真の
+    // 場合だけ木の構築時に部分木ごと切る。対応表は切断の診断に使う。
+    let mut root_bone: HashMap<usize, &str> = HashMap::new();
     for bone in &resolution.phys_bones {
-        root_owner.insert(bone.root_node, bone.id.as_str());
+        if let Some(&sidecar_index) = vrm_to_sidecar.get(&bone.root_node) {
+            root_bone.insert(sidecar_index, bone.id.as_str());
+        }
     }
     let mut report = SpringCompileReport::default();
-    // 先行springが確保した関節。重なりは切断し、二重所有を作らない。
-    let mut claimed: HashMap<usize, &str> = HashMap::new();
-    // springと対応する解決済みPhysBoneの組。空鎖はspringにしない。
-    let mut spring_entries: Vec<(&ResolvedPhysBone, VrmSpring)> = Vec::new();
+    // 解決順（sidecarのcapture順）にPlanを作り、ノードを最初のPlanが所有する。
+    // 所有権争いはここで確定し、後のspringは所有骨だけを使う。
+    let mut plans: Vec<ChainPlan<'_>> = Vec::with_capacity(resolution.phys_bones.len());
+    let mut owner_of: HashMap<usize, &str> = HashMap::new();
     for bone in &resolution.phys_bones {
         let Some(source) = bone_at.get(bone.id.as_str()) else {
             return Err(VrmError::new(
@@ -1988,60 +2078,194 @@ pub fn compile_springs(
         if !source.enabled {
             report.disabled_bones.push(bone.id.clone());
         }
-        let joints = trace_chain(
-            &bone.id,
-            bone.root_node,
-            &bone.ignore_nodes,
-            &root_owner,
-            &mut claimed,
-            &worlds,
-            model,
-            options.max_joints,
+        let Some(&root_sidecar) = vrm_to_sidecar.get(&bone.root_node) else {
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidPhysicsSidecar,
+                format!("解決済みPhysBoneのrootに対応するsidecarが無い: {}", bone.id),
+            ));
+        };
+        let tree = build_plan_tree(
+            sidecar,
+            bone,
+            source,
+            root_sidecar,
+            &children_at,
+            &vrm_to_sidecar,
+            &root_bone,
             &mut report,
         )?;
-        if joints.is_empty() {
-            // 空鎖はVRMに書けないためspringにしない。理由はtrace側が報告済みである。
+        if tree.is_empty() {
+            // rootが無視指定に含まれる場合だけ空になる。黙って落とさず記録する。
+            report.skipped_bones.push(SkippedBone {
+                bone: bone.id.clone(),
+                reason: SkippedBoneReason::RootIgnored,
+            });
+            continue;
+        }
+        let mut owned: Vec<usize> = Vec::new();
+        for node in tree.order() {
+            // avatar rootは所有しない。rootの子から開始・所有する。
+            if Some(&node) == avatar_root {
+                continue;
+            }
+            if let Some(&owner) = owner_of.get(&node) {
+                let id = sidecar.nodes[node].id.clone();
+                let shared = report
+                    .shared_nodes
+                    .iter_mut()
+                    .find(|entry| entry.node == id);
+                match shared {
+                    Some(entry) => {
+                        if !entry.lost_by.contains(&bone.id) {
+                            entry.lost_by.push(bone.id.clone());
+                        }
+                    }
+                    None => report.shared_nodes.push(SharedNode {
+                        node: id,
+                        owner: owner.to_owned(),
+                        lost_by: vec![bone.id.clone()],
+                    }),
+                }
+                report.lost_nodes.push(LostNode {
+                    bone: bone.id.clone(),
+                    node: sidecar.nodes[node].id.clone(),
+                    owner: owner.to_owned(),
+                });
+            } else {
+                owner_of.insert(node, bone.id.as_str());
+                owned.push(node);
+            }
+        }
+        plans.push(ChainPlan {
+            bone,
+            source,
+            root: root_sidecar,
+            tree,
+            owned,
+        });
+    }
+    report.shared_nodes.sort_by(|a, b| a.node.cmp(&b.node));
+    // springと対応する解決済みPhysBoneの組。
+    let mut spring_entries: Vec<(&ResolvedPhysBone, VrmSpring)> = Vec::new();
+    for plan in &plans {
+        let bone = plan.bone;
+        let source = plan.source;
+        let owned: HashSet<usize> = plan.owned.iter().copied().collect();
+        let head_list = plan.heads(&owned, &sidecar_worlds, sidecar, &mut report);
+        if head_list.is_empty() {
+            // 所有したAim骨が無い場合。root共有などで所有を奪われた場合に起こる。
+            let reason = match owner_of.get(&plan.root) {
+                Some(&owner) if owner != bone.id.as_str() => SkippedBoneReason::RootShared {
+                    owner: owner.to_owned(),
+                },
+                _ => SkippedBoneReason::NoHeads,
+            };
+            report.skipped_bones.push(SkippedBone {
+                bone: bone.id.clone(),
+                reason,
+            });
             continue;
         }
         let (hit_radius, stiffness, drag_force) =
             approx_joint_params(&bone.id, source, &mut report)?;
-        let joints = joints
-            .into_iter()
-            .map(|node| VrmSpringJoint {
+        for node in head_list {
+            let (joints, truncated) = trace_spring(
+                plan,
+                sidecar,
                 node,
-                hit_radius,
-                stiffness,
-                gravity_power: 0.0,
-                gravity_dir: [0.0, -1.0, 0.0],
-                drag_force,
-            })
-            .collect::<Vec<_>>();
-        report.joint_count += joints.len();
-        report.gravity_zero_joints += joints.len();
-        // centerとendpointは今回は付けない。近似として記録する。
-        report.center_missing.push(bone.id.clone());
-        report.no_endpoint.push(bone.id.clone());
-        if source.multi_child_type != SidecarMultiChildType::Ignore {
-            report.first_child_multichild.push(bone.id.clone());
+                &owned,
+                &sidecar_worlds,
+                options.max_joints,
+                &mut report,
+            );
+            // 関節をVrm索引へ写す。未解決ノードが混ざる鎖は落とし、
+            // 飛ばして接続はしない。
+            let mut vrm_joints = Vec::with_capacity(joints.len());
+            let mut unmapped: Option<String> = None;
+            for joint in &joints {
+                match resolution.node_map.get(&sidecar.nodes[*joint].id) {
+                    Some(&vrm) => vrm_joints.push(vrm),
+                    None => {
+                        unmapped = Some(sidecar.nodes[*joint].id.clone());
+                        break;
+                    }
+                }
+            }
+            if let Some(node) = unmapped {
+                report.skipped_bones.push(SkippedBone {
+                    bone: bone.id.clone(),
+                    reason: SkippedBoneReason::UnmappedJoint { node },
+                });
+                continue;
+            }
+            let name = {
+                let head_name = model.nodes[vrm_joints[0]].name.clone();
+                if head_name.is_empty() {
+                    bone.id.clone()
+                } else {
+                    head_name
+                }
+            };
+            if truncated {
+                report.truncated_chains.push(name.clone());
+            }
+            if vrm_joints.len() < 2 {
+                // Aim先が所有外で1関節だけになったspringは作らない。
+                // シミュレーションの区間を持たないためである。
+                // 切り詰めで1件になった場合は切り詰めの記録が残る。
+                if !truncated {
+                    report.skipped_bones.push(SkippedBone {
+                        bone: bone.id.clone(),
+                        reason: SkippedBoneReason::AimTargetUnowned,
+                    });
+                }
+                continue;
+            }
+            let joints = vrm_joints
+                .into_iter()
+                .map(|node| VrmSpringJoint {
+                    node,
+                    hit_radius,
+                    stiffness,
+                    gravity_power: 0.0,
+                    gravity_dir: [0.0, -1.0, 0.0],
+                    drag_force,
+                })
+                .collect::<Vec<_>>();
+            report.joint_count += joints.len();
+            report.gravity_zero_joints += joints.len();
+            // centerとendpointは今回は付けない。近似として記録する。
+            report.center_missing.push(bone.id.clone());
+            report.no_endpoint.push(bone.id.clone());
+            if source.multi_child_type != SidecarMultiChildType::Ignore
+                && !report.first_child_multichild.contains(&bone.id)
+            {
+                report.first_child_multichild.push(bone.id.clone());
+            }
+            // 平面参照の落下は骨ごとに記録する。全体の一覧は解決側が持つ。
+            if source
+                .collider_ids
+                .iter()
+                .any(|id| resolution.skipped_colliders.iter().any(|skip| skip == id))
+                && !report.plane_colliders_dropped.contains(&bone.id)
+            {
+                report.plane_colliders_dropped.push(bone.id.clone());
+            }
+            report.owned_springs.push(OwnedSpring {
+                bone: bone.id.clone(),
+                name: name.clone(),
+                joints: joints.len(),
+            });
+            spring_entries.push((
+                bone,
+                VrmSpring {
+                    name,
+                    joints,
+                    center: None,
+                    collider_groups: Vec::new(),
+                },
+            ));
         }
-        // 平面参照の落下は骨ごとに記録する。全体の一覧は解決側が持つ。
-        if source
-            .collider_ids
-            .iter()
-            .any(|id| resolution.skipped_colliders.iter().any(|skip| skip == id))
-            && !report.plane_colliders_dropped.contains(&bone.id)
-        {
-            report.plane_colliders_dropped.push(bone.id.clone());
-        }
-        spring_entries.push((
-            bone,
-            VrmSpring {
-                name: bone.id.clone(),
-                joints,
-                center: None,
-                collider_groups: Vec::new(),
-            },
-        ));
     }
     report.spring_count = spring_entries.len();
     // colliderは作ったspringが参照するものだけを、解決順に並べて出力する。
@@ -2152,125 +2376,284 @@ pub fn compile_springs(
     })
 }
 
-/// 線形チェーンを辿る。rootを含み、親から子の順で返す。
-///
-/// 最初の子だけを採用し、分岐・他root・重なり・上限で切る。切断の理由は
-/// 呼び出し側の報告に残す。
-#[allow(clippy::too_many_arguments)]
-fn trace_chain<'a>(
-    spring: &'a str,
+/// 1本のPhysBoneの計画。木と所有骨を持つ。
+/// ノード索引はすべてsidecar索引であり、Vrm索引ではない。
+struct ChainPlan<'a> {
+    /// 解決済みPhysBone。
+    bone: &'a ResolvedPhysBone,
+    /// 対応するsidecar PhysBone。
+    source: &'a SidecarPhysBone,
+    /// rootのsidecar索引。
     root: usize,
-    ignore_nodes: &[usize],
-    root_owner: &HashMap<usize, &'a str>,
-    claimed: &mut HashMap<usize, &'a str>,
-    worlds: &[[f64; 16]],
-    model: &VrmModel,
-    max_joints: usize,
+    /// rootからのDFS木。無視部分木と他のPhysBoneのrootを除く。
+    tree: PlanTree,
+    /// このPlanが所有するノード。木のDFS順である。
+    owned: Vec<usize>,
+}
+
+/// Planの木。DFS順の骨列と索引を持つ。
+#[derive(Debug, Default)]
+struct PlanTree {
+    /// DFS順の骨。
+    bones: Vec<TreeBone>,
+    /// ノード索引から骨位置への対応表。
+    at: HashMap<usize, usize>,
+}
+
+/// 木の骨1件。索引はすべてsidecar索引である。
+#[derive(Debug)]
+struct TreeBone {
+    /// sidecarノード索引。
+    node: usize,
+    /// 木の親ノード。rootは `None` である。
+    parent: Option<usize>,
+    /// Aimする子。無い場合は `None` である。
+    aim: Option<usize>,
+}
+
+impl PlanTree {
+    /// 空の木かどうか。
+    fn is_empty(&self) -> bool {
+        self.bones.is_empty()
+    }
+
+    /// 木のDFS順のノード列。
+    fn order(&self) -> impl Iterator<Item = usize> + '_ {
+        self.bones.iter().map(|bone| bone.node)
+    }
+
+    /// ノードの骨を引く。
+    fn bone(&self, node: usize) -> Option<&TreeBone> {
+        self.at.get(&node).and_then(|&index| self.bones.get(index))
+    }
+}
+
+/// PhysBoneの木を作る。rootから子孫をsidecarの親子と `siblingIndex` 順で
+/// DFSし、無視部分木を除く。他のPhysBoneのrootの部分木は
+/// `ignoreOtherPhysBones` が真の場合だけ除く。分岐のAimは `multiChildType`
+/// で決め、`Average` は今回は最初の子として扱い記録する（平均tail生成は次段階）。
+/// 循環は訪問済み判定で止まる。索引はすべてsidecar由来のため範囲外にならない。
+#[allow(clippy::too_many_arguments)]
+fn build_plan_tree(
+    sidecar: &PhysicsSidecar,
+    bone: &ResolvedPhysBone,
+    source: &SidecarPhysBone,
+    root_sidecar: usize,
+    children_at: &HashMap<usize, Vec<usize>>,
+    vrm_to_sidecar: &HashMap<usize, usize>,
+    root_bone: &HashMap<usize, &str>,
     report: &mut SpringCompileReport,
-) -> Result<Vec<usize>, VrmError> {
+) -> Result<PlanTree, VrmError> {
+    let node_id = |index: usize| sidecar.nodes[index].id.clone();
     // 無視部分木の閉包。無視ノード以下の子孫へは降りない。
+    // 無視指定はVrm索引のため、sidecar索引へ写してから辿る。
     let mut ignored = HashSet::new();
-    let mut stack: Vec<usize> = ignore_nodes.to_vec();
+    let mut stack: Vec<usize> = bone
+        .ignore_nodes
+        .iter()
+        .filter_map(|vrm| vrm_to_sidecar.get(vrm).copied())
+        .collect();
     while let Some(node) = stack.pop() {
         if !ignored.insert(node) {
             continue;
         }
-        let Some(entry) = model.nodes.get(node) else {
-            return Err(VrmError::new(
-                VrmErrorKind::InvalidPhysicsSidecar,
-                "無視ノードの索引が範囲外である",
-            ));
-        };
-        stack.extend(entry.children.iter().copied());
+        if let Some(children) = children_at.get(&node) {
+            stack.extend(children.iter().copied());
+        }
     }
-    let mut chain = vec![root];
-    // root自体の二重所有は、解決順の先勝ちでここで切る。
-    // 空鎖はVRMに書けないため、呼び出し側でspringにしない。
-    if let Some(&owner) = claimed.get(&root) {
-        report.shared_joint_cuts.push(SharedJointCut {
-            spring: spring.to_owned(),
-            node: root,
-            owner: owner.to_owned(),
-        });
-        report.skipped_empty_chains.push(SkippedEmptyChain {
-            spring: spring.to_owned(),
-            owner: owner.to_owned(),
-        });
-        return Ok(Vec::new());
+    if ignored.contains(&root_sidecar) {
+        return Ok(PlanTree::default());
     }
-    claimed.insert(root, spring);
-    let mut current = root;
-    loop {
-        let Some(entry) = model.nodes.get(current) else {
-            return Err(VrmError::new(
-                VrmErrorKind::InvalidPhysicsSidecar,
-                "鎖のノード索引が範囲外である",
-            ));
-        };
-        let mut next: Vec<usize> = entry.children.to_vec();
-        // 無視部分木は黙って落とさず、件数ではなく対象として扱う。
-        // 対象自体が通常の切り捨てのため、個別の記録は残さない。
-        next.retain(|child| !ignored.contains(child));
-        // 他のPhysBoneのrootで切る。自分自身のrootは起点であり対象外である。
-        next.retain(|child| {
-            if *child == root {
-                return true;
-            }
-            match root_owner.get(child) {
-                Some(&owner) => {
-                    report.cut_at_other_roots.push(RootCut {
-                        spring: spring.to_owned(),
-                        node: *child,
-                        other_bone: owner.to_owned(),
+    // 他のPhysBoneのrootは `ignoreOtherPhysBones` が真の場合だけ切る。
+    let cut_roots = source.ignore_other_phys_bones;
+    let mut tree = PlanTree::default();
+    // 未訪問だけを積むため、辺は必ず新規ノードへ向かう。
+    // 挿入順が位相順になり、循環は起きない。
+    let mut pending: Vec<(usize, Option<usize>)> = vec![(root_sidecar, None)];
+    while let Some((node, parent)) = pending.pop() {
+        if tree.at.contains_key(&node) {
+            continue;
+        }
+        let children: Vec<usize> = children_at
+            .get(&node)
+            .map(|siblings| {
+                siblings
+                    .iter()
+                    .copied()
+                    .filter(|child| !ignored.contains(child))
+                    .filter(|child| {
+                        if cut_roots && *child != root_sidecar && root_bone.contains_key(child) {
+                            report.cut_at_other_roots.push(RootCut {
+                                bone: bone.id.clone(),
+                                node: node_id(*child),
+                                other_bone: root_bone[child].to_owned(),
+                            });
+                            return false;
+                        }
+                        true
+                    })
+                    .filter(|child| !tree.at.contains_key(child))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let aim = match children.as_slice() {
+            [] => None,
+            [single] => Some(*single),
+            [first, rest @ ..] => match source.multi_child_type {
+                SidecarMultiChildType::First => {
+                    report.branch_splits.push(BranchSplit {
+                        bone: bone.id.clone(),
+                        node: node_id(node),
+                        aimed: Some(node_id(*first)),
+                        heads: rest.iter().map(|&child| node_id(child)).collect(),
                     });
-                    false
+                    Some(*first)
                 }
-                None => true,
-            }
-        });
-        // 先行springと重なる関節で切る。
-        let mut cut_shared: Option<(usize, String)> = None;
-        next.retain(|child| match claimed.get(child) {
-            Some(&owner) => {
-                cut_shared = Some((*child, owner.to_owned()));
-                false
-            }
-            None => true,
-        });
-        if let Some((node, owner)) = cut_shared {
-            report.shared_joint_cuts.push(SharedJointCut {
-                spring: spring.to_owned(),
-                node,
-                owner,
-            });
+                SidecarMultiChildType::Ignore => {
+                    report.branch_splits.push(BranchSplit {
+                        bone: bone.id.clone(),
+                        node: node_id(node),
+                        aimed: None,
+                        heads: children.iter().map(|&child| node_id(child)).collect(),
+                    });
+                    None
+                }
+                SidecarMultiChildType::Average => {
+                    // 平均tailは作らず、最初の子に畳む。近似として記録する。
+                    report.branch_splits.push(BranchSplit {
+                        bone: bone.id.clone(),
+                        node: node_id(node),
+                        aimed: Some(node_id(*first)),
+                        heads: rest.iter().map(|&child| node_id(child)).collect(),
+                    });
+                    if !report.average_approximated.contains(&bone.id) {
+                        report.average_approximated.push(bone.id.clone());
+                    }
+                    Some(*first)
+                }
+            },
+        };
+        tree.at.insert(node, tree.bones.len());
+        tree.bones.push(TreeBone { node, parent, aim });
+        for &child in children.iter().rev() {
+            pending.push((child, Some(node)));
         }
-        if next.is_empty() {
-            break;
-        }
-        if next.len() > 1 {
-            report.skipped_branches.push(SkippedBranch {
-                spring: spring.to_owned(),
-                node: current,
-                skipped: next[1..].to_vec(),
-            });
-        }
-        if chain.len() >= max_joints {
-            report.truncated_chains.push(spring.to_owned());
-            break;
-        }
-        let child = next[0];
-        if is_zero_length(worlds, current, child) {
-            report.zero_length_joints.push(ZeroLengthJoint {
-                spring: spring.to_owned(),
-                parent: current,
-                child,
-            });
-        }
-        claimed.insert(child, spring);
-        chain.push(child);
-        current = child;
     }
-    Ok(chain)
+    Ok(tree)
+}
+
+impl ChainPlan<'_> {
+    /// springのheadになる所有骨をDFS順で返す。
+    ///
+    /// headは所有しAimし、長さを持つ骨であり、親が無い・親が所有外・
+    /// 親が自分をAimしていない・親との区間が長さ0のいずれかである。
+    /// 長さの無い骨はheadにならず、前springの端末として終わる。
+    /// 長さ0の親区間でheadになる場合はここで記録する。
+    /// avatar rootは所有の段階で除外済みのため、ここには現れない。
+    fn heads(
+        &self,
+        owned: &HashSet<usize>,
+        worlds: &[[f64; 16]],
+        sidecar: &PhysicsSidecar,
+        report: &mut SpringCompileReport,
+    ) -> Vec<usize> {
+        let mut heads = Vec::new();
+        for bone in &self.tree.bones {
+            if !owned.contains(&bone.node) {
+                continue;
+            }
+            let Some(aim) = bone.aim else {
+                continue;
+            };
+            if is_zero_length(worlds, bone.node, aim) {
+                continue;
+            }
+            let head = match bone.parent {
+                None => true,
+                Some(parent) if !owned.contains(&parent) => true,
+                Some(parent) => {
+                    let aims_at = self
+                        .tree
+                        .bone(parent)
+                        .and_then(|entry| entry.aim)
+                        .is_some_and(|aim| aim == bone.node);
+                    if !aims_at {
+                        true
+                    } else if is_zero_length(worlds, parent, bone.node) {
+                        // 長さ0の親区間でheadになる。trace側では重ねないため、
+                        // ここで記録する。
+                        report.zero_length_joints.push(ZeroLengthJoint {
+                            bone: self.bone.id.clone(),
+                            parent: sidecar.nodes[parent].id.clone(),
+                            child: sidecar.nodes[bone.node].id.clone(),
+                        });
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+            if head {
+                heads.push(bone.node);
+            }
+        }
+        heads
+    }
+}
+
+/// headからAimを辿り、関節列を作る。所有骨だけを通り、Aimなし・所有外・
+/// 上限・長さ0で止まる。端末の骨も関節に含み、親子連鎖を保つ。
+/// ゼロ長区間の先がheadになる場合は重ねずに終わり、先が自身のspringを始める。
+/// 辺は挿入順が位相順のため、循環で無限反復しない。
+#[allow(clippy::too_many_arguments)]
+fn trace_spring(
+    plan: &ChainPlan<'_>,
+    sidecar: &PhysicsSidecar,
+    head: usize,
+    owned: &HashSet<usize>,
+    worlds: &[[f64; 16]],
+    max_joints: usize,
+    report: &mut SpringCompileReport,
+) -> (Vec<usize>, bool) {
+    let node_id = |index: usize| sidecar.nodes[index].id.clone();
+    // 長さを持つかどうか。Aim先があり、区間が長さ0でない場合である。
+    let has_length = |node: usize| {
+        plan.tree
+            .bone(node)
+            .and_then(|bone| bone.aim)
+            .is_some_and(|aim| !is_zero_length(worlds, node, aim))
+    };
+    let mut joints = vec![head];
+    let mut truncated = false;
+    let mut current = head;
+    while let Some(next) = plan.tree.bone(current).and_then(|entry| entry.aim) {
+        if !owned.contains(&next) {
+            break;
+        }
+        if joints.len() >= max_joints {
+            truncated = true;
+            break;
+        }
+        let zero_segment = is_zero_length(worlds, current, next);
+        if zero_segment && has_length(next) {
+            // 長さの無い区間の先がheadになる場合は重ねない。
+            // 記録はhead側の判定で行う。
+            break;
+        }
+        if zero_segment {
+            report.zero_length_joints.push(ZeroLengthJoint {
+                bone: plan.bone.id.clone(),
+                parent: node_id(current),
+                child: node_id(next),
+            });
+        }
+        joints.push(next);
+        if !has_length(next) {
+            break;
+        }
+        current = next;
+    }
+    (joints, truncated)
 }
 
 /// 関節パラメータの第一近似を求める。
@@ -2279,7 +2662,7 @@ fn trace_chain<'a>(
 /// `drag_force` は `1 - spring` を0〜1に丸める。`gravity` 系は使わない。
 /// 近似した箇所は報告に残す。参照実装の式への置き換えが前提である。
 fn approx_joint_params(
-    spring: &str,
+    bone: &str,
     source: &SidecarPhysBone,
     report: &mut SpringCompileReport,
 ) -> Result<(f32, f32, f32), VrmError> {
@@ -2290,7 +2673,7 @@ fn approx_joint_params(
     ] {
         if !curve.keys.is_empty() {
             report.curve_base_used.push(CurveBaseUsed {
-                spring: spring.to_owned(),
+                bone: bone.to_owned(),
                 field,
                 keys: curve.keys.len(),
             });
@@ -2300,21 +2683,21 @@ fn approx_joint_params(
     if hit_radius < 0.0 {
         return Err(VrmError::new(
             VrmErrorKind::InvalidPhysicsSidecar,
-            format!("半径が0以上の有限値でない: {spring}"),
+            format!("半径が0以上の有限値でない: {bone}"),
         ));
     }
     let stiffness = to_f32_finite(source.stiffness.value, "硬さ")?;
     if !stiffness.is_finite() || stiffness < 0.0 {
         return Err(VrmError::new(
             VrmErrorKind::InvalidPhysicsSidecar,
-            format!("硬さが0以上の有限値でない: {spring}"),
+            format!("硬さが0以上の有限値でない: {bone}"),
         ));
     }
     let spring_base = to_f32_finite(source.spring.value, "ばね")?;
     let raw = 1.0 - spring_base;
     let drag_force = raw.clamp(0.0, 1.0);
     if drag_force != raw {
-        report.drag_clamped.push(spring.to_owned());
+        report.drag_clamped.push(bone.to_owned());
     }
     Ok((hit_radius, stiffness, drag_force))
 }
