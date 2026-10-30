@@ -1,0 +1,139 @@
+# VRMスプリング
+
+## 担当責務
+
+この文書は、Unityヘルパが出力する物理sidecar（JSON）を読み、
+参照解決と座標検証までを行う設計を担当する。sidecarの目的・スキーマ・
+IDとパスの規則・完全一致の対応付け・座標ゲート・上限と失敗条件を持つ。
+スプリングチェーンのコンパイル・VRMへの書き出し・補助ノードの生成・
+平面colliderや拘束の解釈・FX既定姿勢の評価は担当しない。
+
+中間表現は [`VRM中間モデル`](VRM中間モデル.md) が持ち、
+GLBへの書き出しは [`VRM書き出し`](VRM書き出し.md) が行う。
+この文書はその前段の参照解決だけをまとめる。
+
+## 設計概要
+
+```mermaid
+flowchart LR
+    helper[Unityヘルパ<br/>PhysBone・collider走査] --> json[sidecar JSON<br/>vrctom.physics v1]
+    json --> parse[PhysicsSidecar::parse<br/>検証のみ]
+    fbx[FBXバイト列] --> resolve[VrmModel::resolve_physics_sidecar<br/>SHA照合・完全一致・座標ゲート]
+    model[VrmModel<br/>ノード階層] --> resolve
+    parse --> resolve
+    resolve --> out[PhysicsResolution<br/>対応表・未解決・変換行列]
+    out --> next[次単位<br/>物理コンパイル]
+```
+
+sidecarはUnityにしか無い情報（PhysBoneの付属・連鎖・collider参照・
+参照姿勢のローカルTRS）を運ぶ。Rust側はFBX由来の `VrmModel` と突き合わせ、
+名前の推測をせずに厳密に対応付ける。推測で軸や単位を決めない。
+
+## sidecarのスキーマ
+
+`format` は `vrctom.physics`、`schemaVersion` は `1` である。
+`generator` は出力元の名残、`capture` は取得時の条件、
+`sourceModels` は参照元のFBX、`nodes`・`physBones`・`colliders` は
+参照対象、`unsupportedFeatures` は未対応機能の名残である。
+
+`Curve` の `keys` は時刻・値・傾き・重みの組を持つ。空の場合は
+`value` を使う。`weightedMode` が0以外・未知のwrap値は明示的に失敗し、
+近似しない。
+
+列挙は文字列で受け、未知値は失敗する。
+
+| 項目 | 値 |
+|---|---|
+| `integrationType` | `Simplified`・`Advanced` |
+| `multiChildType` | `Ignore`・`First`・`Average` |
+| `immobileType` | `AllMotion`・`World` |
+| `limitType` | `None`・`Angle`・`Hinge`・`Polar` |
+| `shapeType` | `Sphere`・`Capsule`・`Plane` |
+
+`source` はFBX由来ノードだけが持つ。`path` はFBXルートからの名前列である。
+シーン追加ノード（`Ground`・`Cardigan_Con` など）は `source: null` である。
+`unsupportedFeatures` は `stretch`・`external-colliders`・`plane-colliders`
+などの文字列を運ぶだけで、今回は検証しない。
+
+## IDとパスの規則
+
+IDは `n:`・`pb:`・`c:` の接頭辞を持ち、sidecar全体で一意である。
+接頭辞違いの混同を避けるため、種類をまたいだ重複も拒否する。
+
+ノードの結び付きは `parentId` で表す。循環した親子は失敗する。
+
+対応付けの鍵は `source.path`（FBXルートからの名前列）であり、
+`scenePath`（シーンルートからの名前列）は診断用である。
+`VrmModel` 側はルートからの名前列を索引化し、`source.path` と
+完全一致した場合だけ対応付ける。接尾辞一致・一意名の自動補完はしない。
+診断用に候補を返すことはあるが、対応の決定には使わない。
+
+## 対応解決
+
+`VrmModel::resolve_physics_sidecar` は次の順で進める。
+
+1. `capture.statePolicy` が `bind-pose` または `edit-mode` であることを確かめる。
+   変換にはFBXのbind姿勢と一致する `bind-pose` を推奨する。
+   それ以外は今回未対応として失敗する。
+2. FBXバイト列のSHA-256を求め、`sourceModels` と照合する。
+   一致がちょうど1件でない場合は失敗する。
+3. 完全一致で対応付ける。0件・複数件・出所なしの参照は失敗する。
+4. `source: null` のノードは、参照されていなければ未解決報告に残して続ける。
+   参照されている場合は次単位の補助ノード生成が必要なため、明示的に失敗する。
+   名前で近似しない。
+5. PhysBone・colliderの参照IDを対応表で引き、存在と一意性を確かめる。
+   平面colliderは今回の出力対象外として除外し、`PhysicsResolution` に報告する。
+6. 座標ゲートで単一の変換行列を確かめ、`PhysicsResolution` に保持する。
+
+`PhysicsResolution` はsidecarノードIDからVrmノード索引への対応表・
+未解決の追加ノード・PhysBoneとcolliderの参照・座標変換行列を持つ。
+今回の出力には使わず、次単位の物理コンパイルが使う。
+
+## 座標ゲート
+
+sidecarの参照ローカルTRSから参照世界行列を、
+`VrmModel` の `root` とローカル行列から出力世界行列を組み立てる。
+sidecarの `capture.coordinateSpace` はUnityの左手系
+（`unity-avatar-root-local-meters`）であるため、参照世界をVRMの右手系へ
+変換してから比較する。変換は位置のX反転とクォータニオンの
+`(x, -y, -z, w)` であり、階層のローカルにも同じ変換を適用する。
+
+対応する物理参照ノードで `model_world * inverse(converted_sidecar_world)` が
+単一の行列に一致するか確かめる。許容差はsidecarがf32由来であることを考慮して
+`1e-4` とし、軸や単位を推測しない。一致しない場合は理由付きで失敗する。
+
+対象はPhysBoneのroot・ignoreとcolliderのrootとして参照されるノードだけである。
+メッシュ所有ノードは頂点ベイクで切り離されるため対象外とする。
+基準ノードはsidecar索引順に固定し、HashMapの反復順に依存させない。
+
+## 上限と失敗条件
+
+件数（ノード・PhysBone・collider・カーブキー総数・JSONバイト数）に上限を置き、
+上限の変更は `with_` で始まるメソッドで行う。確保する前に検査する。
+
+失敗条件は次のとおりである。
+
+- JSONの構文破損・書式名や版の不一致・未知の列挙値やwrap。
+- 欠落ID・重複ID・親子の不整合・循環。
+- 非有限値・範囲外（負の半径・正でないルート拡大率・正規化されていない回転など）。
+- 未知の重み付きカーブ。
+- SHA-256の不一致・複数一致。
+- 対応の0件・複数件・参照されるシーン追加ノード。
+- 座標ゲートの不一致。
+- `bind-pose`・`edit-mode` 以外の参照姿勢。
+
+## 保証しないこと
+
+- スプリングチェーンのコンパイル・VRMへの書き出しは行わない。次単位である。
+- シーン追加ノードの補助生成はしない。参照があれば保留として失敗する。
+- 平面colliderは除外して報告する。limit・拘束・FX既定姿勢の評価はしない。
+- 推測での軸決定・単位決定・名前近似はしない。
+
+## 外した選択肢
+
+- 接尾辞一致での自動対応はしない。左右同名の取り違えを型や検査で防げないため、
+  完全一致に絞る。
+- 未知のwrapや重み付きカーブの近似はしない。解釈のずれが物理全体に広がるため、
+  明示的な失敗にする。
+- 対応表の鍵に `scenePath` は使わない。シーンルート名はUnity側の都合で変わるため、
+  FBX由来の `source.path` を正とする。

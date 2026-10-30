@@ -81,4 +81,12 @@ pub enum VrmErrorKind {
     UnsupportedBlendShape,
     /// メッシュ・頂点・三角形・モーフターゲットの件数や量が上限を超える場合。
     LimitExceeded,
+    /// 物理sidecarの書式・参照・座標の検証に失敗した場合。
+    InvalidPhysicsSidecar,
+    /// sidecarのノードを `VrmModel` に対応付けできない場合。
+    UnresolvedPhysicsNode,
+    /// sidecarとモデルの座標変換が単一の行列に一致しない場合。
+    PhysicsCoordinateMismatch,
+    /// 平面colliderや参照姿勢など、今回未対応の機能がある場合。
+    UnsupportedPhysicsFeature,
 }

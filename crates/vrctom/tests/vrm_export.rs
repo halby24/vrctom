@@ -153,6 +153,7 @@ fn 合成モデルを作る() -> VrmModel {
         skins: vec![スキン],
         meshes: vec![メッシュ],
         expressions: VrmExpressions::default(),
+        spring_bones: vrctom::vrm::VrmSpringBones::default(),
     }
 }
 

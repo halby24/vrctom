@@ -22,6 +22,7 @@ mod humanoid;
 mod material;
 mod matrix;
 mod mesh;
+pub mod physics;
 
 pub use error::{VrmError, VrmErrorKind};
 pub use export::{VrmExportError, VrmExportErrorKind, VrmExportOptions, VrmMeta};
@@ -32,6 +33,11 @@ pub use material::{
     VrmOutlineWidthMode, VrmSampler, VrmWrap,
 };
 use matrix::IDENTITY;
+pub use physics::{
+    PhysicsLimits, PhysicsResolution, PhysicsSidecar, ResolvedCollider, ResolvedPhysBone,
+    SidecarCurve, VrmSpring, VrmSpringBones, VrmSpringCollider, VrmSpringColliderGroup,
+    VrmSpringColliderShape, VrmSpringJoint,
+};
 use std::collections::{HashMap, HashSet};
 
 use crate::fbx::{Axis, FbxErrorKind, FbxFile, ObjectId};
@@ -62,6 +68,7 @@ const DEFAULT_MAX_MORPH_BYTES: usize = 512 << 20;
 ///
 /// 読み取り済みの値から作る所有データであり、入力バイト列は保持しない。
 /// 表情（モーフターゲットとその束ね）を持つ。材質の見た目は持たない。
+/// スプリングは [`VrmSpringBones`] に持ち、今回は空のまま置く。書き出しはしない。
 #[derive(Debug, Clone)]
 pub struct VrmModel {
     /// シーンルートに掛ける行列。単位換算だけを含む。
@@ -74,6 +81,8 @@ pub struct VrmModel {
     pub meshes: Vec<VrmMesh>,
     /// 表情。要求が無い場合は空である。
     pub expressions: VrmExpressions,
+    /// スプリング。今回は空であり、書き出しはしない。
+    pub spring_bones: VrmSpringBones,
 }
 
 /// ノード1件。
@@ -390,6 +399,7 @@ impl VrmModel {
             skins,
             meshes,
             expressions,
+            spring_bones: VrmSpringBones::default(),
         };
         Ok((model, report))
     }

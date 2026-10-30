@@ -4,8 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 # glTF JSON型とシリアライズだけを使い、import機能（画像デコーダ）は入れない。
 # `extras` はモーフターゲット名（`targetNames`）の出力に使う。
 gltf = { version = "1.4", default-features = false, features = ["extensions", "extras", "names"] }
