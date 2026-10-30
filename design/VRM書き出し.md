@@ -105,7 +105,11 @@ UVはFBXとUnityの左下原点からglTFの左上原点へ合わせるため、
 `extensionsUsed` に `VRMC_springBone_limit` を加える。
 `spherical` は `{pitch, yaw, rotation}`、`cone`・`hinge` は `{angle, rotation}` を持つ。
 末端・制限なし・rest不明の関節には付けず、1件もない場合は使用宣言にも加えない。
-中身の作り方と近似の範囲は [`VRMスプリング`](VRMスプリング.md) に譲る。
+平面colliderがある場合は、各colliderに
+`extensions: {"VRMC_springBone_extended_collider": {"specVersion": "1.0", "shape": {"plane": {"normal": [...], "offset": [...]}}}}` を付け、
+`extensionsUsed` に `VRMC_springBone_extended_collider` を加える。
+平面の基準ノードは親なしの補助ノードとして末尾に追加する。
+中身の作り方は [`VRMスプリング`](VRMスプリング.md) に譲る。
 
 書き出す前に次を検証する。
 
@@ -117,6 +121,8 @@ UVはFBXとUnityの左下原点からglTFの左上原点へ合わせるため、
 - 角度制限の角度は有限値で、円錐・蝶番は0〜π、球面のpitchは0〜π・yawは0〜π/2の範囲であり、
   回転は単位四元数である。範囲外・非有限は失敗する。
 - colliderの半径は0以上の有限値、形状点は3つの有限値である。
+  平面colliderの法線は単位ベクトル、ずれは有限値であることを確かめる。
+  法線が単位でない・非有限の場合は失敗する。
 - 空の `colliderGroups` は書かない。書式の `minItems: 1` に従う。
 
 ## アクセサ

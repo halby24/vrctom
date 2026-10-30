@@ -322,7 +322,12 @@ fn export(
                 return 1;
             }
         };
-        match compile_springs(&sidecar, &model, &resolution, &SpringCompileOptions::new()) {
+        match compile_springs(
+            &sidecar,
+            &mut model,
+            &resolution,
+            &SpringCompileOptions::new(),
+        ) {
             Ok(compiled) => {
                 // 主要な近似件数と関節値の目安も出し、文書の制限と突き合わせられるようにする。
                 let world = compiled

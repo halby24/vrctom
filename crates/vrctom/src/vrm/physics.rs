@@ -98,7 +98,7 @@ impl Default for PhysicsLimits {
 pub struct VrmSpringBones {
     /// スプリング列。PhysBoneごとの木を分岐分割した線形鎖である。
     pub springs: Vec<VrmSpring>,
-    /// collider列。参照されるsphere/capsuleだけを含む。
+    /// collider列。参照されるsphere/capsuleと、平面（拡張付きの球）を含む。
     pub colliders: Vec<VrmSpringCollider>,
     /// colliderグループ列。PhysBoneの参照集合ごとに1件である。
     pub collider_groups: Vec<VrmSpringColliderGroup>,
@@ -174,6 +174,23 @@ pub struct VrmSpringCollider {
     pub node: usize,
     /// 形状。
     pub shape: VrmSpringColliderShape,
+    /// 拡張collider。平面の場合に `Some` になる。
+    /// 参照実装の拡張colliderに相当し、`VRMC_springBone_extended_collider` として出す。
+    pub extended: Option<VrmSpringColliderExtension>,
+}
+
+/// スプリングcolliderの拡張形状。平面のみを扱う。
+/// 参照実装の拡張colliderの `plane` に相当する。
+#[derive(Debug, Clone)]
+pub enum VrmSpringColliderExtension {
+    /// 平面。法線は単位ベクトル、ずれは平面上の点である。
+    /// いずれもcollider基準ノードのローカル・VRM右手系・メートルである。
+    Plane {
+        /// 法線（単位ベクトル）。
+        normal: [f32; 3],
+        /// 平面上の点（ずれ）。
+        offset: [f32; 3],
+    },
 }
 
 /// スプリングcolliderの形状。
@@ -1096,9 +1113,10 @@ pub struct PhysicsResolution {
     pub unmapped_nodes: Vec<UnmappedPhysicsNode>,
     /// PhysBoneの参照解決。
     pub phys_bones: Vec<ResolvedPhysBone>,
-    /// colliderの参照解決。今回は平面colliderを含まない。
+    /// colliderの参照解決。平面colliderは含まない（平面はsidecarから直接出力する）。
     pub colliders: Vec<ResolvedCollider>,
-    /// 今回の出力対象外として除外したcollider ID（平面）。
+    /// 解決時点では出力対象外として除外したcollider ID（平面）。
+    /// コンパイル側ではsidecarから直接出力するため、出力物には含まれる。
     pub skipped_colliders: Vec<String>,
 }
 
@@ -1853,6 +1871,8 @@ pub struct SpringCompileReport {
     /// 参照されず出力しなかったcolliderのID。
     pub unused_colliders: Vec<String>,
     /// 平面のため落とした参照を持つPhysBoneのID。
+    /// 現在は平面も拡張付きで出力するため、常に空である。
+    /// 互換のために残す。
     pub plane_colliders_dropped: Vec<String>,
     /// VRMに写せない指定（`insideBounds`・`bonesAsSpheres`）を持つcolliderの記録。
     pub ignored_collider_options: Vec<String>,
@@ -3019,10 +3039,70 @@ fn convert_collider_shape(
         }
         SidecarShapeType::Plane => Err(VrmError::new(
             VrmErrorKind::InvalidPhysicsSidecar,
-            // 解決側で除外済みのため到達しない。黙って球にしない。
+            // 通常の形状換算では扱わない。平面は `convert_plane_collider` で
+            // 拡張付きの球に換算する。黙って球にしない。
             format!("平面colliderは換算できない: {id}"),
         )),
     }
+}
+
+/// 平面colliderを拡張付きの球へ換算する。
+///
+/// `position`・`rotation` はrootローカルの値であり、componentには依存しない。
+/// Unity左手系からVRM右手系への鏡像（X反転・四元数のY/Z反転）だけを適用する。
+/// 法線は姿勢の+Y軸、平面ずれは位置であり、baseの球は
+/// `offset - normal*1000` を中心とする半径1000の球になる
+/// （参照実装の `DISTANCE` と同じ）。
+/// 拡張の平面は同じ法線とずれを持つ。法線は単位ベクトルに正規化する。
+fn convert_plane_collider(
+    id: &str,
+    source: &SidecarCollider,
+) -> Result<(VrmSpringColliderShape, VrmSpringColliderExtension), VrmError> {
+    if source.shape_type != SidecarShapeType::Plane {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPhysicsSidecar,
+            format!("平面colliderでない: {id}"),
+        ));
+    }
+    // Unity空間で法線を求めてから鏡像する。鏡像はノルムを保つ。
+    let normal_unity = quat_rotate(source.rotation, [0.0, 1.0, 0.0]);
+    let normal_mirrored = mirror_point(normal_unity);
+    let length2 = normal_mirrored[0] * normal_mirrored[0]
+        + normal_mirrored[1] * normal_mirrored[1]
+        + normal_mirrored[2] * normal_mirrored[2];
+    if !length2.is_finite() || length2 <= 0.0 {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPhysicsSidecar,
+            format!("平面colliderの法線が縮退している: {id}"),
+        ));
+    }
+    let length = length2.sqrt();
+    let normal = [
+        normal_mirrored[0] / length,
+        normal_mirrored[1] / length,
+        normal_mirrored[2] / length,
+    ];
+    let plane_offset = mirror_point(source.position);
+    // baseの球と拡張の平面は有限値である。1000は参照実装の定数である。
+    const PLANE_DISTANCE: f64 = 1000.0;
+    let base = [
+        plane_offset[0] - normal[0] * PLANE_DISTANCE,
+        plane_offset[1] - normal[1] * PLANE_DISTANCE,
+        plane_offset[2] - normal[2] * PLANE_DISTANCE,
+    ];
+    let base_f32 = to_f32x3(base, "平面collider基球")?;
+    let normal_f32 = to_f32x3(normal, "平面collider法線")?;
+    let offset_f32 = to_f32x3(plane_offset, "平面colliderずれ")?;
+    Ok((
+        VrmSpringColliderShape::Sphere {
+            offset: base_f32,
+            radius: PLANE_DISTANCE as f32,
+        },
+        VrmSpringColliderExtension::Plane {
+            normal: normal_f32,
+            offset: offset_f32,
+        },
+    ))
 }
 
 /// `PhysicsResolution` と `PhysicsSidecar` から `VrmSpringBones` を作る。
@@ -3035,17 +3115,20 @@ fn convert_collider_shape(
 /// 長さの無い骨はheadにならず、前springの端末として終わる。
 /// colliderはroot基準で換算する。`position`・`rotation` はrootローカルの値であり、
 /// 鏡像だけを適用する。componentは追従対象の識別にだけ使う。
-/// endpoint生成・平均tail生成・ゼロ長分割・limit拡張の出力はしない。
+/// 平面colliderはシーン専用ノードの補助ノードを末尾に追加して出力する。
+/// endpoint生成・平均tail生成・ゼロ長分割はしない。
 /// centerの計算と制限の評価は行う。未対応は診断と文書に明記する。
 ///
-/// 失敗時は `VrmModel` を変更しない。呼び出し側が結果を受け取ってから代入する。
+/// 平面のための補助ノードは、すべての換算が通ってから末尾に追加する。
+/// 既存ノードの索引は維持し、失敗時は `VrmModel` を変更しない。
 ///
 /// # Errors
 ///
-/// 上限の0指定・f32に収まらない値・負の半径や硬さ・対応表とsidecarの不整合の場合に返す。
+/// 上限の0指定・f32に収まらない値・負の半径や硬さ・対応表とsidecarの不整合・
+/// 補助ノードの行列が求まらない場合に返す。
 pub fn compile_springs(
     sidecar: &PhysicsSidecar,
-    model: &VrmModel,
+    model: &mut VrmModel,
     resolution: &PhysicsResolution,
     options: &SpringCompileOptions,
 ) -> Result<CompiledSprings, VrmError> {
@@ -3428,15 +3511,6 @@ pub fn compile_springs(
             {
                 report.first_child_multichild.push(bone.id.clone());
             }
-            // 平面参照の落下は骨ごとに記録する。全体の一覧は解決側が持つ。
-            if source
-                .collider_ids
-                .iter()
-                .any(|id| resolution.skipped_colliders.iter().any(|skip| skip == id))
-                && !report.plane_colliders_dropped.contains(&bone.id)
-            {
-                report.plane_colliders_dropped.push(bone.id.clone());
-            }
             report.owned_springs.push(OwnedSpring {
                 bone: bone.id.clone(),
                 name: name.clone(),
@@ -3488,9 +3562,6 @@ pub fn compile_springs(
             ));
         };
         for collider in &source.collider_ids {
-            if resolution.skipped_colliders.iter().any(|id| id == collider) {
-                continue;
-            }
             if collider_at.contains_key(collider.as_str()) {
                 referenced_colliders.insert(collider.as_str());
             }
@@ -3528,7 +3599,101 @@ pub fn compile_springs(
         colliders.push(VrmSpringCollider {
             node: resolved.root_node,
             shape: convert_collider_shape(&resolved.id, source)?,
+            extended: None,
         });
+    }
+    // 平面colliderはsidecarから直接換算し、補助ノードを末尾に追加して出力する。
+    // 参照の有無にかかわらず出力し、参照集合には他colliderと同じ規則で含める。
+    // すべての換算が通ってからモデルを変更し、失敗時は追加しない。
+    {
+        let mut plane_work: Vec<(
+            &SidecarCollider,
+            VrmSpringColliderShape,
+            VrmSpringColliderExtension,
+        )> = Vec::new();
+        for source in sidecar
+            .colliders
+            .iter()
+            .filter(|collider| collider.shape_type == SidecarShapeType::Plane)
+        {
+            // 平面は参照の有無にかかわらず出力する。未使用の場合は
+            // colliderだけが出てグループには入らない。
+            if !source.enabled {
+                report.disabled_colliders.push(source.id.clone());
+            }
+            if source.inside_bounds {
+                report
+                    .ignored_collider_options
+                    .push(format!("{}.insideBounds", source.id));
+            }
+            if source.bones_as_spheres {
+                report
+                    .ignored_collider_options
+                    .push(format!("{}.bonesAsSpheres", source.id));
+            }
+            let (shape, extended) = convert_plane_collider(&source.id, source)?;
+            plane_work.push((source, shape, extended));
+        }
+        // 補助ノードの対応付け。同じsidecarノードは1件にまとめる。
+        let mut aux_at: HashMap<&str, usize> = HashMap::new();
+        for (source, _, _) in &plane_work {
+            if aux_at.contains_key(source.root_node_id.as_str()) {
+                continue;
+            }
+            let sidecar_index = sidecar_at
+                .get(source.root_node_id.as_str())
+                .copied()
+                .ok_or_else(|| {
+                    VrmError::new(
+                        VrmErrorKind::InvalidPhysicsSidecar,
+                        format!("平面colliderの基準ノードが無い: {}", source.id),
+                    )
+                })?;
+            let sidecar_node = &sidecar.nodes[sidecar_index];
+            // Unity空間の参照ローカルをVRM右手系の世界行列にし、
+            // モデルルートの逆変換でローカル行列に戻す。
+            // 親なしのrootとして追加するため、ワールド行列がそのまま基準になる。
+            let world = trs_to_matrix(&SidecarTrs {
+                position: mirror_point(sidecar_node.reference_local.position),
+                rotation: mirror_quat(sidecar_node.reference_local.rotation),
+                scale: sidecar_node.reference_local.scale,
+            });
+            let inverse_root = matrix::inverse(&model.root).ok_or_else(|| {
+                VrmError::new(
+                    VrmErrorKind::InvalidStructure,
+                    "モデルのルート行列が正則でない",
+                )
+            })?;
+            let local = matrix::mul(&inverse_root, &world);
+            for component in local {
+                if !component.is_finite() {
+                    return Err(VrmError::new(
+                        VrmErrorKind::InvalidPhysicsSidecar,
+                        format!("平面colliderの補助ノード行列が非有限である: {}", source.id),
+                    ));
+                }
+            }
+            let index = model.nodes.len();
+            model.nodes.push(super::VrmNode {
+                name: sidecar_node.name.clone(),
+                parent: None,
+                children: Vec::new(),
+                local,
+            });
+            aux_at.insert(source.root_node_id.as_str(), index);
+        }
+        for (source, shape, extended) in plane_work {
+            let node = aux_at
+                .get(source.root_node_id.as_str())
+                .copied()
+                .expect("平面の補助ノードがある");
+            collider_index.insert(source.id.as_str(), colliders.len());
+            colliders.push(VrmSpringCollider {
+                node,
+                shape,
+                extended: Some(extended),
+            });
+        }
     }
     report.collider_count = colliders.len();
     // グループはPhysBoneの参照集合ごとに作り、同じ集合は順序や重複によらず共有する。

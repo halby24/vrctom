@@ -1068,6 +1068,7 @@ impl<'a> GlbWriter<'a> {
         others.insert("VRMC_vrm".to_string(), serde_json::Value::Object(vrmc));
         let mut wrote_spring_bone = false;
         let mut wrote_spring_bone_limit = false;
+        let mut wrote_spring_bone_extended_collider = false;
         if !self.model.spring_bones.springs.is_empty()
             || !self.model.spring_bones.colliders.is_empty()
             || !self.model.spring_bones.collider_groups.is_empty()
@@ -1081,6 +1082,13 @@ impl<'a> GlbWriter<'a> {
                 .iter()
                 .flat_map(|spring| spring.joints.iter())
                 .any(|joint| joint.limit.is_some());
+            // 1件でも拡張colliderがあれば、読み手向けに拡張使用を宣言する。
+            wrote_spring_bone_extended_collider = self
+                .model
+                .spring_bones
+                .colliders
+                .iter()
+                .any(|collider| collider.extended.is_some());
             others.insert("VRMC_springBone".to_string(), spring_bone);
             wrote_spring_bone = true;
         }
@@ -1094,6 +1102,9 @@ impl<'a> GlbWriter<'a> {
         }
         if wrote_spring_bone_limit {
             used.push("VRMC_springBone_limit".to_string());
+        }
+        if wrote_spring_bone_extended_collider {
+            used.push("VRMC_springBone_extended_collider".to_string());
         }
         self.root.extensions_used = used;
         Ok(())
@@ -1245,10 +1256,17 @@ impl<'a> GlbWriter<'a> {
                     })
                 }
             };
-            colliders.push(serde_json::json!({
+            let mut entry = serde_json::json!({
                 "node": collider.node,
                 "shape": shape,
-            }));
+            });
+            if let Some(extended) = build_collider_extension_json(collider.extended.as_ref())? {
+                entry
+                    .as_object_mut()
+                    .expect("collider JSONはオブジェクトである")
+                    .insert("extensions".to_string(), extended);
+            }
+            colliders.push(entry);
         }
         let mut groups = Vec::with_capacity(bones.collider_groups.len());
         for group in &bones.collider_groups {
@@ -1721,6 +1739,49 @@ fn build_joint_limit_json(
             "limit": limit_value,
         }
     })))
+}
+
+/// colliderの拡張を `VRMC_springBone_extended_collider` の拡張JSONにする。
+/// 拡張なしの場合は `None` を返す。平面の法線は単位ベクトル、
+/// ずれとbaseの球は有限値を検証する。仕様版は `1.0` である。
+fn build_collider_extension_json(
+    extended: Option<&super::VrmSpringColliderExtension>,
+) -> Result<Option<serde_json::Value>, VrmExportError> {
+    let Some(extended) = extended else {
+        return Ok(None);
+    };
+    match extended {
+        super::VrmSpringColliderExtension::Plane { normal, offset } => {
+            let length2 = normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2];
+            if !length2.is_finite() || length2 <= 0.0 {
+                return Err(VrmExportError::new(
+                    VrmExportErrorKind::InvalidStructure,
+                    "springBone colliderの平面法線が正規化できない",
+                ));
+            }
+            let length = length2.sqrt();
+            // 法線は単位のはずであり、ずれは丸めの範囲に収まる。
+            if (length - 1.0).abs() > 1e-3 {
+                return Err(VrmExportError::new(
+                    VrmExportErrorKind::InvalidStructure,
+                    "springBone colliderの平面法線が単位ベクトルでない",
+                ));
+            }
+            let normal = [normal[0] / length, normal[1] / length, normal[2] / length];
+            check_shape_point(offset, "springBone collider plane offset")?;
+            Ok(Some(serde_json::json!({
+                "VRMC_springBone_extended_collider": {
+                    "specVersion": "1.0",
+                    "shape": {
+                        "plane": {
+                            "normal": [normal[0], normal[1], normal[2]],
+                            "offset": [offset[0], offset[1], offset[2]],
+                        }
+                    },
+                }
+            })))
+        }
+    }
 }
 
 /// アクセサ定義。型情報と用途をまとめて引数の膨張を避ける。

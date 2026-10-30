@@ -38,8 +38,8 @@ pub use physics::{
     NoCenterReason, OwnedSpring, PhysicsLimits, PhysicsResolution, PhysicsSidecar,
     ResolvedCollider, ResolvedPhysBone, RootCut, SharedNode, SidecarCurve, SkippedBone,
     SkippedBoneReason, SpringCompileOptions, SpringCompileReport, VrmSpring, VrmSpringBones,
-    VrmSpringCollider, VrmSpringColliderGroup, VrmSpringColliderShape, VrmSpringJoint,
-    VrmSpringJointLimit, ZeroLengthJoint, compile_springs,
+    VrmSpringCollider, VrmSpringColliderExtension, VrmSpringColliderGroup, VrmSpringColliderShape,
+    VrmSpringJoint, VrmSpringJointLimit, ZeroLengthJoint, compile_springs,
 };
 use std::collections::{HashMap, HashSet};
 

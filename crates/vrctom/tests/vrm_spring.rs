@@ -355,7 +355,7 @@ fn 近似3要素を確かめる(値: &serde_json::Value, 期待: [f64; 3]) {
 /// 解決とコンパイルを通す。合成テストの共通入口である。
 fn 解決してコンパイルする(
     fbxバイト列: &[u8],
-    モデル: &VrmModel,
+    モデル: &mut VrmModel,
 ) -> (
     PhysicsSidecar,
     vrctom::vrm::PhysicsResolution,
@@ -369,7 +369,7 @@ fn 解決してコンパイルする(
 fn 文から解決してコンパイルする(
     文: &str,
     fbxバイト列: &[u8],
-    モデル: &VrmModel,
+    モデル: &mut VrmModel,
 ) -> (
     PhysicsSidecar,
     vrctom::vrm::PhysicsResolution,
@@ -389,8 +389,8 @@ fn 文から解決してコンパイルする(
 #[test]
 fn 線形チェーンを作り分岐を分割する() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
-    let (_, _, コンパイル済み) = 解決してコンパイルする(fbxバイト列, &モデル);
+    let mut モデル = 書き出し可能モデルを作る();
+    let (_, _, コンパイル済み) = 解決してコンパイルする(fbxバイト列, &mut モデル);
     let 報告 = &コンパイル済み.report;
     assert_eq!(報告.spring_count, 1, "springは1本である");
     assert_eq!(報告.joint_count, 2, "関節はHairA・HairBの2件である");
@@ -426,7 +426,7 @@ fn 線形チェーンを作り分岐を分割する() {
 #[test]
 fn 高精度積分は上限の比になる() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 文: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     文["physBones"][0]["integrationType"] = serde_json::json!("Advanced");
@@ -437,7 +437,7 @@ fn 高精度積分は上限の比になる() {
     文["physBones"][0]["stiffness"] =
         serde_json::json!({"value": 1.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &mut モデル);
     let spring = &コンパイル済み.bones.springs[0];
     for 関節 in &spring.joints {
         assert!(
@@ -453,7 +453,7 @@ fn 高精度積分は上限の比になる() {
 #[test]
 fn 単純化積分は分配に従う() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 文: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     文["physBones"][0]["pull"] =
@@ -461,7 +461,7 @@ fn 単純化積分は分配に従う() {
     文["physBones"][0]["spring"] =
         serde_json::json!({"value": 0.5, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &mut モデル);
     let spring = &コンパイル済み.bones.springs[0];
     for 関節 in &spring.joints {
         assert!(
@@ -479,7 +479,7 @@ fn 単純化積分は分配に従う() {
 #[test]
 fn 版10の重力は速度の61倍になる() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 文: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     文["physBones"][0]["version"] = serde_json::json!("1.0");
@@ -490,7 +490,7 @@ fn 版10の重力は速度の61倍になる() {
     文["physBones"][0]["gravity"] =
         serde_json::json!({"value": 1.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &mut モデル);
     let spring = &コンパイル済み.bones.springs[0];
     for 関節 in &spring.joints {
         assert!(
@@ -513,7 +513,7 @@ fn 版10の重力は速度の61倍になる() {
 #[test]
 fn 最大減衰は重力を消す() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 文: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     文["physBones"][0]["pull"] =
@@ -523,7 +523,7 @@ fn 最大減衰は重力を消す() {
     文["physBones"][0]["gravityFalloff"] =
         serde_json::json!({"value": 1.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &mut モデル);
     let spring = &コンパイル済み.bones.springs[0];
     for 関節 in &spring.joints {
         assert_eq!(関節.gravity_power, 0.0, "全減衰で重力は消える");
@@ -535,7 +535,7 @@ fn 最大減衰は重力を消す() {
 #[test]
 fn 角度制限は引きを強める() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let もと文 =
         serde_json::from_str::<serde_json::Value>(&髪sidecarを作る(fbxバイト列, &モデル))
             .expect("合成sidecarは読める");
@@ -543,7 +543,7 @@ fn 角度制限は引きを強める() {
     制限なし["physBones"][0]["pull"] =
         serde_json::json!({"value": 0.1, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
     let (_, _, なし済み) =
-        文から解決してコンパイルする(&制限なし.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&制限なし.to_string(), fbxバイト列, &mut モデル);
     let mut 制限あり = もと文;
     制限あり["physBones"][0]["pull"] =
         serde_json::json!({"value": 0.1, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
@@ -551,7 +551,7 @@ fn 角度制限は引きを強める() {
     制限あり["physBones"][0]["maxAngleX"] =
         serde_json::json!({"value": 10.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
     let (_, _, あり済み) =
-        文から解決してコンパイルする(&制限あり.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&制限あり.to_string(), fbxバイト列, &mut モデル);
     let なし硬さ = なし済み.bones.springs[0].joints[0].stiffness;
     let あり硬さ = あり済み.bones.springs[0].joints[0].stiffness;
     assert!(なし硬さ.is_finite() && なし硬さ > 0.0, "制限なしでも引く");
@@ -565,7 +565,7 @@ fn 角度制限は引きを強める() {
 #[test]
 fn 保持は引きを強める() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 文: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     文["physBones"][0]["pull"] =
@@ -575,7 +575,7 @@ fn 保持は引きを強める() {
     文["physBones"][0]["immobile"] =
         serde_json::json!({"value": 0.5, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &mut モデル);
     assert_eq!(
         コンパイル済み.report.held_immobile,
         vec!["pb:0".to_string()]
@@ -594,8 +594,8 @@ fn 保持は引きを強める() {
 #[test]
 fn colliderを変換しグループを共有する() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
-    let (_, _, コンパイル済み) = 解決してコンパイルする(fbxバイト列, &モデル);
+    let mut モデル = 書き出し可能モデルを作る();
+    let (_, _, コンパイル済み) = 解決してコンパイルする(fbxバイト列, &mut モデル);
     let 報告 = &コンパイル済み.report;
     assert_eq!(報告.collider_count, 2, "参照されるcolliderは2件である");
     assert_eq!(報告.group_count, 1, "同じ参照集合は1グループである");
@@ -631,7 +631,7 @@ fn colliderを変換しグループを共有する() {
 fn springbone拡張を出力し索引を検証する() {
     let fbxバイト列 = b"fake-fbx";
     let mut モデル = 書き出し可能モデルを作る();
-    let (_, _, コンパイル済み) = 解決してコンパイルする(fbxバイト列, &モデル);
+    let (_, _, コンパイル済み) = 解決してコンパイルする(fbxバイト列, &mut モデル);
     モデル.spring_bones = コンパイル済み.bones;
     let バイト列 = モデル
         .to_vrm(&書き出し設定を作る())
@@ -732,7 +732,7 @@ fn 不正なspringは書き出し時に失敗する() {
     // 関節ノード範囲外・重複・非連鎖・範囲外グループを個別に確かめる。
     let mut 良好 = 書き出し可能モデルを作る();
     let (_, _, コンパイル済み) =
-        解決してコンパイルする(b"fake-fbx", &書き出し可能モデルを作る());
+        解決してコンパイルする(b"fake-fbx", &mut 書き出し可能モデルを作る());
     良好.spring_bones = コンパイル済み.bones;
     // 範囲外ノード。
     let mut 範囲外 = 良好.clone();
@@ -771,7 +771,7 @@ fn 不正なspringは書き出し時に失敗する() {
 #[test]
 fn 不正な上限や負値はコンパイル時に失敗する() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let 文 = 髪sidecarを作る(fbxバイト列, &モデル);
     let sidecar =
         PhysicsSidecar::from_json(&文, &PhysicsLimits::new()).expect("合成sidecarは検証を通る");
@@ -780,7 +780,7 @@ fn 不正な上限や負値はコンパイル時に失敗する() {
         .expect("合成対応は解決できる");
     let 上限0 = SpringCompileOptions::new().with_max_joints(0);
     assert_eq!(
-        compile_springs(&sidecar, &モデル, &解決, &上限0)
+        compile_springs(&sidecar, &mut モデル, &解決, &上限0)
             .expect_err("上限0は失敗する")
             .kind(),
         VrmErrorKind::LimitExceeded
@@ -818,8 +818,9 @@ fn 実fixtureと実sidecarでvrmを生成する() {
     let 解決 = モデル
         .resolve_physics_sidecar(&sidecar, &fbxバイト列)
         .expect("実fixtureの参照は解決できる");
-    let コンパイル済み = compile_springs(&sidecar, &モデル, &解決, &SpringCompileOptions::new())
-        .expect("実fixtureの鎖はコンパイルできる");
+    let コンパイル済み =
+        compile_springs(&sidecar, &mut モデル, &解決, &SpringCompileOptions::new())
+            .expect("実fixtureの鎖はコンパイルできる");
     assert!(
         !コンパイル済み.bones.springs.is_empty(),
         "springは非空である"
@@ -931,7 +932,7 @@ fn 実fixtureと実sidecarでvrmを生成する() {
     // center件数はUnity出力と突き合わせる。45spring中43件にcenterが付く。
     assert_eq!(コンパイル済み.report.spring_count, 45);
     assert_eq!(関節数, 148);
-    assert_eq!(コンパイル済み.report.collider_count, 11);
+    assert_eq!(コンパイル済み.report.collider_count, 12);
     assert_eq!(コンパイル済み.report.group_count, 4);
     assert_eq!(コンパイル済み.report.center_applied.len(), 43);
     assert_eq!(コンパイル済み.report.center_missing.len(), 2);
@@ -977,7 +978,7 @@ fn 実fixtureの関節値はunity出力と一致する() {
     let sidecar文 = std::fs::read(&sidecar経路).expect("実sidecarは読める");
     let 解析 = vrctom::fbx::FbxFile::parse(&fbxバイト列, &vrctom::fbx::FbxOptions::new())
         .expect("実fixtureは読める");
-    let (モデル, _) =
+    let (mut モデル, _) =
         VrmModel::from_fbx(&解析, &vrctom::vrm::VrmOptions::new()).expect("実fixtureは変換できる");
     let sidecar =
         PhysicsSidecar::parse(&sidecar文, &PhysicsLimits::new()).expect("実sidecarは検証を通る");
@@ -986,7 +987,7 @@ fn 実fixtureの関節値はunity出力と一致する() {
         .expect("実fixtureの参照は解決できる");
     let コンパイル済み = compile_springs(
         &sidecar,
-        &モデル,
+        &mut モデル,
         &解決,
         &SpringCompileOptions::new().with_joint_trace(true),
     )
@@ -1237,15 +1238,16 @@ fn 実fixtureの角度制限はunity出力と一致する() {
     let sidecar文 = std::fs::read(&sidecar経路).expect("実sidecarは読める");
     let 解析 = vrctom::fbx::FbxFile::parse(&fbxバイト列, &vrctom::fbx::FbxOptions::new())
         .expect("実fixtureは読める");
-    let (モデル, _) =
+    let (mut モデル, _) =
         VrmModel::from_fbx(&解析, &vrctom::vrm::VrmOptions::new()).expect("実fixtureは変換できる");
     let sidecar =
         PhysicsSidecar::parse(&sidecar文, &PhysicsLimits::new()).expect("実sidecarは検証を通る");
     let 解決 = モデル
         .resolve_physics_sidecar(&sidecar, &fbxバイト列)
         .expect("実fixtureの参照は解決できる");
-    let コンパイル済み = compile_springs(&sidecar, &モデル, &解決, &SpringCompileOptions::new())
-        .expect("実fixtureの鎖はコンパイルできる");
+    let コンパイル済み =
+        compile_springs(&sidecar, &mut モデル, &解決, &SpringCompileOptions::new())
+            .expect("実fixtureの鎖はコンパイルできる");
     // 自前の内訳。末端は制限なしである。
     let mut 自内訳 = std::collections::HashMap::new();
     let mut 自総数 = 0usize;
@@ -1479,20 +1481,155 @@ fn 実fixtureの角度制限はunity出力と一致する() {
     );
 }
 
-/// collider参照が無いspringは、空配列を出さずに拡張する。
+/// 実fixtureの平面colliderをUnity出力と突き合わせる。
+/// colliders 12件・Ground補助ノード・base球・平面法線/ずれを比べ、
+/// spring/joint/center/limitの件数が変わらないことも確かめる。
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn 実fixtureの平面colliderはunity出力と一致する() {
+    let (Some(fbx経路), Some(sidecar経路), Some(unity経路)) = (
+        std::env::var_os("VRCTOM_FBX_FIXTURE"),
+        std::env::var_os("VRCTOM_PHYSICS_SIDECAR"),
+        std::env::var_os("VRCTOM_UNITY_VRM"),
+    ) else {
+        eprintln!("VRCTOM_FBX_FIXTURE/VRCTOM_PHYSICS_SIDECAR/VRCTOM_UNITY_VRM未設定のため跳ばす");
+        return;
+    };
+    let fbxバイト列 = std::fs::read(&fbx経路).expect("実fixtureは読める");
+    let sidecar文 = std::fs::read(&sidecar経路).expect("実sidecarは読める");
+    let 解析 = vrctom::fbx::FbxFile::parse(&fbxバイト列, &vrctom::fbx::FbxOptions::new())
+        .expect("実fixtureは読める");
+    let (mut モデル, _) =
+        VrmModel::from_fbx(&解析, &vrctom::vrm::VrmOptions::new()).expect("実fixtureは変換できる");
+    let 前件数 = モデル.nodes.len();
+    let sidecar =
+        PhysicsSidecar::parse(&sidecar文, &PhysicsLimits::new()).expect("実sidecarは検証を通る");
+    let 解決 = モデル
+        .resolve_physics_sidecar(&sidecar, &fbxバイト列)
+        .expect("実fixtureの参照は解決できる");
+    let コンパイル済み =
+        compile_springs(&sidecar, &mut モデル, &解決, &SpringCompileOptions::new())
+            .expect("実fixtureの鎖はコンパイルできる");
+    // 件数は平面1件増の12件で、他は変わらない。
+    assert_eq!(コンパイル済み.report.spring_count, 45);
+    assert_eq!(
+        コンパイル済み
+            .bones
+            .springs
+            .iter()
+            .map(|s| s.joints.len())
+            .sum::<usize>(),
+        148
+    );
+    assert_eq!(コンパイル済み.report.collider_count, 12);
+    assert_eq!(コンパイル済み.report.group_count, 4);
+    assert_eq!(コンパイル済み.report.center_applied.len(), 43);
+    let 制限数: usize = コンパイル済み
+        .bones
+        .springs
+        .iter()
+        .flat_map(|spring| spring.joints.iter())
+        .filter(|関節| 関節.limit.is_some())
+        .count();
+    assert_eq!(制限数, 71);
+    // 補助ノードは末尾に1件だけ増え、既存索引は維持する。
+    assert_eq!(モデル.nodes.len(), 前件数 + 1, "補助ノードが1件増える");
+    assert_eq!(モデル.nodes[前件数].name, "Ground");
+    assert_eq!(モデル.nodes[前件数].parent, None);
+    // Unity出力と比べる。collider順は解決順のため、末尾が平面である。
+    let unityバイト列 = std::fs::read(&unity経路).expect("Unity製VRMは読める");
+    let unity_json = glbのjsonを取る(&unityバイト列);
+    let unity_colliders = unity_json["extensions"]["VRMC_springBone"]["colliders"]
+        .as_array()
+        .expect("Unity製VRMにcolliderがある");
+    assert_eq!(unity_colliders.len(), 12, "Unityのcollider数は12である");
+    let 自平面 = &コンパイル済み.bones.colliders[11];
+    assert_eq!(自平面.node, 前件数, "平面の出力ノードは補助ノードである");
+    let 他平面 = &unity_colliders[11];
+    // base球と平面法線/ずれが一致する。
+    match &自平面.shape {
+        vrctom::vrm::VrmSpringColliderShape::Sphere { offset, radius } => {
+            let 他球 = &他平面["shape"]["sphere"];
+            for (実, 想) in offset.iter().zip(
+                他球["offset"]
+                    .as_array()
+                    .expect("offsetは配列である")
+                    .iter(),
+            ) {
+                assert!(
+                    (*実 as f64 - 想.as_f64().unwrap_or(f64::NAN)).abs() <= 1e-5,
+                    "base球の中心が一致する"
+                );
+            }
+            assert!(
+                (*radius as f64 - 他球["radius"].as_f64().unwrap_or(f64::NAN)).abs() <= 1e-5,
+                "base球の半径が一致する"
+            );
+        }
+        他 => panic!("平面はbaseの球になる: {他:?}"),
+    }
+    match 自平面.extended.as_ref().expect("平面は拡張を持つ") {
+        vrctom::vrm::VrmSpringColliderExtension::Plane { normal, offset } => {
+            let 他平面拡張 =
+                &他平面["extensions"]["VRMC_springBone_extended_collider"]["shape"]["plane"];
+            for (実, 想) in normal.iter().zip(
+                他平面拡張["normal"]
+                    .as_array()
+                    .expect("normalは配列である")
+                    .iter(),
+            ) {
+                assert!(
+                    (*実 as f64 - 想.as_f64().unwrap_or(f64::NAN)).abs() <= 1e-5,
+                    "平面法線が一致する"
+                );
+            }
+            for (実, 想) in offset.iter().zip(
+                他平面拡張["offset"]
+                    .as_array()
+                    .expect("offsetは配列である")
+                    .iter(),
+            ) {
+                assert!(
+                    (*実 as f64 - 想.as_f64().unwrap_or(f64::NAN)).abs() <= 1e-5,
+                    "平面ずれが一致する"
+                );
+            }
+            assert_eq!(
+                他平面["extensions"]["VRMC_springBone_extended_collider"]["specVersion"],
+                serde_json::json!("1.0")
+            );
+        }
+    }
+    // Groundノード名が一致する。行列は直接比べず、書き出し物の一致で確かめる。
+    モデル.spring_bones = コンパイル済み.bones;
+    let 設定 = VrmExportOptions::new(VrmMeta::new("試験", vec!["作者".to_string()]));
+    let バイト列 = モデル.to_vrm(&設定).expect("実fixtureは書き出せる");
+    let json = glbのjsonを取る(&バイト列);
+    assert_eq!(json["nodes"][前件数]["name"], serde_json::json!("Ground"));
+    let 出力平面 = &json["extensions"]["VRMC_springBone"]["colliders"][11];
+    assert_eq!(
+        出力平面["extensions"]["VRMC_springBone_extended_collider"]["specVersion"],
+        serde_json::json!("1.0")
+    );
+    let used = json["extensionsUsed"]
+        .as_array()
+        .expect("extensionsUsedは配列である");
+    assert!(used.contains(&serde_json::json!("VRMC_springBone_extended_collider")));
+}
+
+/// collider参照が無いspringは、空配列を出さずに拡張する。/// collider参照が無いspringは、空配列を出さずに拡張する。
 #[test]
 fn collider参照が無いspringは空配列を出さない() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 値: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     値["physBones"][0]["colliderIds"] = serde_json::json!([]);
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &mut モデル);
     assert_eq!(コンパイル済み.report.collider_count, 0);
     assert_eq!(コンパイル済み.report.group_count, 0);
     assert_eq!(コンパイル済み.report.unused_colliders.len(), 2);
-    let mut モデル = モデル;
     モデル.spring_bones = コンパイル済み.bones;
     let バイト列 = モデル
         .to_vrm(&書き出し設定を作る())
@@ -1611,12 +1748,12 @@ fn 角度制限は拡張に載る() {
 fn 高さのある球は球のままである() {
     use vrctom::vrm::VrmSpringColliderShape;
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 値: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     値["colliders"][0]["height"] = serde_json::json!(0.4);
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &mut モデル);
     match &コンパイル済み.bones.colliders[0].shape {
         VrmSpringColliderShape::Sphere { offset, radius } => {
             assert_eq!(*radius, 0.05);
@@ -1630,7 +1767,7 @@ fn 高さのある球は球のままである() {
 #[test]
 fn colliderの姿勢はrootローカルでありcomponentに影響されない() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 値: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     // c:0の基準をHairA(n:3)へ移し、付属はHairB(n:4)のままにする。
@@ -1645,7 +1782,7 @@ fn colliderの姿勢はrootローカルでありcomponentに影響されない()
         std::f64::consts::FRAC_1_SQRT_2
     ]);
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &mut モデル);
     assert_eq!(コンパイル済み.bones.colliders[0].node, 3);
     assert_eq!(コンパイル済み.bones.colliders[1].node, 3);
     // Sphereは位置のX反転だけであり、componentの平行移動は入らない。
@@ -1665,12 +1802,195 @@ fn colliderの姿勢はrootローカルでありcomponentに影響されない()
     }
 }
 
+/// 平面colliderは補助ノードと拡張付きの球で出る。
+/// 参照集合には他colliderと同じ規則で入り、未使用の平面もcolliderだけ出る。
+#[test]
+fn 平面colliderは補助ノードと拡張付きで出る() {
+    let fbxバイト列 = b"fake-fbx";
+    let mut モデル = 書き出し可能モデルを作る();
+    let 前件数 = モデル.nodes.len();
+    let mut 値: serde_json::Value =
+        serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    // シーン専用のGroundノード2件。参照姿勢はUnity左手系・メートルである。
+    let 地面 = |id: &str| {
+        serde_json::json!({
+            "id": id,
+            "parentId": serde_json::Value::Null,
+            "name": "Ground",
+            "siblingIndex": 27,
+            "scenePath": ["Milfy", "Ground"],
+            "source": serde_json::Value::Null,
+            "referenceSource": "scene",
+            "referenceLocal": {
+                "position": [0.0, 0.0209, 0.0],
+                "rotation": [0.0, 0.0, 0.0, 1.0],
+                "scale": [1.0, 1.0, 1.0],
+            },
+        })
+    };
+    値["nodes"]
+        .as_array_mut()
+        .expect("nodesは配列である")
+        .push(地面("n:100"));
+    値["nodes"]
+        .as_array_mut()
+        .expect("nodesは配列である")
+        .push(地面("n:101"));
+    // c:2は参照あり、c:3は未使用の平面である。
+    let 平面 = |id: &str, 節点: &str| {
+        serde_json::json!({
+            "id": id,
+            "componentNodeId": 節点,
+            "rootNodeId": 節点,
+            "enabled": true,
+            "shapeType": "Plane",
+            "insideBounds": false,
+            "radius": 0.5,
+            "height": 2.0,
+            "position": [0.0, 0.0, 0.0],
+            "rotation": [0.0, 0.0, 0.0, 1.0],
+            "bonesAsSpheres": false,
+        })
+    };
+    値["colliders"]
+        .as_array_mut()
+        .expect("collidersは配列である")
+        .push(平面("c:2", "n:100"));
+    値["colliders"]
+        .as_array_mut()
+        .expect("collidersは配列である")
+        .push(平面("c:3", "n:101"));
+    値["physBones"][0]["colliderIds"]
+        .as_array_mut()
+        .expect("colliderIdsは配列である")
+        .push(serde_json::json!("c:2"));
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &mut モデル);
+    // 補助ノードは末尾に追加し、既存索引は維持する。
+    assert_eq!(モデル.nodes.len(), 前件数 + 2, "補助ノードが2件増える");
+    assert_eq!(モデル.nodes[前件数].name, "Ground");
+    assert_eq!(モデル.nodes[前件数].parent, None);
+    assert_eq!(モデル.nodes[前件数 + 1].name, "Ground");
+    // sphere/capsule 2件と平面2件が出る。平面の出力ノードは補助ノードである。
+    assert_eq!(コンパイル済み.bones.colliders.len(), 4);
+    let 平面錐 = &コンパイル済み.bones.colliders[2];
+    assert_eq!(平面錐.node, 前件数);
+    match &平面錐.shape {
+        vrctom::vrm::VrmSpringColliderShape::Sphere { offset, radius } => {
+            近似3要素を確かめる(&serde_json::json!(offset), [0.0, -1000.0, 0.0]);
+            assert!((radius - 1000.0).abs() < 1e-6);
+        }
+        他 => panic!("平面はbaseの球になる: {他:?}"),
+    }
+    match 平面錐.extended.as_ref().expect("平面は拡張を持つ") {
+        vrctom::vrm::VrmSpringColliderExtension::Plane { normal, offset } => {
+            近似3要素を確かめる(&serde_json::json!(normal), [0.0, 1.0, 0.0]);
+            近似3要素を確かめる(&serde_json::json!(offset), [0.0, 0.0, 0.0]);
+        }
+    }
+    // 未使用の平面もcolliderだけ出る。グループには入らない。
+    let 未使用 = &コンパイル済み.bones.colliders[3];
+    assert_eq!(未使用.node, 前件数 + 1);
+    assert!(未使用.extended.is_some(), "未使用の平面も拡張を持つ");
+    assert!(
+        コンパイル済み.report.unused_colliders.is_empty(),
+        "平面は未使用扱いしない"
+    );
+    let 群あり = コンパイル済み
+        .bones
+        .collider_groups
+        .iter()
+        .any(|群| 群.colliders.contains(&2));
+    assert!(群あり, "参照ありの平面はグループに入る");
+    let 群なし = コンパイル済み
+        .bones
+        .collider_groups
+        .iter()
+        .any(|群| 群.colliders.contains(&3));
+    assert!(!群なし, "未使用の平面はグループに入らない");
+    // 書き出しは拡張と使用宣言を載せる。
+    let mut 書き出し = モデル;
+    書き出し.spring_bones = コンパイル済み.bones;
+    let バイト列 = 書き出し
+        .to_vrm(&書き出し設定を作る())
+        .expect("平面付きは書き出せる");
+    let json = glbのjsonを取る(&バイト列);
+    let 出力錐 = &json["extensions"]["VRMC_springBone"]["colliders"][2];
+    let 拡張 = &出力錐["extensions"]["VRMC_springBone_extended_collider"];
+    assert_eq!(拡張["specVersion"], serde_json::json!("1.0"));
+    近似3要素を確かめる(&拡張["shape"]["plane"]["normal"], [0.0, 1.0, 0.0]);
+    近似3要素を確かめる(&拡張["shape"]["plane"]["offset"], [0.0, 0.0, 0.0]);
+    近似3要素を確かめる(&出力錐["shape"]["sphere"]["offset"], [0.0, -1000.0, 0.0]);
+    let used = json["extensionsUsed"]
+        .as_array()
+        .expect("extensionsUsedは配列である");
+    assert!(used.contains(&serde_json::json!("VRMC_springBone_extended_collider")));
+}
+
+/// 平面の換算失敗時はモデルを変更しない。
+#[test]
+fn 平面の換算失敗時はモデルを変更しない() {
+    let fbxバイト列 = b"fake-fbx";
+    let mut モデル = 書き出し可能モデルを作る();
+    let 前件数 = モデル.nodes.len();
+    let mut 値: serde_json::Value =
+        serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    値["nodes"]
+        .as_array_mut()
+        .expect("nodesは配列である")
+        .push(serde_json::json!({
+            "id": "n:100",
+            "parentId": serde_json::Value::Null,
+            "name": "Ground",
+            "siblingIndex": 27,
+            "scenePath": ["Milfy", "Ground"],
+            "source": serde_json::Value::Null,
+            "referenceSource": "scene",
+            "referenceLocal": {
+                "position": [0.0, 0.0209, 0.0],
+                "rotation": [0.0, 0.0, 0.0, 1.0],
+                "scale": [1.0, 1.0, 1.0],
+            },
+        }));
+    // f32に収まらない位置の平面は換算できない（有限値のため書式は通る）。
+    値["colliders"]
+        .as_array_mut()
+        .expect("collidersは配列である")
+        .push(serde_json::json!({
+            "id": "c:2",
+            "componentNodeId": "n:100",
+            "rootNodeId": "n:100",
+            "enabled": true,
+            "shapeType": "Plane",
+            "insideBounds": false,
+            "radius": 0.5,
+            "height": 2.0,
+            "position": [1e300, 0.0, 0.0],
+            "rotation": [0.0, 0.0, 0.0, 1.0],
+            "bonesAsSpheres": false,
+        }));
+    値["physBones"][0]["colliderIds"]
+        .as_array_mut()
+        .expect("colliderIdsは配列である")
+        .push(serde_json::json!("c:2"));
+    let 結果: Result<_, vrctom::vrm::VrmError> = {
+        let sidecar = PhysicsSidecar::from_json(&値.to_string(), &PhysicsLimits::new())
+            .expect("書式自体は通る");
+        let 解決 = モデル
+            .resolve_physics_sidecar(&sidecar, fbxバイト列)
+            .expect("解決は通る");
+        compile_springs(&sidecar, &mut モデル, &解決, &SpringCompileOptions::new())
+    };
+    assert!(結果.is_err(), "f32に収まらない平面は失敗する");
+    assert_eq!(モデル.nodes.len(), 前件数, "失敗時は補助ノードを足さない");
+}
+
 /// 同じ集合の順序・重複違いはグループを共有する。
 /// `ignoreOtherPhysBones` が偽なら他rootを切らず、所有権で奪い合う。
 #[test]
 fn 順序違いの参照集合はグループを共有する() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 値: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     // pb:1はSpine(n:1)を起点にし、Head(n:2)で終わる。HairA(n:3)は
@@ -1707,7 +2027,7 @@ fn 順序違いの参照集合はグループを共有する() {
         .expect("physBonesは配列である")
         .push(追加);
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &mut モデル);
     // pb:1はSpine起点でHeadまで伸びる。springはHairAとSpine-Headの2本である。
     // sidecarに腕ノードは無いため、腕には伸びない。
     assert_eq!(コンパイル済み.report.spring_count, 2);
@@ -1781,7 +2101,7 @@ fn 奪われたaim先のheadは単関節で落とす() {
     // pb:1 はSpine(n:1)を起点にするが、Head以下はpb:0が先に確保する。
     // pb:1 のhead SpineはAim先Headを失い、単関節になる。
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 値: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     let 追加 = serde_json::json!({
@@ -1800,7 +2120,7 @@ fn 奪われたaim先のheadは単関節で落とす() {
     値["physBones"][0]["componentNodeId"] = serde_json::json!("n:2");
     値["physBones"][0]["rootNodeId"] = serde_json::json!("n:2");
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &mut モデル);
     assert_eq!(コンパイル済み.report.spring_count, 1);
     assert_eq!(コンパイル済み.bones.springs[0].name, "Head");
     let 関節: Vec<usize> = コンパイル済み.bones.springs[0]
@@ -1827,13 +2147,13 @@ fn 奪われたaim先のheadは単関節で落とす() {
 fn 所有もaimも無い場合は作らず記録する() {
     // 単独ノードをrootにする。Aimが無いためheadにならない。
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 値: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     値["physBones"][0]["componentNodeId"] = serde_json::json!("n:4");
     値["physBones"][0]["rootNodeId"] = serde_json::json!("n:4");
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &mut モデル);
     assert_eq!(コンパイル済み.report.spring_count, 0);
     let 捨て = コンパイル済み
         .report
@@ -1851,7 +2171,7 @@ fn 所有もaimも無い場合は作らず記録する() {
 #[test]
 fn 他rootの切断は無視指定があるときだけ起きる() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 値: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     値["physBones"]
@@ -1865,13 +2185,13 @@ fn 他rootの切断は無視指定があるときだけ起きる() {
             "limitType": "None", "limitRotation": [0.0, 0.0, 0.0], "isAnimated": false,
         }));
     let (_, _, 偽) =
-        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &mut モデル);
     assert!(偽.report.cut_at_other_roots.is_empty(), "偽なら切らない");
     assert_eq!(偽.report.spring_count, 2);
     assert_eq!(偽.report.lost_nodes.len(), 3, "n:3・n:4・n:5を奪われる");
     値["physBones"][1]["ignoreOtherPhysBones"] = serde_json::json!(true);
     let (_, _, 真) =
-        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &mut モデル);
     assert_eq!(真.report.cut_at_other_roots.len(), 1, "真なら切る");
     assert_eq!(真.report.cut_at_other_roots[0].bone, "pb:1");
     assert_eq!(真.report.cut_at_other_roots[0].node, "n:3");
@@ -1885,12 +2205,12 @@ fn 他rootの切断は無視指定があるときだけ起きる() {
 #[test]
 fn 無視指定の部分木には降りない() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 値: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     値["physBones"][0]["ignoreNodeIds"] = serde_json::json!(["n:5"]);
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &mut モデル);
     assert_eq!(コンパイル済み.bones.springs.len(), 1);
     let 関節: Vec<usize> = コンパイル済み.bones.springs[0]
         .joints
@@ -1906,12 +2226,12 @@ fn 無視指定の部分木には降りない() {
 #[test]
 fn root自体の無視は空の木として報告する() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 値: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     値["physBones"][0]["ignoreNodeIds"] = serde_json::json!(["n:3"]);
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &mut モデル);
     assert_eq!(コンパイル済み.report.spring_count, 0);
     assert_eq!(コンパイル済み.report.skipped_bones.len(), 1);
     match &コンパイル済み.report.skipped_bones[0].reason {
@@ -1924,7 +2244,7 @@ fn root自体の無視は空の木として報告する() {
 #[test]
 fn sibling順がモデル子順と異なる場合はsidecar順に従う() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 値: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     // モデル上はHairB(n:4)が先だが、siblingIndexではHairC(n:5)を先にする。
@@ -1932,7 +2252,7 @@ fn sibling順がモデル子順と異なる場合はsidecar順に従う() {
     値["nodes"][5]["siblingIndex"] = serde_json::json!(0);
     値["physBones"][0]["multiChildType"] = serde_json::json!("First");
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &mut モデル);
     assert_eq!(コンパイル済み.report.spring_count, 1);
     let 関節: Vec<usize> = コンパイル済み.bones.springs[0]
         .joints
@@ -1955,7 +2275,7 @@ fn sibling順がモデル子順と異なる場合はsidecar順に従う() {
 #[test]
 fn root共有の2本目は作らず書き出しは通す() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 値: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     let 複製 = 値["physBones"][0].clone();
@@ -1967,7 +2287,7 @@ fn root共有の2本目は作らず書き出しは通す() {
         .expect("physBonesは配列である")
         .push(追加);
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &mut モデル);
     assert_eq!(
         コンパイル済み.report.spring_count, 1,
         "奪われたrootのboneはspringを作らない"
@@ -1989,7 +2309,6 @@ fn root共有の2本目は作らず書き出しは通す() {
         }
         他 => panic!("root共有で落とす: {他:?}"),
     }
-    let mut モデル = モデル;
     モデル.spring_bones = コンパイル済み.bones;
     モデル
         .to_vrm(&書き出し設定を作る())
@@ -2000,7 +2319,7 @@ fn root共有の2本目は作らず書き出しは通す() {
 #[test]
 fn 上限で切れた鎖は記録に残す() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     // 上限1ではheadだけになり、区間が無いためspringを作らない。
     // 切り詰め自体は記録に残す。
     let 文 = 髪sidecarを作る(fbxバイト列, &モデル);
@@ -2011,7 +2330,7 @@ fn 上限で切れた鎖は記録に残す() {
         .expect("合成対応は解決できる");
     let 上限1 = SpringCompileOptions::new().with_max_joints(1);
     let 制限付き =
-        compile_springs(&sidecar, &モデル, &解決, &上限1).expect("上限付きでも変換できる");
+        compile_springs(&sidecar, &mut モデル, &解決, &上限1).expect("上限付きでも変換できる");
     assert_eq!(制限付き.report.spring_count, 0);
     assert_eq!(
         制限付き.report.truncated_chains,
@@ -2020,7 +2339,7 @@ fn 上限で切れた鎖は記録に残す() {
     );
     // 上限2ではHairA・HairBの1本が通る。
     let 上限2 = SpringCompileOptions::new().with_max_joints(2);
-    let 通過 = compile_springs(&sidecar, &モデル, &解決, &上限2).expect("上限ちょうどでは通る");
+    let 通過 = compile_springs(&sidecar, &mut モデル, &解決, &上限2).expect("上限ちょうどでは通る");
     assert_eq!(通過.report.spring_count, 1);
     assert!(通過.report.truncated_chains.is_empty());
 }
@@ -2144,10 +2463,10 @@ fn 三分岐sidecarを作る(fbxバイト列: &[u8], モデル: &VrmModel, 分�
 #[test]
 fn 三分岐無視は三つのspringに分かれる() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 三分岐モデルを作る();
+    let mut モデル = 三分岐モデルを作る();
     let 文 = 三分岐sidecarを作る(fbxバイト列, &モデル, "Ignore");
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&文, fbxバイト列, &モデル);
+        文から解決してコンパイルする(&文, fbxバイト列, &mut モデル);
     assert_eq!(コンパイル済み.report.spring_count, 3);
     let 名前: Vec<&str> = コンパイル済み
         .bones
@@ -2214,7 +2533,7 @@ fn 先頭子だけがspringになる() {
             local: 平行移動行列(位置[索引]),
         })
         .collect();
-    let モデル = VrmModel {
+    let mut モデル = VrmModel {
         root: 単位行列(),
         nodes: ノード,
         skins: Vec::new(),
@@ -2262,7 +2581,7 @@ fn 先頭子だけがspringになる() {
     文["physBones"][0]["componentNodeId"] = serde_json::json!("n:1");
     文["physBones"][0]["rootNodeId"] = serde_json::json!("n:1");
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &mut モデル);
     assert_eq!(コンパイル済み.report.spring_count, 1);
     let spring = &コンパイル済み.bones.springs[0];
     assert_eq!(spring.name, "X", "先頭関節のノード名である");
@@ -2310,7 +2629,7 @@ fn 平均指定は先頭子への近似として記録する() {
             local: 平行移動行列(位置[索引]),
         })
         .collect();
-    let モデル = VrmModel {
+    let mut モデル = VrmModel {
         root: 単位行列(),
         nodes: ノード,
         skins: Vec::new(),
@@ -2356,7 +2675,7 @@ fn 平均指定は先頭子への近似として記録する() {
     文["physBones"][0]["componentNodeId"] = serde_json::json!("n:1");
     文["physBones"][0]["rootNodeId"] = serde_json::json!("n:1");
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &mut モデル);
     assert_eq!(コンパイル済み.report.spring_count, 1);
     let 関節: Vec<usize> = コンパイル済み.bones.springs[0]
         .joints
@@ -2393,7 +2712,7 @@ fn avatarrootはjointにしない() {
             local: 平行移動行列(位置[索引]),
         })
         .collect();
-    let モデル = VrmModel {
+    let mut モデル = VrmModel {
         root: 単位行列(),
         nodes: ノード,
         skins: Vec::new(),
@@ -2441,7 +2760,7 @@ fn avatarrootはjointにしない() {
     })
     .to_string();
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&文, fbxバイト列, &モデル);
+        文から解決してコンパイルする(&文, fbxバイト列, &mut モデル);
     assert_eq!(コンパイル済み.report.spring_count, 1);
     assert_eq!(コンパイル済み.bones.springs[0].name, "A");
     let 関節: Vec<usize> = コンパイル済み.bones.springs[0]
@@ -2485,7 +2804,7 @@ fn 内側の候補は祖先へ辿り直す() {
             local: 平行移動行列(位置[索引]),
         })
         .collect();
-    let モデル = VrmModel {
+    let mut モデル = VrmModel {
         root: 単位行列(),
         nodes: ノード,
         skins: Vec::new(),
@@ -2557,7 +2876,7 @@ fn 内側の候補は祖先へ辿り直す() {
         .expect("physBonesは配列である")
         .push(追加);
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &mut モデル);
     assert_eq!(コンパイル済み.report.spring_count, 2);
     // pb:Aの鎖は他rootで切れ、pb:Bの候補は内側のためGへ辿る。
     assert_eq!(コンパイル済み.report.cut_at_other_roots.len(), 1);
@@ -2573,14 +2892,14 @@ fn 内側の候補は祖先へ辿り直す() {
 #[test]
 fn 全固定は親をcenterにする() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 文: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     文["physBones"][0]["immobile"] =
         serde_json::json!({"value": 1.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
     文["physBones"][0]["immobileType"] = serde_json::json!("AllMotion");
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &mut モデル);
     assert_eq!(コンパイル済み.report.spring_count, 1);
     let spring = &コンパイル済み.bones.springs[0];
     // chain rootはHairA(n:3)で、親はHead(n:2 → Vrm索引2)である。
@@ -2602,14 +2921,14 @@ fn 全固定は親をcenterにする() {
 #[test]
 fn 世界固定は最上位をcenterにする() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 文: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     文["physBones"][0]["immobile"] =
         serde_json::json!({"value": 1.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
     文["physBones"][0]["immobileType"] = serde_json::json!("World");
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &mut モデル);
     let spring = &コンパイル済み.bones.springs[0];
     // 最上位はHips(n:0 → Vrm索引0)であり、実アバタールートはその上にある。
     assert_eq!(spring.center, Some(0));
@@ -2626,14 +2945,14 @@ fn 世界固定は最上位をcenterにする() {
 #[test]
 fn 世界弱はcenterなしである() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 文: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     文["physBones"][0]["immobile"] =
         serde_json::json!({"value": 0.4, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
     文["physBones"][0]["immobileType"] = serde_json::json!("World");
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &mut モデル);
     let spring = &コンパイル済み.bones.springs[0];
     assert_eq!(spring.center, None);
     assert_eq!(コンパイル済み.report.weak_world, vec!["pb:0".to_string()]);
@@ -2644,14 +2963,14 @@ fn 世界弱はcenterなしである() {
 #[test]
 fn 部分固定はholdsでcenterなしである() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 文: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     文["physBones"][0]["immobile"] =
         serde_json::json!({"value": 0.5, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
     文["physBones"][0]["immobileType"] = serde_json::json!("AllMotion");
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &mut モデル);
     let spring = &コンパイル済み.bones.springs[0];
     assert_eq!(spring.center, None);
     assert_eq!(
@@ -2666,7 +2985,7 @@ fn 部分固定はholdsでcenterなしである() {
 #[test]
 fn 親がsidecarルートでもcenterにする() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 文: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     // rootをSpine(n:1)に移し、親をsidecarルート(n:0)にする。
@@ -2676,7 +2995,7 @@ fn 親がsidecarルートでもcenterにする() {
         serde_json::json!({"value": 1.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
     文["physBones"][0]["immobileType"] = serde_json::json!("AllMotion");
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &mut モデル);
     assert!(!コンパイル済み.bones.springs.is_empty());
     for spring in &コンパイル済み.bones.springs {
         // sidecarルート(n:0 → Vrm索引0)がcenterになる。
@@ -2691,7 +3010,7 @@ fn 親がsidecarルートでもcenterにする() {
 #[test]
 fn 起点がルート自体はcenterなしである() {
     let fbxバイト列 = b"fake-fbx";
-    let モデル = 書き出し可能モデルを作る();
+    let mut モデル = 書き出し可能モデルを作る();
     let mut 文: serde_json::Value =
         serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
     // rootをsidecarルート(n:0)に移す。親が無いため候補は無い。
@@ -2701,7 +3020,7 @@ fn 起点がルート自体はcenterなしである() {
         serde_json::json!({"value": 1.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
     文["physBones"][0]["immobileType"] = serde_json::json!("AllMotion");
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &mut モデル);
     assert!(!コンパイル済み.bones.springs.is_empty());
     for spring in &コンパイル済み.bones.springs {
         assert_eq!(spring.center, None);
@@ -2736,7 +3055,7 @@ fn 未マップを含む鎖は落とす() {
             local: 平行移動行列(位置[索引]),
         })
         .collect();
-    let モデル = VrmModel {
+    let mut モデル = VrmModel {
         root: 単位行列(),
         nodes: ノード,
         skins: Vec::new(),
@@ -2785,7 +3104,7 @@ fn 未マップを含む鎖は落とす() {
     })
     .to_string();
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&文, fbxバイト列, &モデル);
+        文から解決してコンパイルする(&文, fbxバイト列, &mut モデル);
     assert_eq!(コンパイル済み.report.spring_count, 0);
     assert_eq!(コンパイル済み.report.skipped_bones.len(), 1);
     match &コンパイル済み.report.skipped_bones[0].reason {
@@ -2847,7 +3166,7 @@ fn ゼロ長区間で分割し重ねない() {
             local: 平行移動行列(位置[索引]),
         })
         .collect();
-    let モデル = VrmModel {
+    let mut モデル = VrmModel {
         root: 単位行列(),
         nodes: ノード,
         skins: Vec::new(),
@@ -2894,7 +3213,7 @@ fn ゼロ長区間で分割し重ねない() {
     文["physBones"][0]["rootNodeId"] = serde_json::json!("n:1");
     // multiChildTypeは単一子のままにする。
     let (_, _, コンパイル済み) =
-        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &mut モデル);
     assert_eq!(コンパイル済み.report.spring_count, 2);
     let 名前: Vec<&str> = コンパイル済み
         .bones
@@ -2921,7 +3240,6 @@ fn ゼロ長区間で分割し重ねない() {
     assert_eq!(コンパイル済み.report.zero_length_joints[0].child, "n:3");
     assert!(コンパイル済み.report.truncated_chains.is_empty());
     // 書き出しは親子連鎖と一意性を満たす。
-    let mut モデル = モデル;
     モデル.spring_bones = コンパイル済み.bones;
     モデル
         .to_vrm(&書き出し設定を作る())
