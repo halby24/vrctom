@@ -125,6 +125,9 @@ VRCTOM_PHYSICS_OUT=/tmp/out/physics.json \
   数値・カーブは `pull/spring/stiffness/gravity/gravityFalloff/immobile/radius/maxAngleX/maxAngleZ`、
   カーブは `{value, keys[{time,value,inSlope,outSlope,weightedMode,inWeight,outWeight}],
   preWrapMode, postWrapMode}`（`AnimationCurve` をそのまま写す）。
+  `limitRotation`（float[3]）に加え、軸別カーブ
+  `limitRotationXCurve/limitRotationYCurve/limitRotationZCurve` を同形式で出す。
+  軸別カーブは単独の float 値を持たないため `value` は既定の `1`（空 keys 時は1倍扱い）。
   enum は文字列（`integrationType/multiChildType/immobileType/limitType`、
   `version` は `Version_1_1`→`"1.1"` に読み替える）。
 - `colliders[]`: 有効な `VRCPhysBoneCollider` を Transform 順に `c:0..`。
@@ -143,7 +146,7 @@ VRCTOM_PHYSICS_OUT=/tmp/out/physics.json \
   `False` 以外を `true` に丸めて bool で出す（VRM 側に中間値が無いため）。
 - `allowGrabbing` / `allowPosing` / `stretchMotion` 系（maxStretch/maxSquish 含む）、
   `grabMovement` / `snapToHand` / `parameter` / `resetWhenDisabled`、
-  `limitRotation` 系カーブ、`staticFreezeAxis`、各種 Filter は sidecar に出さない。
+  `staticFreezeAxis`、各種 Filter は sidecar に出さない。
   把握・伸縮は `unsupportedFeatures` にだけ残す。
 - Unity / VRC の Constraint 系コンポーネント、FX レイヤーのデフォルト値は収集しない。
   Plane コライダーは記録するが `plane-colliders` として申告する（変換は次単位）。

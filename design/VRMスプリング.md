@@ -192,17 +192,16 @@ flowchart LR
   計算にはlimit入力（種別・最大角・制限回転・カーブ）を必ず使う。
 - `HoldsImmobile`（centerなしの部分immobile）はhead位置のimmobile値を
   `held` として引きに織り込む。centerあり・未使用の場合は0である。
-- Unity出力との突き合わせでは、drag・gravity・hitRadius・重力方向は完全一致し、
-  stiffnessは111/148件（75%）が許容差（abs 1e-5 + rel 1e-4）に収まる。
-  残る37件はいずれもPolar制限で、こちらが0.1〜0.8%だけ高い。
-  単精度36方向ループ（`Mathf`・`Vector3`・`Quaternion` と同じ順序）で再計算しても
-  703/740件（95.0%）・stiffness 111/148件のまま変わらず、不一致37件も同一集合のため、
-  f32版は破棄して倍精度一本に戻した。許容差を広げて合わせることはしない。
-  不一致の主因はsidecar欠落のlimitRotationカーブである。Ribbon A-D L/R・SideHair_A L/Rの
-  28件はUnityスナップショットにlimitRotationX/Y/ZCurveがあるのにsidecarに無く、
-  自前ループにスナップショットのカーブ値を入れるとUnity implied値と一致する
-  （Ribbon_A.L[0]: 34.289対34.294、SideHair_A.L[0]: 7.965対7.964）。
-  残り9件は一致方向試行のacos特異性による丸めのくじ引きと見込む。
+- Unity出力との突き合わせでは、drag・gravity・hitRadius・重力方向は完全一致する。
+  sidecarに`limitRotationX/Y/ZCurve`が無い状態ではstiffness 111/148件（75%）、
+  全体703/740件（95.0%）であった。Unityスナップショットのカーブ値をsidecarへ補うと
+  **stiffness 139/148件（93.9%）、全体731/740件（98.8%）**まで改善する。
+  この補完はUnityヘルパのカーブ出力（`limitRotationX/Y/ZCurve`）で行う。
+- 残る9件（Cardigan_1.L/R、Cardigan_3.R、Spine_Ribbon_4）はいずれもPolar制限で、
+  こちらが0.1〜0.8%だけ高い。単精度36方向ループ（`Mathf`・`Vector3`・`Quaternion`と
+  同じ順序）で再計算しても同じ9件のままで改善しないため、f32版は破棄して
+  倍精度一本に戻した。一致方向試行のacos特異性による丸めのくじ引きと見込む。
+  許容差を広げて合わせることはしない。
   Cardigan_1.L/RのUnity値が8桁完全一致なのに自前は4桁目で相違する点や、
   Cardigan_3.L一致/R不一致のL/R非対称、JointLimitクォータニオンの一般経路確認、
   スナップショットとsidecarの位置差最大5.5e-7・全スカラー設定一致と合わせると、

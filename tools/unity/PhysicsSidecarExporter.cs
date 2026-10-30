@@ -574,6 +574,10 @@ public static class PhysicsSidecarExporter
             maxAngleX = Curved(bone.maxAngleX, bone.maxAngleXCurve),
             maxAngleZ = Curved(bone.maxAngleZ, bone.maxAngleZCurve),
             limitRotation = Float3(bone.limitRotation),
+            // 制限回転の軸別カーブ。対応する float 値が無いため value は既定の 1。
+            limitRotationXCurve = LimitCurve(bone.limitRotationXCurve),
+            limitRotationYCurve = LimitCurve(bone.limitRotationYCurve),
+            limitRotationZCurve = LimitCurve(bone.limitRotationZCurve),
             isAnimated = bone.isAnimated,
             ignoreNodeIds = new string[0],
             colliderIds = new string[0],
@@ -665,6 +669,12 @@ public static class PhysicsSidecarExporter
             preWrapMode = curve != null ? (int)curve.preWrapMode : 0,
             postWrapMode = curve != null ? (int)curve.postWrapMode : 0,
         };
+    }
+
+    // 制限回転の軸別カーブ用。単独の float 値を持たないため value は既定の 1。
+    private static CurvedDto LimitCurve(AnimationCurve curve)
+    {
+        return Curved(1f, curve);
     }
 
     private static CurveKeyDto[] CurveKeys(AnimationCurve curve)
@@ -879,6 +889,9 @@ public static class PhysicsSidecarExporter
         public CurvedDto maxAngleX;
         public CurvedDto maxAngleZ;
         public float[] limitRotation;
+        public CurvedDto limitRotationXCurve;
+        public CurvedDto limitRotationYCurve;
+        public CurvedDto limitRotationZCurve;
         public bool isAnimated;
     }
 
