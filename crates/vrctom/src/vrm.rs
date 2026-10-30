@@ -37,9 +37,10 @@ pub use physics::{
     BranchSplit, CenterAssigned, CenterKind, CompiledSprings, JointTrace, LostNode, NoCenter,
     NoCenterReason, OwnedSpring, PhysicsLimits, PhysicsResolution, PhysicsSidecar,
     ResolvedCollider, ResolvedPhysBone, RootCut, SharedNode, SidecarCurve, SkippedBone,
-    SkippedBoneReason, SpringCompileOptions, SpringCompileReport, VrmSpring, VrmSpringBones,
-    VrmSpringCollider, VrmSpringColliderExtension, VrmSpringColliderGroup, VrmSpringColliderShape,
-    VrmSpringJoint, VrmSpringJointLimit, ZeroLengthJoint, compile_springs,
+    SkippedBoneReason, SpringCompileOptions, SpringCompileReport, VrmAimAxis, VrmNodeConstraint,
+    VrmNodeConstraintKind, VrmRollAxis, VrmSpring, VrmSpringBones, VrmSpringCollider,
+    VrmSpringColliderExtension, VrmSpringColliderGroup, VrmSpringColliderShape, VrmSpringJoint,
+    VrmSpringJointLimit, ZeroLengthJoint, compile_springs,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -86,6 +87,8 @@ pub struct VrmModel {
     pub expressions: VrmExpressions,
     /// スプリング。今回は空であり、書き出しはしない。
     pub spring_bones: VrmSpringBones,
+    /// ノード制約列。空の場合は拡張を書かない。
+    pub node_constraints: Vec<VrmNodeConstraint>,
 }
 
 /// ノード1件。
@@ -403,6 +406,7 @@ impl VrmModel {
             meshes,
             expressions,
             spring_bones: VrmSpringBones::default(),
+            node_constraints: Vec::new(),
         };
         Ok((model, report))
     }

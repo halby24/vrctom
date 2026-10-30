@@ -138,6 +138,7 @@ fn 書き出し可能モデルを作る() -> VrmModel {
         meshes: Vec::new(),
         expressions: VrmExpressions::default(),
         spring_bones: VrmSpringBones::default(),
+        node_constraints: Vec::new(),
     }
 }
 
@@ -1617,7 +1618,135 @@ fn 実fixtureの平面colliderはunity出力と一致する() {
     assert!(used.contains(&serde_json::json!("VRMC_springBone_extended_collider")));
 }
 
-/// collider参照が無いspringは、空配列を出さずに拡張する。/// collider参照が無いspringは、空配列を出さずに拡張する。
+/// 実fixtureのノード制約をUnity出力と突き合わせる。
+/// 制約入りsidecarで8件（回転4・ひねり4）が出て、種別・軸・参照先・重みが
+/// Unity出力と名前基準で一致する。spring・joint・center・limit・colliderの
+/// 件数は変わらない。
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn 実fixtureのノード制約はunity出力と一致する() {
+    let (Some(fbx経路), Some(制約sidecar経路), Some(unity経路)) = (
+        std::env::var_os("VRCTOM_FBX_FIXTURE"),
+        std::env::var_os("VRCTOM_PHYSICS_SIDECAR_CONSTRAINTS"),
+        std::env::var_os("VRCTOM_UNITY_VRM"),
+    ) else {
+        eprintln!(
+            "VRCTOM_FBX_FIXTURE/VRCTOM_PHYSICS_SIDECAR_CONSTRAINTS/VRCTOM_UNITY_VRM未設定のため跳ばす"
+        );
+        return;
+    };
+    let fbxバイト列 = std::fs::read(&fbx経路).expect("実fixtureは読める");
+    let sidecar文 = std::fs::read(&制約sidecar経路).expect("制約入りsidecarは読める");
+    let 解析 = vrctom::fbx::FbxFile::parse(&fbxバイト列, &vrctom::fbx::FbxOptions::new())
+        .expect("実fixtureは読める");
+    let (mut モデル, _) =
+        VrmModel::from_fbx(&解析, &vrctom::vrm::VrmOptions::new()).expect("実fixtureは変換できる");
+    let sidecar =
+        PhysicsSidecar::parse(&sidecar文, &PhysicsLimits::new()).expect("実sidecarは検証を通る");
+    assert!(!sidecar.constraints.is_empty(), "制約入りsidecarを使う");
+    let 解決 = モデル
+        .resolve_physics_sidecar(&sidecar, &fbxバイト列)
+        .expect("実fixtureの参照は解決できる");
+    let コンパイル済み =
+        compile_springs(&sidecar, &mut モデル, &解決, &SpringCompileOptions::new())
+            .expect("実fixtureの鎖はコンパイルできる");
+    // 件数は制約8件で、他は変わらない。
+    assert_eq!(コンパイル済み.report.spring_count, 45);
+    assert_eq!(
+        コンパイル済み
+            .bones
+            .springs
+            .iter()
+            .map(|s| s.joints.len())
+            .sum::<usize>(),
+        148
+    );
+    assert_eq!(コンパイル済み.report.collider_count, 12);
+    assert_eq!(コンパイル済み.report.group_count, 4);
+    assert_eq!(コンパイル済み.report.center_applied.len(), 43);
+    assert_eq!(モデル.node_constraints.len(), 8, "制約は8件である");
+    // 落とした3件は2件のblendと親付けである。
+    assert_eq!(コンパイル済み.report.skipped_constraints.len(), 3);
+    // Unity出力と名前基準で突き合わせる。ノード順は一致しないため索引では比べない。
+    let unityバイト列 = std::fs::read(&unity経路).expect("Unity製VRMは読める");
+    let unity_json = glbのjsonを取る(&unityバイト列);
+    let unity節点 = unity_json["nodes"].as_array().expect("Unityにnodesがある");
+    let mut unity表: std::collections::HashMap<&str, &serde_json::Value> =
+        std::collections::HashMap::new();
+    for 節点 in unity節点 {
+        let 名前 = 節点["name"].as_str().expect("Unityの節点名は文字列である");
+        assert!(
+            unity表.insert(名前, 節点).is_none(),
+            "Unityの節点名は重ならない"
+        );
+    }
+    let 許容 = |実: f64, 想: f64| (実 - 想).abs() <= 1e-5 + 1e-4 * 想.abs();
+    let mut 合致 = 0usize;
+    for 制約 in &モデル.node_constraints {
+        let 対象名 = &モデル.nodes[制約.node].name;
+        let 参照名 = &モデル.nodes[制約.source].name;
+        let 他 = unity表
+            .get(対象名.as_str())
+            .unwrap_or_else(|| panic!("Unity出力に節点が無い: {対象名}"));
+        let 他制約 = &他["extensions"]["VRMC_node_constraint"]["constraint"];
+        let 他種別 = match &制約.kind {
+            vrctom::vrm::VrmNodeConstraintKind::Rotation => {
+                let 他回転 = &他制約["rotation"];
+                assert!(他回転.is_object(), "Unityも回転である: {対象名}");
+                他回転
+            }
+            vrctom::vrm::VrmNodeConstraintKind::Roll { axis } => {
+                let 他捻 = &他制約["roll"];
+                let 想軸 = match axis {
+                    vrctom::vrm::VrmRollAxis::X => "X",
+                    vrctom::vrm::VrmRollAxis::Y => "Y",
+                    vrctom::vrm::VrmRollAxis::Z => "Z",
+                };
+                assert_eq!(
+                    他捻["rollAxis"],
+                    serde_json::json!(想軸),
+                    "ひねり軸が一致する: {対象名}"
+                );
+                他捻
+            }
+            vrctom::vrm::VrmNodeConstraintKind::Aim { .. } => {
+                panic!("実fixtureに注視は無い");
+            }
+        };
+        let 他参照名 =
+            unity節点[他種別["source"].as_u64().expect("参照先は数である") as usize]["name"]
+                .as_str()
+                .expect("Unityの参照先名は文字列である");
+        assert_eq!(他参照名, 参照名, "参照先が一致する: {対象名}");
+        assert!(
+            許容(
+                f64::from(制約.weight),
+                他種別["weight"].as_f64().unwrap_or(f64::NAN)
+            ),
+            "重みが一致する: {対象名}"
+        );
+        合致 += 1;
+    }
+    assert_eq!(合致, 8);
+    eprintln!("制約一致: {合致}/8");
+    // 書き出しは拡張と使用宣言を載せる。
+    モデル.spring_bones = コンパイル済み.bones;
+    let 設定 = VrmExportOptions::new(VrmMeta::new("試験", vec!["作者".to_string()]));
+    let バイト列 = モデル.to_vrm(&設定).expect("実fixtureは書き出せる");
+    let json = glbのjsonを取る(&バイト列);
+    let used = json["extensionsUsed"]
+        .as_array()
+        .expect("extensionsUsedは配列である");
+    assert!(used.contains(&serde_json::json!("VRMC_node_constraint")));
+    let 節点 = json["nodes"].as_array().expect("nodesは配列である");
+    let 拡張数 = 節点
+        .iter()
+        .filter(|節点| 節点["extensions"]["VRMC_node_constraint"].is_object())
+        .count();
+    assert_eq!(拡張数, 8);
+}
+
+/// collider参照が無いspringは、空配列を出さずに拡張する。
 #[test]
 fn collider参照が無いspringは空配列を出さない() {
     let fbxバイト列 = b"fake-fbx";
@@ -1741,6 +1870,27 @@ fn 角度制限は拡張に載る() {
         .as_array()
         .expect("extensionsUsedは配列である");
     assert!(!used2.contains(&serde_json::json!("VRMC_springBone_limit")));
+}
+
+/// 制約なしは拡張を書かない。`--physics` なしの退行確認も兼ねる。
+#[test]
+fn 制約なしは拡張を書かない() {
+    let モデル = 書き出し可能モデルを作る();
+    assert!(モデル.node_constraints.is_empty());
+    let バイト列 = モデル
+        .to_vrm(&書き出し設定を作る())
+        .expect("制約なしは書き出せる");
+    let json = glbのjsonを取る(&バイト列);
+    let used = json["extensionsUsed"]
+        .as_array()
+        .expect("extensionsUsedは配列である");
+    assert!(!used.contains(&serde_json::json!("VRMC_node_constraint")));
+    for 節点 in json["nodes"].as_array().expect("nodesは配列である") {
+        assert!(
+            節点.get("extensions").is_none(),
+            "制約なしの節点に拡張は付かない"
+        );
+    }
 }
 
 /// Sphereは高さがあっても球のままである。
@@ -1983,6 +2133,160 @@ fn 平面の換算失敗時はモデルを変更しない() {
     };
     assert!(結果.is_err(), "f32に収まらない平面は失敗する");
     assert_eq!(モデル.nodes.len(), 前件数, "失敗時は補助ノードを足さない");
+}
+
+/// 制約の種別写像に従う。回転3軸は回転、1軸はひねり、2軸・複数参照・
+/// 親付け・自己参照・重複対象は落とす。注視は主軸の場合だけ写す。
+#[test]
+fn 制約の種別写像に従う() {
+    let fbxバイト列 = b"fake-fbx";
+    let mut モデル = 書き出し可能モデルを作る();
+    let mut 値: serde_json::Value =
+        serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    let 制約 = |id: &str,
+                対象: &str,
+                参照: serde_json::Value,
+                種別: &str,
+                軸: serde_json::Value,
+                注視: serde_json::Value| {
+        serde_json::json!({
+            "id": id,
+            "nodeId": 対象,
+            "targetNodeId": 対象,
+            "type": 種別,
+            "family": "vrchat",
+            "weight": 0.5,
+            "enabled": true,
+            "active": true,
+            "freezeToWorld": false,
+            "affectsRotation": 軸,
+            "aimAxis": 注視,
+            "sources": 参照,
+        })
+    };
+    let 参照1 =
+        |節点: &str| serde_json::json!([{"nodeId": 節点, "external": false, "weight": 1.0}]);
+    値["constraints"] = serde_json::json!([
+        制約(
+            "k:0",
+            "n:3",
+            参照1("n:4"),
+            "Rotation",
+            serde_json::json!([true, true, true]),
+            serde_json::json!([0.0, 0.0, 1.0])
+        ),
+        制約(
+            "k:1",
+            "n:5",
+            参照1("n:4"),
+            "Rotation",
+            serde_json::json!([false, true, false]),
+            serde_json::json!([0.0, 0.0, 1.0])
+        ),
+        制約(
+            "k:2",
+            "n:2",
+            参照1("n:1"),
+            "Aim",
+            serde_json::json!([true, true, true]),
+            serde_json::json!([0.0, 0.0, 1.0])
+        ),
+        制約(
+            "k:3",
+            "n:5",
+            参照1("n:4"),
+            "Rotation",
+            serde_json::json!([true, true, false]),
+            serde_json::json!([0.0, 0.0, 1.0])
+        ),
+        制約(
+            "k:4",
+            "n:2",
+            serde_json::json!([{"nodeId": "n:1", "external": false, "weight": 0.5}, {"nodeId": "n:0", "external": false, "weight": 0.5}]),
+            "Rotation",
+            serde_json::json!([true, true, true]),
+            serde_json::json!([0.0, 0.0, 1.0])
+        ),
+        制約(
+            "k:5",
+            "n:2",
+            参照1("n:1"),
+            "Parent",
+            serde_json::json!([true, true, true]),
+            serde_json::json!([0.0, 0.0, 1.0])
+        ),
+        制約(
+            "k:6",
+            "n:3",
+            参照1("n:4"),
+            "Rotation",
+            serde_json::json!([true, true, true]),
+            serde_json::json!([0.0, 0.0, 1.0])
+        ),
+        制約(
+            "k:7",
+            "n:4",
+            serde_json::json!([{"nodeId": "n:4", "external": false, "weight": 1.0}]),
+            "Rotation",
+            serde_json::json!([true, true, true]),
+            serde_json::json!([0.0, 0.0, 1.0])
+        ),
+    ]);
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&値.to_string(), fbxバイト列, &mut モデル);
+    // 回転・ひねり・注視の3件だけ残り、落とした5件を記録する。
+    assert_eq!(モデル.node_constraints.len(), 3);
+    let 回転 = &モデル.node_constraints[0];
+    assert_eq!(回転.node, 3);
+    assert_eq!(回転.source, 4);
+    assert!((回転.weight - 0.5).abs() < 1e-6);
+    assert!(matches!(
+        回転.kind,
+        vrctom::vrm::VrmNodeConstraintKind::Rotation
+    ));
+    let 捻り = &モデル.node_constraints[1];
+    assert_eq!(捻り.node, 5);
+    assert!(matches!(
+        捻り.kind,
+        vrctom::vrm::VrmNodeConstraintKind::Roll {
+            axis: vrctom::vrm::VrmRollAxis::Y
+        }
+    ));
+    let 注視 = &モデル.node_constraints[2];
+    assert_eq!(注視.node, 2);
+    assert!(matches!(
+        注視.kind,
+        vrctom::vrm::VrmNodeConstraintKind::Aim {
+            axis: vrctom::vrm::VrmAimAxis::PositiveZ
+        }
+    ));
+    let mut 落下 = コンパイル済み.report.skipped_constraints.clone();
+    落下.sort();
+    assert_eq!(落下, vec!["k:3", "k:4", "k:5", "k:6", "k:7"]);
+    // 書き出しは拡張と使用宣言を載せる。注視軸はZのため鏡像でも変わらない。
+    let バイト列 = モデル
+        .to_vrm(&書き出し設定を作る())
+        .expect("制約付きは書き出せる");
+    let json = glbのjsonを取る(&バイト列);
+    let 節点 = json["nodes"].as_array().expect("nodesは配列である");
+    let 拡張 = &節点[3]["extensions"]["VRMC_node_constraint"];
+    assert_eq!(拡張["specVersion"], serde_json::json!("1.0"));
+    assert_eq!(
+        拡張["constraint"]["rotation"]["source"],
+        serde_json::json!(4)
+    );
+    assert_eq!(
+        拡張["constraint"]["rotation"]["weight"],
+        serde_json::json!(0.5f32)
+    );
+    assert_eq!(
+        節点[2]["extensions"]["VRMC_node_constraint"]["constraint"]["aim"]["aimAxis"],
+        serde_json::json!("PositiveZ")
+    );
+    let used = json["extensionsUsed"]
+        .as_array()
+        .expect("extensionsUsedは配列である");
+    assert!(used.contains(&serde_json::json!("VRMC_node_constraint")));
 }
 
 /// 同じ集合の順序・重複違いはグループを共有する。
@@ -2380,6 +2684,7 @@ fn 三分岐モデルを作る() -> VrmModel {
         meshes: Vec::new(),
         expressions: VrmExpressions::default(),
         spring_bones: VrmSpringBones::default(),
+        node_constraints: Vec::new(),
     }
 }
 
@@ -2540,6 +2845,7 @@ fn 先頭子だけがspringになる() {
         meshes: Vec::new(),
         expressions: VrmExpressions::default(),
         spring_bones: VrmSpringBones::default(),
+        node_constraints: Vec::new(),
     };
     let fbxバイト列 = b"fake-fbx";
     let 道 = [
@@ -2636,6 +2942,7 @@ fn 平均指定は先頭子への近似として記録する() {
         meshes: Vec::new(),
         expressions: VrmExpressions::default(),
         spring_bones: VrmSpringBones::default(),
+        node_constraints: Vec::new(),
     };
     let fbxバイト列 = b"fake-fbx";
     let 道 = [
@@ -2719,6 +3026,7 @@ fn avatarrootはjointにしない() {
         meshes: Vec::new(),
         expressions: VrmExpressions::default(),
         spring_bones: VrmSpringBones::default(),
+        node_constraints: Vec::new(),
     };
     let fbxバイト列 = b"fake-fbx";
     let 出所 = |パス: &[&str]| serde_json::json!({"modelId": "milfy", "path": パス, "assetGuid": "g", "localId": -1});
@@ -2811,6 +3119,7 @@ fn 内側の候補は祖先へ辿り直す() {
         meshes: Vec::new(),
         expressions: VrmExpressions::default(),
         spring_bones: VrmSpringBones::default(),
+        node_constraints: Vec::new(),
     };
     let fbxバイト列 = b"fake-fbx";
     let 道 = [
@@ -3062,6 +3371,7 @@ fn 未マップを含む鎖は落とす() {
         meshes: Vec::new(),
         expressions: VrmExpressions::default(),
         spring_bones: VrmSpringBones::default(),
+        node_constraints: Vec::new(),
     };
     // sidecarはTopとHだけを持ち、Gは出所なし（scene追加）で残す。
     let fbxバイト列 = b"fake-fbx";
@@ -3173,6 +3483,7 @@ fn ゼロ長区間で分割し重ねない() {
         meshes: Vec::new(),
         expressions: VrmExpressions::default(),
         spring_bones: VrmSpringBones::default(),
+        node_constraints: Vec::new(),
     };
     let fbxバイト列 = b"fake-fbx";
     let 道 = [

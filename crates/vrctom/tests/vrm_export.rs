@@ -154,6 +154,7 @@ fn 合成モデルを作る() -> VrmModel {
         meshes: vec![メッシュ],
         expressions: VrmExpressions::default(),
         spring_bones: vrctom::vrm::VrmSpringBones::default(),
+        node_constraints: Vec::new(),
     }
 }
 

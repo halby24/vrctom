@@ -858,6 +858,11 @@ impl<'a> GlbWriter<'a> {
     /// 単位行列の箇所は `matrix` を省略する（glTFの既定値が単位行列のため）。
     fn build_nodes(&mut self) -> Result<(), VrmExportError> {
         let mesh_of_node = self.node_mesh_map()?;
+        // 対象ノードごとの制約。写像時は対象が一意であり、重複は最初の1件を使う。
+        let mut constraint_at: HashMap<usize, &super::VrmNodeConstraint> = HashMap::new();
+        for constraint in &self.model.node_constraints {
+            constraint_at.entry(constraint.node).or_insert(constraint);
+        }
         let mut nodes = Vec::with_capacity(self.model.nodes.len());
         for (index, node) in self.model.nodes.iter().enumerate() {
             if let Some(parent) = node.parent
@@ -910,6 +915,10 @@ impl<'a> GlbWriter<'a> {
                 mesh,
                 skin,
                 name: Some(node.name.clone()),
+                extensions: build_node_constraint_extension(
+                    constraint_at.get(&index).copied(),
+                    self.model.nodes.len(),
+                )?,
                 ..Default::default()
             });
         }
@@ -1105,6 +1114,9 @@ impl<'a> GlbWriter<'a> {
         }
         if wrote_spring_bone_extended_collider {
             used.push("VRMC_springBone_extended_collider".to_string());
+        }
+        if !self.model.node_constraints.is_empty() {
+            used.push("VRMC_node_constraint".to_string());
         }
         self.root.extensions_used = used;
         Ok(())
@@ -1782,6 +1794,87 @@ fn build_collider_extension_json(
             })))
         }
     }
+}
+
+/// ノード制約を `VRMC_node_constraint` の拡張JSONにする。
+/// 制約なしの場合は `None` を返す。対象と参照先の索引・重みの有限値と値域を検証する。
+/// 注視軸はXだけ鏡像する（`PositiveX` と `NegativeX` を入れ替える）。
+/// 仕様版は `1.0` である。
+fn build_node_constraint_extension(
+    constraint: Option<&super::VrmNodeConstraint>,
+    node_count: usize,
+) -> Result<Option<gltf::json::extensions::scene::Node>, VrmExportError> {
+    let Some(constraint) = constraint else {
+        return Ok(None);
+    };
+    let where_ = "node constraint";
+    if constraint.node >= node_count || constraint.source >= node_count {
+        return Err(VrmExportError::new(
+            VrmExportErrorKind::InvalidStructure,
+            format!("{where_}のノード索引が範囲外である"),
+        ));
+    }
+    if constraint.source == constraint.node {
+        return Err(VrmExportError::new(
+            VrmExportErrorKind::InvalidStructure,
+            format!("{where_}の参照先が対象と同じである"),
+        ));
+    }
+    if !constraint.weight.is_finite() || !(0.0..=1.0).contains(&constraint.weight) {
+        return Err(VrmExportError::new(
+            VrmExportErrorKind::InvalidStructure,
+            format!("{where_}の重みが0〜1の有限値でない"),
+        ));
+    }
+    let body = match &constraint.kind {
+        super::VrmNodeConstraintKind::Rotation => serde_json::json!({
+            "rotation": {
+                "source": constraint.source,
+                "weight": constraint.weight,
+            }
+        }),
+        super::VrmNodeConstraintKind::Roll { axis } => {
+            let roll_axis = match axis {
+                super::VrmRollAxis::X => "X",
+                super::VrmRollAxis::Y => "Y",
+                super::VrmRollAxis::Z => "Z",
+            };
+            serde_json::json!({
+                "roll": {
+                    "source": constraint.source,
+                    "weight": constraint.weight,
+                    "rollAxis": roll_axis,
+                }
+            })
+        }
+        super::VrmNodeConstraintKind::Aim { axis } => {
+            // Unity軸からVRM軸への鏡像。Xだけが反転する。
+            let aim_axis = match axis {
+                super::VrmAimAxis::PositiveX => "NegativeX",
+                super::VrmAimAxis::NegativeX => "PositiveX",
+                super::VrmAimAxis::PositiveY => "PositiveY",
+                super::VrmAimAxis::NegativeY => "NegativeY",
+                super::VrmAimAxis::PositiveZ => "PositiveZ",
+                super::VrmAimAxis::NegativeZ => "NegativeZ",
+            };
+            serde_json::json!({
+                "aim": {
+                    "source": constraint.source,
+                    "weight": constraint.weight,
+                    "aimAxis": aim_axis,
+                }
+            })
+        }
+    };
+    let mut others = serde_json::Map::new();
+    others.insert(
+        "VRMC_node_constraint".to_string(),
+        serde_json::json!({
+            "specVersion": "1.0",
+            "constraint": body,
+        }),
+    );
+    Ok(Some(gltf::json::extensions::scene::Node { others }))
 }
 
 /// アクセサ定義。型情報と用途をまとめて引数の膨張を避ける。

@@ -125,6 +125,22 @@ UVはFBXとUnityの左下原点からglTFの左上原点へ合わせるため、
   法線が単位でない・非有限の場合は失敗する。
 - 空の `colliderGroups` は書かない。書式の `minItems: 1` に従う。
 
+## ノード制約
+
+`VrmModel.node_constraints` が空でない場合、各対象ノードに
+`extensions: {"VRMC_node_constraint": {"specVersion": "1.0", "constraint": {...}}}` を付け、
+`extensionsUsed` に `VRMC_node_constraint` を加える。
+`rotation` は `{source, weight}`、`roll` は `{source, weight, rollAxis: "X"|"Y"|"Z"}`、
+`aim` は `{source, weight, aimAxis: "PositiveX"|...|"NegativeZ"}` を持つ。
+注視軸はXだけ鏡像する（`PositiveX` と `NegativeX` を入れ替える）。
+空の場合は拡張を付けず、`extensionsUsed` にも加えない。
+中身の作り方は [`VRMスプリング`](VRMスプリング.md) に譲る。
+
+書き出す前に次を検証する。
+
+- 対象と参照先のノード索引は範囲内であり、互いに異なる。
+- 重みは0〜1の有限値である。
+
 ## アクセサ
 
 - 位置はVEC3/F32で、min/maxを付ける。

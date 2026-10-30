@@ -360,7 +360,7 @@ fn export(
                     0.0
                 };
                 let summary = format!(
-                    "スプリング{}件 関節{}件 collider{}件 グループ{}件 分岐{}件 center{}件（world{} / all-motion{} / なし{}） 近似(endpoint未生成{} gravity0関節{} first-child{} 平均近似{} 平面落下{}) 関節値(硬さ平均{:.3} 重力あり{}件) 共有{}件 スキップ{}件",
+                    "スプリング{}件 関節{}件 collider{}件 グループ{}件 分岐{}件 center{}件（world{} / all-motion{} / なし{}） 近似(endpoint未生成{} gravity0関節{} first-child{} 平均近似{} 平面落下{}) 関節値(硬さ平均{:.3} 重力あり{}件) 共有{}件 スキップ{}件 制約{}件 制約スキップ{}件",
                     compiled.report.spring_count,
                     compiled.report.joint_count,
                     compiled.report.collider_count,
@@ -379,6 +379,8 @@ fn export(
                     grav_count,
                     compiled.report.lost_nodes.len(),
                     compiled.report.skipped_bones.len(),
+                    model.node_constraints.len(),
+                    compiled.report.skipped_constraints.len(),
                 );
                 model.spring_bones = compiled.bones;
                 spring_summary = Some(summary);

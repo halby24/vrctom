@@ -81,6 +81,7 @@ fn 合成モデルを作る(
         meshes: Vec::new(),
         expressions: vrctom::vrm::VrmExpressions::default(),
         spring_bones: VrmSpringBones::default(),
+        node_constraints: Vec::new(),
     }
 }
 
@@ -507,6 +508,86 @@ fn 資源上限の超過を拒否する() {
     assert_eq!(エラー.kind(), VrmErrorKind::LimitExceeded);
 }
 
+/// 制約の破損（未知種別・重複ID・空対象・非有限・上限）を拒否する。
+#[test]
+fn 制約の破損を拒否する() {
+    let fbxバイト列 = b"fake-fbx";
+    let 位置 = [[0.0, 0.0, 0.0]; 4];
+    let (_, 文) = 左右の対応を作る(fbxバイト列, 位置, 位置);
+    let 基底: serde_json::Value = serde_json::from_str(&文).expect("合成sidecarは読める");
+    let 正常 = |id: &str| {
+        serde_json::json!({
+            "id": id,
+            "nodeId": "n:2",
+            "targetNodeId": "n:2",
+            "type": "Rotation",
+            "family": "vrchat",
+            "weight": 0.5,
+            "enabled": true,
+            "active": true,
+            "freezeToWorld": false,
+            "affectsRotation": [true, true, true],
+            "aimAxis": [0.0, 0.0, 1.0],
+            "sources": [{"nodeId": "n:3", "external": false, "weight": 1.0}],
+        })
+    };
+    // 正常な1件は通る。
+    let mut 通る = 基底.clone();
+    通る["constraints"] = serde_json::json!([正常("k:0")]);
+    PhysicsSidecar::from_json(&通る.to_string(), &PhysicsLimits::new()).expect("正常な制約は通る");
+    // 未知種別・重複ID・空対象は拒否する。
+    let 場合: Vec<(&str, serde_json::Value)> = vec![
+        (
+            "未知種別",
+            serde_json::json!([{
+                "id": "k:0", "nodeId": "n:2", "targetNodeId": "n:2", "type": "Magic",
+                "family": "vrchat", "weight": 0.5, "enabled": true, "active": true,
+                "freezeToWorld": false, "affectsRotation": [true, true, true],
+                "aimAxis": [0.0, 0.0, 1.0],
+                "sources": [{"nodeId": "n:3", "external": false, "weight": 1.0}],
+            }]),
+        ),
+        ("重複ID", serde_json::json!([正常("k:0"), 正常("k:0")])),
+        (
+            "空対象",
+            serde_json::json!([{
+                "id": "k:0", "nodeId": "", "targetNodeId": "", "type": "Rotation",
+                "family": "vrchat", "weight": 0.5, "enabled": true, "active": true,
+                "freezeToWorld": false, "affectsRotation": [true, true, true],
+                "aimAxis": [0.0, 0.0, 1.0],
+                "sources": [{"nodeId": "n:3", "external": false, "weight": 1.0}],
+            }]),
+        ),
+    ];
+    for (名, 制約列) in 場合 {
+        let mut 値 = 基底.clone();
+        値["constraints"] = 制約列;
+        let 結果 = PhysicsSidecar::from_json(&値.to_string(), &PhysicsLimits::new());
+        assert!(
+            matches!(
+                結果.as_ref().map(|_| ()).map_err(|e| e.kind()),
+                Err(VrmErrorKind::InvalidPhysicsSidecar | VrmErrorKind::LimitExceeded)
+            ),
+            "{名}は拒否する",
+        );
+    }
+    // 非有限の重みはJSONとして読めず拒否する。
+    let mut 非有限 = 基底.clone();
+    非有限["constraints"] = serde_json::json!([正常("k:0")]);
+    let 壊れ = 非有限
+        .to_string()
+        .replace("\"weight\":0.5", "\"weight\":NaN");
+    assert!(
+        PhysicsSidecar::from_json(&壊れ, &PhysicsLimits::new()).is_err(),
+        "非有限の重みは拒否する",
+    );
+    // 制約数の上限超過は失敗する。
+    let 制限 = PhysicsLimits::new().with_max_constraints(0);
+    let エラー =
+        PhysicsSidecar::from_json(&通る.to_string(), &制限).expect_err("制約上限の超過は失敗する");
+    assert_eq!(エラー.kind(), VrmErrorKind::LimitExceeded);
+}
+
 /// 参照姿勢が編集時でない場合は未対応で失敗する。
 #[test]
 fn 編集時以外の参照姿勢は未対応で失敗する() {
@@ -611,6 +692,7 @@ fn 既定のスプリングは空で書き出せる() {
         meshes: Vec::new(),
         expressions: VrmExpressions::default(),
         spring_bones: VrmSpringBones::default(),
+        node_constraints: Vec::new(),
     };
     assert!(モデル.spring_bones.springs.is_empty());
     assert!(モデル.spring_bones.colliders.is_empty());

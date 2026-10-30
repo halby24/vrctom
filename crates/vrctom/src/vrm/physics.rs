@@ -35,6 +35,7 @@ pub struct PhysicsLimits {
     max_colliders: usize,
     max_curve_keys: usize,
     max_source_models: usize,
+    max_constraints: usize,
 }
 
 impl PhysicsLimits {
@@ -53,6 +54,8 @@ impl PhysicsLimits {
             max_curve_keys: 1_000_000,
             // 実データの1件が収まる大きさである。
             max_source_models: 64,
+            // 実データの十数件が収まる大きさである。
+            max_constraints: 10_000,
         }
     }
 
@@ -83,6 +86,12 @@ impl PhysicsLimits {
     /// カーブキー総数の上限を変更する。
     pub fn with_max_curve_keys(mut self, value: usize) -> Self {
         self.max_curve_keys = value;
+        self
+    }
+
+    /// 制約数の上限を変更する。
+    pub fn with_max_constraints(mut self, value: usize) -> Self {
+        self.max_constraints = value;
         self
     }
 }
@@ -179,6 +188,67 @@ pub struct VrmSpringCollider {
     pub extended: Option<VrmSpringColliderExtension>,
 }
 
+/// ノード制約1件。対象ノードの回転を参照先から写す。
+/// 参照実装の `CompiledConstraint` に相当し、
+/// `VRMC_node_constraint` として出す。
+#[derive(Debug, Clone)]
+pub struct VrmNodeConstraint {
+    /// 対象ノードの索引。
+    pub node: usize,
+    /// 参照先ノードの索引。
+    pub source: usize,
+    /// 制約の重み。0〜1である。
+    pub weight: f32,
+    /// 制約の種別。
+    pub kind: VrmNodeConstraintKind,
+}
+
+/// ノード制約の種別。参照実装の `NodeConstraintKind` に相当する。
+#[derive(Debug, Clone)]
+pub enum VrmNodeConstraintKind {
+    /// 回転の複写。
+    Rotation,
+    /// 1軸のひねり。Unity軸で表す。
+    Roll {
+        /// ひねりの軸。
+        axis: VrmRollAxis,
+    },
+    /// 主軸の注視。Unity軸で表し、書き出し時にX鏡像する。
+    Aim {
+        /// 注視の軸。
+        axis: VrmAimAxis,
+    },
+}
+
+/// ひねりの軸。参照実装の `ConstraintRollAxis` に相当する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VrmRollAxis {
+    /// X軸。
+    X,
+    /// Y軸。
+    Y,
+    /// Z軸。
+    Z,
+}
+
+/// 注視の軸（Unity軸）。参照実装の `ConstraintAimAxis` に相当する。
+/// 書き出し時にXだけ鏡像する（`PositiveX` と `NegativeX` を入れ替える）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VrmAimAxis {
+    /// +X。
+    PositiveX,
+    /// -X。
+    NegativeX,
+    /// +Y。
+    PositiveY,
+    /// -Y。
+    NegativeY,
+    /// +Z。
+    PositiveZ,
+    /// -Z。
+    NegativeZ,
+}
+
 /// スプリングcolliderの拡張形状。平面のみを扱う。
 /// 参照実装の拡張colliderの `plane` に相当する。
 #[derive(Debug, Clone)]
@@ -245,6 +315,9 @@ pub struct PhysicsSidecar {
     pub phys_bones: Vec<SidecarPhysBone>,
     /// collider列。
     pub colliders: Vec<SidecarCollider>,
+    /// 制約列。無い場合は空として扱い、後方互換を保つ。
+    #[serde(default)]
+    pub constraints: Vec<SidecarConstraint>,
     /// 未対応機能の名残。今回は検証せず保持する。
     #[serde(rename = "unsupportedFeatures", default)]
     pub unsupported_features: Vec<String>,
@@ -470,6 +543,74 @@ pub struct SidecarCollider {
     /// 骨を球として扱うかどうか。
     #[serde(rename = "bonesAsSpheres", default)]
     pub bones_as_spheres: bool,
+}
+
+/// 制約の種別。未知値は検証で失敗する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum SidecarConstraintType {
+    /// 回転の複写。
+    Rotation,
+    /// 親付け（今回は出力対象外として落とす）。
+    Parent,
+    /// 主軸への注視。
+    Aim,
+    /// +Z軸への注視。
+    LookAt,
+}
+
+/// 制約の参照先1件。
+#[derive(Debug, Clone, Deserialize)]
+pub struct SidecarConstraintSource {
+    /// 参照先ノードのID。外部参照の場合は空である。
+    #[serde(rename = "nodeId", default)]
+    pub node_id: String,
+    /// アバター外の参照かどうか。
+    #[serde(default)]
+    pub external: bool,
+    /// 参照の重み。
+    #[serde(default)]
+    pub weight: f64,
+}
+
+/// ノード制約1件。Unity・VRChat由来の制約のうち、
+/// 回転・1軸ロール・主軸Aim・注視だけを `VRMC_node_constraint` へ写す。
+#[derive(Debug, Clone, Deserialize)]
+pub struct SidecarConstraint {
+    /// 制約のID。
+    pub id: String,
+    /// 付属するノードのID。
+    #[serde(rename = "nodeId", default)]
+    pub node_id: String,
+    /// 対象ノードのID。空の場合は `nodeId` を使う。
+    #[serde(rename = "targetNodeId", default)]
+    pub target_node_id: String,
+    /// 制約の種別。
+    #[serde(rename = "type")]
+    pub constraint_type: SidecarConstraintType,
+    /// 由来（`vrchat` など）。診断用であり、判定には使わない。
+    #[serde(default)]
+    pub family: String,
+    /// 制約全体の重み。
+    #[serde(default)]
+    pub weight: f64,
+    /// 有効かどうか。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 稼働中かどうか。
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// ワールド固定かどうか。真の場合は出力しない。
+    #[serde(rename = "freezeToWorld", default)]
+    pub freeze_to_world: bool,
+    /// 回転に効かせる軸列。真の軸数を数えて種別を決める。
+    #[serde(rename = "affectsRotation", default)]
+    pub affects_rotation: [bool; 3],
+    /// 注視の軸（Unity軸）。主軸の場合だけ使う。
+    #[serde(rename = "aimAxis", default)]
+    pub aim_axis: [f64; 3],
+    /// 参照先列。
+    #[serde(default)]
+    pub sources: Vec<SidecarConstraintSource>,
 }
 
 /// アニメーションカーブ。
@@ -737,6 +878,63 @@ impl PhysicsSidecar {
                 VrmErrorKind::LimitExceeded,
                 "sidecarのcollider数が上限を超えた",
             ));
+        }
+        if self.constraints.len() > limits.max_constraints {
+            return Err(VrmError::new(
+                VrmErrorKind::LimitExceeded,
+                "sidecarの制約数が上限を超えた",
+            ));
+        }
+        // 制約のID・対象・値を確認する。種別の可否は変換時に判断する。
+        {
+            let mut seen = HashSet::new();
+            for constraint in &self.constraints {
+                if constraint.id.is_empty() {
+                    return Err(VrmError::new(
+                        VrmErrorKind::InvalidPhysicsSidecar,
+                        "制約のIDが空である",
+                    ));
+                }
+                if !seen.insert(constraint.id.as_str()) {
+                    return Err(VrmError::new(
+                        VrmErrorKind::InvalidPhysicsSidecar,
+                        format!("制約のIDが重複する: {}", constraint.id),
+                    ));
+                }
+                let target = if constraint.target_node_id.is_empty() {
+                    constraint.node_id.as_str()
+                } else {
+                    constraint.target_node_id.as_str()
+                };
+                if target.is_empty() {
+                    return Err(VrmError::new(
+                        VrmErrorKind::InvalidPhysicsSidecar,
+                        format!("制約の対象ノードが空である: {}", constraint.id),
+                    ));
+                }
+                if !constraint.weight.is_finite() {
+                    return Err(VrmError::new(
+                        VrmErrorKind::InvalidPhysicsSidecar,
+                        format!("制約の重みが非有限である: {}", constraint.id),
+                    ));
+                }
+                for component in constraint.aim_axis {
+                    if !component.is_finite() {
+                        return Err(VrmError::new(
+                            VrmErrorKind::InvalidPhysicsSidecar,
+                            format!("制約の注視軸が非有限である: {}", constraint.id),
+                        ));
+                    }
+                }
+                for source in &constraint.sources {
+                    if !source.weight.is_finite() {
+                        return Err(VrmError::new(
+                            VrmErrorKind::InvalidPhysicsSidecar,
+                            format!("制約の参照重みが非有限である: {}", constraint.id),
+                        ));
+                    }
+                }
+            }
         }
         // 参照モデルのIDとSHA-256の書式を確認する。照合自体は解決時に行う。
         {
@@ -1874,6 +2072,8 @@ pub struct SpringCompileReport {
     /// 現在は平面も拡張付きで出力するため、常に空である。
     /// 互換のために残す。
     pub plane_colliders_dropped: Vec<String>,
+    /// 出力しなかった制約のID。種別・軸数・参照の不備や重複による。
+    pub skipped_constraints: Vec<String>,
     /// VRMに写せない指定（`insideBounds`・`bonesAsSpheres`）を持つcolliderの記録。
     pub ignored_collider_options: Vec<String>,
     /// `center` を付けなかったspringのPhysBone ID。springごとに1件である。
@@ -2733,6 +2933,156 @@ fn joint_limit(
         }),
         SidecarLimitType::None => None,
     }
+}
+
+/// 主軸の判定許容差。参照実装の `PrincipalTolerance` と同じ値である。
+const PRINCIPAL_TOLERANCE: f64 = 1e-4;
+
+/// 注視軸が6主軸のいずれかに沿うか確かめる。Unity軸で返す。
+/// 参照実装の `TryPrincipalAxis` に相当する。
+fn principal_axis(axis: [f64; 3]) -> Option<VrmAimAxis> {
+    let length2 = axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2];
+    if !length2.is_finite() || length2 < 1e-12 {
+        return None;
+    }
+    let length = length2.sqrt();
+    for (index, component) in axis.iter().enumerate() {
+        if ((component / length).abs() - 1.0).abs() > PRINCIPAL_TOLERANCE {
+            continue;
+        }
+        let positive = *component > 0.0;
+        return Some(match (index, positive) {
+            (0, true) => VrmAimAxis::PositiveX,
+            (0, false) => VrmAimAxis::NegativeX,
+            (1, true) => VrmAimAxis::PositiveY,
+            (1, false) => VrmAimAxis::NegativeY,
+            (2, true) => VrmAimAxis::PositiveZ,
+            _ => VrmAimAxis::NegativeZ,
+        });
+    }
+    None
+}
+
+/// sidecar制約1件を `VrmNodeConstraint` へ写す。出力しない場合は `None` を返す。
+/// 参照実装の `ConstraintCompiler.Map` と `WithSource` に相当する。
+/// 回転3軸→回転、1軸→その軸のひねり、2軸→出力しない。
+/// 注視は3軸かつ主軸の場合だけ写し、注視は+Z軸として写す。
+/// 親付け・外部参照・負の重み・ワールド固定・無効な対象と参照は出力しない。
+/// 重みは全体重みに注視の場合だけ参照重みを掛け、0〜1に丸める。
+fn map_node_constraint(
+    record: &SidecarConstraint,
+    node_map: &HashMap<String, usize>,
+) -> Option<VrmNodeConstraint> {
+    let target_id = if record.target_node_id.is_empty() {
+        record.node_id.as_str()
+    } else {
+        record.target_node_id.as_str()
+    };
+    let &target = node_map.get(target_id)?;
+    // capture時に無効な制約と重み0は動かないため出力しない。
+    // FX既定値の上書きは未対応であり、capture時の状態で判断する。
+    if !(record.enabled && record.active) {
+        return None;
+    }
+    if record.weight <= 0.0 {
+        return None;
+    }
+    if record.freeze_to_world {
+        return None;
+    }
+    let axes = record.affects_rotation.iter().filter(|axis| **axis).count();
+    let kind = match record.constraint_type {
+        SidecarConstraintType::Rotation => match axes {
+            3 => VrmNodeConstraintKind::Rotation,
+            1 => {
+                let index = record
+                    .affects_rotation
+                    .iter()
+                    .position(|axis| *axis)
+                    .expect("1軸は位置を持つ");
+                VrmNodeConstraintKind::Roll {
+                    axis: match index {
+                        0 => VrmRollAxis::X,
+                        1 => VrmRollAxis::Y,
+                        _ => VrmRollAxis::Z,
+                    },
+                }
+            }
+            // 2軸はVRMで表せず、0軸は動かないため出力しない。
+            _ => return None,
+        },
+        SidecarConstraintType::Aim => {
+            if axes != 3 {
+                return None;
+            }
+            VrmNodeConstraintKind::Aim {
+                axis: principal_axis(record.aim_axis)?,
+            }
+        }
+        SidecarConstraintType::LookAt => VrmNodeConstraintKind::Aim {
+            axis: VrmAimAxis::PositiveZ,
+        },
+        // 親付けはリペアレントであり、今回の出力対象外として落とす。
+        SidecarConstraintType::Parent => return None,
+    };
+    let is_aim = matches!(kind, VrmNodeConstraintKind::Aim { .. });
+    // 有効な参照先だけを数える。負の重みがある場合は動きを変えるため落とす。
+    if record
+        .sources
+        .iter()
+        .any(|source| (source.external || !source.node_id.is_empty()) && source.weight < 0.0)
+    {
+        return None;
+    }
+    let mut weighted = record
+        .sources
+        .iter()
+        .filter(|source| (source.external || !source.node_id.is_empty()) && source.weight > 0.0);
+    let single = match (weighted.next(), weighted.next()) {
+        (Some(only), None) => only,
+        // 参照なし・複数参照（blend）は出力しない。
+        _ => return None,
+    };
+    if single.external {
+        return None;
+    }
+    let &source = node_map.get(single.node_id.as_str())?;
+    if source == target {
+        return None;
+    }
+    let weight = (record.weight * if is_aim { single.weight } else { 1.0 }).clamp(0.0, 1.0);
+    if !weight.is_finite() {
+        return None;
+    }
+    Some(VrmNodeConstraint {
+        node: target,
+        source,
+        weight: weight as f32,
+        kind,
+    })
+}
+
+/// sidecar制約列を `VrmNodeConstraint` 列へ写す。sidecar順に処理し、
+/// 同じ対象の2件目以降は最初だけを残す。戻り値は（制約列、落とした制約ID列）である。
+fn compile_node_constraints(
+    sidecar: &PhysicsSidecar,
+    resolution: &PhysicsResolution,
+) -> (Vec<VrmNodeConstraint>, Vec<String>) {
+    let mut constraints = Vec::new();
+    let mut skipped = Vec::new();
+    let mut seen_targets: HashSet<usize> = HashSet::new();
+    for record in &sidecar.constraints {
+        let Some(mapped) = map_node_constraint(record, &resolution.node_map) else {
+            skipped.push(record.id.clone());
+            continue;
+        };
+        if !seen_targets.insert(mapped.node) {
+            skipped.push(record.id.clone());
+            continue;
+        }
+        constraints.push(mapped);
+    }
+    (constraints, skipped)
 }
 
 /// rest方向から重力への角度（ラジアン）。rest不明時は直角である。
@@ -3730,6 +4080,11 @@ pub fn compile_springs(
         spring.collider_groups.push(group);
     }
     report.group_count = collider_groups.len();
+    // ノード制約はsidecar順に写し、モデルに設定する。写像自体は失敗しない。
+    // 補助ノードの追加より後に行い、失敗時の部分更新を避ける配置にする。
+    let (node_constraints, skipped_constraints) = compile_node_constraints(sidecar, resolution);
+    report.skipped_constraints = skipped_constraints;
+    model.node_constraints = node_constraints;
     let springs = spring_entries
         .into_iter()
         .map(|(_, spring)| spring)
