@@ -114,6 +114,12 @@ impl VrmExportOptions {
         self
     }
 
+    /// humanoidの対応付けを明示指定する。指定時は名前検出を使わない。
+    pub fn with_humanoid(mut self, humanoid: HumanoidBones) -> Self {
+        self.humanoid = Some(humanoid);
+        self
+    }
+
     /// 出力バイト数の上限を変更する。
     pub fn with_max_output_bytes(mut self, bytes: usize) -> Self {
         self.max_output_bytes = bytes;
@@ -1060,10 +1066,22 @@ impl<'a> GlbWriter<'a> {
         }
         let mut others = serde_json::Map::new();
         others.insert("VRMC_vrm".to_string(), serde_json::Value::Object(vrmc));
+        let mut wrote_spring_bone = false;
+        if !self.model.spring_bones.springs.is_empty()
+            || !self.model.spring_bones.colliders.is_empty()
+            || !self.model.spring_bones.collider_groups.is_empty()
+        {
+            let spring_bone = self.build_spring_bone_json()?;
+            others.insert("VRMC_springBone".to_string(), spring_bone);
+            wrote_spring_bone = true;
+        }
         self.root.extensions = Some(gltf::json::extensions::root::Root { others });
         let mut used = vec!["VRMC_vrm".to_string()];
         if self.wrote_mtoon {
             used.push("VRMC_materials_mtoon".to_string());
+        }
+        if wrote_spring_bone {
+            used.push("VRMC_springBone".to_string());
         }
         self.root.extensions_used = used;
         Ok(())
@@ -1164,6 +1182,176 @@ impl<'a> GlbWriter<'a> {
         let mut out = serde_json::Map::new();
         out.insert("preset".to_string(), serde_json::Value::Object(preset));
         Ok(out)
+    }
+
+    /// `VRMC_springBone` 拡張のJSONを作る。
+    ///
+    /// ノード索引・関節の親子連鎖と一意性・colliderとグループの索引・
+    /// 値の有限値と範囲を検証する。`gravityDir` は正規化して書く。
+    /// 中心（`center`）の解決は今回の対象外であり、ある場合は索引だけ確かめる。
+    fn build_spring_bone_json(&self) -> Result<serde_json::Value, VrmExportError> {
+        let node_count = self.model.nodes.len();
+        let check_node = |node: usize, where_: &str| -> Result<(), VrmExportError> {
+            if node >= node_count {
+                return Err(VrmExportError::new(
+                    VrmExportErrorKind::InvalidStructure,
+                    format!("{where_}のノード索引が範囲外である"),
+                )
+                .with_node(node));
+            }
+            Ok(())
+        };
+        let bones = &self.model.spring_bones;
+        let mut colliders = Vec::with_capacity(bones.colliders.len());
+        for collider in &bones.colliders {
+            check_node(collider.node, "springBone collider")?;
+            let shape = match &collider.shape {
+                super::VrmSpringColliderShape::Sphere { offset, radius } => {
+                    check_shape_point(offset, "springBone collider sphere offset")?;
+                    check_radius(*radius, "springBone collider sphere")?;
+                    serde_json::json!({
+                        "sphere": {
+                            "offset": [offset[0], offset[1], offset[2]],
+                            "radius": radius,
+                        }
+                    })
+                }
+                super::VrmSpringColliderShape::Capsule {
+                    offset,
+                    radius,
+                    tail,
+                } => {
+                    check_shape_point(offset, "springBone collider capsule offset")?;
+                    check_shape_point(tail, "springBone collider capsule tail")?;
+                    check_radius(*radius, "springBone collider capsule")?;
+                    serde_json::json!({
+                        "capsule": {
+                            "offset": [offset[0], offset[1], offset[2]],
+                            "radius": radius,
+                            "tail": [tail[0], tail[1], tail[2]],
+                        }
+                    })
+                }
+            };
+            colliders.push(serde_json::json!({
+                "node": collider.node,
+                "shape": shape,
+            }));
+        }
+        let mut groups = Vec::with_capacity(bones.collider_groups.len());
+        for group in &bones.collider_groups {
+            for collider in &group.colliders {
+                if *collider >= colliders.len() {
+                    return Err(VrmExportError::new(
+                        VrmExportErrorKind::InvalidStructure,
+                        "springBone colliderグループの参照が範囲外である",
+                    ));
+                }
+            }
+            groups.push(serde_json::json!({
+                "name": group.name,
+                "colliders": group.colliders,
+            }));
+        }
+        // 関節ノードの二重所有は書式違反のため、springをまたいで確かめる。
+        let mut joint_owner: HashMap<usize, &str> = HashMap::new();
+        let mut springs = Vec::with_capacity(bones.springs.len());
+        for spring in &bones.springs {
+            if spring.joints.is_empty() {
+                return Err(VrmExportError::new(
+                    VrmExportErrorKind::InvalidStructure,
+                    format!("関節が無いspringがある: {}", spring.name),
+                ));
+            }
+            let mut joints = Vec::with_capacity(spring.joints.len());
+            let mut previous: Option<usize> = None;
+            for joint in &spring.joints {
+                check_node(joint.node, "springBone joint")?;
+                if let Some(owner) = joint_owner.insert(joint.node, spring.name.as_str()) {
+                    return Err(VrmExportError::new(
+                        VrmExportErrorKind::InvalidStructure,
+                        format!(
+                            "関節ノードが複数のspringに属する: {}（{}と重なる）",
+                            joint.node, owner
+                        ),
+                    )
+                    .with_node(joint.node));
+                }
+                if let Some(before) = previous
+                    && !self.model.nodes[before].children.contains(&joint.node)
+                {
+                    return Err(VrmExportError::new(
+                        VrmExportErrorKind::InvalidStructure,
+                        format!(
+                            "springの関節が親子でつながらない: {} -> {}",
+                            before, joint.node
+                        ),
+                    )
+                    .with_node(joint.node));
+                }
+                previous = Some(joint.node);
+                check_joint_value(joint.hit_radius, "hitRadius", 0.0, f32::INFINITY)?;
+                check_joint_value(joint.stiffness, "stiffness", 0.0, f32::INFINITY)?;
+                check_joint_value(joint.gravity_power, "gravityPower", 0.0, f32::INFINITY)?;
+                check_joint_value(joint.drag_force, "dragForce", 0.0, 1.0)?;
+                let gravity_dir = normalize_unit(joint.gravity_dir, "gravityDir")?;
+                joints.push(serde_json::json!({
+                    "node": joint.node,
+                    "hitRadius": joint.hit_radius,
+                    "stiffness": joint.stiffness,
+                    "gravityPower": joint.gravity_power,
+                    "gravityDir": [gravity_dir[0], gravity_dir[1], gravity_dir[2]],
+                    "dragForce": joint.drag_force,
+                }));
+            }
+            if let Some(center) = spring.center {
+                check_node(center, "springBone center")?;
+            }
+            for group in &spring.collider_groups {
+                if *group >= groups.len() {
+                    return Err(VrmExportError::new(
+                        VrmExportErrorKind::InvalidStructure,
+                        format!("springのグループ参照が範囲外である: {}", spring.name),
+                    ));
+                }
+            }
+            let mut entry = serde_json::Map::new();
+            entry.insert(
+                "name".to_string(),
+                serde_json::Value::String(spring.name.clone()),
+            );
+            if let Some(center) = spring.center {
+                entry.insert("center".to_string(), serde_json::json!(center));
+            }
+            entry.insert("joints".to_string(), serde_json::Value::Array(joints));
+            // 空の `colliderGroups` は書式違反（`minItems: 1`）のため、無い場合は書かない。
+            if !spring.collider_groups.is_empty() {
+                entry.insert(
+                    "colliderGroups".to_string(),
+                    serde_json::json!(spring.collider_groups),
+                );
+            }
+            springs.push(serde_json::Value::Object(entry));
+        }
+        // 空配列は書式違反（`minItems: 1`）のため、ある場合だけ書く。
+        let mut root = serde_json::Map::new();
+        root.insert(
+            "specVersion".to_string(),
+            serde_json::Value::String("1.0".to_string()),
+        );
+        if !colliders.is_empty() {
+            root.insert("colliders".to_string(), serde_json::Value::Array(colliders));
+        }
+        if !groups.is_empty() {
+            root.insert(
+                "colliderGroups".to_string(),
+                serde_json::Value::Array(groups),
+            );
+        }
+        if !springs.is_empty() {
+            root.insert("springs".to_string(), serde_json::Value::Array(springs));
+        }
+        Ok(serde_json::Value::Object(root))
     }
 
     /// バッファ定義を作る。BINが空の場合は定義を置かない。
@@ -1384,6 +1572,51 @@ impl<'a> GlbWriter<'a> {
             },
         )
     }
+}
+
+/// springBoneの形状点が3つの有限値か確かめる。
+fn check_shape_point(point: &[f32; 3], where_: &str) -> Result<(), VrmExportError> {
+    if !point.iter().all(|v| v.is_finite()) {
+        return Err(VrmExportError::new(
+            VrmExportErrorKind::InvalidStructure,
+            format!("{where_}に非有限値がある"),
+        ));
+    }
+    Ok(())
+}
+
+/// springBoneのcollider半径が0以上の有限値か確かめる。
+fn check_radius(radius: f32, where_: &str) -> Result<(), VrmExportError> {
+    if !radius.is_finite() || radius < 0.0 {
+        return Err(VrmExportError::new(
+            VrmExportErrorKind::InvalidStructure,
+            format!("{where_}が0以上の有限値でない"),
+        ));
+    }
+    Ok(())
+}
+
+/// springBoneの関節値が範囲内の有限値か確かめる。
+fn check_joint_value(value: f32, field: &str, min: f32, max: f32) -> Result<(), VrmExportError> {
+    if !value.is_finite() || value < min || value > max {
+        return Err(VrmExportError::new(
+            VrmExportErrorKind::InvalidStructure,
+            format!("springBone jointの{field}が範囲外である"),
+        ));
+    }
+    Ok(())
+}
+
+/// 単位ベクトルを正規化して返す。ゼロや非有限の場合は失敗する。
+fn normalize_unit(vector: [f32; 3], field: &str) -> Result<[f32; 3], VrmExportError> {
+    let length = (vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]).sqrt();
+    if !length.is_finite() || length <= 0.0 {
+        return Err(VrmExportError::new(
+            VrmExportErrorKind::InvalidStructure,
+            format!("springBone jointの{field}が正規化できない"),
+        ));
+    }
+    Ok([vector[0] / length, vector[1] / length, vector[2] / length])
 }
 
 /// アクセサ定義。型情報と用途をまとめて引数の膨張を避ける。

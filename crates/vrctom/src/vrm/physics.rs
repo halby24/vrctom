@@ -1,9 +1,10 @@
-//! Unityヘルパが出力する物理sidecarの読み取りと対応解決。
+//! Unityヘルパが出力する物理sidecarの読み取りと対応解決、スプリングの最小出力。
 //!
 //! 入口は [`PhysicsSidecar::parse`]（バイト列の検証）と
 //! [`VrmModel::resolve_physics_sidecar`](crate::vrm::VrmModel::resolve_physics_sidecar)
-//! （`VrmModel` のノードへの対応付け）である。スプリングチェーンの
-//! コンパイルやVRM出力は次の作業単位であり、ここでは行わない。
+//! （`VrmModel` のノードへの対応付け）、[`compile_springs`]（`VrmSpringBones` の
+//! 生成）である。完全な参照実装一致（分岐・endpoint・limit・center・曲線の再現）は
+//! 次の作業単位であり、ここでは線形チェーンと第一近似の値を出すだけである。
 
 use std::collections::{HashMap, HashSet};
 
@@ -92,25 +93,25 @@ impl Default for PhysicsLimits {
     }
 }
 
-/// VRMのスプリングボーン全体。今回は空のまま置き、出力しない。
+/// VRMのスプリングボーン全体。[`compile_springs`] が作り、書き出し層が出力する。
 #[derive(Debug, Clone, Default)]
 pub struct VrmSpringBones {
-    /// スプリング列。今回は空である。
+    /// スプリング列。PhysBoneごとに1件の線形チェーンである。
     pub springs: Vec<VrmSpring>,
-    /// collider列。今回は空である。
+    /// collider列。参照されるsphere/capsuleだけを含む。
     pub colliders: Vec<VrmSpringCollider>,
-    /// colliderグループ列。今回は空である。
+    /// colliderグループ列。PhysBoneの参照集合ごとに1件である。
     pub collider_groups: Vec<VrmSpringColliderGroup>,
 }
 
-/// スプリング1件。今回は作らず、型だけ用意する。
+/// スプリング1件。1本のPhysBoneに対応する線形チェーンである。
 #[derive(Debug, Clone, Default)]
 pub struct VrmSpring {
-    /// スプリング名。
+    /// スプリング名。sidecarのPhysBone IDである。
     pub name: String,
-    /// 関節列。
+    /// 関節列。親から子への順である。
     pub joints: Vec<VrmSpringJoint>,
-    /// 中心ノードの索引。無い場合は `None` である。
+    /// 中心ノードの索引。今回は `None` である。
     pub center: Option<usize>,
     /// 参照するcolliderグループの索引列。
     pub collider_groups: Vec<usize>,
@@ -1651,4 +1652,683 @@ fn check_coordinate_gate(
             "座標ゲートの対象ノードが無い",
         )
     })
+}
+
+/// スプリング出力の上限。
+///
+/// フィールドは非公開で、既定値は [`Default`] が設定する。
+/// 上限の変更は `with_` で始まるメソッドで行う。
+#[derive(Debug, Clone)]
+pub struct SpringCompileOptions {
+    max_joints: usize,
+}
+
+/// 1springのjoint数の既定上限（64）。
+///
+/// 実データの十数件が収まる大きさにし、破損由来の鎖の暴走を抑える。
+const DEFAULT_MAX_SPRING_JOINTS: usize = 64;
+
+impl SpringCompileOptions {
+    /// 既定の上限を持つ設定を生成する。
+    pub fn new() -> Self {
+        Self {
+            max_joints: DEFAULT_MAX_SPRING_JOINTS,
+        }
+    }
+
+    /// 1springのjoint数の上限を変更する。1以上である。
+    pub fn with_max_joints(mut self, max_joints: usize) -> Self {
+        self.max_joints = max_joints;
+        self
+    }
+}
+
+impl Default for SpringCompileOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// コンパイル結果。次段の書き出しが使う骨格と、近似の診断である。
+#[derive(Debug, Clone)]
+pub struct CompiledSprings {
+    /// 出力する骨格。
+    pub bones: VrmSpringBones,
+    /// 近似と切り捨ての記録。
+    pub report: SpringCompileReport,
+}
+
+/// スプリング出力の診断。近似・切り捨て・未出力の内訳である。
+#[derive(Debug, Clone, Default)]
+pub struct SpringCompileReport {
+    /// 出力したspring数。
+    pub spring_count: usize,
+    /// 出力したjoint総数。
+    pub joint_count: usize,
+    /// 出力したcollider数。
+    pub collider_count: usize,
+    /// 出力したcolliderグループ数。
+    pub group_count: usize,
+    /// 分岐で捨てた子。最初の子だけを採用した記録である。
+    pub skipped_branches: Vec<SkippedBranch>,
+    /// 他のPhysBoneのrootで切断した記録。
+    pub cut_at_other_roots: Vec<RootCut>,
+    /// 先行springと関節が重なるため切断した記録。
+    pub shared_joint_cuts: Vec<SharedJointCut>,
+    /// joint上限で切断したspringのID。
+    pub truncated_chains: Vec<String>,
+    /// 長さがほぼ0の区間。分割せずそのまま残した記録である。
+    pub zero_length_joints: Vec<ZeroLengthJoint>,
+    /// 曲線のbase値を使った記録。キー列は評価しない。
+    pub curve_base_used: Vec<CurveBaseUsed>,
+    /// `1 - spring` が範囲外で丸めたspringのID。
+    pub drag_clamped: Vec<String>,
+    /// 無効化されていたが出力したPhysBoneのID。VRMに有効無効は無い。
+    pub disabled_bones: Vec<String>,
+    /// 無効化されていたが出力したcolliderのID。
+    pub disabled_colliders: Vec<String>,
+    /// 参照されず出力しなかったcolliderのID。
+    pub unused_colliders: Vec<String>,
+    /// 平面のため落とした参照を持つPhysBoneのID。
+    pub plane_colliders_dropped: Vec<String>,
+    /// VRMに写せない指定（`insideBounds`・`bonesAsSpheres`）を持つcolliderの記録。
+    pub ignored_collider_options: Vec<String>,
+    /// 空鎖のためspringにしなかった記録。rootの重なりでのみ起こる。
+    pub skipped_empty_chains: Vec<SkippedEmptyChain>,
+    /// `center` を付けなかったspringのID。今回は全件である。
+    pub center_missing: Vec<String>,
+    /// endpointを生成しなかったspringのID。今回は全件である。
+    pub no_endpoint: Vec<String>,
+    /// `multiChildType` が `Ignore` 以外で最初の子に畳んだspringのID。
+    pub first_child_multichild: Vec<String>,
+    /// `gravity_power` に0を置いた関節数。今回は全関節である。
+    pub gravity_zero_joints: usize,
+}
+
+/// 空鎖でspringにしなかった記録1件。
+#[derive(Debug, Clone)]
+pub struct SkippedEmptyChain {
+    /// spring名（PhysBone ID）。
+    pub spring: String,
+    /// rootを先に確保したspring名（PhysBone ID）。
+    pub owner: String,
+}
+
+/// 分岐で捨てた子1件。
+#[derive(Debug, Clone)]
+pub struct SkippedBranch {
+    /// spring名（PhysBone ID）。
+    pub spring: String,
+    /// 分岐元のVrmノード索引。
+    pub node: usize,
+    /// 捨てた子のVrmノード索引列。採用した最初の子は含まない。
+    pub skipped: Vec<usize>,
+}
+
+/// 他のPhysBoneのrootでの切断1件。
+#[derive(Debug, Clone)]
+pub struct RootCut {
+    /// spring名（PhysBone ID）。
+    pub spring: String,
+    /// 切断したVrmノード索引。他のPhysBoneのrootである。
+    pub node: usize,
+    /// 他のPhysBoneのID。
+    pub other_bone: String,
+}
+
+/// 関節の重なりでの切断1件。
+#[derive(Debug, Clone)]
+pub struct SharedJointCut {
+    /// spring名（PhysBone ID）。
+    pub spring: String,
+    /// 重なったVrmノード索引。ここから先は伸ばさない。
+    pub node: usize,
+    /// 先に確保したspring名（PhysBone ID）。
+    pub owner: String,
+}
+
+/// 長さがほぼ0の区間1件。
+#[derive(Debug, Clone)]
+pub struct ZeroLengthJoint {
+    /// spring名（PhysBone ID）。
+    pub spring: String,
+    /// 親のVrmノード索引。
+    pub parent: usize,
+    /// 子のVrmノード索引。
+    pub child: usize,
+}
+
+/// 曲線のbase値使用1件。
+#[derive(Debug, Clone)]
+pub struct CurveBaseUsed {
+    /// spring名（PhysBone ID）。
+    pub spring: String,
+    /// 曲線名（`radius`・`spring`・`stiffness`）。
+    pub field: &'static str,
+    /// 使わなかったキー数。
+    pub keys: usize,
+}
+
+/// ゼロ長とみなす区間の長さ（メートル）。
+///
+/// 出力世界行列はメートル単位であり、丸め由来の微小なずれを吸収する。
+/// この値自体は仮であり、実データでの観測に基づく見直しの対象である。
+const ZERO_LENGTH_TOLERANCE: f64 = 1e-9;
+
+/// Unity左手系からVRM右手系への点変換。Xを反転する。
+fn mirror_point(point: [f64; 3]) -> [f64; 3] {
+    [-point[0], point[1], point[2]]
+}
+
+/// Unity左手系からVRM右手系への四元数変換。YとZを反転する。
+fn mirror_quat(rotation: [f64; 4]) -> [f64; 4] {
+    [rotation[0], -rotation[1], -rotation[2], rotation[3]]
+}
+
+/// f64の有限値をf32へ寄せる。溢れて非有限になる場合は失敗する。
+fn to_f32_finite(value: f64, what: &str) -> Result<f32, VrmError> {
+    let out = value as f32;
+    if out.is_finite() {
+        Ok(out)
+    } else {
+        Err(VrmError::new(
+            VrmErrorKind::InvalidPhysicsSidecar,
+            format!("{what}がf32に収まらない"),
+        ))
+    }
+}
+
+/// 3要素をf32へ寄せる。いずれかが非有限になる場合は失敗する。
+fn to_f32x3(point: [f64; 3], what: &str) -> Result<[f32; 3], VrmError> {
+    Ok([
+        to_f32_finite(point[0], what)?,
+        to_f32_finite(point[1], what)?,
+        to_f32_finite(point[2], what)?,
+    ])
+}
+
+/// sidecarのcolliderをVRMの形状へ換える。
+///
+/// `position`・`rotation` はrootローカルの値であり、componentには依存しない。
+/// componentは追従対象の識別にだけ使い、値の座標換算には使わない。
+/// Unity左手系からVRM右手系への鏡像（X反転・四元数のY/Z反転）だけを適用する。
+/// `Sphere` は高さを無視して必ず球にする。`Capsule` は回転した+Y軸の
+/// 両端から `height/2 - radius` を詰め、縮退した場合は球にする。
+fn convert_collider_shape(
+    id: &str,
+    source: &SidecarCollider,
+) -> Result<VrmSpringColliderShape, VrmError> {
+    let local = trs_to_matrix(&SidecarTrs {
+        position: mirror_point(source.position),
+        rotation: mirror_quat(source.rotation),
+        scale: [1.0, 1.0, 1.0],
+    });
+    let center = to_f32x3([local[12], local[13], local[14]], "collider位置")?;
+    let radius = to_f32_finite(source.radius, "collider半径")?;
+    if radius < 0.0 {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPhysicsSidecar,
+            format!("colliderの半径が0以上の有限値でない: {id}"),
+        ));
+    }
+    match source.shape_type {
+        SidecarShapeType::Sphere => Ok(VrmSpringColliderShape::Sphere {
+            offset: center,
+            radius,
+        }),
+        SidecarShapeType::Capsule => {
+            let height = to_f32_finite(source.height, "collider高さ")?;
+            if height < 0.0 {
+                return Err(VrmError::new(
+                    VrmErrorKind::InvalidPhysicsSidecar,
+                    format!("colliderの高さが0以上の有限値でない: {id}"),
+                ));
+            }
+            // 長さと半径の差が0以下の場合は球とみなす。
+            let half = (f64::from(height) / 2.0 - f64::from(radius)).max(0.0);
+            if half <= 0.0 {
+                return Ok(VrmSpringColliderShape::Sphere {
+                    offset: center,
+                    radius,
+                });
+            }
+            // 軸は姿勢のY列である。拡大率は1のため正規化済みのはずだが、
+            // 丸めに備えて確かめる。縮退した姿勢は検証で弾く。
+            let axis = [local[4], local[5], local[6]];
+            let length = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+            if !length.is_finite() || length == 0.0 {
+                return Err(VrmError::new(
+                    VrmErrorKind::InvalidPhysicsSidecar,
+                    format!("colliderの軸が縮退している: {id}"),
+                ));
+            }
+            let unit = [axis[0] / length, axis[1] / length, axis[2] / length];
+            let half_f32 = to_f32_finite(half, "collider半長")?;
+            let axis_f32 = to_f32x3(unit, "collider軸")?;
+            let offset = [
+                center[0] - axis_f32[0] * half_f32,
+                center[1] - axis_f32[1] * half_f32,
+                center[2] - axis_f32[2] * half_f32,
+            ];
+            let tail = [
+                center[0] + axis_f32[0] * half_f32,
+                center[1] + axis_f32[1] * half_f32,
+                center[2] + axis_f32[2] * half_f32,
+            ];
+            Ok(VrmSpringColliderShape::Capsule {
+                offset,
+                radius,
+                tail,
+            })
+        }
+        SidecarShapeType::Plane => Err(VrmError::new(
+            VrmErrorKind::InvalidPhysicsSidecar,
+            // 解決側で除外済みのため到達しない。黙って球にしない。
+            format!("平面colliderは換算できない: {id}"),
+        )),
+    }
+}
+
+/// `PhysicsResolution` と `PhysicsSidecar` から `VrmSpringBones` を作る。
+///
+/// 各解決済みPhysBoneにつき1本の線形チェーンを作る。rootから子を深さ優先で辿り、
+/// 最初の子だけを採用する。`ignore_nodes` の部分木・他のPhysBoneのroot・先行springと
+/// 重なる関節で切る。rootが重なって空鎖になったspringは作らず、報告に残す。
+/// colliderはroot基準で換算する。`position`・`rotation` はrootローカルの値であり、
+/// 鏡像だけを適用する。componentは追従対象の識別にだけ使う。
+/// 分岐・endpoint・limit・center・曲線の再現はしない。
+/// パラメータは第一近似であり、詳細は [`SpringCompileReport`] に残る。
+/// 参照実装の完全移植ではなく、近似であることを診断と文書に明記する。
+///
+/// 失敗時は `VrmModel` を変更しない。呼び出し側が結果を受け取ってから代入する。
+///
+/// # Errors
+///
+/// 上限の0指定・f32に収まらない値・負の半径や硬さ・対応表とsidecarの不整合の場合に返す。
+pub fn compile_springs(
+    sidecar: &PhysicsSidecar,
+    model: &VrmModel,
+    resolution: &PhysicsResolution,
+    options: &SpringCompileOptions,
+) -> Result<CompiledSprings, VrmError> {
+    if options.max_joints == 0 {
+        return Err(VrmError::new(
+            VrmErrorKind::LimitExceeded,
+            "1springのjoint上限が0である",
+        ));
+    }
+    let bone_at: HashMap<&str, &SidecarPhysBone> = sidecar
+        .phys_bones
+        .iter()
+        .map(|bone| (bone.id.as_str(), bone))
+        .collect();
+    let collider_at: HashMap<&str, &SidecarCollider> = sidecar
+        .colliders
+        .iter()
+        .map(|collider| (collider.id.as_str(), collider))
+        .collect();
+    let worlds = model_world_matrices(model)?;
+    // 他のPhysBoneのroot集合。鎖はここで切る（有効無効を問わない）。
+    let mut root_owner: HashMap<usize, &str> = HashMap::new();
+    for bone in &resolution.phys_bones {
+        root_owner.insert(bone.root_node, bone.id.as_str());
+    }
+    let mut report = SpringCompileReport::default();
+    // 先行springが確保した関節。重なりは切断し、二重所有を作らない。
+    let mut claimed: HashMap<usize, &str> = HashMap::new();
+    // springと対応する解決済みPhysBoneの組。空鎖はspringにしない。
+    let mut spring_entries: Vec<(&ResolvedPhysBone, VrmSpring)> = Vec::new();
+    for bone in &resolution.phys_bones {
+        let Some(source) = bone_at.get(bone.id.as_str()) else {
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidPhysicsSidecar,
+                format!("解決済みPhysBoneに対応するsidecarが無い: {}", bone.id),
+            ));
+        };
+        if !source.enabled {
+            report.disabled_bones.push(bone.id.clone());
+        }
+        let joints = trace_chain(
+            &bone.id,
+            bone.root_node,
+            &bone.ignore_nodes,
+            &root_owner,
+            &mut claimed,
+            &worlds,
+            model,
+            options.max_joints,
+            &mut report,
+        )?;
+        if joints.is_empty() {
+            // 空鎖はVRMに書けないためspringにしない。理由はtrace側が報告済みである。
+            continue;
+        }
+        let (hit_radius, stiffness, drag_force) =
+            approx_joint_params(&bone.id, source, &mut report)?;
+        let joints = joints
+            .into_iter()
+            .map(|node| VrmSpringJoint {
+                node,
+                hit_radius,
+                stiffness,
+                gravity_power: 0.0,
+                gravity_dir: [0.0, -1.0, 0.0],
+                drag_force,
+            })
+            .collect::<Vec<_>>();
+        report.joint_count += joints.len();
+        report.gravity_zero_joints += joints.len();
+        // centerとendpointは今回は付けない。近似として記録する。
+        report.center_missing.push(bone.id.clone());
+        report.no_endpoint.push(bone.id.clone());
+        if source.multi_child_type != SidecarMultiChildType::Ignore {
+            report.first_child_multichild.push(bone.id.clone());
+        }
+        // 平面参照の落下は骨ごとに記録する。全体の一覧は解決側が持つ。
+        if source
+            .collider_ids
+            .iter()
+            .any(|id| resolution.skipped_colliders.iter().any(|skip| skip == id))
+            && !report.plane_colliders_dropped.contains(&bone.id)
+        {
+            report.plane_colliders_dropped.push(bone.id.clone());
+        }
+        spring_entries.push((
+            bone,
+            VrmSpring {
+                name: bone.id.clone(),
+                joints,
+                center: None,
+                collider_groups: Vec::new(),
+            },
+        ));
+    }
+    report.spring_count = spring_entries.len();
+    // colliderは作ったspringが参照するものだけを、解決順に並べて出力する。
+    let created: HashSet<&str> = spring_entries
+        .iter()
+        .map(|(bone, _)| bone.id.as_str())
+        .collect();
+    let mut referenced_colliders: HashSet<&str> = HashSet::new();
+    for bone in &resolution.phys_bones {
+        if !created.contains(bone.id.as_str()) {
+            continue;
+        }
+        let Some(source) = bone_at.get(bone.id.as_str()) else {
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidPhysicsSidecar,
+                format!("解決済みPhysBoneに対応するsidecarが無い: {}", bone.id),
+            ));
+        };
+        for collider in &source.collider_ids {
+            if resolution.skipped_colliders.iter().any(|id| id == collider) {
+                continue;
+            }
+            if collider_at.contains_key(collider.as_str()) {
+                referenced_colliders.insert(collider.as_str());
+            }
+        }
+    }
+    // colliderは参照されるものだけを、解決順に並べて出力する。
+    let mut collider_index: HashMap<&str, usize> = HashMap::new();
+    let mut colliders = Vec::new();
+    for resolved in &resolution.colliders {
+        if !referenced_colliders.contains(resolved.id.as_str()) {
+            report.unused_colliders.push(resolved.id.clone());
+            continue;
+        }
+        let Some(source) = collider_at.get(resolved.id.as_str()) else {
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidPhysicsSidecar,
+                format!("解決済みcolliderに対応するsidecarが無い: {}", resolved.id),
+            ));
+        };
+        if !source.enabled {
+            report.disabled_colliders.push(resolved.id.clone());
+        }
+        if source.inside_bounds {
+            report
+                .ignored_collider_options
+                .push(format!("{}.insideBounds", resolved.id));
+        }
+        if source.bones_as_spheres {
+            report
+                .ignored_collider_options
+                .push(format!("{}.bonesAsSpheres", resolved.id));
+        }
+        collider_index.insert(resolved.id.as_str(), colliders.len());
+        // 出力ノードはrootであり、姿勢はrootローカルのまま鏡像だけ換算する。
+        colliders.push(VrmSpringCollider {
+            node: resolved.root_node,
+            shape: convert_collider_shape(&resolved.id, source)?,
+        });
+    }
+    report.collider_count = colliders.len();
+    // グループはPhysBoneの参照集合ごとに作り、同じ集合は順序や重複によらず共有する。
+    // 順序に依存しないよう重複を除いて並べ替え、鍵と出力の両方に使う。
+    let mut group_at: HashMap<Vec<usize>, usize> = HashMap::new();
+    let mut collider_groups = Vec::new();
+    for (bone, spring) in &mut spring_entries {
+        let Some(source) = bone_at.get(bone.id.as_str()) else {
+            continue;
+        };
+        let mut members = Vec::new();
+        for collider in &source.collider_ids {
+            if let Some(&index) = collider_index.get(collider.as_str()) {
+                members.push(index);
+            }
+        }
+        if members.is_empty() {
+            continue;
+        }
+        members.sort_unstable();
+        members.dedup();
+        let group = match group_at.get(&members) {
+            Some(&index) => index,
+            None => {
+                let index = collider_groups.len();
+                collider_groups.push(VrmSpringColliderGroup {
+                    name: format!("{}-colliders", bone.id),
+                    colliders: members.clone(),
+                });
+                group_at.insert(members, index);
+                index
+            }
+        };
+        spring.collider_groups.push(group);
+    }
+    report.group_count = collider_groups.len();
+    let springs = spring_entries
+        .into_iter()
+        .map(|(_, spring)| spring)
+        .collect::<Vec<_>>();
+    Ok(CompiledSprings {
+        bones: VrmSpringBones {
+            springs,
+            colliders,
+            collider_groups,
+        },
+        report,
+    })
+}
+
+/// 線形チェーンを辿る。rootを含み、親から子の順で返す。
+///
+/// 最初の子だけを採用し、分岐・他root・重なり・上限で切る。切断の理由は
+/// 呼び出し側の報告に残す。
+#[allow(clippy::too_many_arguments)]
+fn trace_chain<'a>(
+    spring: &'a str,
+    root: usize,
+    ignore_nodes: &[usize],
+    root_owner: &HashMap<usize, &'a str>,
+    claimed: &mut HashMap<usize, &'a str>,
+    worlds: &[[f64; 16]],
+    model: &VrmModel,
+    max_joints: usize,
+    report: &mut SpringCompileReport,
+) -> Result<Vec<usize>, VrmError> {
+    // 無視部分木の閉包。無視ノード以下の子孫へは降りない。
+    let mut ignored = HashSet::new();
+    let mut stack: Vec<usize> = ignore_nodes.to_vec();
+    while let Some(node) = stack.pop() {
+        if !ignored.insert(node) {
+            continue;
+        }
+        let Some(entry) = model.nodes.get(node) else {
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidPhysicsSidecar,
+                "無視ノードの索引が範囲外である",
+            ));
+        };
+        stack.extend(entry.children.iter().copied());
+    }
+    let mut chain = vec![root];
+    // root自体の二重所有は、解決順の先勝ちでここで切る。
+    // 空鎖はVRMに書けないため、呼び出し側でspringにしない。
+    if let Some(&owner) = claimed.get(&root) {
+        report.shared_joint_cuts.push(SharedJointCut {
+            spring: spring.to_owned(),
+            node: root,
+            owner: owner.to_owned(),
+        });
+        report.skipped_empty_chains.push(SkippedEmptyChain {
+            spring: spring.to_owned(),
+            owner: owner.to_owned(),
+        });
+        return Ok(Vec::new());
+    }
+    claimed.insert(root, spring);
+    let mut current = root;
+    loop {
+        let Some(entry) = model.nodes.get(current) else {
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidPhysicsSidecar,
+                "鎖のノード索引が範囲外である",
+            ));
+        };
+        let mut next: Vec<usize> = entry.children.to_vec();
+        // 無視部分木は黙って落とさず、件数ではなく対象として扱う。
+        // 対象自体が通常の切り捨てのため、個別の記録は残さない。
+        next.retain(|child| !ignored.contains(child));
+        // 他のPhysBoneのrootで切る。自分自身のrootは起点であり対象外である。
+        next.retain(|child| {
+            if *child == root {
+                return true;
+            }
+            match root_owner.get(child) {
+                Some(&owner) => {
+                    report.cut_at_other_roots.push(RootCut {
+                        spring: spring.to_owned(),
+                        node: *child,
+                        other_bone: owner.to_owned(),
+                    });
+                    false
+                }
+                None => true,
+            }
+        });
+        // 先行springと重なる関節で切る。
+        let mut cut_shared: Option<(usize, String)> = None;
+        next.retain(|child| match claimed.get(child) {
+            Some(&owner) => {
+                cut_shared = Some((*child, owner.to_owned()));
+                false
+            }
+            None => true,
+        });
+        if let Some((node, owner)) = cut_shared {
+            report.shared_joint_cuts.push(SharedJointCut {
+                spring: spring.to_owned(),
+                node,
+                owner,
+            });
+        }
+        if next.is_empty() {
+            break;
+        }
+        if next.len() > 1 {
+            report.skipped_branches.push(SkippedBranch {
+                spring: spring.to_owned(),
+                node: current,
+                skipped: next[1..].to_vec(),
+            });
+        }
+        if chain.len() >= max_joints {
+            report.truncated_chains.push(spring.to_owned());
+            break;
+        }
+        let child = next[0];
+        if is_zero_length(worlds, current, child) {
+            report.zero_length_joints.push(ZeroLengthJoint {
+                spring: spring.to_owned(),
+                parent: current,
+                child,
+            });
+        }
+        claimed.insert(child, spring);
+        chain.push(child);
+        current = child;
+    }
+    Ok(chain)
+}
+
+/// 関節パラメータの第一近似を求める。
+///
+/// `hit_radius` と `stiffness` はbase値を使い、曲線のキー列は評価しない。
+/// `drag_force` は `1 - spring` を0〜1に丸める。`gravity` 系は使わない。
+/// 近似した箇所は報告に残す。参照実装の式への置き換えが前提である。
+fn approx_joint_params(
+    spring: &str,
+    source: &SidecarPhysBone,
+    report: &mut SpringCompileReport,
+) -> Result<(f32, f32, f32), VrmError> {
+    for (field, curve) in [
+        ("radius", &source.radius),
+        ("spring", &source.spring),
+        ("stiffness", &source.stiffness),
+    ] {
+        if !curve.keys.is_empty() {
+            report.curve_base_used.push(CurveBaseUsed {
+                spring: spring.to_owned(),
+                field,
+                keys: curve.keys.len(),
+            });
+        }
+    }
+    let hit_radius = to_f32_finite(source.radius.value, "半径")?;
+    if hit_radius < 0.0 {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPhysicsSidecar,
+            format!("半径が0以上の有限値でない: {spring}"),
+        ));
+    }
+    let stiffness = to_f32_finite(source.stiffness.value, "硬さ")?;
+    if !stiffness.is_finite() || stiffness < 0.0 {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPhysicsSidecar,
+            format!("硬さが0以上の有限値でない: {spring}"),
+        ));
+    }
+    let spring_base = to_f32_finite(source.spring.value, "ばね")?;
+    let raw = 1.0 - spring_base;
+    let drag_force = raw.clamp(0.0, 1.0);
+    if drag_force != raw {
+        report.drag_clamped.push(spring.to_owned());
+    }
+    Ok((hit_radius, stiffness, drag_force))
+}
+
+/// world位置の差がほぼ0かどうか。ゼロ長区間の検出に使う。
+fn is_zero_length(worlds: &[[f64; 16]], parent: usize, child: usize) -> bool {
+    let Some(from) = worlds.get(parent) else {
+        return false;
+    };
+    let Some(to) = worlds.get(child) else {
+        return false;
+    };
+    let dx = to[12] - from[12];
+    let dy = to[13] - from[13];
+    let dz = to[14] - from[14];
+    (dx * dx + dy * dy + dz * dz).sqrt() < ZERO_LENGTH_TOLERANCE
 }

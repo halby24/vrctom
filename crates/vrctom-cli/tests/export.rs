@@ -288,3 +288,77 @@ fn 相対の資材指定でも材質入りvrmを書き出せる() {
     assert_eq!(&bytes[..4], b"glTF", "GLBである");
     assert!(json塊に含まれるか(&bytes, "\"images\""), "画像が入る");
 }
+
+#[test]
+fn physics指定でスプリング入りvrmを書き出せる() {
+    let (fixture, sidecar) = match (
+        std::env::var("VRCTOM_FBX_FIXTURE"),
+        std::env::var("VRCTOM_PHYSICS_SIDECAR"),
+    ) {
+        (Ok(fbx), Ok(sidecar)) if !fbx.trim().is_empty() && !sidecar.trim().is_empty() => {
+            (fbx, sidecar)
+        }
+        _ => {
+            eprintln!("skip: VRCTOM_FBX_FIXTUREまたはVRCTOM_PHYSICS_SIDECAR未設定のため読み飛ばす");
+            return;
+        }
+    };
+    let work = tempfile::TempDir::new().expect("作業場所は作れる");
+    let destination = work.path().join("out.vrm");
+    let destination_arg = destination.to_string_lossy().into_owned();
+    let output = run(
+        &[
+            "export",
+            &fixture,
+            "-o",
+            &destination_arg,
+            "--physics",
+            &sidecar,
+        ],
+        work.path(),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(output.stdout.is_empty(), "標準出力は空である");
+    assert!(
+        stderr.contains("スプリング"),
+        "スプリング件数を出す: {stderr}"
+    );
+    let bytes = fs::read(&destination).expect("出力は読める");
+    assert!(
+        json塊に含まれるか(&bytes, "\"VRMC_springBone\""),
+        "spring拡張が入る"
+    );
+}
+
+#[test]
+fn physics指定の失敗は終了コード1になり出力先を作らない() {
+    let fixture = match std::env::var("VRCTOM_FBX_FIXTURE") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            eprintln!("skip: VRCTOM_FBX_FIXTURE 未設定のため読み飛ばす");
+            return;
+        }
+    };
+    // 存在しないsidecarは解決前に失敗する。
+    let work = tempfile::TempDir::new().expect("作業場所は作れる");
+    let destination = work.path().join("out.vrm");
+    let destination_arg = destination.to_string_lossy().into_owned();
+    let missing = work.path().join("存在しない.json");
+    let missing_arg = missing.to_string_lossy().into_owned();
+    let output = run(
+        &[
+            "export",
+            &fixture,
+            "-o",
+            &destination_arg,
+            "--physics",
+            &missing_arg,
+        ],
+        work.path(),
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+    assert!(!destination.exists(), "失敗時は出力先を作らない");
+}

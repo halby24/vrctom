@@ -12,8 +12,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use vrctom::fbx::{FbxFile, FbxOptions};
 use vrctom::unitypackage::{UnpackOptions, unpack_to};
 use vrctom::vrm::{
-    MaterialOptions, VrmExportOptions, VrmExpressionProfile, VrmMaterials, VrmMeta, VrmModel,
-    VrmOptions,
+    MaterialOptions, PhysicsLimits, PhysicsSidecar, SpringCompileOptions, VrmExportOptions,
+    VrmExpressionProfile, VrmMaterials, VrmMeta, VrmModel, VrmOptions, compile_springs,
 };
 
 #[derive(Debug, Parser)]
@@ -56,6 +56,9 @@ enum Command {
         /// 表情の選択指定。`vrc` はVRChat向けの8件（あいうえお・瞬き・視線上下）を使う。
         #[arg(long, value_name = "PROFILE")]
         expressions: Option<ExpressionProfile>,
+        /// 物理sidecar（JSON）のパス。指定時はスプリングをコンパイルして載せる。
+        #[arg(long, value_name = "FILE")]
+        physics: Option<PathBuf>,
     },
 }
 
@@ -94,7 +97,8 @@ fn main() {
             author,
             assets,
             expressions,
-        } => export(input, output, name, author, assets, expressions),
+            physics,
+        } => export(input, output, name, author, assets, expressions, physics),
     };
     std::process::exit(code);
 }
@@ -233,6 +237,7 @@ fn export(
     authors: Vec<String>,
     assets: Option<PathBuf>,
     expressions: Option<ExpressionProfile>,
+    physics: Option<PathBuf>,
 ) -> i32 {
     // 既定出力先は入力の拡張子を `vrm` に変えたパスとする。
     let destination = match output {
@@ -281,13 +286,68 @@ fn export(
     if expressions == Some(ExpressionProfile::Vrc) {
         vrm_options = vrm_options.with_expressions(VrmExpressionProfile::vrchat());
     }
-    let (model, report) = match VrmModel::from_fbx(&file, &vrm_options) {
+    let (mut model, report) = match VrmModel::from_fbx(&file, &vrm_options) {
         Ok(built) => built,
         Err(error) => {
             diagnose_stage("中間モデルの生成に失敗した", &error);
             return 1;
         }
     };
+    // 物理sidecarの指定時は、解決とコンパイルが通ってから代入する。
+    // 失敗時はモデルを部分更新しない。
+    let mut spring_summary: Option<String> = None;
+    if let Some(sidecar_path) = physics {
+        let sidecar_bytes = match std::fs::read(&sidecar_path) {
+            Ok(sidecar_bytes) => sidecar_bytes,
+            Err(error) => {
+                eprintln!(
+                    "物理sidecarを読み込めない: {}: {}",
+                    escape_diag(&format!("{sidecar_path:?}")),
+                    escape_diag(&error.to_string())
+                );
+                return 1;
+            }
+        };
+        let sidecar = match PhysicsSidecar::parse(&sidecar_bytes, &PhysicsLimits::new()) {
+            Ok(sidecar) => sidecar,
+            Err(error) => {
+                diagnose_stage("物理sidecarの解析に失敗した", &error);
+                return 1;
+            }
+        };
+        let resolution = match model.resolve_physics_sidecar(&sidecar, &bytes) {
+            Ok(resolution) => resolution,
+            Err(error) => {
+                diagnose_stage("物理sidecarの解決に失敗した", &error);
+                return 1;
+            }
+        };
+        match compile_springs(&sidecar, &model, &resolution, &SpringCompileOptions::new()) {
+            Ok(compiled) => {
+                // 主要な近似件数も出し、文書の制限と突き合わせられるようにする。
+                let summary = format!(
+                    "スプリング{}件 関節{}件 collider{}件 グループ{}件 分岐{}件 近似(曲線base{} endpoint未生成{} gravity0関節{} first-child{} 平面落下{}) 空鎖{}件",
+                    compiled.report.spring_count,
+                    compiled.report.joint_count,
+                    compiled.report.collider_count,
+                    compiled.report.group_count,
+                    compiled.report.skipped_branches.len(),
+                    compiled.report.curve_base_used.len(),
+                    compiled.report.no_endpoint.len(),
+                    compiled.report.gravity_zero_joints,
+                    compiled.report.first_child_multichild.len(),
+                    compiled.report.plane_colliders_dropped.len(),
+                    compiled.report.skipped_empty_chains.len(),
+                );
+                model.spring_bones = compiled.bones;
+                spring_summary = Some(summary);
+            }
+            Err(error) => {
+                diagnose_stage("スプリングの生成に失敗した", &error);
+                return 1;
+            }
+        }
+    }
     let meta = VrmMeta::new(meta_name, meta_authors);
     // 材質の読み取り。指定時はその配置、省略時はFBXの祖先の `Assets` から求める。
     let explicit_assets = assets.is_some();
@@ -363,6 +423,9 @@ fn export(
         vrm_bytes.len(),
         escape_diag(&format!("{destination:?}"))
     );
+    if let Some(summary) = spring_summary {
+        eprintln!("物理: {summary}");
+    }
     0
 }
 

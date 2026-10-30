@@ -3,14 +3,15 @@
 ## 担当責務
 
 この文書は、Unityヘルパが出力する物理sidecar（JSON）を読み、
-参照解決と座標検証までを行う設計を担当する。sidecarの目的・スキーマ・
-IDとパスの規則・完全一致の対応付け・座標ゲート・上限と失敗条件を持つ。
-スプリングチェーンのコンパイル・VRMへの書き出し・補助ノードの生成・
-平面colliderや拘束の解釈・FX既定姿勢の評価は担当しない。
+参照解決と座標検証、スプリングの最小出力を行う設計を担当する。
+sidecarの目的・スキーマ・IDとパスの規則・完全一致の対応付け・
+座標ゲート・上限と失敗条件・出力範囲と制限を持つ。
+完全な参照実装一致（分岐・endpoint・limit・center・曲線の再現）・
+補助ノードの生成・平面colliderや拘束の解釈・FX既定姿勢の評価は担当しない。
 
 中間表現は [`VRM中間モデル`](VRM中間モデル.md) が持ち、
 GLBへの書き出しは [`VRM書き出し`](VRM書き出し.md) が行う。
-この文書はその前段の参照解決だけをまとめる。
+この文書は参照解決と最小出力の判断をまとめる。
 
 ## 設計概要
 
@@ -22,7 +23,10 @@ flowchart LR
     model[VrmModel<br/>ノード階層] --> resolve
     parse --> resolve
     resolve --> out[PhysicsResolution<br/>対応表・未解決・変換行列]
-    out --> next[次単位<br/>物理コンパイル]
+    out --> comp[compile_springs<br/>線形チェーン・第一近似]
+    sidecar2[PhysicsSidecar<br/>値] --> comp
+    comp --> bones[VrmSpringBones<br/>診断付き]
+    bones --> next[次単位<br/>完全移植]
 ```
 
 sidecarはUnityにしか無い情報（PhysBoneの付属・連鎖・collider参照・
@@ -87,7 +91,7 @@ IDは `n:`・`pb:`・`c:` の接頭辞を持ち、sidecar全体で一意であ�
 
 `PhysicsResolution` はsidecarノードIDからVrmノード索引への対応表・
 未解決の追加ノード・PhysBoneとcolliderの参照・座標変換行列を持つ。
-今回の出力には使わず、次単位の物理コンパイルが使う。
+[`compile_springs`] が最小出力に使う。
 
 ## 座標ゲート
 
@@ -124,10 +128,51 @@ sidecarの `capture.coordinateSpace` はUnityの左手系
 
 ## 保証しないこと
 
-- スプリングチェーンのコンパイル・VRMへの書き出しは行わない。次単位である。
+- スプリングチェーンの完全なコンパイルはしない。出力するのは線形チェーンと
+  第一近似の値だけであり、制限は [`VRMスプリング`](#出力範囲と制限) に残す。
+  参照実装の完全移植は次の作業単位である。
 - シーン追加ノードの補助生成はしない。参照があれば保留として失敗する。
 - 平面colliderは除外して報告する。limit・拘束・FX既定姿勢の評価はしない。
 - 推測での軸決定・単位決定・名前近似はしない。
+
+## 出力範囲と制限
+
+`compile_springs` は各解決済みPhysBoneにつき1本の線形チェーンを作る。
+rootから子を深さ優先で辿り、最初の子だけを採用する。`ignore_nodes` の
+部分木・他のPhysBoneのroot・先行springと重なる関節で切る。rootが重なって
+空鎖になったspringは作らず、理由とともに報告する。
+分岐・endpoint生成・ゼロ長の分割・joint所有権の完全再現・limit・center・
+曲線の再現はしない。近似と切り捨ては [`SpringCompileReport`] に残し、
+CLIのstderrにも主要な件数を出す。
+
+```mermaid
+flowchart LR
+    res[PhysicsResolution<br/>対応表] --> chain[線形チェーン<br/>first child]
+    side[PhysicsSidecar<br/>値・参照] --> chain
+    model[VrmModel<br/>階層] --> chain
+    chain --> bones[VrmSpringBones<br/>springs・colliders・groups]
+    chain --> rep[SpringCompileReport<br/>分岐・近似・未出力]
+    bones --> glb[VRMC_springBone<br/>specVersion 1.0]
+```
+
+パラメータは第一近似であり、参照実装準拠ではない。
+
+- `hit_radius` は `radius` のbase値。曲線のキー列は評価せず、使った場合は記録する。
+- `stiffness` は `stiffness` のbase値。Simplifiedでも0にしない。
+- `drag_force` は `clamp01(1 - spring)`。範囲外は丸めて記録する。
+- `gravity_power` は0、`gravity_dir` は `[0,-1,0]`。関節数で記録する。
+- `center` とendpointは付けない。付けなかったspringを記録する。
+- `multiChildType` が `Ignore` 以外でも最初の子に畳み、該当springを記録する。
+- colliderはsphere/capsuleだけを出す。`Sphere` は高さを無視して必ず球にし、
+  `Capsule` は回転した+Y軸の両端から `height/2 - radius` を詰め、
+  縮退は球にする。平面は解決側で除外済みである。
+- 姿勢と出力ノードはroot基準である。`position`・`rotation` はroot-localの値であり、
+  componentは追従対象の識別に使うが、値の座標換算には使わない。
+  Unity左手系からVRM右手系への鏡像（X反転・四元数のY/Z反転）だけを適用する。
+- グループはPhysBoneの参照集合ごとに作り、同じ集合は順序や重複によらず共有する。
+  参照されないcolliderは出さない。
+- 空配列は書式違反（`minItems: 1`）のため、空のルート配列と空の
+  spring内 `colliderGroups` は省略する。springが空の場合も拡張自体を付けない。
 
 ## 外した選択肢
 
