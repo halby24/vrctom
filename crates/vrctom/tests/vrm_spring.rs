@@ -1619,31 +1619,29 @@ fn 実fixtureの平面colliderはunity出力と一致する() {
 }
 
 /// 実fixtureのノード制約をUnity出力と突き合わせる。
-/// 制約入りsidecarで8件（回転4・ひねり4）が出て、種別・軸・参照先・重みが
+/// 正式sidecarの制約11件から8件（回転4・ひねり4）が出て、種別・軸・参照先・重みが
 /// Unity出力と名前基準で一致する。spring・joint・center・limit・colliderの
-/// 件数は変わらない。
+/// 件数は変わらない。正式sidecarは制約を含むため、空なら失敗する。
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn 実fixtureのノード制約はunity出力と一致する() {
-    let (Some(fbx経路), Some(制約sidecar経路), Some(unity経路)) = (
+    let (Some(fbx経路), Some(sidecar経路), Some(unity経路)) = (
         std::env::var_os("VRCTOM_FBX_FIXTURE"),
-        std::env::var_os("VRCTOM_PHYSICS_SIDECAR_CONSTRAINTS"),
+        std::env::var_os("VRCTOM_PHYSICS_SIDECAR"),
         std::env::var_os("VRCTOM_UNITY_VRM"),
     ) else {
-        eprintln!(
-            "VRCTOM_FBX_FIXTURE/VRCTOM_PHYSICS_SIDECAR_CONSTRAINTS/VRCTOM_UNITY_VRM未設定のため跳ばす"
-        );
+        eprintln!("VRCTOM_FBX_FIXTURE/VRCTOM_PHYSICS_SIDECAR/VRCTOM_UNITY_VRM未設定のため跳ばす");
         return;
     };
     let fbxバイト列 = std::fs::read(&fbx経路).expect("実fixtureは読める");
-    let sidecar文 = std::fs::read(&制約sidecar経路).expect("制約入りsidecarは読める");
+    let sidecar文 = std::fs::read(&sidecar経路).expect("実sidecarは読める");
     let 解析 = vrctom::fbx::FbxFile::parse(&fbxバイト列, &vrctom::fbx::FbxOptions::new())
         .expect("実fixtureは読める");
     let (mut モデル, _) =
         VrmModel::from_fbx(&解析, &vrctom::vrm::VrmOptions::new()).expect("実fixtureは変換できる");
     let sidecar =
         PhysicsSidecar::parse(&sidecar文, &PhysicsLimits::new()).expect("実sidecarは検証を通る");
-    assert!(!sidecar.constraints.is_empty(), "制約入りsidecarを使う");
+    assert!(!sidecar.constraints.is_empty(), "正式sidecarは制約を含む");
     let 解決 = モデル
         .resolve_physics_sidecar(&sidecar, &fbxバイト列)
         .expect("実fixtureの参照は解決できる");

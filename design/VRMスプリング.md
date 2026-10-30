@@ -54,6 +54,14 @@ sidecarはUnityにしか無い情報（PhysBoneの付属・連鎖・collider参�
 | `immobileType` | `AllMotion`・`World` |
 | `limitType` | `None`・`Angle`・`Hinge`・`Polar` |
 | `shapeType` | `Sphere`・`Capsule`・`Plane` |
+| 制約 `type` | `Rotation`・`Position`・`Scale`・`Parent`・`Aim`・`LookAt` |
+
+`constraints[]` は Unity ヘルパが出力する VRChat・Unity 由来の制約列である。
+`{id, nodeId, targetNodeId, type, family, weight, enabled, active,
+freezeToWorld, affectsRotation[3], aimAxis[3], sources[{nodeId, external, weight}]}` の
+形式であり、ID は `vc:`・`uc:` 接頭辞の決定的な値である。
+VRChat に bound された Unity 制約は二重に出さない。実 fixture では11件が出て、
+回転3軸は回転、1軸はひねりとして8件を写し、複数参照（blend）2件と親付け1件を落とす。
 
 `source` はFBX由来ノードだけが持つ。`path` はFBXルートからの名前列である。
 シーン追加ノード（`Ground`・`Cardigan_Con` など）は `source: null` である。

@@ -5,14 +5,17 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEngine;
+using UnityEngine.Animations;
 using UnityEngine.SceneManagement;
 using VRC.Dynamics;
+using VRC.Dynamics.ManagedTypes;
 using VRC.SDK3.Avatars.Components;
 using VRC.SDK3.Dynamics.PhysBone.Components;
 
@@ -114,11 +117,12 @@ public static class PhysicsSidecarExporter
             // BOM 無し UTF-8 で書き出す。Rust 側の読み取りと差分比較を安定させる。
             File.WriteAllText(outPath, json, new UTF8Encoding(false));
             Debug.Log(string.Format(
-                "[PhysicsSidecarExporter] wrote {0} policy={1} (nodes={2} bind={3} scene={4} approx={5} changed={6} maxAngle={7:F4}deg maxPos={8:E2} maxScale={9:E2} physBones={10} colliders={11} unsupported={12})",
+                "[PhysicsSidecarExporter] wrote {0} policy={1} (nodes={2} bind={3} scene={4} approx={5} changed={6} maxAngle={7:F4}deg maxPos={8:E2} maxScale={9:E2} physBones={10} colliders={11} constraints={12} unsupported={13})",
                 outPath, StatePolicyName(policy), sidecar.nodes.Length,
                 stats.BindNodes, stats.SceneFallbacks, stats.ApproxDecomposed, stats.ChangedFromScene,
                 stats.MaxAngleDeg, stats.MaxPosDiff, stats.MaxScaleDiff,
                 sidecar.physBones.Length, sidecar.colliders.Length,
+                sidecar.constraints.Length,
                 sidecar.unsupportedFeatures.Length));
             if (stats.ChangedIds.Count > 0)
             {
@@ -224,6 +228,8 @@ public static class PhysicsSidecarExporter
         for (int i = 0; i < enabledBones.Count; i++)
             physBones[i] = BuildPhysBone(enabledBones[i], "pb:" + i, nodeIndex, colliderIdOf, unsupported);
 
+        ConstraintDto[] constraints = BuildConstraints(avatarRoot, nodeIndex);
+
         var unsupportedSorted = new List<string>(unsupported);
         unsupportedSorted.Sort(StringComparer.Ordinal);
 
@@ -251,6 +257,7 @@ public static class PhysicsSidecarExporter
             nodes = nodes,
             physBones = physBones,
             colliders = colliders,
+            constraints = constraints,
             unsupportedFeatures = unsupportedSorted.ToArray(),
         };
     }
@@ -651,6 +658,232 @@ public static class PhysicsSidecarExporter
         return "n:" + nodeIndex[componentTransform];
     }
 
+    // VRChat と Unity の制約を sidecar 形式で集める。決定性のため Transform 順に並べる。
+    // VRChat に bound された Unity 制約は二重に出さない。未知の型は出さない。
+    private static ConstraintDto[] BuildConstraints(
+        GameObject avatarRoot, Dictionary<Transform, int> nodeIndex)
+    {
+        var into = new List<ConstraintDto>();
+        var bound = CollectBoundUnityConstraints(avatarRoot);
+        foreach (VRCConstraintBase constraint in SortedComponents<VRCConstraintBase>(avatarRoot, nodeIndex))
+        {
+            ConstraintDto dto = BuildVrcConstraint(avatarRoot, constraint, nodeIndex);
+            if (dto != null) into.Add(dto);
+        }
+        foreach (IConstraint constraint in SortedUnityConstraints(avatarRoot, nodeIndex))
+        {
+            var behaviour = constraint as Behaviour;
+            if (behaviour == null) continue;
+            if (bound.Contains(behaviour)) continue;
+            ConstraintDto dto = BuildUnityConstraint(avatarRoot, behaviour, constraint, nodeIndex);
+            if (dto != null) into.Add(dto);
+        }
+        return into.ToArray();
+    }
+
+    // SDK が VRChat 制約に結び付けた Unity 制約を集める。結び付けが読めない場合は空にする。
+    private static HashSet<Component> CollectBoundUnityConstraints(GameObject avatarRoot)
+    {
+        var bound = new HashSet<Component>();
+        if (BoundUnityMethod == null)
+        {
+            Debug.Log("[PhysicsSidecarExporter] GetBoundUnityConstraint が無いため bound 除外をしない。");
+            return bound;
+        }
+        foreach (VRCConstraintBase constraint in avatarRoot.GetComponentsInChildren<VRCConstraintBase>(true))
+        {
+            try
+            {
+                var unity = BoundUnityMethod.Invoke(constraint, null) as Component;
+                if (unity != null) bound.Add(unity);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[PhysicsSidecarExporter] bound の読み取りに失敗した:" + constraint.name + ":" + e.Message);
+            }
+        }
+        return bound;
+    }
+
+    // GetBoundUnityConstraint は SDK 3.8 で公開、3.10 で内部のため reflection で読む。無ければ null。
+    private static readonly MethodInfo BoundUnityMethod = typeof(VRCConstraintBase).GetMethod(
+        "GetBoundUnityConstraint",
+        BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+        null, Type.EmptyTypes, null);
+
+    private static IConstraint[] SortedUnityConstraints(
+        GameObject avatarRoot, Dictionary<Transform, int> nodeIndex)
+    {
+        IConstraint[] found = avatarRoot.GetComponentsInChildren<IConstraint>(true);
+        var original = new Dictionary<IConstraint, int>(found.Length);
+        for (int i = 0; i < found.Length; i++) original[found[i]] = i;
+        Array.Sort(found, (a, b) =>
+        {
+            var ta = ((Component)a).transform;
+            var tb = ((Component)b).transform;
+            int order = nodeIndex[ta].CompareTo(nodeIndex[tb]);
+            return order != 0 ? order : original[a].CompareTo(original[b]);
+        });
+        return found;
+    }
+
+    // VRChat 制約1件を sidecar 形式にする。対象がアバター外の場合は出さない。未知の型は出さない。
+    private static ConstraintDto BuildVrcConstraint(
+        GameObject avatarRoot, VRCConstraintBase constraint, Dictionary<Transform, int> nodeIndex)
+    {
+        Transform target = constraint.TargetTransform != null ? constraint.TargetTransform : constraint.transform;
+        if (!nodeIndex.ContainsKey(target)) return null;
+        string type;
+        bool[] affects;
+        float[] aimAxis = new[] { 0f, 0f, 1f };
+        if (constraint is VRCAimConstraintBase)
+        {
+            var aim = (VRCAimConstraintBase)constraint;
+            type = "Aim";
+            affects = new[] { aim.AffectsRotationX, aim.AffectsRotationY, aim.AffectsRotationZ };
+            aimAxis = Float3(aim.AimAxis);
+        }
+        else if (constraint is VRCLookAtConstraintBase)
+        {
+            type = "LookAt";
+            affects = new[] { true, true, true };
+        }
+        else if (constraint is VRCParentConstraintBase)
+        {
+            var parent = (VRCParentConstraintBase)constraint;
+            type = "Parent";
+            affects = new[] { parent.AffectsRotationX, parent.AffectsRotationY, parent.AffectsRotationZ };
+        }
+        else if (constraint is VRCRotationConstraintBase)
+        {
+            var rotation = (VRCRotationConstraintBase)constraint;
+            type = "Rotation";
+            affects = new[] { rotation.AffectsRotationX, rotation.AffectsRotationY, rotation.AffectsRotationZ };
+        }
+        else if (constraint is VRCPositionConstraintBase)
+        {
+            type = "Position";
+            affects = new[] { false, false, false };
+        }
+        else if (constraint is VRCScaleConstraintBase)
+        {
+            type = "Scale";
+            affects = new[] { false, false, false };
+        }
+        else
+        {
+            return null;
+        }
+        var sources = new List<ConstraintSourceDto>();
+        var list = constraint.Sources;
+        for (int i = 0; i < list.Count; i++)
+        {
+            var slot = list[i];
+            sources.Add(BuildConstraintSource(slot.SourceTransform, slot.Weight, nodeIndex));
+        }
+        return new ConstraintDto
+        {
+            id = "vc:" + string.Join("/", BuildScenePath(avatarRoot.transform, constraint.transform)) + "#"
+                + Array.IndexOf(constraint.GetComponents<VRCConstraintBase>(), constraint),
+            nodeId = "n:" + nodeIndex[constraint.transform],
+            targetNodeId = "n:" + nodeIndex[target],
+            type = type,
+            family = "vrchat",
+            weight = constraint.GlobalWeight,
+            enabled = constraint.enabled && constraint.gameObject.activeInHierarchy,
+            active = constraint.IsActive,
+            freezeToWorld = constraint.FreezeToWorld,
+            affectsRotation = affects,
+            aimAxis = aimAxis,
+            sources = sources.ToArray(),
+        };
+    }
+
+    // Unity 制約1件を sidecar 形式にする。target は常に自ノードである。未知の型は出さない。
+    private static ConstraintDto BuildUnityConstraint(
+        GameObject avatarRoot, Behaviour behaviour, IConstraint constraint, Dictionary<Transform, int> nodeIndex)
+    {
+        string type;
+        bool[] affects;
+        float[] aimAxis = new[] { 0f, 0f, 1f };
+        if (constraint is RotationConstraint)
+        {
+            var rotation = (RotationConstraint)constraint;
+            type = "Rotation";
+            affects = UnityAxes(rotation.rotationAxis);
+        }
+        else if (constraint is AimConstraint)
+        {
+            var aim = (AimConstraint)constraint;
+            type = "Aim";
+            affects = UnityAxes(aim.rotationAxis);
+            aimAxis = Float3(aim.aimVector);
+        }
+        else if (constraint is LookAtConstraint)
+        {
+            type = "LookAt";
+            affects = new[] { true, true, true };
+        }
+        else if (constraint is ParentConstraint)
+        {
+            var parent = (ParentConstraint)constraint;
+            type = "Parent";
+            affects = UnityAxes(parent.rotationAxis);
+        }
+        else if (constraint is PositionConstraint)
+        {
+            type = "Position";
+            affects = new[] { false, false, false };
+        }
+        else if (constraint is ScaleConstraint)
+        {
+            type = "Scale";
+            affects = new[] { false, false, false };
+        }
+        else
+        {
+            return null;
+        }
+        var sources = new List<ConstraintSourceDto>();
+        for (int i = 0; i < constraint.sourceCount; i++)
+        {
+            ConstraintSource slot = constraint.GetSource(i);
+            sources.Add(BuildConstraintSource(slot.sourceTransform, slot.weight, nodeIndex));
+        }
+        return new ConstraintDto
+        {
+            id = "uc:" + string.Join("/", BuildScenePath(avatarRoot.transform, behaviour.transform)) + "#"
+                + Array.IndexOf(behaviour.GetComponents<IConstraint>(), constraint),
+            nodeId = "n:" + nodeIndex[behaviour.transform],
+            targetNodeId = "n:" + nodeIndex[behaviour.transform],
+            type = type,
+            family = "unity",
+            weight = constraint.weight,
+            enabled = behaviour.enabled && behaviour.gameObject.activeInHierarchy,
+            active = constraint.constraintActive,
+            freezeToWorld = false,
+            affectsRotation = affects,
+            aimAxis = aimAxis,
+            sources = sources.ToArray(),
+        };
+    }
+
+    // 参照先を sidecar 形式にする。解決できない参照は空 ID にし、重みを保持する。
+    private static ConstraintSourceDto BuildConstraintSource(
+        Transform source, float weight, Dictionary<Transform, int> nodeIndex)
+    {
+        if (source == null) return new ConstraintSourceDto { nodeId = "", external = false, weight = weight };
+        int index;
+        if (nodeIndex.TryGetValue(source, out index))
+            return new ConstraintSourceDto { nodeId = "n:" + index, external = false, weight = weight };
+        return new ConstraintSourceDto { nodeId = "", external = true, weight = weight };
+    }
+
+    private static bool[] UnityAxes(Axis axis)
+    {
+        return new[] { (axis & Axis.X) != 0, (axis & Axis.Y) != 0, (axis & Axis.Z) != 0 };
+    }
+
     private static string PhysBoneVersionName(VRCPhysBoneBase.Version version)
     {
         const string prefix = "Version_";
@@ -768,6 +1001,31 @@ public static class PhysicsSidecarExporter
             if (model.sha256 == null || model.sha256.Length != 64)
                 throw new InvalidOperationException("SHA-256 が不正:" + model.id);
         }
+        var constraintIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (ConstraintDto constraint in sidecar.constraints)
+        {
+            if (string.IsNullOrEmpty(constraint.id))
+                throw new InvalidOperationException("制約の ID が空。");
+            if (!constraintIds.Add(constraint.id))
+                throw new InvalidOperationException("制約の ID が重複する:" + constraint.id);
+            if (!IsFinite(constraint.weight))
+                throw new InvalidOperationException("制約の重みが非有限である:" + constraint.id);
+            if (constraint.affectsRotation == null || constraint.affectsRotation.Length != 3)
+                throw new InvalidOperationException("制約の affectsRotation が3要素でない:" + constraint.id);
+            if (constraint.aimAxis == null || constraint.aimAxis.Length != 3)
+                throw new InvalidOperationException("制約の aimAxis が3要素でない:" + constraint.id);
+            foreach (float component in constraint.aimAxis)
+                if (!IsFinite(component))
+                    throw new InvalidOperationException("制約の注視軸が非有限である:" + constraint.id);
+            foreach (ConstraintSourceDto source in constraint.sources)
+                if (!IsFinite(source.weight))
+                    throw new InvalidOperationException("制約の参照重みが非有限である:" + constraint.id);
+        }
+    }
+
+    private static bool IsFinite(float value)
+    {
+        return !float.IsNaN(value) && !float.IsInfinity(value);
     }
 
     private static float[] Float3(Vector3 v)
@@ -801,6 +1059,7 @@ public static class PhysicsSidecarExporter
         public NodeDto[] nodes;
         public PhysBoneDto[] physBones;
         public ColliderDto[] colliders;
+        public ConstraintDto[] constraints;
         public string[] unsupportedFeatures;
     }
 
@@ -909,6 +1168,31 @@ public static class PhysicsSidecarExporter
         public float[] position;
         public float[] rotation;
         public bool bonesAsSpheres;
+    }
+
+    [Serializable]
+    private sealed class ConstraintDto
+    {
+        public string id;
+        public string nodeId;
+        public string targetNodeId;
+        public string type;
+        public string family;
+        public float weight;
+        public bool enabled;
+        public bool active;
+        public bool freezeToWorld;
+        public bool[] affectsRotation;
+        public float[] aimAxis;
+        public ConstraintSourceDto[] sources;
+    }
+
+    [Serializable]
+    private sealed class ConstraintSourceDto
+    {
+        public string nodeId;
+        public bool external;
+        public float weight;
     }
 
     [Serializable]

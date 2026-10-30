@@ -550,6 +550,10 @@ pub struct SidecarCollider {
 pub enum SidecarConstraintType {
     /// 回転の複写。
     Rotation,
+    /// 位置の複写（今回は出力対象外として落とす）。
+    Position,
+    /// 拡大率の複写（今回は出力対象外として落とす）。
+    Scale,
     /// 親付け（今回は出力対象外として落とす）。
     Parent,
     /// 主軸への注視。
@@ -2967,7 +2971,8 @@ fn principal_axis(axis: [f64; 3]) -> Option<VrmAimAxis> {
 /// 参照実装の `ConstraintCompiler.Map` と `WithSource` に相当する。
 /// 回転3軸→回転、1軸→その軸のひねり、2軸→出力しない。
 /// 注視は3軸かつ主軸の場合だけ写し、注視は+Z軸として写す。
-/// 親付け・外部参照・負の重み・ワールド固定・無効な対象と参照は出力しない。
+/// 親付け・位置・拡大率・外部参照・負の重み・ワールド固定・
+/// 無効な対象と参照は出力しない。
 /// 重みは全体重みに注視の場合だけ参照重みを掛け、0〜1に丸める。
 fn map_node_constraint(
     record: &SidecarConstraint,
@@ -3023,7 +3028,10 @@ fn map_node_constraint(
             axis: VrmAimAxis::PositiveZ,
         },
         // 親付けはリペアレントであり、今回の出力対象外として落とす。
-        SidecarConstraintType::Parent => return None,
+        // 位置・拡大率も回転を写さないため出力しない。
+        SidecarConstraintType::Parent
+        | SidecarConstraintType::Position
+        | SidecarConstraintType::Scale => return None,
     };
     let is_aim = matches!(kind, VrmNodeConstraintKind::Aim { .. });
     // 有効な参照先だけを数える。負の重みがある場合は動きを変えるため落とす。

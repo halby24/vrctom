@@ -132,6 +132,26 @@ VRCTOM_PHYSICS_OUT=/tmp/out/physics.json \
   `version` は `Version_1_1`→`"1.1"` に読み替える）。
 - `colliders[]`: 有効な `VRCPhysBoneCollider` を Transform 順に `c:0..`。
   `shapeType/radius/height/position/rotation/insideBounds/bonesAsSpheres` を収録。
+- `constraints[]`: VRChat 制約（`VRCConstraintBase` 派生）と Unity 制約（`IConstraint`）を
+  Transform 順に出す。`{id, nodeId, targetNodeId, type, family, weight, enabled, active,
+  freezeToWorld, affectsRotation[3], aimAxis[3], sources[]}` の形式である。
+  `type` は `Rotation`・`Position`・`Scale`・`Parent`・`Aim`・`LookAt`、
+  `family` は `vrchat`・`unity`。`nodeId`/`targetNodeId`/`sources[].nodeId` は
+  ノードと同じ `n:N` の ID 体系であり、解決できない参照は `nodeId: ""` にし、
+  `external: true` と `weight` を保持する（`targetNodeId` に外部参照は無く、
+  アバター外の対象は収録しない）。VRChat 制約の種別別の軸は
+  `VRCRotationConstraintBase.AffectsRotationX/Y/Z`、`VRCAimConstraintBase.AffectsRotationX/Y/Z` と
+  `AimAxis`、`VRCLookAtConstraintBase` は3軸真、`VRCParentConstraintBase` は
+  `AffectsRotationX/Y/Z`、Position/Scale は `affectsRotation` 全偽である。
+  Unity 制約も同形式であり（Rotation/RotationAxes→`affectsRotation`、Aim/LookAt/Parent も同様、
+  Position/Scale は全偽、`aimAxis` は Aim の `aimVector` のみ、他は既定の `[0,0,1]`）、
+  `targetNodeId` は常に自ノードである。VRChat 制約に bound された Unity 制約
+  （`GetBoundUnityConstraint`）は二重に出さない。取得できない場合はその旨をログに出す。
+  ID は決定的であり、VRChat 制約は `vc:{scenePath}#{componentIndex}`、
+  Unity 制約は `uc:{scenePath}#{componentIndex}`（`scenePath` は `/` 区切り、
+  `componentIndex` は同 Transform 上の取得順）。
+  出力可否の選別（2軸・複数参照・親付け・外部参照などの除外）は Rust 側が行い、
+  こちらは読み取った値をそのまま出す。
 - `unsupportedFeatures[]`: VRM に持っていけない要素の記録（ソート済み）。
   `plane-colliders`（Plane コライダーあり）、
   `stretch-motion:pb:N`、`allow-grabbing:pb:N:値`、`allow-posing:pb:N:値`、
@@ -140,16 +160,18 @@ VRCTOM_PHYSICS_OUT=/tmp/out/physics.json \
 
 ## 制限（次単位としないもの）
 
-- 収録対象のコンポーネントは Edit Mode で有効なものだけ
+- 収録対象の PhysBone・コライダーは Edit Mode で有効なものだけ
   （`component.enabled && activeInHierarchy`）。無効な SmartPhone 系は出ない。
+  制約は有効・無効を問わず収録し、`enabled`/`active` で区別する（選別は Rust 側）。
 - `allowCollision` は SDK 3.10.5 では `AdvancedBool` enum（False/True/Other）のため、
   `False` 以外を `true` に丸めて bool で出す（VRM 側に中間値が無いため）。
 - `allowGrabbing` / `allowPosing` / `stretchMotion` 系（maxStretch/maxSquish 含む）、
   `grabMovement` / `snapToHand` / `parameter` / `resetWhenDisabled`、
   `staticFreezeAxis`、各種 Filter は sidecar に出さない。
   把握・伸縮は `unsupportedFeatures` にだけ残す。
-- Unity / VRC の Constraint 系コンポーネント、FX レイヤーのデフォルト値は収集しない。
-  Plane コライダーは記録するが `plane-colliders` として申告する（変換は次単位）。
+- FX レイヤーのデフォルト値は収集しない。
+  Plane コライダーは記録し、`plane-colliders` として申告する（Rust 側は補助ノードと
+  `VRMC_springBone_extended_collider` で出力する）。
 - 決定性: ノード DFS 順、コンポーネントは Transform 順（同 Transform 内は取得順）。
   同じ状態からはバイト同一の JSON になる（同一コードの再実行で md5 一致を確認）。
 - bind-pose の復元は Unity 空間（インポート適用後）の行列で行う。FBX 生値との突合せは
