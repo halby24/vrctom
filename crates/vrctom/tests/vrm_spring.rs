@@ -1013,6 +1013,8 @@ fn 実fixtureの関節値はunity出力と一致する() {
         std::collections::HashMap::new();
     let mut 代表値: Vec<String> = Vec::new();
     let mut 不一致: Vec<String> = Vec::new();
+    // 許容差を超えたstiffnessの相対差。0.8%以内で9件までを許容する。
+    let mut 硬さ残差: Vec<f64> = Vec::new();
     // 残差の出た (spring順, 関節索引)。追跡記録と突き合わせる。
     let mut 詳細対象: Vec<(usize, usize)> = Vec::new();
     // 追跡記録の索引付け。キーは (spring名, spring内の関節索引) である。
@@ -1065,6 +1067,10 @@ fn 実fixtureの関節値はunity出力と一致する() {
                     全体.0 += 1;
                     項目.0 += 1;
                 } else {
+                    if 名 == "stiffness" {
+                        let 他値 = 期待(名);
+                        硬さ残差.push((実 - 他値).abs() / 他値.abs());
+                    }
                     不一致.push(format!(
                         "{}[{i}].{名}: 自={実:.6} 他={:.6}",
                         spring.name,
@@ -1207,11 +1213,22 @@ fn 実fixtureの関節値はunity出力と一致する() {
     assert_eq!(項目別["dragForce"].0, 項目別["dragForce"].1);
     assert_eq!(項目別["gravityPower"].0, 項目別["gravityPower"].1);
     assert_eq!(項目別["hitRadius"].0, 項目別["hitRadius"].1);
-    // stiffnessはPolar制限の37関節だけが許容差（0.1〜0.8%）を超える。
+    // stiffnessはPolar制限の9関節だけが許容差（0.1〜0.8%）を超える。
     let (合致, 総数) = 項目別["stiffness"];
     assert!(
         合致 as f64 / 総数 as f64 >= 0.74,
         "stiffness一致率が下がった"
+    );
+    // 残差は件数と相対差の両方で固定する。件数が増えるか0.8%を超えれば退行である。
+    assert!(
+        硬さ残差.len() <= 9,
+        "許容差を超えるstiffnessが増えた: {}件",
+        硬さ残差.len()
+    );
+    let 最大残差 = 硬さ残差.iter().copied().fold(0.0f64, f64::max);
+    assert!(
+        最大残差 <= 0.008,
+        "stiffnessの相対残差が0.8%を超えた: {最大残差}"
     );
     assert!(
         全体.0 as f64 / 全体.1 as f64 >= 0.94,
