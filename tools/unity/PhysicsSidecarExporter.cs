@@ -116,14 +116,18 @@ public static class PhysicsSidecarExporter
             Directory.CreateDirectory(Path.GetDirectoryName(outPath));
             // BOM 無し UTF-8 で書き出す。Rust 側の読み取りと差分比較を安定させる。
             File.WriteAllText(outPath, json, new UTF8Encoding(false));
+            string lookAtSummary = sidecar.lookAt != null
+                ? string.Format("eyeLook={0} left={1} right={2}",
+                    sidecar.lookAt.eyeLook, sidecar.lookAt.leftEyeNodeId, sidecar.lookAt.rightEyeNodeId)
+                : "none";
             Debug.Log(string.Format(
-                "[PhysicsSidecarExporter] wrote {0} policy={1} (nodes={2} bind={3} scene={4} approx={5} changed={6} maxAngle={7:F4}deg maxPos={8:E2} maxScale={9:E2} physBones={10} colliders={11} constraints={12} unsupported={13})",
+                "[PhysicsSidecarExporter] wrote {0} policy={1} (nodes={2} bind={3} scene={4} approx={5} changed={6} maxAngle={7:F4}deg maxPos={8:E2} maxScale={9:E2} physBones={10} colliders={11} constraints={12} unsupported={13} lookAt={14})",
                 outPath, StatePolicyName(policy), sidecar.nodes.Length,
                 stats.BindNodes, stats.SceneFallbacks, stats.ApproxDecomposed, stats.ChangedFromScene,
                 stats.MaxAngleDeg, stats.MaxPosDiff, stats.MaxScaleDiff,
                 sidecar.physBones.Length, sidecar.colliders.Length,
                 sidecar.constraints.Length,
-                sidecar.unsupportedFeatures.Length));
+                sidecar.unsupportedFeatures.Length, lookAtSummary));
             if (stats.ChangedIds.Count > 0)
             {
                 Debug.Log("[PhysicsSidecarExporter] bind changed: "
@@ -229,6 +233,7 @@ public static class PhysicsSidecarExporter
             physBones[i] = BuildPhysBone(enabledBones[i], "pb:" + i, nodeIndex, colliderIdOf, unsupported);
 
         ConstraintDto[] constraints = BuildConstraints(avatarRoot, nodeIndex);
+        LookAtDto lookAt = BuildLookAt(avatarRoot, nodeIndex);
 
         var unsupportedSorted = new List<string>(unsupported);
         unsupportedSorted.Sort(StringComparer.Ordinal);
@@ -259,6 +264,7 @@ public static class PhysicsSidecarExporter
             colliders = colliders,
             constraints = constraints,
             unsupportedFeatures = unsupportedSorted.ToArray(),
+            lookAt = lookAt,
         };
     }
 
@@ -884,6 +890,62 @@ public static class PhysicsSidecarExporter
         return new[] { (axis & Axis.X) != 0, (axis & Axis.Y) != 0, (axis & Axis.Z) != 0 };
     }
 
+    // descriptor の Eye Look を sidecar 形式で集める。値は生値のまま写し、
+    // 正規化しない。未設定の目は空文字、未初期化の姿勢は非 linked の恒等回転になる。
+    // ノード ID は sidecar の n:N 体系であり、アバター外の目は空文字になる。
+    private static LookAtDto BuildLookAt(GameObject avatarRoot, Dictionary<Transform, int> nodeIndex)
+    {
+        var lookAt = new LookAtDto
+        {
+            eyeLook = false,
+            leftEyeNodeId = string.Empty,
+            rightEyeNodeId = string.Empty,
+            eyesLookingStraight = EyePose(null),
+            eyesLookingUp = EyePose(null),
+            eyesLookingDown = EyePose(null),
+            eyesLookingLeft = EyePose(null),
+            eyesLookingRight = EyePose(null),
+        };
+        VRCAvatarDescriptor descriptor = avatarRoot.GetComponent<VRCAvatarDescriptor>();
+        if (descriptor == null) return lookAt;
+        var settings = descriptor.customEyeLookSettings;
+        lookAt.eyeLook = descriptor.enableEyeLook;
+        lookAt.leftEyeNodeId = LookAtNodeId(settings.leftEye, nodeIndex);
+        lookAt.rightEyeNodeId = LookAtNodeId(settings.rightEye, nodeIndex);
+        lookAt.eyesLookingStraight = EyePose(settings.eyesLookingStraight);
+        lookAt.eyesLookingUp = EyePose(settings.eyesLookingUp);
+        lookAt.eyesLookingDown = EyePose(settings.eyesLookingDown);
+        lookAt.eyesLookingLeft = EyePose(settings.eyesLookingLeft);
+        lookAt.eyesLookingRight = EyePose(settings.eyesLookingRight);
+        return lookAt;
+    }
+
+    // 視線の目の Transform を sidecar のノード ID に写す。未設定・アバター外は空文字。
+    private static string LookAtNodeId(Transform eye, Dictionary<Transform, int> nodeIndex)
+    {
+        int index;
+        if (eye != null && nodeIndex.TryGetValue(eye, out index)) return "n:" + index;
+        return string.Empty;
+    }
+
+    // 視線の1方向の姿勢を sidecar 形式にする。未初期化は非 linked の恒等回転になる。
+    private static EyePoseDto EyePose(VRCAvatarDescriptor.CustomEyeLookSettings.EyeRotations rotations)
+    {
+        if (rotations == null)
+            return new EyePoseDto
+            {
+                linked = false,
+                left = Float4(Quaternion.identity),
+                right = Float4(Quaternion.identity),
+            };
+        return new EyePoseDto
+        {
+            linked = rotations.linked,
+            left = Float4(rotations.left),
+            right = Float4(rotations.right),
+        };
+    }
+
     private static string PhysBoneVersionName(VRCPhysBoneBase.Version version)
     {
         const string prefix = "Version_";
@@ -1021,6 +1083,37 @@ public static class PhysicsSidecarExporter
                 if (!IsFinite(source.weight))
                     throw new InvalidOperationException("制約の参照重みが非有限である:" + constraint.id);
         }
+        if (sidecar.lookAt != null) ValidateLookAt(sidecar.lookAt, nodeIds);
+    }
+
+    // 視線記録を検査する。目の参照は空（未設定）か既存ノードであり、
+    // 姿勢は4要素の有限値である。正規化は Rust 側の測定時に行う。
+    private static void ValidateLookAt(LookAtDto lookAt, HashSet<string> nodeIds)
+    {
+        foreach (string eye in new[] { lookAt.leftEyeNodeId, lookAt.rightEyeNodeId })
+        {
+            if (!string.IsNullOrEmpty(eye) && !nodeIds.Contains(eye))
+                throw new InvalidOperationException("視線の目の参照ノードが nodes に無い:" + eye);
+        }
+        CheckEyePose(lookAt.eyesLookingStraight, "eyesLookingStraight");
+        CheckEyePose(lookAt.eyesLookingUp, "eyesLookingUp");
+        CheckEyePose(lookAt.eyesLookingDown, "eyesLookingDown");
+        CheckEyePose(lookAt.eyesLookingLeft, "eyesLookingLeft");
+        CheckEyePose(lookAt.eyesLookingRight, "eyesLookingRight");
+    }
+
+    private static void CheckEyePose(EyePoseDto pose, string name)
+    {
+        if (pose == null)
+            throw new InvalidOperationException("視線の姿勢が無い:" + name);
+        foreach (float[] rotation in new[] { pose.left, pose.right })
+        {
+            if (rotation == null || rotation.Length != 4)
+                throw new InvalidOperationException("視線の姿勢が4要素でない:" + name);
+            foreach (float component in rotation)
+                if (!IsFinite(component))
+                    throw new InvalidOperationException("視線の姿勢に非有限値がある:" + name);
+        }
     }
 
     private static bool IsFinite(float value)
@@ -1061,6 +1154,7 @@ public static class PhysicsSidecarExporter
         public ColliderDto[] colliders;
         public ConstraintDto[] constraints;
         public string[] unsupportedFeatures;
+        public LookAtDto lookAt;
     }
 
     [Serializable]
@@ -1193,6 +1287,29 @@ public static class PhysicsSidecarExporter
         public string nodeId;
         public bool external;
         public float weight;
+    }
+
+    // 視線記録。値は descriptor の生値であり、正規化しない。
+    // 未設定の目は空文字、未初期化の姿勢は非 linked の恒等回転になる。
+    [Serializable]
+    private sealed class LookAtDto
+    {
+        public bool eyeLook;
+        public string leftEyeNodeId;
+        public string rightEyeNodeId;
+        public EyePoseDto eyesLookingStraight;
+        public EyePoseDto eyesLookingUp;
+        public EyePoseDto eyesLookingDown;
+        public EyePoseDto eyesLookingLeft;
+        public EyePoseDto eyesLookingRight;
+    }
+
+    [Serializable]
+    private sealed class EyePoseDto
+    {
+        public bool linked;
+        public float[] left;
+        public float[] right;
     }
 
     [Serializable]

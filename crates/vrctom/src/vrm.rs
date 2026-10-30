@@ -19,6 +19,7 @@
 mod error;
 mod export;
 mod humanoid;
+mod look_at;
 mod material;
 mod matrix;
 mod mesh;
@@ -27,6 +28,9 @@ pub mod physics;
 pub use error::{VrmError, VrmErrorKind};
 pub use export::{VrmExportError, VrmExportErrorKind, VrmExportOptions, VrmMeta};
 pub use humanoid::{HumanoidBone, HumanoidBones};
+pub use look_at::{
+    LookAtReport, SidecarEyePose, SidecarLookAt, VrmLookAt, VrmLookAtRange, resolve_look_at,
+};
 pub use material::{
     MaterialError, MaterialErrorKind, MaterialOptions, MaterialReport, VrmAlphaMode, VrmFilter,
     VrmImage, VrmImageMime, VrmMaterial, VrmMaterialEntry, VrmMaterials, VrmMtoonParameters,
@@ -89,6 +93,9 @@ pub struct VrmModel {
     pub spring_bones: VrmSpringBones,
     /// ノード制約列。空の場合は拡張を書かない。
     pub node_constraints: Vec<VrmNodeConstraint>,
+    /// 視線設定。物理sidecarの視線記録から解決した場合だけ `Some` になる。
+    /// `None` の場合は `VRMC_vrm.lookAt` を書かず、従来どおり省略する。
+    pub look_at: Option<VrmLookAt>,
 }
 
 /// ノード1件。
@@ -407,6 +414,7 @@ impl VrmModel {
             expressions,
             spring_bones: VrmSpringBones::default(),
             node_constraints: Vec::new(),
+            look_at: None,
         };
         Ok((model, report))
     }

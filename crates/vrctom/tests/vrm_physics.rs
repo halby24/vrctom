@@ -82,6 +82,7 @@ fn 合成モデルを作る(
         expressions: vrctom::vrm::VrmExpressions::default(),
         spring_bones: VrmSpringBones::default(),
         node_constraints: Vec::new(),
+        look_at: None,
     }
 }
 
@@ -693,6 +694,7 @@ fn 既定のスプリングは空で書き出せる() {
         expressions: VrmExpressions::default(),
         spring_bones: VrmSpringBones::default(),
         node_constraints: Vec::new(),
+        look_at: None,
     };
     assert!(モデル.spring_bones.springs.is_empty());
     assert!(モデル.spring_bones.colliders.is_empty());

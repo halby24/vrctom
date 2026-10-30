@@ -318,6 +318,9 @@ pub struct PhysicsSidecar {
     /// 制約列。無い場合は空として扱い、後方互換を保つ。
     #[serde(default)]
     pub constraints: Vec<SidecarConstraint>,
+    /// 視線記録。無い旧形式の場合は `None` として扱い、後方互換を保つ。
+    #[serde(rename = "lookAt", default)]
+    pub look_at: Option<super::look_at::SidecarLookAt>,
     /// 未対応機能の名残。今回は検証せず保持する。
     #[serde(rename = "unsupportedFeatures", default)]
     pub unsupported_features: Vec<String>,
@@ -1046,6 +1049,11 @@ impl PhysicsSidecar {
             check_trs(&node.reference_local, &node.id)?;
         }
         check_parent_cycles(&self.nodes, &node_at)?;
+        // 視線記録は任意であり、無い旧形式は検証しない。ある場合は目の参照と
+        // 姿勢の有限値を確認する。正規化は測定時に行うためここでは求めない。
+        if let Some(look) = self.look_at.as_ref() {
+            super::look_at::validate_sidecar_look_at(look, &node_at)?;
+        }
         let mut key_total = 0usize;
         for bone in &self.phys_bones {
             check_node_ref(&node_at, &bone.component_node_id, &bone.id, "付属ノード")?;
@@ -2312,7 +2320,10 @@ fn mirror_point(point: [f64; 3]) -> [f64; 3] {
 }
 
 /// Unity左手系からVRM右手系への四元数変換。YとZを反転する。
-fn mirror_quat(rotation: [f64; 4]) -> [f64; 4] {
+///
+/// 視線の測定でもVRM空間からUnity空間へ戻す際に使う。鏡像は群同型のため、
+/// 往復で厳密に戻る。
+pub(crate) fn mirror_quat(rotation: [f64; 4]) -> [f64; 4] {
     [rotation[0], -rotation[1], -rotation[2], rotation[3]]
 }
 

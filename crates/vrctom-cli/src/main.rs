@@ -12,8 +12,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use vrctom::fbx::{FbxFile, FbxOptions};
 use vrctom::unitypackage::{UnpackOptions, unpack_to};
 use vrctom::vrm::{
-    MaterialOptions, PhysicsLimits, PhysicsSidecar, SpringCompileOptions, VrmExportOptions,
-    VrmExpressionProfile, VrmMaterials, VrmMeta, VrmModel, VrmOptions, compile_springs,
+    HumanoidBones, MaterialOptions, PhysicsLimits, PhysicsSidecar, SpringCompileOptions,
+    VrmExportOptions, VrmExpressionProfile, VrmMaterials, VrmMeta, VrmModel, VrmOptions,
+    compile_springs, resolve_look_at,
 };
 
 #[derive(Debug, Parser)]
@@ -322,6 +323,29 @@ fn export(
                 return 1;
             }
         };
+        // 視線の解決。sidecarに視線記録が無い旧形式では何もしない。
+        // 測定も既定もここで確定する。モデルは変更しないため、
+        // 失敗時は部分更新なく打ち切る。humanoidの検出は鎖の生成より前に行い、
+        // 平面用の補助ノードの影響を受けない。
+        let look_at = match sidecar.look_at.as_ref() {
+            Some(_) => {
+                let humanoid = match HumanoidBones::detect(&model) {
+                    Ok(humanoid) => humanoid,
+                    Err(error) => {
+                        diagnose_stage("視線の解決に失敗した", &error);
+                        return 1;
+                    }
+                };
+                match resolve_look_at(&sidecar, &model, &resolution, &humanoid) {
+                    Ok(look_at) => look_at,
+                    Err(error) => {
+                        diagnose_stage("視線の解決に失敗した", &error);
+                        return 1;
+                    }
+                }
+            }
+            None => None,
+        };
         match compile_springs(
             &sidecar,
             &mut model,
@@ -384,6 +408,26 @@ fn export(
                 );
                 model.spring_bones = compiled.bones;
                 spring_summary = Some(summary);
+                // 視線は鎖の生成が通ってから代入する。失敗時はモデルを更新しない。
+                if let Some((look, report)) = look_at {
+                    model.look_at = Some(look);
+                    eprintln!(
+                        "視線: lookAt={} {} 内{:.3}度 外{:.3}度 下{:.3}度 上{:.3}度 頭基準ずれ[{:.6}, {:.6}, {:.6}]",
+                        report.look_type,
+                        if report.measured {
+                            "測定値"
+                        } else {
+                            "既定値"
+                        },
+                        report.range.horizontal_inner,
+                        report.range.horizontal_outer,
+                        report.range.vertical_down,
+                        report.range.vertical_up,
+                        report.offset_from_head[0],
+                        report.offset_from_head[1],
+                        report.offset_from_head[2],
+                    );
+                }
             }
             Err(error) => {
                 diagnose_stage("スプリングの生成に失敗した", &error);

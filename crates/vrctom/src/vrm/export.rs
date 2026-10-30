@@ -1073,6 +1073,11 @@ impl<'a> GlbWriter<'a> {
             let preset = self.build_expressions_json()?;
             vrmc.insert("expressions".to_string(), serde_json::Value::Object(preset));
         }
+        // 視線は物理sidecarの解決で `Some` の場合だけ書く。無い場合は従来どおり省略する。
+        if let Some(look) = self.model.look_at.as_ref() {
+            let look_value = super::look_at::look_at_json(look, self.model.nodes.len())?;
+            vrmc.insert("lookAt".to_string(), look_value);
+        }
         let mut others = serde_json::Map::new();
         others.insert("VRMC_vrm".to_string(), serde_json::Value::Object(vrmc));
         let mut wrote_spring_bone = false;

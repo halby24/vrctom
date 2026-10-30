@@ -139,6 +139,7 @@ fn 書き出し可能モデルを作る() -> VrmModel {
         expressions: VrmExpressions::default(),
         spring_bones: VrmSpringBones::default(),
         node_constraints: Vec::new(),
+        look_at: None,
     }
 }
 
@@ -2700,6 +2701,7 @@ fn 三分岐モデルを作る() -> VrmModel {
         expressions: VrmExpressions::default(),
         spring_bones: VrmSpringBones::default(),
         node_constraints: Vec::new(),
+        look_at: None,
     }
 }
 
@@ -2861,6 +2863,7 @@ fn 先頭子だけがspringになる() {
         expressions: VrmExpressions::default(),
         spring_bones: VrmSpringBones::default(),
         node_constraints: Vec::new(),
+        look_at: None,
     };
     let fbxバイト列 = b"fake-fbx";
     let 道 = [
@@ -2958,6 +2961,7 @@ fn 平均指定は先頭子への近似として記録する() {
         expressions: VrmExpressions::default(),
         spring_bones: VrmSpringBones::default(),
         node_constraints: Vec::new(),
+        look_at: None,
     };
     let fbxバイト列 = b"fake-fbx";
     let 道 = [
@@ -3042,6 +3046,7 @@ fn avatarrootはjointにしない() {
         expressions: VrmExpressions::default(),
         spring_bones: VrmSpringBones::default(),
         node_constraints: Vec::new(),
+        look_at: None,
     };
     let fbxバイト列 = b"fake-fbx";
     let 出所 = |パス: &[&str]| serde_json::json!({"modelId": "milfy", "path": パス, "assetGuid": "g", "localId": -1});
@@ -3135,6 +3140,7 @@ fn 内側の候補は祖先へ辿り直す() {
         expressions: VrmExpressions::default(),
         spring_bones: VrmSpringBones::default(),
         node_constraints: Vec::new(),
+        look_at: None,
     };
     let fbxバイト列 = b"fake-fbx";
     let 道 = [
@@ -3387,6 +3393,7 @@ fn 未マップを含む鎖は落とす() {
         expressions: VrmExpressions::default(),
         spring_bones: VrmSpringBones::default(),
         node_constraints: Vec::new(),
+        look_at: None,
     };
     // sidecarはTopとHだけを持ち、Gは出所なし（scene追加）で残す。
     let fbxバイト列 = b"fake-fbx";
@@ -3499,6 +3506,7 @@ fn ゼロ長区間で分割し重ねない() {
         expressions: VrmExpressions::default(),
         spring_bones: VrmSpringBones::default(),
         node_constraints: Vec::new(),
+        look_at: None,
     };
     let fbxバイト列 = b"fake-fbx";
     let 道 = [

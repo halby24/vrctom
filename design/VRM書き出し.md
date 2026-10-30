@@ -4,7 +4,7 @@
 
 この文書は、VRM中間モデルからVRM 1.0のGLBバイト列を作る設計を担当する。
 glTFのノード・メッシュ・スキン・材質・モーフターゲットと、
-`VRMC_vrm` 拡張のmeta・humanoid・expressions、`VRMC_springBone` 拡張の
+`VRMC_vrm` 拡張のmeta・humanoid・expressions・lookAt、`VRMC_springBone` 拡張の
 springs・colliderGroups・colliders、`VRMC_springBone_limit` 拡張の
 関節ごとの角度制限を書き出す。
 材質の内容（Unityの `.mat` からの写像）は [`VRM材質`](VRM材質.md) が担当し、
@@ -93,6 +93,31 @@ UVはFBXとUnityの左下原点からglTFの左上原点へ合わせるため、
 - 束ねの重みは0〜1の有限値である。
 - 式名はVRM 1.0のプリセット18種のいずれかであり、重複も空もない。
 - 束ねのメッシュ索引・ターゲット索引は範囲内であり、ターゲットの長さは出力頂点数と一致する。
+
+## 視線（lookAt）
+
+`VrmModel.look_at` が `Some` の場合だけ `VRMC_vrm.lookAt` を書く。
+`None` の場合は従来どおり省略する。`--physics` 無しでは `None` のままになる。
+
+- `Bone` は目の骨で視線を動かす。`offsetFromHeadBone` に頭基準の注視原点、
+  `rangeMapHorizontalInner`・`rangeMapHorizontalOuter`・`rangeMapVerticalDown`・
+  `rangeMapVerticalUp` に4方向の範囲写像、`type` に `bone` を書く。
+  - `offsetFromHeadBone` はVRM空間の `inverse(head世界) * 眼の中点`（同次変換）であり、
+    頭のローカルで注視の原点を表す。Milfy実測では `[0, 0.044, 0.024]`（m）程度である。
+  - 範囲写像は `inputMaxValue`（入力最大角・度）と `outputScale`（出力角・度）を持つ。
+    測定値は入力と出力が同値（入力は1度で止める）であり、VRChatのEye Lookが
+    視線角そのままに目を振り止める動きに対応する。
+    未測定の既定値は入力90度・出力10度である。
+- `Expression` は目が無い場合に使い、頭上6cmを原点に入力90度・重み1.0で見る。
+  `type` は `expression` である。表情の有無とは関係なく書く。
+- 測定の規則・既定値・除外条件は [`VRM表情`](VRM表情.md) に譲る。
+
+書き出す前に次を検証する。
+
+- `type` は `bone`・`expression` のいずれかである。
+- 骨型の目の索引は範囲内で、左右は異なる。
+- `offsetFromHeadBone` は3つの有限値である。
+- 範囲の値は0以上上限（90度）以下の有限値であり、`inputMaxValue` は正である。
 
 ## スプリング
 

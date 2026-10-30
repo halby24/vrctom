@@ -76,6 +76,7 @@ VRCTOM_PHYSICS_OUT=/tmp/out/physics.json \
 （保存せずに）開いて再探索する。
 
 成功時は出力パスと件数をログに出し、バッチでは終了コード 0 で終わる。
+成功ログには視線の要約（`lookAt=eyeLook... left=... right=...`）も出す。
 失敗時は `Debug.LogError` して終了コード 1。
 
 ## 参照姿勢 (statePolicy)
@@ -152,6 +153,14 @@ VRCTOM_PHYSICS_OUT=/tmp/out/physics.json \
   `componentIndex` は同 Transform 上の取得順）。
   出力可否の選別（2軸・複数参照・親付け・外部参照などの除外）は Rust 側が行い、
   こちらは読み取った値をそのまま出す。
+- `lookAt`: descriptor の Eye Look を写した視線記録。
+  `{eyeLook, leftEyeNodeId, rightEyeNodeId,
+  eyesLookingStraight, eyesLookingUp, eyesLookingDown, eyesLookingLeft, eyesLookingRight}` の
+  形式であり、参照姿勢の方針によらず descriptor の生値を出す。
+  目のIDはノードと同じ `n:N` のID体系であり、未設定・アバター外は `""` になる。
+  姿勢は `{linked, left[4], right[4]}` であり、値は正規化しない生値、
+  `linked` が真の場合は左の値を両目に使う。未初期化の姿勢は非 linked の恒等回転になる。
+  Rust 側は目の参照の存在と姿勢の有限値・4要素を検査し、正規化は測定時に行う。
 - `unsupportedFeatures[]`: VRM に持っていけない要素の記録（ソート済み）。
   `plane-colliders`（Plane コライダーあり）、
   `stretch-motion:pb:N`、`allow-grabbing:pb:N:値`、`allow-posing:pb:N:値`、
