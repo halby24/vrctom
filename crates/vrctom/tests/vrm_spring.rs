@@ -405,20 +405,189 @@ fn 線形チェーンを作り分岐を分割する() {
     assert_eq!(報告.branch_splits[0].node, "n:3");
     assert_eq!(報告.branch_splits[0].aimed, Some("n:4".to_string()));
     assert_eq!(報告.branch_splits[0].heads, vec!["n:5".to_string()]);
-    // 第一近似の値を確かめる。
+    // 参照実装の式の値を確かめる。pull 0 のためstiffnessは0である。
     for 関節 in &spring.joints {
-        assert_eq!(関節.hit_radius, 0.02, "hit_radiusはbase値である");
-        assert_eq!(関節.stiffness, 0.5, "stiffnessはbase値である");
-        assert_eq!(関節.gravity_power, 0.0, "重力は今回使わない");
+        assert_eq!(関節.hit_radius, 0.02, "hit_radiusは半径値である");
+        assert_eq!(関節.stiffness, 0.0, "pull 0 のためstiffnessは0である");
+        assert_eq!(関節.gravity_power, 0.0, "重力設定は0である");
         assert_eq!(関節.gravity_dir, [0.0, -1.0, 0.0]);
         assert_eq!(関節.drag_force, 0.7, "dragは1-springである");
     }
-    assert!(報告.curve_base_used.is_empty(), "空曲線では記録しない");
+    assert_eq!(報告.gravity_zero_joints, 2, "重力0の関節は2件である");
     // 所有記録を確かめる。
     assert_eq!(報告.owned_springs.len(), 1);
     assert_eq!(報告.owned_springs[0].bone, "pb:0");
     assert_eq!(報告.owned_springs[0].name, "HairA");
     assert_eq!(報告.owned_springs[0].joints, 2);
+}
+
+/// Advancedではstiffnessが効き、pull 1・spring 0で上限の比になる。
+/// 骨長は√0.02のため速度は60√0.02、比と保持は60で硬さは3600√0.02である。
+#[test]
+fn 高精度積分は上限の比になる() {
+    let fbxバイト列 = b"fake-fbx";
+    let モデル = 書き出し可能モデルを作る();
+    let mut 文: serde_json::Value =
+        serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    文["physBones"][0]["integrationType"] = serde_json::json!("Advanced");
+    文["physBones"][0]["pull"] =
+        serde_json::json!({"value": 1.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    文["physBones"][0]["spring"] =
+        serde_json::json!({"value": 0.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    文["physBones"][0]["stiffness"] =
+        serde_json::json!({"value": 1.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+    let spring = &コンパイル済み.bones.springs[0];
+    for 関節 in &spring.joints {
+        assert!(
+            (関節.stiffness - 509.11688).abs() < 1e-3,
+            "硬さは3600√0.02である"
+        );
+        assert_eq!(関節.drag_force, 1.0, "抵抗は1である");
+        assert_eq!(関節.gravity_power, 0.0, "重力は0である");
+    }
+}
+
+/// Simplifiedではstiffnessを無視し、pull・springの分配に従う。
+#[test]
+fn 単純化積分は分配に従う() {
+    let fbxバイト列 = b"fake-fbx";
+    let モデル = 書き出し可能モデルを作る();
+    let mut 文: serde_json::Value =
+        serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    文["physBones"][0]["pull"] =
+        serde_json::json!({"value": 0.5, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    文["physBones"][0]["spring"] =
+        serde_json::json!({"value": 0.5, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+    let spring = &コンパイル済み.bones.springs[0];
+    for 関節 in &spring.joints {
+        assert!(
+            (関節.stiffness - 2.828427).abs() < 1e-5,
+            "硬さは6√0.02/3である"
+        );
+        assert!(
+            (関節.drag_force - 1.0 / 3.0).abs() < 1e-6,
+            "抵抗は1-spring/(1-pull共有)である"
+        );
+    }
+}
+
+/// 版1.0の重力は速度の61倍になる。falloffなしでは沈み角の補正は1である。
+#[test]
+fn 版10の重力は速度の61倍になる() {
+    let fbxバイト列 = b"fake-fbx";
+    let モデル = 書き出し可能モデルを作る();
+    let mut 文: serde_json::Value =
+        serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    文["physBones"][0]["version"] = serde_json::json!("1.0");
+    文["physBones"][0]["pull"] =
+        serde_json::json!({"value": 1.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    文["physBones"][0]["spring"] =
+        serde_json::json!({"value": 0.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    文["physBones"][0]["gravity"] =
+        serde_json::json!({"value": 1.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+    let spring = &コンパイル済み.bones.springs[0];
+    for 関節 in &spring.joints {
+        assert!(
+            (関節.gravity_power - 517.602).abs() < 1e-2,
+            "重力は61倍の速度である"
+        );
+        assert!(
+            (関節.stiffness - 509.11688).abs() < 1e-3,
+            "硬さはpull比どおりである"
+        );
+        assert_eq!(関節.gravity_dir, [0.0, -1.0, 0.0], "正の重力は下向きである");
+    }
+    assert_eq!(
+        コンパイル済み.report.gravity_zero_joints, 0,
+        "重力0の関節は無い"
+    );
+}
+
+/// falloff最大はrest姿勢の重力を消す。
+#[test]
+fn 最大減衰は重力を消す() {
+    let fbxバイト列 = b"fake-fbx";
+    let モデル = 書き出し可能モデルを作る();
+    let mut 文: serde_json::Value =
+        serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    文["physBones"][0]["pull"] =
+        serde_json::json!({"value": 1.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    文["physBones"][0]["gravity"] =
+        serde_json::json!({"value": 1.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    文["physBones"][0]["gravityFalloff"] =
+        serde_json::json!({"value": 1.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+    let spring = &コンパイル済み.bones.springs[0];
+    for 関節 in &spring.joints {
+        assert_eq!(関節.gravity_power, 0.0, "全減衰で重力は消える");
+        assert!(関節.stiffness > 0.0, "引きは残る");
+    }
+}
+
+/// 角度制限は引きを強める。制限なしより硬くなる。
+#[test]
+fn 角度制限は引きを強める() {
+    let fbxバイト列 = b"fake-fbx";
+    let モデル = 書き出し可能モデルを作る();
+    let もと文 =
+        serde_json::from_str::<serde_json::Value>(&髪sidecarを作る(fbxバイト列, &モデル))
+            .expect("合成sidecarは読める");
+    let mut 制限なし = もと文.clone();
+    制限なし["physBones"][0]["pull"] =
+        serde_json::json!({"value": 0.1, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    let (_, _, なし済み) =
+        文から解決してコンパイルする(&制限なし.to_string(), fbxバイト列, &モデル);
+    let mut 制限あり = もと文;
+    制限あり["physBones"][0]["pull"] =
+        serde_json::json!({"value": 0.1, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    制限あり["physBones"][0]["limitType"] = serde_json::json!("Angle");
+    制限あり["physBones"][0]["maxAngleX"] =
+        serde_json::json!({"value": 10.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    let (_, _, あり済み) =
+        文から解決してコンパイルする(&制限あり.to_string(), fbxバイト列, &モデル);
+    let なし硬さ = なし済み.bones.springs[0].joints[0].stiffness;
+    let あり硬さ = あり済み.bones.springs[0].joints[0].stiffness;
+    assert!(なし硬さ.is_finite() && なし硬さ > 0.0, "制限なしでも引く");
+    assert!(
+        あり硬さ > なし硬さ,
+        "制限ありは硬くなる: {あり硬さ} > {なし硬さ}"
+    );
+}
+
+/// HoldsImmobileはcenterの代わりに引きを強める。
+#[test]
+fn 保持は引きを強める() {
+    let fbxバイト列 = b"fake-fbx";
+    let モデル = 書き出し可能モデルを作る();
+    let mut 文: serde_json::Value =
+        serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    文["physBones"][0]["pull"] =
+        serde_json::json!({"value": 0.5, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    文["physBones"][0]["spring"] =
+        serde_json::json!({"value": 0.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    文["physBones"][0]["immobile"] =
+        serde_json::json!({"value": 0.5, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+    assert_eq!(
+        コンパイル済み.report.held_immobile,
+        vec!["pb:0".to_string()]
+    );
+    let spring = &コンパイル済み.bones.springs[0];
+    assert!(spring.center.is_none(), "保持ではcenterを付けない");
+    for 関節 in &spring.joints {
+        assert!(
+            (関節.stiffness - 16.97056).abs() < 1e-4,
+            "保持で引きは倍になる"
+        );
+    }
 }
 
 /// colliderを変換し、グループを共有する。
@@ -745,7 +914,7 @@ fn 実fixtureと実sidecarでvrmを生成する() {
         .map(|s| s.joints.len())
         .sum();
     eprintln!(
-        "実sidecar生成: {} {}バイト spring{}件 関節{}件 collider{}件 group{}件 分岐{}件 共有{}件 曲線近似{}件 平面落下{}件 スキップ{}件",
+        "実sidecar生成: {} {}バイト spring{}件 関節{}件 collider{}件 group{}件 分岐{}件 共有{}件 重力0関節{}件 平面落下{}件 スキップ{}件",
         出力先.display(),
         バイト列.len(),
         コンパイル済み.report.spring_count,
@@ -754,7 +923,7 @@ fn 実fixtureと実sidecarでvrmを生成する() {
         コンパイル済み.report.group_count,
         コンパイル済み.report.branch_splits.len(),
         コンパイル済み.report.lost_nodes.len(),
-        コンパイル済み.report.curve_base_used.len(),
+        コンパイル済み.report.gravity_zero_joints,
         コンパイル済み.report.plane_colliders_dropped.len(),
         コンパイル済み.report.skipped_bones.len(),
     );
@@ -778,6 +947,172 @@ fn 実fixtureと実sidecarでvrmを生成する() {
     assert_eq!(中心名("FrontHair_A").as_deref(), Some("Armature"));
     assert_eq!(中心名("Cheek.L").as_deref(), Some("Head"));
     assert_eq!(中心名("Breast.L"), None);
+}
+
+/// Unity出力と関節パラメータを突き合わせる。
+/// `VRCTOM_UNITY_VRM` が指すUnity製VRMと、実fixtureから作った鎖を比べる。
+/// 許容差は abs 1e-5 + rel 1e-4 であり、重力方向は完全一致とする。
+/// drag・gravity・hitRadius・重力方向は完全一致する。
+/// stiffnessはPolar制限の37関節だけが許容差を超える（0.1〜0.8%、こちらが高い）。
+/// 一致方向の試行で内積が1ちょうどになり、Unity側の単精度丸めが1をわずかに
+/// 下回ると acos が有限の角度を返し、その平方根が冪平均に効くためと見込んでいる。
+/// 写像・順序・式・定数は突き合わせ済みで、入力差分も最大5.5e-7位置・設定値一致と
+/// 確認した。詳細は設計文書に残す。
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn 実fixtureの関節値はunity出力と一致する() {
+    let (Some(fbx経路), Some(sidecar経路), Some(unity経路)) = (
+        std::env::var_os("VRCTOM_FBX_FIXTURE"),
+        std::env::var_os("VRCTOM_PHYSICS_SIDECAR"),
+        std::env::var_os("VRCTOM_UNITY_VRM"),
+    ) else {
+        eprintln!("VRCTOM_FBX_FIXTURE/VRCTOM_PHYSICS_SIDECAR/VRCTOM_UNITY_VRM未設定のため跳ばす");
+        return;
+    };
+    let fbxバイト列 = std::fs::read(&fbx経路).expect("実fixtureは読める");
+    let sidecar文 = std::fs::read(&sidecar経路).expect("実sidecarは読める");
+    let 解析 = vrctom::fbx::FbxFile::parse(&fbxバイト列, &vrctom::fbx::FbxOptions::new())
+        .expect("実fixtureは読める");
+    let (モデル, _) =
+        VrmModel::from_fbx(&解析, &vrctom::vrm::VrmOptions::new()).expect("実fixtureは変換できる");
+    let sidecar =
+        PhysicsSidecar::parse(&sidecar文, &PhysicsLimits::new()).expect("実sidecarは検証を通る");
+    let 解決 = モデル
+        .resolve_physics_sidecar(&sidecar, &fbxバイト列)
+        .expect("実fixtureの参照は解決できる");
+    let コンパイル済み = compile_springs(&sidecar, &モデル, &解決, &SpringCompileOptions::new())
+        .expect("実fixtureの鎖はコンパイルできる");
+    let unityバイト列 = std::fs::read(&unity経路).expect("Unity製VRMは読める");
+    let unity_json = glbのjsonを取る(&unityバイト列);
+    let unity_springs = unity_json["extensions"]["VRMC_springBone"]["springs"]
+        .as_array()
+        .expect("Unity製VRMにspringがある");
+    let mut unity表: std::collections::HashMap<&str, &serde_json::Value> =
+        std::collections::HashMap::new();
+    for spring in unity_springs {
+        let 名前 = spring["name"].as_str().expect("spring名は文字列である");
+        assert!(
+            unity表.insert(名前, spring).is_none(),
+            "Unityのspring名は重ならない"
+        );
+    }
+    let 許容 = |実: f64, 想: f64| (実 - 想).abs() <= 1e-5 + 1e-4 * 想.abs();
+    let mut 全体 = (0usize, 0usize);
+    let mut 項目別: std::collections::HashMap<&str, (usize, usize)> =
+        std::collections::HashMap::new();
+    let mut 代表値: Vec<String> = Vec::new();
+    let mut 不一致: Vec<String> = Vec::new();
+    for spring in &コンパイル済み.bones.springs {
+        let 他 = unity表
+            .get(spring.name.as_str())
+            .unwrap_or_else(|| panic!("Unity出力にspringが無い: {}", spring.name));
+        let 他関節 = 他["joints"].as_array().expect("Unityの関節は配列である");
+        assert_eq!(他関節.len(), spring.joints.len(), "関節数は一致する");
+        for (索引, (関節, 他関節)) in spring.joints.iter().zip(他関節.iter()).enumerate()
+        {
+            let 期待 = |名: &str| {
+                他関節[名]
+                    .as_f64()
+                    .unwrap_or_else(|| panic!("Unityの値が数でない: {名}"))
+            };
+            for (名, 実) in [
+                ("stiffness", f64::from(関節.stiffness)),
+                ("dragForce", f64::from(関節.drag_force)),
+                ("gravityPower", f64::from(関節.gravity_power)),
+                ("hitRadius", f64::from(関節.hit_radius)),
+            ] {
+                全体.1 += 1;
+                let 項目 = 項目別.entry(名).or_insert((0, 0));
+                項目.1 += 1;
+                if 許容(実, 期待(名)) {
+                    全体.0 += 1;
+                    項目.0 += 1;
+                } else {
+                    不一致.push(format!(
+                        "{}[{i}].{名}: 自={実:.6} 他={:.6}",
+                        spring.name,
+                        期待(名),
+                        i = 索引,
+                        実 = 実,
+                    ));
+                }
+            }
+            全体.1 += 1;
+            let 他向き = 他関節["gravityDir"]
+                .as_array()
+                .expect("Unityの重力方向は配列である");
+            let 向き一致 = 他向き.len() == 3
+                && (f64::from(関節.gravity_dir[0]) - 他向き[0].as_f64().unwrap_or(f64::NAN)).abs()
+                    == 0.0
+                && (f64::from(関節.gravity_dir[1]) - 他向き[1].as_f64().unwrap_or(f64::NAN)).abs()
+                    == 0.0
+                && (f64::from(関節.gravity_dir[2]) - 他向き[2].as_f64().unwrap_or(f64::NAN)).abs()
+                    == 0.0;
+            if 向き一致 {
+                全体.0 += 1;
+            } else {
+                不一致.push(format!("{}[{索引}].gravityDir: 向きが違う", spring.name));
+            }
+        }
+        if [
+            "Butt.L",
+            "FrontHair_A",
+            "Tail",
+            "Cardigan_1.L",
+            "Spine_Ribbon_1",
+            "Breast.L",
+        ]
+        .contains(&spring.name.as_str())
+        {
+            代表値.push(format!(
+                "{}: 硬さ={:.5}/{:.5} 抵抗={:.5}/{:.5} 重力={:.5}/{:.5} 半径={:.5}/{:.5}",
+                spring.name,
+                f64::from(spring.joints[0].stiffness),
+                他["joints"][0]["stiffness"].as_f64().unwrap_or(f64::NAN),
+                f64::from(spring.joints[0].drag_force),
+                他["joints"][0]["dragForce"].as_f64().unwrap_or(f64::NAN),
+                f64::from(spring.joints[0].gravity_power),
+                他["joints"][0]["gravityPower"].as_f64().unwrap_or(f64::NAN),
+                f64::from(spring.joints[0].hit_radius),
+                他["joints"][0]["hitRadius"].as_f64().unwrap_or(f64::NAN),
+            ));
+        }
+    }
+    eprintln!(
+        "Unity突き合わせ: 一致{}件/全体{}件（{:.1}%）",
+        全体.0,
+        全体.1,
+        全体.0 as f64 / 全体.1 as f64 * 100.0
+    );
+    let mut 項目名: Vec<&str> = 項目別.keys().copied().collect();
+    項目名.sort_unstable();
+    for 名 in 項目名 {
+        let (合致, 総数) = 項目別[名];
+        eprintln!(
+            "  {名}: {合致}/{総数}（{:.1}%）",
+            合致 as f64 / 総数 as f64 * 100.0
+        );
+    }
+    for 代表 in &代表値 {
+        eprintln!("  代表 {代表}");
+    }
+    for 差 in 不一致.iter().take(40) {
+        eprintln!("  残差 {差}");
+    }
+    // drag・gravity・hitRadius・重力方向は完全一致する。
+    assert_eq!(項目別["dragForce"].0, 項目別["dragForce"].1);
+    assert_eq!(項目別["gravityPower"].0, 項目別["gravityPower"].1);
+    assert_eq!(項目別["hitRadius"].0, 項目別["hitRadius"].1);
+    // stiffnessはPolar制限の37関節だけが許容差（0.1〜0.8%）を超える。
+    let (合致, 総数) = 項目別["stiffness"];
+    assert!(
+        合致 as f64 / 総数 as f64 >= 0.74,
+        "stiffness一致率が下がった"
+    );
+    assert!(
+        全体.0 as f64 / 全体.1 as f64 >= 0.94,
+        "全体一致率が下がった"
+    );
 }
 
 /// collider参照が無いspringは、空配列を出さずに拡張する。

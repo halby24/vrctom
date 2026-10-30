@@ -324,7 +324,7 @@ fn export(
         };
         match compile_springs(&sidecar, &model, &resolution, &SpringCompileOptions::new()) {
             Ok(compiled) => {
-                // 主要な近似件数も出し、文書の制限と突き合わせられるようにする。
+                // 主要な近似件数と関節値の目安も出し、文書の制限と突き合わせられるようにする。
                 let world = compiled
                     .report
                     .center_applied
@@ -337,8 +337,25 @@ fn export(
                     .iter()
                     .filter(|entry| entry.kind == vrctom::vrm::CenterKind::AllMotion)
                     .count();
+                let mut stiff_sum = 0.0f64;
+                let mut grav_count = 0usize;
+                let mut joint_total = 0usize;
+                for spring in &compiled.bones.springs {
+                    for joint in &spring.joints {
+                        stiff_sum += f64::from(joint.stiffness);
+                        if joint.gravity_power > 0.0 {
+                            grav_count += 1;
+                        }
+                        joint_total += 1;
+                    }
+                }
+                let stiff_mean = if joint_total > 0 {
+                    stiff_sum / joint_total as f64
+                } else {
+                    0.0
+                };
                 let summary = format!(
-                    "スプリング{}件 関節{}件 collider{}件 グループ{}件 分岐{}件 center{}件（world{} / all-motion{} / なし{}） 近似(曲線base{} endpoint未生成{} gravity0関節{} first-child{} 平均近似{} 平面落下{}) 共有{}件 スキップ{}件",
+                    "スプリング{}件 関節{}件 collider{}件 グループ{}件 分岐{}件 center{}件（world{} / all-motion{} / なし{}） 近似(endpoint未生成{} gravity0関節{} first-child{} 平均近似{} 平面落下{}) 関節値(硬さ平均{:.3} 重力あり{}件) 共有{}件 スキップ{}件",
                     compiled.report.spring_count,
                     compiled.report.joint_count,
                     compiled.report.collider_count,
@@ -348,12 +365,13 @@ fn export(
                     world,
                     all_motion,
                     compiled.report.center_missing.len(),
-                    compiled.report.curve_base_used.len(),
                     compiled.report.no_endpoint.len(),
                     compiled.report.gravity_zero_joints,
                     compiled.report.first_child_multichild.len(),
                     compiled.report.average_approximated.len(),
                     compiled.report.plane_colliders_dropped.len(),
+                    stiff_mean,
+                    grav_count,
                     compiled.report.lost_nodes.len(),
                     compiled.report.skipped_bones.len(),
                 );

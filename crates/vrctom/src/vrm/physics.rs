@@ -3,8 +3,8 @@
 //! 入口は [`PhysicsSidecar::parse`]（バイト列の検証）と
 //! [`VrmModel::resolve_physics_sidecar`](crate::vrm::VrmModel::resolve_physics_sidecar)
 //! （`VrmModel` のノードへの対応付け）、[`compile_springs`]（`VrmSpringBones` の
-//! 生成）である。完全な参照実装一致（endpoint・limit・center・曲線の再現）は
-//! 次の作業単位であり、ここでは分岐分割した鎖と第一近似の値を出すだけである。
+//! 生成）である。endpoint・平均tail・limit拡張の出力は次の作業単位であり、
+//! ここでは分岐分割した鎖と参照実装の式による関節値を出す。
 
 use std::collections::{HashMap, HashSet};
 
@@ -371,6 +371,15 @@ pub struct SidecarPhysBone {
     /// 制限回転。
     #[serde(rename = "limitRotation", default = "default_vec3")]
     pub limit_rotation: [f64; 3],
+    /// 制限回転X軸のカーブ。キーが無い場合は1倍である。
+    #[serde(rename = "limitRotationXCurve", default = "default_unit_curve")]
+    pub limit_rotation_x_curve: SidecarCurve,
+    /// 制限回転Y軸のカーブ。キーが無い場合は1倍である。
+    #[serde(rename = "limitRotationYCurve", default = "default_unit_curve")]
+    pub limit_rotation_y_curve: SidecarCurve,
+    /// 制限回転Z軸のカーブ。キーが無い場合は1倍である。
+    #[serde(rename = "limitRotationZCurve", default = "default_unit_curve")]
+    pub limit_rotation_z_curve: SidecarCurve,
     /// 動画化されているかどうか。
     #[serde(rename = "isAnimated", default)]
     pub is_animated: bool,
@@ -524,6 +533,16 @@ fn default_quat() -> [f64; 4] {
 fn default_curve() -> SidecarCurve {
     SidecarCurve {
         value: 0.0,
+        keys: Vec::new(),
+        pre_wrap_mode: 8,
+        post_wrap_mode: 8,
+    }
+}
+
+/// 係数1のカーブ。キーが無い場合の倍率として使う。
+fn default_unit_curve() -> SidecarCurve {
+    SidecarCurve {
+        value: 1.0,
         keys: Vec::new(),
         pre_wrap_mode: 8,
         post_wrap_mode: 8,
@@ -794,6 +813,9 @@ impl PhysicsSidecar {
                 ("radius", &bone.radius),
                 ("maxAngleX", &bone.max_angle_x),
                 ("maxAngleZ", &bone.max_angle_z),
+                ("limitRotationXCurve", &bone.limit_rotation_x_curve),
+                ("limitRotationYCurve", &bone.limit_rotation_y_curve),
+                ("limitRotationZCurve", &bone.limit_rotation_z_curve),
             ] {
                 key_total += curve.keys.len();
                 check_curve(curve, &format!("{}:{}", bone.id, name))?;
@@ -1416,6 +1438,63 @@ fn trs_to_matrix(trs: &SidecarTrs) -> [f64; 16] {
 
 /// sidecarの参照世界行列を求める。
 fn sidecar_world_matrices(sidecar: &PhysicsSidecar) -> Result<Vec<[f64; 16]>, VrmError> {
+    world_matrices(sidecar, false).map(|(worlds, _)| worlds)
+}
+
+/// sidecarの参照世界行列と世界拡大率をUnity空間のまま求める。
+/// 関節のrest形状と骨長の計算に使う。ルートは拡大率だけを残す、
+/// という参照実装の約束に従う。
+fn unity_worlds_and_scales(
+    sidecar: &PhysicsSidecar,
+) -> Result<(Vec<[f64; 16]>, Vec<f64>), VrmError> {
+    world_matrices(sidecar, true)
+}
+
+/// 親の連鎖をルートから並べる。循環と欠落は失敗する。
+fn upward_chain(
+    sidecar: &PhysicsSidecar,
+    at: &HashMap<&str, usize>,
+    start: usize,
+    done: &[bool],
+) -> Result<Vec<usize>, VrmError> {
+    let mut chain = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = start;
+    loop {
+        if done[current] {
+            break;
+        }
+        if !seen.insert(current) {
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidPhysicsSidecar,
+                "sidecarの親子に循環がある",
+            ));
+        }
+        chain.push(current);
+        match sidecar.nodes[current].parent_id.as_deref() {
+            Some(parent) => match at.get(parent) {
+                Some(&index) => current = index,
+                None => {
+                    return Err(VrmError::new(
+                        VrmErrorKind::InvalidPhysicsSidecar,
+                        "sidecarの親ノードが無い",
+                    ));
+                }
+            },
+            None => break,
+        }
+    }
+    chain.reverse();
+    Ok(chain)
+}
+
+/// 参照世界行列を求める。`unity` の場合はUnity空間のままにし、
+/// ルートは拡大率だけを残す。世界拡大率の最大成分も同時に返す。
+/// 拡大率は参照姿勢の積であり、鏡像の影響を受けない。
+fn world_matrices(
+    sidecar: &PhysicsSidecar,
+    unity: bool,
+) -> Result<(Vec<[f64; 16]>, Vec<f64>), VrmError> {
     let at: HashMap<&str, usize> = sidecar
         .nodes
         .iter()
@@ -1423,60 +1502,48 @@ fn sidecar_world_matrices(sidecar: &PhysicsSidecar) -> Result<Vec<[f64; 16]>, Vr
         .map(|(index, node)| (node.id.as_str(), index))
         .collect();
     // UnityのTransformは左手系、VRM/glTFは右手系である。sidecarは
-    // Unity空間（`unity-avatar-root-local-meters`）なので、X反転と
-    // 四元数の共役でVRM空間へ移してから比較する。
+    // Unity空間（`unity-avatar-root-local-meters`）なので、VRM比較用は
+    // X反転と四元数の共役でVRM空間へ移す。Unity空間のままの行列は
+    // 関節形状の計算に使い、ルートは拡大率だけを残す。
     let locals: Vec<[f64; 16]> = sidecar
         .nodes
         .iter()
         .map(|node| {
             let local = &node.reference_local;
-            let converted = SidecarTrs {
-                position: [-local.position[0], local.position[1], local.position[2]],
-                rotation: [
-                    local.rotation[0],
-                    -local.rotation[1],
-                    -local.rotation[2],
-                    local.rotation[3],
-                ],
-                scale: local.scale,
-            };
-            trs_to_matrix(&converted)
+            if unity {
+                trs_to_matrix(local)
+            } else {
+                let converted = SidecarTrs {
+                    position: [-local.position[0], local.position[1], local.position[2]],
+                    rotation: [
+                        local.rotation[0],
+                        -local.rotation[1],
+                        -local.rotation[2],
+                        local.rotation[3],
+                    ],
+                    scale: local.scale,
+                };
+                trs_to_matrix(&converted)
+            }
         })
         .collect();
     let mut worlds = vec![matrix::IDENTITY; sidecar.nodes.len()];
+    let mut scales = vec![[1.0; 3]; sidecar.nodes.len()];
     let mut done = vec![false; sidecar.nodes.len()];
     for start in 0..sidecar.nodes.len() {
-        let mut chain = Vec::new();
-        let mut seen = HashSet::new();
-        let mut current = start;
-        loop {
-            if done[current] {
-                break;
-            }
-            if !seen.insert(current) {
-                return Err(VrmError::new(
-                    VrmErrorKind::InvalidPhysicsSidecar,
-                    "sidecarの親子に循環がある",
-                ));
-            }
-            chain.push(current);
-            match sidecar.nodes[current].parent_id.as_deref() {
-                Some(parent) => match at.get(parent) {
-                    Some(&index) => current = index,
-                    None => {
-                        return Err(VrmError::new(
-                            VrmErrorKind::InvalidPhysicsSidecar,
-                            "sidecarの親ノードが無い",
-                        ));
-                    }
-                },
-                None => break,
-            }
-        }
-        for &node in chain.iter().rev() {
+        for node in upward_chain(sidecar, &at, start, &done)? {
             match sidecar.nodes[node].parent_id.as_deref() {
                 Some(parent) => match at.get(parent) {
-                    Some(&index) => worlds[node] = matrix::mul(&worlds[index], &locals[node]),
+                    Some(&index) => {
+                        worlds[node] = matrix::mul(&worlds[index], &locals[node]);
+                        let parent_scale = scales[index];
+                        let local_scale = sidecar.nodes[node].reference_local.scale;
+                        scales[node] = [
+                            parent_scale[0] * local_scale[0],
+                            parent_scale[1] * local_scale[1],
+                            parent_scale[2] * local_scale[2],
+                        ];
+                    }
                     None => {
                         return Err(VrmError::new(
                             VrmErrorKind::InvalidPhysicsSidecar,
@@ -1484,12 +1551,30 @@ fn sidecar_world_matrices(sidecar: &PhysicsSidecar) -> Result<Vec<[f64; 16]>, Vr
                         ));
                     }
                 },
-                None => worlds[node] = locals[node],
+                None => {
+                    if unity {
+                        let scale = sidecar.nodes[node].reference_local.scale;
+                        worlds[node] = [
+                            scale[0], 0.0, 0.0, 0.0, //
+                            0.0, scale[1], 0.0, 0.0, //
+                            0.0, 0.0, scale[2], 0.0, //
+                            0.0, 0.0, 0.0, 1.0, //
+                        ];
+                        scales[node] = scale;
+                    } else {
+                        worlds[node] = locals[node];
+                        scales[node] = sidecar.nodes[node].reference_local.scale;
+                    }
+                }
             }
             done[node] = true;
         }
     }
-    Ok(worlds)
+    let max_scales = scales
+        .iter()
+        .map(|scale| scale[0].abs().max(scale[1].abs()).max(scale[2].abs()))
+        .collect();
+    Ok((worlds, max_scales))
 }
 
 /// モデルの出力世界行列を求める。親なしには `root * local` を掛ける。
@@ -1717,10 +1802,6 @@ pub struct SpringCompileReport {
     pub truncated_chains: Vec<String>,
     /// 長さがほぼ0の区間。分割せずそのまま残した記録である。
     pub zero_length_joints: Vec<ZeroLengthJoint>,
-    /// 曲線のbase値を使った記録。キー列は評価しない。
-    pub curve_base_used: Vec<CurveBaseUsed>,
-    /// `1 - spring` が範囲外で丸めたPhysBoneのID。
-    pub drag_clamped: Vec<String>,
     /// 無効化されていたが出力したPhysBoneのID。VRMに有効無効は無い。
     pub disabled_bones: Vec<String>,
     /// 無効化されていたが出力したcolliderのID。
@@ -1737,7 +1818,7 @@ pub struct SpringCompileReport {
     pub no_endpoint: Vec<String>,
     /// `multiChildType` が `Ignore` 以外で最初の子に畳んだspringのPhysBone ID。
     pub first_child_multichild: Vec<String>,
-    /// `gravity_power` に0を置いた関節数。今回は全関節である。
+    /// `gravity_power` が0の関節数。
     pub gravity_zero_joints: usize,
     /// springにならなかったPhysBoneの記録。
     pub skipped_bones: Vec<SkippedBone>,
@@ -1897,17 +1978,6 @@ pub struct ZeroLengthJoint {
     pub child: String,
 }
 
-/// 曲線のbase値使用1件。
-#[derive(Debug, Clone)]
-pub struct CurveBaseUsed {
-    /// PhysBoneのID。
-    pub bone: String,
-    /// 曲線名（`radius`・`spring`・`stiffness`）。
-    pub field: &'static str,
-    /// 使わなかったキー数。
-    pub keys: usize,
-}
-
 /// ゼロ長とみなす区間の長さ（メートル）。
 ///
 /// 出力世界行列はメートル単位であり、丸め由来の微小なずれを吸収する。
@@ -2027,6 +2097,889 @@ fn eval_curved(curve: &SidecarCurve, t: f64) -> f64 {
     }
 }
 
+/// 関節パラメータ式の定数。参照実装と同値である。
+/// 較正記録のフレーム率は、PhysBoneの motion が骨長に依存しないのに対し、
+/// VRMのstiffnessと重力が速度であるため、骨長で比例させる倍率である。
+const CALIBRATION_FRAME_RATE: f64 = 60.0;
+/// 較正記録の骨長。骨長が不明な場合の仮定値でもある。
+const CALIBRATION_LENGTH: f64 = 0.1;
+/// pull比の上限。1に近いpullは骨をrestに留める。
+const MAX_PULL_RATIO: f64 = 60.0;
+/// Simplifiedで式が使うspringの上限。
+const MAX_SIMPLIFIED_SPRING: f64 = 0.9;
+/// 版1.1の重力換算における `1 - |G|` の下限。
+const MIN_GRAVITY_BALANCE: f64 = 0.05;
+/// 制限角の基準。制限がこれを下回るとpull比を強める。
+const LIMIT_REFERENCE_ANGLE: f64 = 45.0;
+/// きつい制限の下限。0制限が有限に収まる。
+const MIN_LIMIT_ANGLE: f64 = 1.0;
+/// 緩いheld jointのpull下限係数。
+const LOOSE_FLOOR_FACTOR: f64 = 9.0;
+/// held jointの運動量がpullを上回るとみなすdragの境目。
+const LOOSE_DRAG_GATE: f64 = 0.5;
+/// 骨長が不明扱いになる上限。参照実装の `1e-5` と同値である。
+const UNKNOWN_BONE_LENGTH: f64 = 1e-5;
+/// 沈み角の一致判定。参照実装と同値である。
+const SETTLED_ANGLE_TOLERANCE: f64 = 1e-4;
+/// 有効制限角の応答方向数。参照実装と同値である。
+const LIMIT_RESPONSE_STEPS: usize = 36;
+/// 有効制限角の平均の冪。参照実装と同値である。
+const LIMIT_RESPONSE_POWER: f64 = 0.5;
+
+/// 3要素ベクトルの内積。
+fn vec_dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// 3要素ベクトルの外積。
+fn vec_cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// 3要素ベクトルの長さの二乗。
+fn vec_len2(v: [f64; 3]) -> f64 {
+    vec_dot(v, v)
+}
+
+/// 3要素ベクトルの長さ。
+fn vec_len(v: [f64; 3]) -> f64 {
+    vec_len2(v).sqrt()
+}
+
+/// 零ベクトルは零のまま返す正規化。Unityの `Vector3.Normalize` と同じ扱いである。
+fn vec_normalized_or_zero(v: [f64; 3]) -> [f64; 3] {
+    let len = vec_len(v);
+    if len > 0.0 && len.is_finite() {
+        [v[0] / len, v[1] / len, v[2] / len]
+    } else {
+        [0.0; 3]
+    }
+}
+
+/// 2ベクトルの角度（度）。いずれかが零の場合は0を返す。
+fn vec_angle_deg(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let denom = vec_len(a) * vec_len(b);
+    if denom <= 0.0 || !denom.is_finite() {
+        return 0.0;
+    }
+    (vec_dot(a, b) / denom).clamp(-1.0, 1.0).acos() * 180.0 / std::f64::consts::PI
+}
+
+/// 0〜1に丸める。非有限値は0にする。
+fn clamp01(value: f64) -> f64 {
+    if !value.is_finite() {
+        return 0.0;
+    }
+    value.clamp(0.0, 1.0)
+}
+
+/// 非有限値を0にする。
+fn finite_or_zero(value: f64) -> f64 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
+/// 四元数の積。Unityと同じHamilton積（列ベクトル規約）である。
+fn quat_mul(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
+    [
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    ]
+}
+
+/// 軸回りの回転。軸が零の場合は恒等写像を返す。
+fn quat_angle_axis(axis: [f64; 3], angle_deg: f64) -> [f64; 4] {
+    let axis = vec_normalized_or_zero(axis);
+    if vec_len2(axis) <= 0.0 {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    let half = angle_deg * std::f64::consts::PI / 360.0;
+    [
+        axis[0] * half.sin(),
+        axis[1] * half.sin(),
+        axis[2] * half.sin(),
+        half.cos(),
+    ]
+}
+
+/// 単位四元数によるベクトルの回転。
+fn quat_rotate(rotation: [f64; 4], v: [f64; 3]) -> [f64; 3] {
+    let u = [rotation[0], rotation[1], rotation[2]];
+    let uv = vec_cross(u, v);
+    let uuv = vec_cross(u, uv);
+    [
+        v[0] + 2.0 * (rotation[3] * uv[0] + uuv[0]),
+        v[1] + 2.0 * (rotation[3] * uv[1] + uuv[1]),
+        v[2] + 2.0 * (rotation[3] * uv[2] + uuv[2]),
+    ]
+}
+
+/// `from` から `to` への回転。正反対の場合は直交軸の180度回転を返す。
+fn quat_from_to_rotation(from: [f64; 3], to: [f64; 3]) -> [f64; 4] {
+    let from = vec_normalized_or_zero(from);
+    let to = vec_normalized_or_zero(to);
+    let dot = vec_dot(from, to);
+    if dot >= 1.0 - 1e-9 {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    if dot <= -1.0 + 1e-9 {
+        let mut axis = vec_cross(from, [1.0, 0.0, 0.0]);
+        if vec_len2(axis) < 1e-12 {
+            axis = vec_cross(from, [0.0, 1.0, 0.0]);
+        }
+        return quat_angle_axis(axis, 180.0);
+    }
+    let cross = vec_cross(from, to);
+    let len = (vec_len2(cross) + (1.0 + dot) * (1.0 + dot)).sqrt();
+    if len > 0.0 && len.is_finite() {
+        [
+            cross[0] / len,
+            cross[1] / len,
+            cross[2] / len,
+            (1.0 + dot) / len,
+        ]
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    }
+}
+
+/// オイラー角（yawをY軸、pitchをX軸に掛ける）。Unityの `Quaternion.Euler` と同じ順序である。
+fn quat_euler_yx(yaw_deg: f64, pitch_deg: f64) -> [f64; 4] {
+    quat_mul(
+        quat_angle_axis([0.0, 1.0, 0.0], yaw_deg),
+        quat_angle_axis([1.0, 0.0, 0.0], pitch_deg),
+    )
+}
+
+/// `current` を `target` へ `max_rad` だけ近づける。単位ベクトル同士で使う。
+fn rotate_towards(current: [f64; 3], target: [f64; 3], max_rad: f64) -> [f64; 3] {
+    let angle = vec_angle_deg(current, target) * std::f64::consts::PI / 180.0;
+    if angle <= max_rad || angle < 1e-12 {
+        return target;
+    }
+    let axis = vec_normalized_or_zero(vec_cross(current, target));
+    let step = max_rad.min(angle);
+    let (sin, cos) = step.sin_cos();
+    let across = vec_cross(axis, current);
+    [
+        current[0] * cos + across[0] * sin,
+        current[1] * cos + across[1] * sin,
+        current[2] * cos + across[2] * sin,
+    ]
+}
+
+/// 関節のrest形状。制限角と重力が働く基準であり、参照実装の `JointRest` に相当する。
+#[derive(Debug, Clone, Copy)]
+struct JointRest {
+    /// Aim先への自空間ベクトル（Unity軸）。
+    bone_vector: [f64; 3],
+    /// 骨のrest世界行列（Unity軸）。ルートは拡大率だけを残す。
+    bone_to_world: [f64; 16],
+}
+
+/// 計算済みの関節パラメータ。重さ・長さはメートル、角度は度である。
+#[derive(Debug, Clone, Copy)]
+struct JointParams {
+    /// 硬さ。
+    stiffness: f64,
+    /// 抵抗。
+    drag: f64,
+    /// 重力の強さ。
+    power: f64,
+    /// 重力が上向きかどうか。下向きが既定である。
+    gravity_up: bool,
+    /// 当たり半径。
+    hit_radius: f64,
+}
+
+/// 1フレームのVRM pull比。PhysBoneの `share` だけ寄せ、`keep` だけ残す。
+fn pull_ratio(share: f64, keep: f64) -> f64 {
+    if share <= 0.0 {
+        return 0.0;
+    }
+    let denominator = (1.0 - share) * keep;
+    if denominator * MAX_PULL_RATIO <= share {
+        MAX_PULL_RATIO
+    } else {
+        share / denominator
+    }
+}
+
+/// 制限角で強めたpull比。制限が基準角を下回ると平方根で強める。
+fn held_ratio(ratio: f64, immobile: f64, limit_angle: f64) -> f64 {
+    if ratio <= 0.0 {
+        return 0.0;
+    }
+    let scale = if limit_angle < LIMIT_REFERENCE_ANGLE {
+        (LIMIT_REFERENCE_ANGLE / limit_angle.max(MIN_LIMIT_ANGLE)).sqrt()
+    } else {
+        1.0
+    };
+    let keep = 1.0 - immobile;
+    let held = ratio * scale;
+    if keep * MAX_PULL_RATIO <= held {
+        MAX_PULL_RATIO
+    } else {
+        (held / keep).min(MAX_PULL_RATIO)
+    }
+}
+
+/// 緩いheld jointのpull下限。運動量がpullを上回り制限が基準角を下回る場合に使う。
+/// 制限角が非数値の場合は適用しない（参照実装の否定比較と同じ）。
+fn loose_floor(held: f64, drag: f64, limit_angle: f64) -> f64 {
+    if drag >= LOOSE_DRAG_GATE || limit_angle.is_nan() || limit_angle >= LIMIT_REFERENCE_ANGLE {
+        return held;
+    }
+    let floor =
+        LOOSE_FLOOR_FACTOR * (1.0 / limit_angle.max(MIN_LIMIT_ANGLE) - 1.0 / LIMIT_REFERENCE_ANGLE);
+    held.max(floor).min(MAX_PULL_RATIO)
+}
+
+/// 制限角（度）。rest形状が不明な場合の `EffectiveLimitAngle` であり、
+/// Angle/HingeはX軸、Polarは両軸の平均、制限なしは無限大である。
+fn limit_angle(record: &SidecarPhysBone, t: f64) -> f64 {
+    let axis = |curve: &SidecarCurve| finite_or_zero(eval_curved(curve, t)).abs();
+    match record.limit_type {
+        SidecarLimitType::Angle | SidecarLimitType::Hinge => axis(&record.max_angle_x),
+        SidecarLimitType::Polar => (axis(&record.max_angle_x) + axis(&record.max_angle_z)) / 2.0,
+        SidecarLimitType::None => f64::INFINITY,
+    }
+}
+
+/// 制限回転（度）。各軸の設定値にカーブを掛ける。
+/// カーブの `value` は使わず、キー列だけを評価する（参照実装の `CurveRecord` と同じ）。
+fn limit_rotation(record: &SidecarPhysBone, t: f64) -> [f64; 3] {
+    let axis =
+        |setting: f64, curve: &SidecarCurve| finite_or_zero(setting) * eval_unity_curve(curve, t);
+    [
+        axis(record.limit_rotation[0], &record.limit_rotation_x_curve),
+        axis(record.limit_rotation[1], &record.limit_rotation_y_curve),
+        axis(record.limit_rotation[2], &record.limit_rotation_z_curve),
+    ]
+}
+
+/// X/Z軸の最大角（度）。0未満は0にする。
+fn max_angles(record: &SidecarPhysBone, t: f64) -> [f64; 2] {
+    [
+        finite_or_zero(eval_curved(&record.max_angle_x, t)).max(0.0),
+        finite_or_zero(eval_curved(&record.max_angle_z, t)).max(0.0),
+    ]
+}
+
+/// 制限の枠組み。骨ベクトルから上向きへの回転に制限回転（x→y→z）を掛ける。
+fn limit_frame(bone_vector: [f64; 3], limit_rotation: [f64; 3]) -> [f64; 4] {
+    quat_mul(
+        quat_from_to_rotation([0.0, 1.0, 0.0], vec_normalized_or_zero(bone_vector)),
+        quat_mul(
+            quat_angle_axis([0.0, 0.0, 1.0], limit_rotation[2]),
+            quat_mul(
+                quat_angle_axis([0.0, 1.0, 0.0], limit_rotation[1]),
+                quat_angle_axis([1.0, 0.0, 0.0], limit_rotation[0]),
+            ),
+        ),
+    )
+}
+
+/// 方向を錐体に収める。角度内ならそのまま返す。
+fn clamp_to_cone(axis: [f64; 3], direction: [f64; 3], max_angle: f64) -> [f64; 3] {
+    if vec_angle_deg(axis, direction) <= max_angle {
+        return direction;
+    }
+    quat_rotate(
+        quat_angle_axis(
+            vec_normalized_or_zero(vec_cross(axis, direction)),
+            max_angle,
+        ),
+        axis,
+    )
+}
+
+/// 極座標（度）。前方からの方位角と水平面からの仰角である。
+fn cartesian_to_polar(normal: [f64; 3]) -> [f64; 2] {
+    let flat = vec_normalized_or_zero([normal[0], 0.0, normal[2]]);
+    let mut around = flat[2].clamp(-1.0, 1.0).acos() * 180.0 / std::f64::consts::PI;
+    if flat[0] < 0.0 {
+        around = -around;
+    }
+    let height = normal[1].clamp(-1.0, 1.0).acos() * 180.0 / std::f64::consts::PI - 90.0;
+    [around, height]
+}
+
+/// VRChatの角度制限。SDKの適用と同形（Angle/Hinge/Polar）である。
+fn apply_angle_limit(
+    limit_type: &SidecarLimitType,
+    bone_vector: [f64; 3],
+    rotation: [f64; 3],
+    max_angle: [f64; 2],
+    direction: [f64; 3],
+) -> [f64; 3] {
+    let frame = limit_frame(bone_vector, rotation);
+    let axis_x = quat_rotate(frame, [1.0, 0.0, 0.0]);
+    let axis_y = quat_rotate(frame, [0.0, 1.0, 0.0]);
+    match limit_type {
+        SidecarLimitType::None => direction,
+        SidecarLimitType::Angle => clamp_to_cone(axis_y, direction, max_angle[0]),
+        SidecarLimitType::Hinge => {
+            let dot = vec_dot(axis_x, direction);
+            let flat = vec_normalized_or_zero([
+                direction[0] - axis_x[0] * dot,
+                direction[1] - axis_x[1] * dot,
+                direction[2] - axis_x[2] * dot,
+            ]);
+            clamp_to_cone(axis_y, flat, max_angle[0])
+        }
+        SidecarLimitType::Polar => {
+            let axis_z = vec_normalized_or_zero(vec_cross(axis_x, axis_y));
+            let local = vec_normalized_or_zero([
+                vec_dot(axis_z, direction),
+                vec_dot(axis_x, direction),
+                vec_dot(axis_y, direction),
+            ]);
+            let mut polar = cartesian_to_polar(local);
+            polar[0] = polar[0].clamp(-max_angle[0], max_angle[0]);
+            polar[1] = polar[1].clamp(-max_angle[1], max_angle[1]);
+            let back = quat_rotate(quat_euler_yx(polar[0], polar[1]), [0.0, 0.0, 1.0]);
+            vec_normalized_or_zero([
+                axis_z[0] * back[0] + axis_x[0] * back[1] + axis_y[0] * back[2],
+                axis_z[1] * back[0] + axis_x[1] * back[1] + axis_y[1] * back[2],
+                axis_z[2] * back[0] + axis_x[2] * back[1] + axis_y[2] * back[2],
+            ])
+        }
+    }
+}
+
+/// 制限下での方向。軸だけの場合は制限の上軸を返す。
+fn limit_direction(
+    record: &SidecarPhysBone,
+    t: f64,
+    bone_vector: [f64; 3],
+    direction: [f64; 3],
+    axis_only: bool,
+) -> [f64; 3] {
+    let rotation = limit_rotation(record, t);
+    if axis_only {
+        return quat_rotate(limit_frame(bone_vector, rotation), [0.0, 1.0, 0.0]);
+    }
+    apply_angle_limit(
+        &record.limit_type,
+        bone_vector,
+        rotation,
+        max_angles(record, t),
+        direction,
+    )
+}
+
+/// 制限の有無。Angle/Hinge/Polarの場合に真である。
+fn has_angle_limit(record: &SidecarPhysBone) -> bool {
+    !matches!(record.limit_type, SidecarLimitType::None)
+}
+
+/// 制限が許す最大の振り（度）。rest方向からの回転に最大角を足し、180で止める。
+fn max_reach(record: &SidecarPhysBone, t: f64, bone_vector: [f64; 3]) -> f64 {
+    let axis = limit_direction(record, t, bone_vector, [0.0; 3], true);
+    let max_x = finite_or_zero(eval_curved(&record.max_angle_x, t)).max(0.0);
+    let widest = match record.limit_type {
+        SidecarLimitType::Polar => {
+            max_x.max(finite_or_zero(eval_curved(&record.max_angle_z, t)).max(0.0))
+        }
+        _ => max_x,
+    };
+    (vec_angle_deg(bone_vector, axis) + widest).min(180.0)
+}
+
+/// 単精度3要素ベクトルの内積。参照実装と同じ左畳み込みである。
+fn v3dot_f32(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+/// 単精度3要素ベクトルの外積。
+fn v3cross_f32(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// 単精度ベクトルの正規化。零ベクトルは零のまま返す。
+fn v3norm_f32(v: [f32; 3]) -> [f32; 3] {
+    let len = v3dot_f32(v, v).sqrt();
+    if len > 0.0 && len.is_finite() {
+        [v[0] / len, v[1] / len, v[2] / len]
+    } else {
+        [0.0; 3]
+    }
+}
+
+/// 単精度2ベクトルの角度（度）。いずれかが零の場合は0を返す。
+fn v3angle_f32(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let denom = v3dot_f32(a, a).sqrt() * v3dot_f32(b, b).sqrt();
+    if denom <= 0.0 || !denom.is_finite() {
+        return 0.0;
+    }
+    (v3dot_f32(a, b) / denom).clamp(-1.0, 1.0).acos() * 180.0 / std::f32::consts::PI
+}
+
+/// 単精度四元数の積。
+fn qmul_f32(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+    [
+        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+    ]
+}
+
+/// 単精度軸回転。軸が零の場合は恒等写像を返す。
+fn qaxis_f32(axis: [f32; 3], angle_deg: f32) -> [f32; 4] {
+    let a = v3norm_f32(axis);
+    if v3dot_f32(a, a) <= 0.0 {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    let half = angle_deg * std::f32::consts::PI / 360.0;
+    [
+        a[0] * half.sin(),
+        a[1] * half.sin(),
+        a[2] * half.sin(),
+        half.cos(),
+    ]
+}
+
+/// 単精度四元数によるベクトルの回転。
+fn qrot_f32(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
+    let u = [q[0], q[1], q[2]];
+    let uv = v3cross_f32(u, v);
+    let uuv = v3cross_f32(u, uv);
+    [
+        v[0] + 2.0 * (q[3] * uv[0] + uuv[0]),
+        v[1] + 2.0 * (q[3] * uv[1] + uuv[1]),
+        v[2] + 2.0 * (q[3] * uv[2] + uuv[2]),
+    ]
+}
+
+/// 単精度の方向転換。一般経路で求める。
+/// UnityのJointLimit出力と突き合わせると、一致方向でも一般経路を通るため、
+/// 恒等への近道は入れない。反対向きは直交軸の180度回転で返す。
+fn qfromto_f32(from: [f32; 3], to: [f32; 3]) -> [f32; 4] {
+    let f = v3norm_f32(from);
+    let t = v3norm_f32(to);
+    let dot = v3dot_f32(f, t);
+    if dot <= -1.0 + 1e-6 {
+        let mut axis = v3cross_f32(f, [1.0, 0.0, 0.0]);
+        if v3dot_f32(axis, axis) < 1e-12 {
+            axis = v3cross_f32(f, [0.0, 1.0, 0.0]);
+        }
+        return qaxis_f32(v3norm_f32(axis), 180.0);
+    }
+    let c = v3cross_f32(f, t);
+    let mut q = [c[0], c[1], c[2], 1.0 + dot];
+    let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+    if len <= 0.0 || !len.is_finite() {
+        return [0.0, 0.0, 0.0, 1.0];
+    }
+    for v in q.iter_mut() {
+        *v /= len;
+    }
+    q
+}
+
+/// 単精度の制限枠組み。骨ベクトルから上向きへの回転に制限回転を掛ける。
+fn frame_f32(bone: [f32; 3], rot: [f32; 3]) -> [[f32; 3]; 3] {
+    let r = qfromto_f32([0.0, 1.0, 0.0], v3norm_f32(bone));
+    let q = qmul_f32(
+        r,
+        qmul_f32(
+            qaa_f32_z(rot[2]),
+            qmul_f32(qaa_f32_y(rot[1]), qaa_f32_x(rot[0])),
+        ),
+    );
+    [
+        qrot_f32(q, [1.0, 0.0, 0.0]),
+        qrot_f32(q, [0.0, 1.0, 0.0]),
+        qrot_f32(q, [0.0, 0.0, 1.0]),
+    ]
+}
+
+/// 単精度軸回転の軸別版。frame_f32の可読性のために分ける。
+fn qaa_f32_x(deg: f32) -> [f32; 4] {
+    qaxis_f32([1.0, 0.0, 0.0], deg)
+}
+fn qaa_f32_y(deg: f32) -> [f32; 4] {
+    qaxis_f32([0.0, 1.0, 0.0], deg)
+}
+fn qaa_f32_z(deg: f32) -> [f32; 4] {
+    qaxis_f32([0.0, 0.0, 1.0], deg)
+}
+
+/// 単精度の極座標（度）。前方からの方位角と水平面からの仰角である。
+fn cartpol_f32(n: [f32; 3]) -> [f32; 2] {
+    let flat = v3norm_f32([n[0], 0.0, n[2]]);
+    let mut around = flat[2].clamp(-1.0, 1.0).acos() * 180.0 / std::f32::consts::PI;
+    if flat[0] < 0.0 {
+        around = -around;
+    }
+    let height = n[1].clamp(-1.0, 1.0).acos() * 180.0 / std::f32::consts::PI - 90.0;
+    [around, height]
+}
+
+/// 単精度の方向転換。Unityと同じ順序（yawをY軸・pitchをX軸）で掛ける。
+fn euler_yx_f32(yaw_deg: f32, pitch_deg: f32) -> [f32; 4] {
+    qmul_f32(qaa_f32_y(yaw_deg), qaa_f32_x(pitch_deg))
+}
+
+/// 単精度の錐体制限。角度内ならそのまま返す。
+fn clamp_cone_f32(axis: [f32; 3], dir: [f32; 3], max_angle: f32) -> [f32; 3] {
+    if v3angle_f32(axis, dir) <= max_angle {
+        return dir;
+    }
+    qrot_f32(
+        qaxis_f32(v3norm_f32(v3cross_f32(axis, dir)), max_angle),
+        axis,
+    )
+}
+
+/// 単精度の角度制限。SDKの適用と同形（Angle/Hinge/Polar）である。
+fn apply_limit_f32(
+    limit_type: &SidecarLimitType,
+    bone: [f32; 3],
+    rot: [f32; 3],
+    max: [f32; 2],
+    dir: [f32; 3],
+) -> [f32; 3] {
+    let f = frame_f32(bone, rot);
+    let (ax, ay) = (f[0], f[1]);
+    match limit_type {
+        SidecarLimitType::None => dir,
+        SidecarLimitType::Angle => clamp_cone_f32(ay, dir, max[0]),
+        SidecarLimitType::Hinge => {
+            let dot = v3dot_f32(ax, dir);
+            let flat = v3norm_f32([
+                dir[0] - ax[0] * dot,
+                dir[1] - ax[1] * dot,
+                dir[2] - ax[2] * dot,
+            ]);
+            clamp_cone_f32(ay, flat, max[0])
+        }
+        SidecarLimitType::Polar => {
+            let az = v3norm_f32(v3cross_f32(ax, ay));
+            let local = v3norm_f32([v3dot_f32(az, dir), v3dot_f32(ax, dir), v3dot_f32(ay, dir)]);
+            let mut p = cartpol_f32(local);
+            p[0] = p[0].clamp(-max[0], max[0]);
+            p[1] = p[1].clamp(-max[1], max[1]);
+            let back = qrot_f32(euler_yx_f32(p[0], p[1]), [0.0, 0.0, 1.0]);
+            v3norm_f32([
+                az[0] * back[0] + ax[0] * back[1] + ay[0] * back[2],
+                az[1] * back[0] + ax[1] * back[1] + ay[1] * back[2],
+                az[2] * back[0] + ax[2] * back[1] + ay[2] * back[2],
+            ])
+        }
+    }
+}
+
+/// 単精度の制限下での方向。軸だけの場合は制限の上軸を返す。
+fn limit_dir_f32(
+    limit_type: &SidecarLimitType,
+    bone: [f32; 3],
+    rot: [f32; 3],
+    max: [f32; 2],
+    dir: [f32; 3],
+    axis_only: bool,
+) -> [f32; 3] {
+    if axis_only {
+        let f = frame_f32(bone, rot);
+        return f[1];
+    }
+    apply_limit_f32(limit_type, bone, rot, max, dir)
+}
+
+/// 単精度の有効制限角（度）。参照実装と同じ36方向の冪平均である。
+fn efflim_f32(bone: [f32; 3], rot: [f32; 3], max: [f32; 2], limit_type: &SidecarLimitType) -> f32 {
+    let b = v3norm_f32(bone);
+    let mut across = v3cross_f32(b, [0.0, 0.0, 1.0]);
+    if v3dot_f32(across, across) < 1e-6 {
+        across = v3cross_f32(b, [1.0, 0.0, 0.0]);
+    }
+    let across = v3norm_f32(across);
+    let other = v3cross_f32(b, across);
+    let lrest = limit_dir_f32(limit_type, bone, rot, max, b, false);
+    let tilt = 45.0f32 * std::f32::consts::PI / 180.0;
+    let mut sum = 0.0f32;
+    for i in 0..LIMIT_RESPONSE_STEPS {
+        let around = 2.0 * std::f32::consts::PI * i as f32 / LIMIT_RESPONSE_STEPS as f32;
+        let pushed = [
+            tilt.cos() * b[0] + tilt.sin() * (around.cos() * across[0] + around.sin() * other[0]),
+            tilt.cos() * b[1] + tilt.sin() * (around.cos() * across[1] + around.sin() * other[1]),
+            tilt.cos() * b[2] + tilt.sin() * (around.cos() * across[2] + around.sin() * other[2]),
+        ];
+        let turned = limit_dir_f32(limit_type, bone, rot, max, pushed, false);
+        sum += v3angle_f32(lrest, turned).powf(LIMIT_RESPONSE_POWER as f32);
+    }
+    (sum / LIMIT_RESPONSE_STEPS as f32).powf(1.0 / LIMIT_RESPONSE_POWER as f32)
+}
+
+/// 有効制限角（度）。36方向に押した応答の冪平均であり、塞ぐ方向を重く見る。
+fn effective_limit_angle(record: &SidecarPhysBone, t: f64, rest: Option<&JointRest>) -> f64 {
+    let Some(rest) = rest else {
+        return limit_angle(record, t);
+    };
+    if !has_angle_limit(record) {
+        return limit_angle(record, t);
+    }
+    // 参照実装と同じ単精度で計算する。倍精度との差は通常は無視できるが、
+    // 方向が一致する試行では acos の特異性で差が増幅される場合がある。
+    // Unity出力との突き合わせは試験で行い、残差は設計文書に残す。
+    let bone = [
+        rest.bone_vector[0] as f32,
+        rest.bone_vector[1] as f32,
+        rest.bone_vector[2] as f32,
+    ];
+    let rotation = [
+        finite_or_zero(limit_rotation(record, t)[0]) as f32,
+        finite_or_zero(limit_rotation(record, t)[1]) as f32,
+        finite_or_zero(limit_rotation(record, t)[2]) as f32,
+    ];
+    // max_angles already clamps at zero; cast after.
+    let max = max_angles(record, t);
+    efflim_f32(
+        bone,
+        rotation,
+        [max[0] as f32, max[1] as f32],
+        &record.limit_type,
+    ) as f64
+}
+
+/// rest方向から重力への角度（ラジアン）。rest不明時は直角である。
+fn rest_to_gravity(rest: Option<&JointRest>, gravity_up: bool) -> f64 {
+    let Some(rest) = rest else {
+        return std::f64::consts::PI / 2.0;
+    };
+    let Some(world) = matrix::transform_vector(&rest.bone_to_world, rest.bone_vector) else {
+        return std::f64::consts::PI / 2.0;
+    };
+    let world = vec_normalized_or_zero(world);
+    if vec_len2(world) <= 0.0 {
+        return std::f64::consts::PI / 2.0;
+    }
+    let gravity = if gravity_up {
+        [0.0, 1.0, 0.0]
+    } else {
+        [0.0, -1.0, 0.0]
+    };
+    vec_dot(world, gravity).clamp(-1.0, 1.0).acos()
+}
+
+/// 版1.0の重力の当てはめ。pullの後に足す力である。
+fn gravity_at10(gravity: f64, falloff: f64, ratio: f64, scale: f64, closeness: f64) -> f64 {
+    gravity * (1.0 - falloff * closeness) * (1.0 + ratio) * scale
+}
+
+/// 版1.0の接線。pullなしで力が残る場合は無限大、力なしは0である。
+/// 0/0を無限とみなすとfalloff全除去が消えるため分ける。
+fn gravity_tangent10(at: f64, ratio: f64) -> f64 {
+    if ratio > 0.0 {
+        at / ratio
+    } else if at > 0.0 {
+        f64::INFINITY
+    } else {
+        0.0
+    }
+}
+
+/// 版1.0の重力比。falloffは沈み角で取り除く。
+fn gravity_ratio10(gravity: f64, falloff: f64, ratio: f64, scale: f64, to_gravity: f64) -> f64 {
+    if falloff <= 0.0 {
+        return gravity_at10(gravity, falloff, ratio, scale, 1.0);
+    }
+    let mut angle = 0.0f64;
+    for _ in 0..64 {
+        let closeness = 0.0f64.max(angle.cos());
+        let tangent = gravity_tangent10(
+            gravity_at10(gravity, falloff, ratio, scale, closeness),
+            ratio,
+        );
+        angle = if tangent.is_infinite() {
+            to_gravity
+        } else {
+            (tangent * to_gravity.sin()).atan2(1.0 + tangent * to_gravity.cos())
+        };
+    }
+    gravity_at10(gravity, falloff, ratio, scale, 0.0f64.max(angle.cos()))
+}
+
+/// 版1.1の重力比。rest姿勢と同じ倒れになる `G / (1 - G)` である。
+fn gravity_share11(gravity: f64, falloff: f64, closeness: f64) -> f64 {
+    (gravity * (1.0 - falloff * closeness)).min(1.0)
+}
+
+/// 版1.1の比 `G / (1 - G)`。分母の下限で発散を抑える。
+fn gravity_balance11(share: f64) -> f64 {
+    share / (1.0 - share).max(MIN_GRAVITY_BALANCE)
+}
+
+/// 版1.1の重力比。falloffは沈み角で取り除く。
+fn gravity_ratio11(gravity: f64, falloff: f64, to_gravity: f64) -> f64 {
+    if falloff <= 0.0 {
+        return gravity_balance11(gravity_share11(gravity, falloff, 1.0));
+    }
+    let mut angle = 0.0f64;
+    for _ in 0..64 {
+        let closeness = 0.0f64.max(angle.cos());
+        let ratio = gravity_balance11(gravity_share11(gravity, falloff, closeness));
+        angle = (ratio * to_gravity.sin()).atan2(1.0 + ratio * to_gravity.cos());
+    }
+    gravity_balance11(gravity_share11(gravity, falloff, 0.0f64.max(angle.cos())))
+}
+
+/// 制限で抑えられる重力。制限が沈みを止める場合はそこに収める。
+fn limited_gravity(
+    record: &SidecarPhysBone,
+    t: f64,
+    rest: Option<&JointRest>,
+    stiffness: f64,
+    power: f64,
+    gravity_up: bool,
+) -> f64 {
+    let Some(rest) = rest else {
+        return power;
+    };
+    if power <= 0.0 || stiffness <= 0.0 || !has_angle_limit(record) {
+        return power;
+    }
+    let mut power = power;
+    let widest = max_reach(record, t, rest.bone_vector);
+    if widest < 90.0 {
+        power = power.min(stiffness * (widest * std::f64::consts::PI / 180.0).sin());
+    }
+    let Some(rest_world) = matrix::transform_vector(&rest.bone_to_world, rest.bone_vector) else {
+        return power;
+    };
+    let rest_world = vec_normalized_or_zero(rest_world);
+    if vec_len2(rest_world) <= 0.0 {
+        return power;
+    }
+    let gravity = if gravity_up {
+        [0.0, 1.0, 0.0]
+    } else {
+        [0.0, -1.0, 0.0]
+    };
+    let to_gravity = vec_dot(rest_world, gravity).clamp(-1.0, 1.0).acos();
+    if to_gravity < SETTLED_ANGLE_TOLERANCE {
+        return power;
+    }
+    let settled = (power * to_gravity.sin()).atan2(stiffness + power * to_gravity.cos());
+    let settled_world = rotate_towards(rest_world, gravity, settled);
+    let Some(inverse) = matrix::inverse(&rest.bone_to_world) else {
+        return power;
+    };
+    let Some(local) = matrix::transform_vector(&inverse, settled_world) else {
+        return power;
+    };
+    let limited_local = limit_direction(
+        record,
+        t,
+        rest.bone_vector,
+        vec_normalized_or_zero(local),
+        false,
+    );
+    if vec_len2(limited_local) <= 0.0 {
+        return power;
+    }
+    let Some(limited_world) =
+        matrix::transform_vector(&rest.bone_to_world, vec_normalized_or_zero(limited_local))
+    else {
+        return power;
+    };
+    let reach = vec_dot(rest_world, vec_normalized_or_zero(limited_world))
+        .clamp(-1.0, 1.0)
+        .acos();
+    if reach >= settled - SETTLED_ANGLE_TOLERANCE {
+        return power;
+    }
+    power.min(stiffness * reach.sin() / (to_gravity - reach).sin())
+}
+
+/// 1関節のパラメータ。参照実装の `JointParameters` に相当する。
+/// 版1.0とそれ以外で重力式が変わり、制限とheld immobileでpullを強める。
+/// 端末は呼び出し側で直前headの値を写す。
+#[allow(clippy::too_many_arguments)]
+fn joint_parameters(
+    source: &SidecarPhysBone,
+    head_t: f64,
+    tail_t: f64,
+    tail_scale: f64,
+    bone_length: f64,
+    held_immobile: f64,
+    rest: Option<&JointRest>,
+) -> JointParams {
+    let speed = CALIBRATION_FRAME_RATE
+        * if bone_length.is_nan() || bone_length.is_infinite() || bone_length <= UNKNOWN_BONE_LENGTH
+        {
+            CALIBRATION_LENGTH
+        } else {
+            bone_length
+        };
+    let pull = clamp01(eval_curved(&source.pull, head_t));
+    let mut spring = clamp01(eval_curved(&source.spring, head_t));
+    let advanced = source.integration_type == SidecarIntegrationType::Advanced;
+    // stiffnessはAdvancedでのみ効く。Simplifiedでは測定上無視された。
+    let own_stiffness = if advanced {
+        clamp01(eval_curved(&source.stiffness, head_t))
+    } else {
+        0.0
+    };
+    let (ratio, drag, gravity_scale) = if advanced {
+        (
+            pull_ratio(pull, 1.0 - spring * own_stiffness),
+            1.0 - spring * (1.0 - own_stiffness),
+            1.0,
+        )
+    } else {
+        // spring 1の鎖も戻って静止するため、springは0.9で止める。
+        spring = spring.min(MAX_SIMPLIFIED_SPRING);
+        let pull_share = pull * (1.0 - spring);
+        (
+            pull_ratio(pull_share, 1.0),
+            1.0 - spring / (1.0 - pull_share).max(1.0 / MAX_PULL_RATIO),
+            1.0 - spring,
+        )
+    };
+    let gravity = finite_or_zero(eval_curved(&source.gravity, head_t));
+    let falloff = clamp01(eval_curved(&source.gravity_falloff, head_t));
+    let gravity_up = gravity < 0.0;
+    let to_gravity = rest_to_gravity(rest, gravity_up);
+    let version10 = source.version.as_deref() == Some("1.0");
+    let mut power = if version10 {
+        speed * gravity_ratio10(gravity.abs(), falloff, ratio, gravity_scale, to_gravity)
+    } else if pull > 0.0 {
+        speed * ratio * gravity_ratio11(gravity.abs(), falloff, to_gravity)
+    } else {
+        0.0
+    };
+    let limit = effective_limit_angle(source, head_t, rest);
+    let mut held = held_ratio(ratio, clamp01(held_immobile), limit);
+    if ratio > 0.0 {
+        held = loose_floor(held, drag, limit);
+    }
+    if ratio > 0.0 {
+        power *= held / ratio;
+    }
+    let stiffness = speed * held;
+    power = limited_gravity(source, head_t, rest, stiffness, power, gravity_up);
+    let hit_radius = 0.0f64.max(eval_curved(&source.radius, tail_t) * tail_scale.abs());
+    JointParams {
+        stiffness: finite_or_zero(stiffness),
+        drag: clamp01(drag),
+        power: finite_or_zero(power),
+        gravity_up,
+        hit_radius: finite_or_zero(hit_radius),
+    }
+}
+
 /// sidecarのcolliderをVRMの形状へ換える。
 ///
 /// `position`・`rotation` はrootローカルの値であり、componentには依存しない。
@@ -2119,9 +3072,8 @@ fn convert_collider_shape(
 /// 長さの無い骨はheadにならず、前springの端末として終わる。
 /// colliderはroot基準で換算する。`position`・`rotation` はrootローカルの値であり、
 /// 鏡像だけを適用する。componentは追従対象の識別にだけ使う。
-/// endpoint生成・平均tail生成・ゼロ長分割・limit・center・曲線の再現はしない。
-/// パラメータは第一近似であり、詳細は [`SpringCompileReport`] に残る。
-/// 参照実装の完全移植ではなく、近似であることを診断と文書に明記する。
+/// endpoint生成・平均tail生成・ゼロ長分割・limit拡張の出力はしない。
+/// centerの計算と制限の評価は行う。未対応は診断と文書に明記する。
 ///
 /// 失敗時は `VrmModel` を変更しない。呼び出し側が結果を受け取ってから代入する。
 ///
@@ -2182,6 +3134,8 @@ pub fn compile_springs(
         .map(|(id, &vrm)| (vrm, sidecar_at[id.as_str()]))
         .collect();
     let sidecar_worlds = sidecar_world_matrices(sidecar)?;
+    // 関節形状の計算用にUnity空間の行列と拡大率も求める。
+    let (unity_worlds, unity_max_scales) = unity_worlds_and_scales(sidecar)?;
     // avatar rootは所有しない。rootの子から開始・所有する。
     let avatar_root = sidecar_at.get(sidecar.capture.avatar_root_id.as_str());
     // 他のPhysBoneのroot集合（sidecar索引）。`ignoreOtherPhysBones` が真の
@@ -2298,8 +3252,16 @@ pub fn compile_springs(
             });
             continue;
         }
-        let (hit_radius, stiffness, drag_force) =
-            approx_joint_params(&bone.id, source, &mut report)?;
+        // 参照実装の `MaxDepth` に相当する。endpointは作らないため、
+        // 末端なしのまま深さの最大値を使う。
+        let max_depth = plan
+            .tree
+            .bones
+            .iter()
+            .map(|bone| bone.depth)
+            .max()
+            .unwrap_or(0);
+        let holds_immobile = plan_immobile(plan, &owned, source).holds;
         for node in head_list {
             let (joints, truncated) = trace_spring(
                 plan,
@@ -2353,19 +3315,84 @@ pub fn compile_springs(
                 }
                 continue;
             }
+            // 関節ごとに参照実装の式で求める。末端は直前headの値を写す
+            // （VRMは末端の値を無視するため）。
+            let mut params_list = Vec::with_capacity(joints.len());
+            for (index, &sidecar_joint) in joints.iter().enumerate() {
+                let is_tail = index + 1 == joints.len() && !truncated;
+                if is_tail {
+                    let tail = params_list
+                        .last()
+                        .copied()
+                        .expect("末端の前にhead関節がある");
+                    params_list.push(tail);
+                    continue;
+                }
+                let entry = plan
+                    .tree
+                    .bone(sidecar_joint)
+                    .expect("鎖の関節は木の骨である");
+                let head_t = chain_t(entry.depth, max_depth);
+                let tail_t = radius_t(entry.depth + 1, max_depth);
+                let held = if holds_immobile {
+                    clamp01(eval_curved(&source.immobile, head_t))
+                } else {
+                    0.0
+                };
+                let bone_length =
+                    matrix::transform_vector(&unity_worlds[sidecar_joint], entry.aim_local)
+                        .map(vec_len)
+                        .unwrap_or(f64::NAN);
+                // 半径の基準はChildのAim先、Averageでは自身である。
+                let radius_node = if entry.aim_average {
+                    sidecar_joint
+                } else {
+                    entry.aim.unwrap_or(sidecar_joint)
+                };
+                let rest = if vec_len2(entry.aim_local) > 0.0
+                    && matrix::det3(&unity_worlds[sidecar_joint]) != 0.0
+                {
+                    Some(JointRest {
+                        bone_vector: entry.aim_local,
+                        bone_to_world: unity_worlds[sidecar_joint],
+                    })
+                } else {
+                    None
+                };
+                params_list.push(joint_parameters(
+                    source,
+                    head_t,
+                    tail_t,
+                    unity_max_scales[radius_node],
+                    bone_length,
+                    held,
+                    rest.as_ref(),
+                ));
+            }
             let joints = vrm_joints
                 .into_iter()
-                .map(|node| VrmSpringJoint {
-                    node,
-                    hit_radius,
-                    stiffness,
-                    gravity_power: 0.0,
-                    gravity_dir: [0.0, -1.0, 0.0],
-                    drag_force,
+                .zip(params_list)
+                .map(|(node, params)| {
+                    let gravity_dir = if params.gravity_up {
+                        [0.0, 1.0, 0.0]
+                    } else {
+                        [0.0, -1.0, 0.0]
+                    };
+                    Ok(VrmSpringJoint {
+                        node,
+                        hit_radius: to_f32_finite(params.hit_radius, "半径")?,
+                        stiffness: to_f32_finite(params.stiffness, "硬さ")?,
+                        gravity_power: to_f32_finite(params.power, "重力")?,
+                        gravity_dir,
+                        drag_force: to_f32_finite(params.drag, "抵抗")?,
+                    })
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, VrmError>>()?;
             report.joint_count += joints.len();
-            report.gravity_zero_joints += joints.len();
+            report.gravity_zero_joints += joints
+                .iter()
+                .filter(|joint| joint.gravity_power == 0.0)
+                .count();
             // endpointは今回は付けない。近似として記録する。
             report.no_endpoint.push(bone.id.clone());
             if source.multi_child_type != SidecarMultiChildType::Ignore
@@ -2559,6 +3586,12 @@ struct TreeBone {
     depth: usize,
     /// Aimする子。無い場合は `None` である。
     aim: Option<usize>,
+    /// Aim先の自空間位置。子1件または `First` では子の参照位置、
+    /// `Average` では子位置の平均、Aimなしでは零である。
+    /// 参照実装の `AimLocalPosition` に相当する。
+    aim_local: [f64; 3],
+    /// `Average` によるAimかどうか。半径の基準ノード判定に使う。
+    aim_average: bool,
 }
 
 impl PlanTree {
@@ -2646,9 +3679,10 @@ fn build_plan_tree(
                     .collect()
             })
             .unwrap_or_default();
-        let aim = match children.as_slice() {
-            [] => None,
-            [single] => Some(*single),
+        let child_position = |child: usize| sidecar.nodes[child].reference_local.position;
+        let (aim, aim_average) = match children.as_slice() {
+            [] => (None, false),
+            [single] => (Some(*single), false),
             [first, rest @ ..] => match source.multi_child_type {
                 SidecarMultiChildType::First => {
                     report.branch_splits.push(BranchSplit {
@@ -2657,7 +3691,7 @@ fn build_plan_tree(
                         aimed: Some(node_id(*first)),
                         heads: rest.iter().map(|&child| node_id(child)).collect(),
                     });
-                    Some(*first)
+                    (Some(*first), false)
                 }
                 SidecarMultiChildType::Ignore => {
                     report.branch_splits.push(BranchSplit {
@@ -2666,7 +3700,7 @@ fn build_plan_tree(
                         aimed: None,
                         heads: children.iter().map(|&child| node_id(child)).collect(),
                     });
-                    None
+                    (None, false)
                 }
                 SidecarMultiChildType::Average => {
                     // 平均tailは作らず、最初の子に畳む。近似として記録する。
@@ -2679,9 +3713,25 @@ fn build_plan_tree(
                     if !report.average_approximated.contains(&bone.id) {
                         report.average_approximated.push(bone.id.clone());
                     }
-                    Some(*first)
+                    (Some(*first), true)
                 }
             },
+        };
+        // Aim先の自空間位置。参照実装の `AimLocalPosition` に相当する。
+        let aim_local = match (aim, aim_average) {
+            (Some(child), false) => child_position(child),
+            (Some(_), true) => {
+                let mut sum = [0.0; 3];
+                for &child in &children {
+                    let position = child_position(child);
+                    sum[0] += position[0];
+                    sum[1] += position[1];
+                    sum[2] += position[2];
+                }
+                let count = children.len() as f64;
+                [sum[0] / count, sum[1] / count, sum[2] / count]
+            }
+            (None, _) => [0.0; 3],
         };
         tree.at.insert(node, tree.bones.len());
         tree.bones.push(TreeBone {
@@ -2689,6 +3739,8 @@ fn build_plan_tree(
             parent,
             depth,
             aim,
+            aim_local,
+            aim_average,
         });
         for &child in children.iter().rev() {
             pending.push((child, Some(node), depth + 1));
@@ -2958,52 +4010,6 @@ fn trace_spring(
     (joints, truncated)
 }
 
-/// 関節パラメータの第一近似を求める。
-///
-/// `hit_radius` と `stiffness` はbase値を使い、曲線のキー列は評価しない。
-/// `drag_force` は `1 - spring` を0〜1に丸める。`gravity` 系は使わない。
-/// 近似した箇所は報告に残す。参照実装の式への置き換えが前提である。
-fn approx_joint_params(
-    bone: &str,
-    source: &SidecarPhysBone,
-    report: &mut SpringCompileReport,
-) -> Result<(f32, f32, f32), VrmError> {
-    for (field, curve) in [
-        ("radius", &source.radius),
-        ("spring", &source.spring),
-        ("stiffness", &source.stiffness),
-    ] {
-        if !curve.keys.is_empty() {
-            report.curve_base_used.push(CurveBaseUsed {
-                bone: bone.to_owned(),
-                field,
-                keys: curve.keys.len(),
-            });
-        }
-    }
-    let hit_radius = to_f32_finite(source.radius.value, "半径")?;
-    if hit_radius < 0.0 {
-        return Err(VrmError::new(
-            VrmErrorKind::InvalidPhysicsSidecar,
-            format!("半径が0以上の有限値でない: {bone}"),
-        ));
-    }
-    let stiffness = to_f32_finite(source.stiffness.value, "硬さ")?;
-    if !stiffness.is_finite() || stiffness < 0.0 {
-        return Err(VrmError::new(
-            VrmErrorKind::InvalidPhysicsSidecar,
-            format!("硬さが0以上の有限値でない: {bone}"),
-        ));
-    }
-    let spring_base = to_f32_finite(source.spring.value, "ばね")?;
-    let raw = 1.0 - spring_base;
-    let drag_force = raw.clamp(0.0, 1.0);
-    if drag_force != raw {
-        report.drag_clamped.push(bone.to_owned());
-    }
-    Ok((hit_radius, stiffness, drag_force))
-}
-
 /// world位置の差がほぼ0かどうか。ゼロ長区間の検出に使う。
 fn is_zero_length(worlds: &[[f64; 16]], parent: usize, child: usize) -> bool {
     let Some(from) = worlds.get(parent) else {
@@ -3024,6 +4030,16 @@ fn chain_t(depth: usize, max_depth: usize) -> f64 {
         0.0
     } else {
         (depth as f64 / (max_depth - 1) as f64).clamp(0.0, 1.0)
+    }
+}
+
+/// 半径の深さ位置。SDKが半径を1手先で測ることに対応する。
+/// 端末を作らないため、末端なしのまま `depth / maxDepth` を使う。
+fn radius_t(depth: usize, max_depth: usize) -> f64 {
+    if max_depth == 0 {
+        0.0
+    } else {
+        (depth as f64 / max_depth as f64).clamp(0.0, 1.0)
     }
 }
 
@@ -3100,5 +4116,328 @@ fn is_ancestor_or_self(
             return false;
         };
         node = parent;
+    }
+}
+
+#[cfg(test)]
+mod joint_tests {
+    use super::*;
+
+    /// キー無しのカーブ。
+    fn plain(value: f64) -> SidecarCurve {
+        SidecarCurve {
+            value,
+            keys: Vec::new(),
+            pre_wrap_mode: 8,
+            post_wrap_mode: 8,
+        }
+    }
+
+    /// 1件のキー。
+    fn key(time: f64, value: f64, in_slope: f64, out_slope: f64) -> SidecarCurveKey {
+        SidecarCurveKey {
+            time,
+            value,
+            in_slope,
+            out_slope,
+            weighted_mode: 0,
+            in_weight: 0.0,
+            out_weight: 0.0,
+        }
+    }
+
+    /// 試験用のPhysBone。曲線は全てキー無しである。
+    fn bone() -> SidecarPhysBone {
+        SidecarPhysBone {
+            id: "pb:test".to_string(),
+            component_node_id: "n:0".to_string(),
+            root_node_id: "n:0".to_string(),
+            enabled: true,
+            version: Some("1.1".to_string()),
+            integration_type: SidecarIntegrationType::Simplified,
+            ignore_node_ids: Vec::new(),
+            ignore_other_phys_bones: false,
+            endpoint_position: [0.0; 3],
+            multi_child_type: SidecarMultiChildType::Ignore,
+            pull: plain(0.0),
+            spring: plain(0.0),
+            stiffness: plain(0.0),
+            gravity: plain(0.0),
+            gravity_falloff: plain(0.0),
+            immobile_type: SidecarImmobileType::AllMotion,
+            immobile: plain(0.0),
+            radius: plain(0.0),
+            allow_collision: true,
+            collider_ids: Vec::new(),
+            limit_type: SidecarLimitType::None,
+            max_angle_x: plain(0.0),
+            max_angle_z: plain(0.0),
+            limit_rotation: [0.0; 3],
+            limit_rotation_x_curve: plain(1.0),
+            limit_rotation_y_curve: plain(1.0),
+            limit_rotation_z_curve: plain(1.0),
+            is_animated: false,
+        }
+    }
+
+    /// キー無しは既定値を返す。
+    #[test]
+    fn 曲線なしは既定値を返す() {
+        assert_eq!(eval_curved(&plain(0.3), 0.7), 0.3);
+        assert_eq!(eval_unity_curve(&plain(0.3), 0.7), 1.0);
+    }
+
+    /// 1キーは時刻によらず値を返す。
+    #[test]
+    fn 単一キーは値を返す() {
+        let mut curve = plain(0.0);
+        curve.keys.push(key(0.5, 2.0, 0.0, 0.0));
+        assert_eq!(eval_unity_curve(&curve, 0.0), 2.0);
+        assert_eq!(eval_unity_curve(&curve, 9.0), 2.0);
+        assert_eq!(eval_curved(&curve, 0.25), 0.0);
+    }
+
+    /// 傾き0の2キーは中点で平均を返す。
+    #[test]
+    fn 直線補間は中点で平均になる() {
+        let mut curve = plain(0.0);
+        curve.keys.push(key(0.0, 10.0, 0.0, 0.0));
+        curve.keys.push(key(1.0, 20.0, 0.0, 0.0));
+        assert!((eval_unity_curve(&curve, 0.5) - 15.0).abs() < 1e-12);
+    }
+
+    /// Hermiteの傾きは区間幅を掛けて使う。
+    #[test]
+    fn 傾き付き補間は三次式に従う() {
+        let mut curve = plain(0.0);
+        curve.keys.push(key(0.0, 0.0, 0.0, 3.0));
+        curve.keys.push(key(1.0, 1.0, 0.0, 0.0));
+        // h00=0.5、h10=0.125、h01=0.5、h11=-0.125 のため0.5+0.375=0.875。
+        assert!((eval_unity_curve(&curve, 0.5) - 0.875).abs() < 1e-12);
+    }
+
+    /// 時刻0の重複キーは0除算を避けて先の値を返す。
+    #[test]
+    fn 時刻重複は先の値を返す() {
+        let mut curve = plain(0.0);
+        curve.keys.push(key(0.0, 1.0, 0.0, 0.0));
+        curve.keys.push(key(0.0, 2.0, 0.0, 0.0));
+        assert_eq!(eval_unity_curve(&curve, 0.0), 1.0);
+    }
+
+    /// 範囲外は端値に丸める（Clamp相当）。
+    #[test]
+    fn 範囲外は端値になる() {
+        let mut curve = plain(0.0);
+        curve.keys.push(key(0.0, 10.0, 0.0, 0.0));
+        curve.keys.push(key(1.0, 20.0, 0.0, 0.0));
+        assert_eq!(eval_unity_curve(&curve, -2.0), 10.0);
+        assert_eq!(eval_unity_curve(&curve, 5.0), 20.0);
+    }
+
+    /// Loop wrapは折り返す。
+    #[test]
+    fn 繰り返しは折り返す() {
+        let mut curve = plain(0.0);
+        curve.pre_wrap_mode = 2;
+        curve.post_wrap_mode = 2;
+        curve.keys.push(key(0.0, 10.0, 0.0, 0.0));
+        curve.keys.push(key(1.0, 20.0, 0.0, 0.0));
+        assert!((eval_unity_curve(&curve, 2.5) - 15.0).abs() < 1e-12);
+        assert!((eval_unity_curve(&curve, -0.5) - 15.0).abs() < 1e-12);
+    }
+
+    /// PingPong wrapは往復する。
+    #[test]
+    fn 往復は折り返して戻る() {
+        let mut curve = plain(0.0);
+        curve.pre_wrap_mode = 4;
+        curve.post_wrap_mode = 4;
+        curve.keys.push(key(0.0, 10.0, 0.0, 0.0));
+        curve.keys.push(key(1.0, 20.0, 0.0, 0.0));
+        assert!((eval_unity_curve(&curve, 1.5) - 15.0).abs() < 1e-12);
+        assert!((eval_unity_curve(&curve, 0.5) - 15.0).abs() < 1e-12);
+    }
+
+    /// pull比の基本。0は0、1は上限、0.5は等倍である。
+    #[test]
+    fn 引き比は分配に従う() {
+        assert_eq!(pull_ratio(0.0, 1.0), 0.0);
+        assert_eq!(pull_ratio(1.0, 1.0), MAX_PULL_RATIO);
+        assert!((pull_ratio(0.5, 1.0) - 1.0).abs() < 1e-12);
+    }
+
+    /// 保持比の基本。0は0、制限なしは等倍、きつい制限は強める。
+    #[test]
+    fn 保持比は制限で強まる() {
+        assert_eq!(held_ratio(0.0, 0.5, 10.0), 0.0);
+        assert!((held_ratio(2.0, 0.0, f64::INFINITY) - 2.0).abs() < 1e-12);
+        // 制限11.25度は基準の4分の1のため2倍になる。
+        assert!((held_ratio(2.0, 0.0, 11.25) - 4.0).abs() < 1e-12);
+        // 不動1は上限に張り付く。
+        assert_eq!(held_ratio(2.0, 1.0, f64::INFINITY), MAX_PULL_RATIO);
+    }
+
+    /// 版1.1の重力比。0は0、半分は等倍である。
+    #[test]
+    fn 重力比11は比に従う() {
+        assert_eq!(gravity_ratio11(0.0, 0.0, 1.0), 0.0);
+        assert!((gravity_ratio11(0.5, 0.0, 1.0) - 1.0).abs() < 1e-12);
+    }
+
+    /// 版1.0の重力比。0は0である。
+    #[test]
+    fn 重力比10は0で0になる() {
+        assert_eq!(gravity_ratio10(0.0, 0.0, 1.0, 1.0, 1.0), 0.0);
+    }
+
+    /// Advancedの基本。pull 1・spring 0・stiffness 1で上限の比になる。
+    #[test]
+    fn 高精度積分は上限の比になる() {
+        let mut source = bone();
+        source.integration_type = SidecarIntegrationType::Advanced;
+        source.pull = plain(1.0);
+        source.stiffness = plain(1.0);
+        // 速度6・比60・保持60のため硬さ360、抵抗1、重力0である。
+        let params = joint_parameters(&source, 0.0, 0.0, 1.0, 0.1, 0.0, None);
+        assert!((params.stiffness - 360.0).abs() < 1e-9);
+        assert_eq!(params.drag, 1.0);
+        assert_eq!(params.power, 0.0);
+        assert!(!params.gravity_up);
+        assert_eq!(params.hit_radius, 0.0);
+    }
+
+    /// Simplifiedの基本。pull・spring半分で3分の1の比になる。
+    #[test]
+    fn 単純化積分は分配に従う() {
+        let mut source = bone();
+        source.pull = plain(0.5);
+        source.spring = plain(0.5);
+        // pull共有0.25・比1/3・抵抗1/3・速度6のため硬さ2である。
+        let params = joint_parameters(&source, 0.0, 0.0, 1.0, 0.1, 0.0, None);
+        assert!((params.stiffness - 2.0).abs() < 1e-9);
+        assert!((params.drag - (1.0 / 3.0)).abs() < 1e-12);
+        assert_eq!(params.power, 0.0);
+    }
+
+    /// 版1.0の重力。pull 1・falloffなしで61倍の速度になる。
+    #[test]
+    fn 版10の重力は速度の61倍になる() {
+        let mut source = bone();
+        source.version = Some("1.0".to_string());
+        source.pull = plain(1.0);
+        source.gravity = plain(1.0);
+        // 速度6・比60・重力比61のため重力366、硬さ360である。
+        let params = joint_parameters(&source, 0.0, 0.0, 1.0, 0.1, 0.0, None);
+        assert!((params.power - 366.0).abs() < 1e-9);
+        assert!((params.stiffness - 360.0).abs() < 1e-9);
+        assert!(!params.gravity_up);
+    }
+
+    /// falloff最大はrest姿勢の重力を消す。
+    #[test]
+    fn 最大減衰は重力を消す() {
+        let mut source = bone();
+        source.version = Some("1.0".to_string());
+        source.pull = plain(1.0);
+        source.gravity = plain(1.0);
+        source.gravity_falloff = plain(1.0);
+        let params = joint_parameters(&source, 0.0, 0.0, 1.0, 0.1, 0.0, None);
+        assert_eq!(params.power, 0.0);
+    }
+
+    /// 中間減衰は重力を弱める。
+    #[test]
+    fn 中間減衰は重力を弱める() {
+        let mut full = bone();
+        full.version = Some("1.0".to_string());
+        full.pull = plain(1.0);
+        full.gravity = plain(1.0);
+        let mut half = full.clone();
+        half.gravity_falloff = plain(0.5);
+        let base_power = joint_parameters(&full, 0.0, 0.0, 1.0, 0.1, 0.0, None).power;
+        let half_power = joint_parameters(&half, 0.0, 0.0, 1.0, 0.1, 0.0, None).power;
+        assert!(half_power > 0.0 && half_power < base_power);
+    }
+
+    /// 負の重力は上向きになる。
+    #[test]
+    fn 負の重力は上向きになる() {
+        let mut source = bone();
+        source.version = Some("1.0".to_string());
+        source.pull = plain(1.0);
+        source.gravity = plain(-1.0);
+        let params = joint_parameters(&source, 0.0, 0.0, 1.0, 0.1, 0.0, None);
+        assert!(params.gravity_up);
+        assert!(params.power > 0.0);
+    }
+
+    /// held immobileは引きを強める。
+    #[test]
+    fn 保持は引きを強める() {
+        let mut source = bone();
+        source.integration_type = SidecarIntegrationType::Advanced;
+        source.pull = plain(0.5);
+        // 比1・不動0.5のため保持2・硬さ12、不動なしなら硬さ6である。
+        let held = joint_parameters(&source, 0.0, 0.0, 1.0, 0.1, 0.5, None);
+        let free = joint_parameters(&source, 0.0, 0.0, 1.0, 0.1, 0.0, None);
+        assert!((held.stiffness - 12.0).abs() < 1e-9);
+        assert!((free.stiffness - 6.0).abs() < 1e-9);
+    }
+
+    /// 制限なしの制限角は無限大、Polarは平均である。
+    #[test]
+    fn 制限角は種別に従う() {
+        let plain_bone = bone();
+        assert_eq!(limit_angle(&plain_bone, 0.0), f64::INFINITY);
+        let mut angle = bone();
+        angle.limit_type = SidecarLimitType::Angle;
+        angle.max_angle_x = plain(30.0);
+        assert!((limit_angle(&angle, 0.0) - 30.0).abs() < 1e-12);
+        let mut polar = bone();
+        polar.limit_type = SidecarLimitType::Polar;
+        polar.max_angle_x = plain(30.0);
+        polar.max_angle_z = plain(60.0);
+        assert!((limit_angle(&polar, 0.0) - 45.0).abs() < 1e-12);
+    }
+
+    /// rest不明時は制限角に落ちる。
+    #[test]
+    fn 不明形状は制限角に落ちる() {
+        let mut angle = bone();
+        angle.limit_type = SidecarLimitType::Angle;
+        angle.max_angle_x = plain(30.0);
+        assert!((effective_limit_angle(&angle, 0.0, None) - 30.0).abs() < 1e-12);
+    }
+
+    /// 広い制限は方向を変えない。
+    #[test]
+    fn 広い制限は方向を変えない() {
+        let mut polar = bone();
+        polar.limit_type = SidecarLimitType::Polar;
+        polar.max_angle_x = plain(180.0);
+        polar.max_angle_z = plain(90.0);
+        let direction = [0.3, 0.5, 0.8];
+        let limited = apply_angle_limit(
+            &polar.limit_type,
+            [0.0, 1.0, 0.0],
+            [0.0; 3],
+            [180.0, 90.0],
+            direction,
+        );
+        let want = vec_normalized_or_zero(direction);
+        for i in 0..3 {
+            assert!((limited[i] - want[i]).abs() < 1e-12);
+        }
+    }
+
+    /// 錐体制限は角度内に収める。
+    #[test]
+    fn 錐体制限は角度内に収める() {
+        let tilted = [0.0, 0.9961946980917455, 0.08715574274765817];
+        let kept = clamp_to_cone([0.0, 1.0, 0.0], tilted, 45.0);
+        assert!((vec_angle_deg([0.0, 1.0, 0.0], kept) - 5.0).abs() < 1e-9);
+        let cut = clamp_to_cone([0.0, 1.0, 0.0], tilted, 2.0);
+        assert!((vec_angle_deg([0.0, 1.0, 0.0], cut) - 2.0).abs() < 1e-9);
     }
 }

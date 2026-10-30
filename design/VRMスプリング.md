@@ -6,8 +6,9 @@
 参照解決と座標検証、スプリングの最小出力を行う設計を担当する。
 sidecarの目的・スキーマ・IDとパスの規則・完全一致の対応付け・
 座標ゲート・上限と失敗条件・出力範囲と制限を持つ。
-完全な参照実装一致（分岐・endpoint・limit・center・曲線の再現）・
-補助ノードの生成・平面colliderや拘束の解釈・FX既定姿勢の評価は担当しない。
+完全な参照実装一致（endpoint・平均tail・limit拡張の出力・補助ノードの生成）・
+平面colliderや拘束の解釈・FX既定姿勢の評価は担当しない。
+関節値は参照実装の式どおりに求め、Unity出力と突き合わせる。
 
 中間表現は [`VRM中間モデル`](VRM中間モデル.md) が持ち、
 GLBへの書き出しは [`VRM書き出し`](VRM書き出し.md) が行う。
@@ -23,7 +24,7 @@ flowchart LR
     model[VrmModel<br/>ノード階層] --> resolve
     parse --> resolve
     resolve --> out[PhysicsResolution<br/>対応表・未解決・変換行列]
-    out --> comp[compile_springs<br/>分岐分割・第一近似]
+    out --> comp[compile_springs<br/>分岐分割・式どおりの関節値]
     sidecar2[PhysicsSidecar<br/>値] --> comp
     comp --> bones[VrmSpringBones<br/>診断付き]
     bones --> next[次単位<br/>完全移植]
@@ -129,10 +130,12 @@ sidecarの `capture.coordinateSpace` はUnityの左手系
 ## 保証しないこと
 
 - スプリングチェーンの完全なコンパイルはしない。出力するのは分岐分割した鎖と
-  第一近似の値だけであり、制限は [`VRMスプリング`](#出力範囲と制限) に残す。
-  参照実装の完全移植は次の作業単位である。
+  参照実装の式による関節値であり、制限は [`VRMスプリング`](#出力範囲と制限) に残す。
+  endpoint・平均tail・limit拡張の出力は次の作業単位である。
 - シーン追加ノードの補助生成はしない。参照があれば保留として失敗する。
-- 平面colliderは除外して報告する。limit・拘束・FX既定姿勢の評価はしない。
+- 平面colliderは除外して報告する。`VRMC_springBone_limit` 拡張の出力・拘束・
+  FX既定姿勢・animated・stretch系の評価はしない。
+  制限は関節値の計算にだけ使い、拡張としては出さない。
 - 推測での軸決定・単位決定・名前近似はしない。
 
 ## 出力範囲と制限
@@ -150,8 +153,8 @@ headとして始め、所有するAim先を辿る。端末の骨も関節に含�
 長さの無い骨はheadにならず、前springの端末として終わり、
 そのAim先が次のspringを始める。
 jointにできない未解決ノードが混ざる鎖は落とし、飛ばして接続はしない。
-endpoint生成・平均tail生成・ゼロ長分割・limit・曲線の再現はしない。
-centerは付ける。pull補正（HoldsImmobileの強い引き）は次単位であり、今回は行わない。
+endpoint生成・平均tail生成・ゼロ長分割・`VRMC_springBone_limit` の出力はしない。
+centerは付ける。`HoldsImmobile` はcenterなしの鎖の引きの強さに織り込む。
 近似と切り捨ては [`SpringCompileReport`] に残し、CLIのstderrにも主要な件数を出す。
 
 ```mermaid
@@ -172,17 +175,39 @@ flowchart LR
   各子は新しいspringのheadになり得る。
 - `Average` は今回は最初の子に畳み、近似として記録する。平均tail生成は次段階である。
 
-パラメータは第一近似であり、参照実装準拠ではない。
+パラメータは参照実装の式どおりに求める。末端は直前headの値を写す。
 
-- `hit_radius` は `radius` のbase値。曲線のキー列は評価せず、使った場合は記録する。
-- `stiffness` は `stiffness` のbase値。Simplifiedでも0にしない。
-- `drag_force` は `clamp01(1 - spring)`。範囲外は丸めて記録する。
-- `gravity_power` は0、`gravity_dir` は `[0,-1,0]`。関節数で記録する。
+- 曲線は `value × curve(t)` で評価する（キーが無ければ `value`）。
+  Hermite補間（傾き×区間幅）とwrap（0/1/2/4/8）を使い、重み付きは拒否する。
+  頭側はchain depth位置 `T`、半径は1手先の `RadiusT` で評価する。
+  endpointは作らないため、末端なしのまま `T = depth/(maxDepth-1)`、
+  `RadiusT = depth/maxDepth` を使う。
+- `stiffness`・`drag_force`・`gravity_power`・`hit_radius` は
+  Advanced/Simplified・版1.0/1.1・falloff・制限・HoldsImmobileを織り込んだ
+  参照実装の式で求める。骨長はUnity空間の世界行列×aim位置の長さであり、
+  不明時は較正長を使う。重力方向は符号だけで決まる単位ベクトルである。
+- 制限角は `EffectiveLimitAngle`（36方向の冪平均）で求め、
+  `HeldRatio`・`LooseFloor` で引きを強める。limitの計算だけは
+  参照実装と同じ単精度で行う。`VRMC_springBone_limit` 拡張の出力はしないが、
+  計算にはlimit入力（種別・最大角・制限回転・カーブ）を必ず使う。
+- `HoldsImmobile`（centerなしの部分immobile）はhead位置のimmobile値を
+  `held` として引きに織り込む。centerあり・未使用の場合は0である。
+- Unity出力との突き合わせでは、drag・gravity・hitRadius・重力方向は完全一致し、
+  stiffnessは111/148件（75%）が許容差（abs 1e-5 + rel 1e-4）に収まる。
+  残る37件はいずれもPolar制限の頭関節で、Unity側が0.1〜0.8%だけ弱い。
+  原因はUnity側の単精度36方向ループの丸めと見込んでいる。一致方向の試行では
+  内積が1ちょうどになり、単精度の丸めで1をわずかに下回ると acos が有限の角度を
+  返し、その平方根が冪平均に効いて制限が緩む。こちらは参照実装と同じ単精度で
+  求めており、Unity側だけが緩めの制限として弱めの硬さに出る。原因の切り分けとして、
+  写像・関節順・式文・定数・Euler順序・枠組みの突き合わせと、f32版の再計算、
+  入力差分（Unity側スナップショットとsidecarは位置最大5.5e-7・設定一致）の確認を
+  行い、いずれも差を説明できないことを確かめた。詳細は試験の報告に残す。
 - `center` は次の規則で付ける。付けなかったspringは理由別に記録する。
   - 各PhysBoneのimmobileは `value × curve(t)` で評価する（キーが無ければ `value`）。
     Tは木の深さ位置（端末が無い鎖は0）である。
   - `HoldsImmobile`（AllMotionかつ部分的なimmobile）の場合はcenterを付けない。
-    強いpullでの近似は次単位であり、今回は行わない。該当PhysBoneを記録する。
+    代わりにhead位置のimmobile値を引きの強さに織り込む。
+    該当PhysBoneを記録する。
   - Worldかつchain rootの値が0.5未満の場合はcenterを付けない。該当PhysBoneを記録する。
   - 候補はAllMotionではchain rootの親、Worldでは鎖の最上位祖先である。
     実アバタールート（Milfyのようにsidecarに含まれない）は辿れないため、
