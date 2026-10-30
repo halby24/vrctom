@@ -39,7 +39,7 @@ pub use physics::{
     ResolvedCollider, ResolvedPhysBone, RootCut, SharedNode, SidecarCurve, SkippedBone,
     SkippedBoneReason, SpringCompileOptions, SpringCompileReport, VrmSpring, VrmSpringBones,
     VrmSpringCollider, VrmSpringColliderGroup, VrmSpringColliderShape, VrmSpringJoint,
-    ZeroLengthJoint, compile_springs,
+    VrmSpringJointLimit, ZeroLengthJoint, compile_springs,
 };
 use std::collections::{HashMap, HashSet};
 

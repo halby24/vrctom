@@ -6,7 +6,7 @@
 参照解決と座標検証、スプリングの最小出力を行う設計を担当する。
 sidecarの目的・スキーマ・IDとパスの規則・完全一致の対応付け・
 座標ゲート・上限と失敗条件・出力範囲と制限を持つ。
-完全な参照実装一致（endpoint・平均tail・limit拡張の出力・補助ノードの生成）・
+完全な参照実装一致（endpoint・平均tail・補助ノードの生成）・
 平面colliderや拘束の解釈・FX既定姿勢の評価は担当しない。
 関節値は参照実装の式どおりに求め、Unity出力と突き合わせる。
 
@@ -130,12 +130,11 @@ sidecarの `capture.coordinateSpace` はUnityの左手系
 ## 保証しないこと
 
 - スプリングチェーンの完全なコンパイルはしない。出力するのは分岐分割した鎖と
-  参照実装の式による関節値であり、制限は [`VRMスプリング`](#出力範囲と制限) に残す。
-  endpoint・平均tail・limit拡張の出力は次の作業単位である。
+  参照実装の式による関節値・角度制限であり、制限は [`VRMスプリング`](#出力範囲と制限) に残す。
+  endpoint・平均tailの出力は次の作業単位である。
 - シーン追加ノードの補助生成はしない。参照があれば保留として失敗する。
-- 平面colliderは除外して報告する。`VRMC_springBone_limit` 拡張の出力・拘束・
+- 平面colliderは除外して報告する。拘束・
   FX既定姿勢・animated・stretch系の評価はしない。
-  制限は関節値の計算にだけ使い、拡張としては出さない。
 - 推測での軸決定・単位決定・名前近似はしない。
 
 ## 出力範囲と制限
@@ -153,7 +152,8 @@ headとして始め、所有するAim先を辿る。端末の骨も関節に含�
 長さの無い骨はheadにならず、前springの端末として終わり、
 そのAim先が次のspringを始める。
 jointにできない未解決ノードが混ざる鎖は落とし、飛ばして接続はしない。
-endpoint生成・平均tail生成・ゼロ長分割・`VRMC_springBone_limit` の出力はしない。
+endpoint生成・平均tail生成・ゼロ長分割はしない。
+角度制限（`VRMC_springBone_limit`）はhead関節に出す。
 centerは付ける。`HoldsImmobile` はcenterなしの鎖の引きの強さに織り込む。
 近似と切り捨ては [`SpringCompileReport`] に残し、CLIのstderrにも主要な件数を出す。
 
@@ -188,8 +188,16 @@ flowchart LR
   不明時は較正長を使う。重力方向は符号だけで決まる単位ベクトルである。
 - 制限角は `EffectiveLimitAngle`（36方向の冪平均）で求め、
   `HeldRatio`・`LooseFloor` で引きを強める。倍精度で求めた数学的に正しい値を
-  そのまま使い、単精度化は行わない。`VRMC_springBone_limit` 拡張の出力はしないが、
+  そのまま使い、単精度化は行わない。
   計算にはlimit入力（種別・最大角・制限回転・カーブ）を必ず使う。
+- 角度制限は `JointLimit` 相当をhead関節に付け、`VRMC_springBone_limit` として出す。
+  種別は Angle→Cone、Hinge→Hinge、Polar→Sphericalであり、
+  角度は `min(maxAngleX, 180°)`（yawは `min(maxAngleZ, 90°)`）をラジアンで持つ。
+  回転はUnity空間の `limit_frame` をVRM空間へ鏡像した単位四元数である。
+  rest不明・制限なしの場合は付けず、末端（springの末尾）にも付けない。
+  参照実装のTailはlimitを消すことに対応する。
+  UniVRMの `LimitSpaceOffset`（軸合わせのオフセット）・`StraightDownMargin` による除外・
+  `OmittedLimits` 報告は未対応であり、その他のlimit拡張も出さない。
 - `HoldsImmobile`（centerなしの部分immobile）はhead位置のimmobile値を
   `held` として引きに織り込む。centerあり・未使用の場合は0である。
 - Unity出力との突き合わせでは、drag・gravity・hitRadius・重力方向は完全一致する。

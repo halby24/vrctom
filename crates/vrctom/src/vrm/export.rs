@@ -1067,11 +1067,20 @@ impl<'a> GlbWriter<'a> {
         let mut others = serde_json::Map::new();
         others.insert("VRMC_vrm".to_string(), serde_json::Value::Object(vrmc));
         let mut wrote_spring_bone = false;
+        let mut wrote_spring_bone_limit = false;
         if !self.model.spring_bones.springs.is_empty()
             || !self.model.spring_bones.colliders.is_empty()
             || !self.model.spring_bones.collider_groups.is_empty()
         {
             let spring_bone = self.build_spring_bone_json()?;
+            // 1件でも角度制限があれば、読み手向けに拡張使用を宣言する。
+            wrote_spring_bone_limit = self
+                .model
+                .spring_bones
+                .springs
+                .iter()
+                .flat_map(|spring| spring.joints.iter())
+                .any(|joint| joint.limit.is_some());
             others.insert("VRMC_springBone".to_string(), spring_bone);
             wrote_spring_bone = true;
         }
@@ -1082,6 +1091,9 @@ impl<'a> GlbWriter<'a> {
         }
         if wrote_spring_bone {
             used.push("VRMC_springBone".to_string());
+        }
+        if wrote_spring_bone_limit {
+            used.push("VRMC_springBone_limit".to_string());
         }
         self.root.extensions_used = used;
         Ok(())
@@ -1295,14 +1307,21 @@ impl<'a> GlbWriter<'a> {
                 check_joint_value(joint.gravity_power, "gravityPower", 0.0, f32::INFINITY)?;
                 check_joint_value(joint.drag_force, "dragForce", 0.0, 1.0)?;
                 let gravity_dir = normalize_unit(joint.gravity_dir, "gravityDir")?;
-                joints.push(serde_json::json!({
+                let mut joint_value = serde_json::json!({
                     "node": joint.node,
                     "hitRadius": joint.hit_radius,
                     "stiffness": joint.stiffness,
                     "gravityPower": joint.gravity_power,
                     "gravityDir": [gravity_dir[0], gravity_dir[1], gravity_dir[2]],
                     "dragForce": joint.drag_force,
-                }));
+                });
+                if let Some(limit_value) = build_joint_limit_json(joint.limit.as_ref())? {
+                    joint_value
+                        .as_object_mut()
+                        .expect("関節JSONはオブジェクトである")
+                        .insert("extensions".to_string(), limit_value);
+                }
+                joints.push(joint_value);
             }
             if let Some(center) = spring.center {
                 check_node(center, "springBone center")?;
@@ -1617,6 +1636,91 @@ fn normalize_unit(vector: [f32; 3], field: &str) -> Result<[f32; 3], VrmExportEr
         ));
     }
     Ok([vector[0] / length, vector[1] / length, vector[2] / length])
+}
+
+/// 関節の角度制限が単位四元数か確かめる。非有限・ゼロ長の場合は失敗する。
+fn check_quat(rotation: [f32; 4], field: &str) -> Result<[f32; 4], VrmExportError> {
+    let length2 = rotation[0] * rotation[0]
+        + rotation[1] * rotation[1]
+        + rotation[2] * rotation[2]
+        + rotation[3] * rotation[3];
+    if !length2.is_finite() || length2 <= 0.0 {
+        return Err(VrmExportError::new(
+            VrmExportErrorKind::InvalidStructure,
+            format!("springBone jointの{field}が正規化できない"),
+        ));
+    }
+    let length = length2.sqrt();
+    // 既に単位のはずであり、ずれは丸めの範囲に収まる。
+    if (length - 1.0).abs() > 1e-3 {
+        return Err(VrmExportError::new(
+            VrmExportErrorKind::InvalidStructure,
+            format!("springBone jointの{field}が単位四元数でない"),
+        ));
+    }
+    Ok([
+        rotation[0] / length,
+        rotation[1] / length,
+        rotation[2] / length,
+        rotation[3] / length,
+    ])
+}
+
+/// 関節の角度制限を `VRMC_springBone_limit` の拡張JSONにする。
+/// 制限なしの場合は `None` を返す。角度は有限値で、円錐・蝶番は0〜π、
+/// 球面のpitchは0〜π・yawは0〜π/2の範囲を検証する。
+/// 回転は単位四元数を検証する。仕様版は `1.0-draft` である。
+fn build_joint_limit_json(
+    limit: Option<&super::VrmSpringJointLimit>,
+) -> Result<Option<serde_json::Value>, VrmExportError> {
+    use std::f32::consts::{FRAC_PI_2, PI};
+    let Some(limit) = limit else {
+        return Ok(None);
+    };
+    let limit_value = match limit {
+        super::VrmSpringJointLimit::Cone { angle, rotation } => {
+            check_joint_value(*angle, "limit angle", 0.0, PI)?;
+            let rotation = check_quat(*rotation, "limit rotation")?;
+            serde_json::json!({
+                "cone": {
+                    "angle": angle,
+                    "rotation": [rotation[0], rotation[1], rotation[2], rotation[3]],
+                }
+            })
+        }
+        super::VrmSpringJointLimit::Hinge { angle, rotation } => {
+            check_joint_value(*angle, "limit angle", 0.0, PI)?;
+            let rotation = check_quat(*rotation, "limit rotation")?;
+            serde_json::json!({
+                "hinge": {
+                    "angle": angle,
+                    "rotation": [rotation[0], rotation[1], rotation[2], rotation[3]],
+                }
+            })
+        }
+        super::VrmSpringJointLimit::Spherical {
+            pitch,
+            yaw,
+            rotation,
+        } => {
+            check_joint_value(*pitch, "limit pitch", 0.0, PI)?;
+            check_joint_value(*yaw, "limit yaw", 0.0, FRAC_PI_2)?;
+            let rotation = check_quat(*rotation, "limit rotation")?;
+            serde_json::json!({
+                "spherical": {
+                    "pitch": pitch,
+                    "yaw": yaw,
+                    "rotation": [rotation[0], rotation[1], rotation[2], rotation[3]],
+                }
+            })
+        }
+    };
+    Ok(Some(serde_json::json!({
+        "VRMC_springBone_limit": {
+            "specVersion": "1.0-draft",
+            "limit": limit_value,
+        }
+    })))
 }
 
 /// アクセサ定義。型情報と用途をまとめて引数の膨張を避ける。

@@ -132,6 +132,39 @@ pub struct VrmSpringJoint {
     pub gravity_dir: [f32; 3],
     /// 抵抗。
     pub drag_force: f32,
+    /// 角度制限。末端や制限なし・rest不明の場合は `None` である。
+    /// 参照実装の `SpringJointLimit` に相当し、`VRMC_springBone_limit` として出す。
+    pub limit: Option<VrmSpringJointLimit>,
+}
+
+/// スプリング関節の角度制限。角度はラジアン、回転はVRM空間の単位四元数である。
+/// 参照実装の `SpringJointLimit`（`SpringLimitKind`）に相当する。
+/// `Cone` はVRChatのAngle、`Hinge` はHinge、`Spherical` はPolar制限である。
+#[derive(Debug, Clone)]
+pub enum VrmSpringJointLimit {
+    /// 円錐制限。`angle` は最大角（`maxAngleX` を180度で止めた値）である。
+    Cone {
+        /// 最大角（ラジアン）。
+        angle: f32,
+        /// 制限の枠組み（VRM空間）。
+        rotation: [f32; 4],
+    },
+    /// 蝶番制限。`angle` は最大角（`maxAngleX` を180度で止めた値）である。
+    Hinge {
+        /// 最大角（ラジアン）。
+        angle: f32,
+        /// 制限の枠組み（VRM空間）。
+        rotation: [f32; 4],
+    },
+    /// 球面制限。`pitch` はX軸、`yaw` はZ軸の最大角である。
+    Spherical {
+        /// X軸の最大角（ラジアン。180度で止める）。
+        pitch: f32,
+        /// Z軸の最大角（ラジアン。90度で止める）。
+        yaw: f32,
+        /// 制限の枠組み（VRM空間）。
+        rotation: [f32; 4],
+    },
 }
 
 /// スプリングcollider1件。
@@ -2621,6 +2654,67 @@ fn effective_limit_angle(record: &SidecarPhysBone, t: f64, rest: Option<&JointRe
     efflim(rest.bone_vector, rotation, max_angle, &record.limit_type).0
 }
 
+/// 関節の角度制限。`VRMC_springBone_limit` として出す値であり、
+/// 参照実装の `JointLimit` に相当する。
+/// rest不明・制限なしの場合は `None` を返す。末端の扱いは呼び出し側で行い、
+/// ここでは末端かどうかを問わない。
+/// 角度は有限値に丸めて180度（yawは90度）で止め、ラジアンで持つ。
+/// 回転はUnity空間の `limit_frame` をVRM空間へ鏡像した単位四元数である。
+fn joint_limit(
+    record: &SidecarPhysBone,
+    t: f64,
+    rest: Option<&JointRest>,
+) -> Option<VrmSpringJointLimit> {
+    let rest = rest?;
+    if !has_angle_limit(record) {
+        return None;
+    }
+    let max = max_angles(record, t);
+    let rotation = limit_rotation(record, t);
+    let frame = limit_frame(rest.bone_vector, rotation);
+    // 鏡像はノルムを保つため、正規化して有限性を確かめる。
+    let mirrored = mirror_quat(frame);
+    let len2 = mirrored[0] * mirrored[0]
+        + mirrored[1] * mirrored[1]
+        + mirrored[2] * mirrored[2]
+        + mirrored[3] * mirrored[3];
+    if !len2.is_finite() || len2 <= 0.0 {
+        return None;
+    }
+    let len = len2.sqrt();
+    let normalized = [
+        (mirrored[0] / len) as f32,
+        (mirrored[1] / len) as f32,
+        (mirrored[2] / len) as f32,
+        (mirrored[3] / len) as f32,
+    ];
+    if !normalized.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let to_radians = std::f64::consts::PI / 180.0;
+    let pitch = (finite_or_zero(max[0]).min(180.0) * to_radians) as f32;
+    let yaw = (finite_or_zero(max[1]).min(90.0) * to_radians) as f32;
+    if !pitch.is_finite() || !yaw.is_finite() {
+        return None;
+    }
+    match record.limit_type {
+        SidecarLimitType::Angle => Some(VrmSpringJointLimit::Cone {
+            angle: pitch,
+            rotation: normalized,
+        }),
+        SidecarLimitType::Hinge => Some(VrmSpringJointLimit::Hinge {
+            angle: pitch,
+            rotation: normalized,
+        }),
+        SidecarLimitType::Polar => Some(VrmSpringJointLimit::Spherical {
+            pitch,
+            yaw,
+            rotation: normalized,
+        }),
+        SidecarLimitType::None => None,
+    }
+}
+
 /// rest方向から重力への角度（ラジアン）。rest不明時は直角である。
 fn rest_to_gravity(rest: Option<&JointRest>, gravity_up: bool) -> f64 {
     let Some(rest) = rest else {
@@ -3186,7 +3280,9 @@ pub fn compile_springs(
             }
             // 関節ごとに参照実装の式で求める。末端は直前headの値を写す
             // （VRMは末端の値を無視するため）。
+            // 角度制限はheadごとに求め、末端（springの末尾）には付けない。
             let mut params_list = Vec::with_capacity(joints.len());
+            let mut limits: Vec<Option<VrmSpringJointLimit>> = Vec::with_capacity(joints.len());
             for (index, &sidecar_joint) in joints.iter().enumerate() {
                 let is_tail = index + 1 == joints.len() && !truncated;
                 if is_tail {
@@ -3195,6 +3291,8 @@ pub fn compile_springs(
                         .copied()
                         .expect("末端の前にhead関節がある");
                     params_list.push(tail);
+                    // 末端には角度制限を付けない。参照実装のTailはlimitを消す。
+                    limits.push(None);
                     // 末端は直前headの写しとして記録する。
                     if options.joint_trace {
                         let mut traced = report
@@ -3239,6 +3337,7 @@ pub fn compile_springs(
                 } else {
                     None
                 };
+                limits.push(joint_limit(source, head_t, rest.as_ref()));
                 params_list.push(joint_parameters(
                     source,
                     head_t,
@@ -3291,10 +3390,16 @@ pub fn compile_springs(
                     });
                 }
             }
+            // springの末尾は末端として角度制限を付けない。
+            // 切り詰めで末端写しが無い場合も、出力上の末尾は制限なしにする。
+            if let Some(last) = limits.last_mut() {
+                *last = None;
+            }
             let joints = vrm_joints
                 .into_iter()
                 .zip(params_list)
-                .map(|(node, params)| {
+                .zip(limits)
+                .map(|((node, params), limit)| {
                     let gravity_dir = if params.gravity_up {
                         [0.0, 1.0, 0.0]
                     } else {
@@ -3307,6 +3412,7 @@ pub fn compile_springs(
                         gravity_power: to_f32_finite(params.power, "重力")?,
                         gravity_dir,
                         drag_force: to_f32_finite(params.drag, "抵抗")?,
+                        limit,
                     })
                 })
                 .collect::<Result<Vec<_>, VrmError>>()?;
@@ -4361,5 +4467,96 @@ mod joint_tests {
         assert!((vec_angle_deg([0.0, 1.0, 0.0], kept) - 5.0).abs() < 1e-9);
         let cut = clamp_to_cone([0.0, 1.0, 0.0], tilted, 2.0);
         assert!((vec_angle_deg([0.0, 1.0, 0.0], cut) - 2.0).abs() < 1e-9);
+    }
+
+    /// 角度制限の出力形。種別ごとに円錐・蝶番・球面へ写す。
+    #[test]
+    fn 制限出力は種別に従う() {
+        let rest = JointRest {
+            bone_vector: [0.0, 1.0, 0.0],
+            bone_to_world: [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+        };
+        let mut polar = bone();
+        polar.limit_type = SidecarLimitType::Polar;
+        polar.max_angle_x = plain(30.0);
+        polar.max_angle_z = plain(60.0);
+        let spherical = joint_limit(&polar, 0.0, Some(&rest)).expect("Polarは球面になる");
+        match spherical {
+            VrmSpringJointLimit::Spherical {
+                pitch,
+                yaw,
+                rotation,
+            } => {
+                assert!((pitch - 30.0f32.to_radians()).abs() < 1e-6);
+                assert!((yaw - 60.0f32.to_radians()).abs() < 1e-6);
+                assert!((rotation[3] - 1.0).abs() < 1e-6);
+            }
+            _ => panic!("Polarは球面である"),
+        }
+        let mut angle = bone();
+        angle.limit_type = SidecarLimitType::Angle;
+        angle.max_angle_x = plain(30.0);
+        let cone = joint_limit(&angle, 0.0, Some(&rest)).expect("Angleは円錐になる");
+        match cone {
+            VrmSpringJointLimit::Cone { angle, rotation } => {
+                assert!((angle - 30.0f32.to_radians()).abs() < 1e-6);
+                assert!((rotation[3] - 1.0).abs() < 1e-6);
+            }
+            _ => panic!("Angleは円錐である"),
+        }
+        let mut hinge = bone();
+        hinge.limit_type = SidecarLimitType::Hinge;
+        hinge.max_angle_x = plain(30.0);
+        let hinge_limit = joint_limit(&hinge, 0.0, Some(&rest)).expect("Hingeは蝶番になる");
+        match hinge_limit {
+            VrmSpringJointLimit::Hinge { angle, rotation } => {
+                assert!((angle - 30.0f32.to_radians()).abs() < 1e-6);
+                assert!((rotation[3] - 1.0).abs() < 1e-6);
+            }
+            _ => panic!("Hingeは蝶番である"),
+        }
+    }
+
+    /// 角度制限の上限。180度・90度で止める。
+    #[test]
+    fn 制限出力は上限で止まる() {
+        let rest = JointRest {
+            bone_vector: [0.0, 1.0, 0.0],
+            bone_to_world: [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+        };
+        let mut polar = bone();
+        polar.limit_type = SidecarLimitType::Polar;
+        polar.max_angle_x = plain(200.0);
+        polar.max_angle_z = plain(120.0);
+        let limited = joint_limit(&polar, 0.0, Some(&rest)).expect("上限でも球面になる");
+        match limited {
+            VrmSpringJointLimit::Spherical { pitch, yaw, .. } => {
+                assert!((pitch - std::f32::consts::PI).abs() < 1e-6);
+                assert!((yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+            }
+            _ => panic!("Polarは球面である"),
+        }
+    }
+
+    /// 制限なし・rest不明は制限なしになる。
+    #[test]
+    fn 制限なしは出力しない() {
+        let rest = JointRest {
+            bone_vector: [0.0, 1.0, 0.0],
+            bone_to_world: [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+        };
+        let none = bone();
+        assert!(joint_limit(&none, 0.0, Some(&rest)).is_none());
+        let mut polar = bone();
+        polar.limit_type = SidecarLimitType::Polar;
+        polar.max_angle_x = plain(30.0);
+        polar.max_angle_z = plain(60.0);
+        assert!(joint_limit(&polar, 0.0, None).is_none());
     }
 }

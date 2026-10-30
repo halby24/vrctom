@@ -686,6 +686,7 @@ fn 空のグループ参照は書かない() {
                 gravity_power: 0.0,
                 gravity_dir: [0.0, -1.0, 0.0],
                 drag_force: 0.5,
+                limit: None,
             }],
             center: None,
             collider_groups: Vec::new(),
@@ -1216,6 +1217,268 @@ fn 実fixtureの関節値はunity出力と一致する() {
     );
 }
 
+/// 角度制限の拡張出力をUnity出力と突き合わせる。
+/// 末端・制限なし・rest不明には付けず、headのみに付ける。
+/// Unityは71関節（spherical 58/cone 9/hinge 4）に拡張を持つ。
+/// 角度（pitch/yaw/angle）は完全一致し、回転はsidecar欠落カーブの20関節だけが
+/// ずれる（Ribbon A-D L/R・SideHair_A L/R）。詳細は設計文書に残す。
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn 実fixtureの角度制限はunity出力と一致する() {
+    let (Some(fbx経路), Some(sidecar経路), Some(unity経路)) = (
+        std::env::var_os("VRCTOM_FBX_FIXTURE"),
+        std::env::var_os("VRCTOM_PHYSICS_SIDECAR"),
+        std::env::var_os("VRCTOM_UNITY_VRM"),
+    ) else {
+        eprintln!("VRCTOM_FBX_FIXTURE/VRCTOM_PHYSICS_SIDECAR/VRCTOM_UNITY_VRM未設定のため跳ばす");
+        return;
+    };
+    let fbxバイト列 = std::fs::read(&fbx経路).expect("実fixtureは読める");
+    let sidecar文 = std::fs::read(&sidecar経路).expect("実sidecarは読める");
+    let 解析 = vrctom::fbx::FbxFile::parse(&fbxバイト列, &vrctom::fbx::FbxOptions::new())
+        .expect("実fixtureは読める");
+    let (モデル, _) =
+        VrmModel::from_fbx(&解析, &vrctom::vrm::VrmOptions::new()).expect("実fixtureは変換できる");
+    let sidecar =
+        PhysicsSidecar::parse(&sidecar文, &PhysicsLimits::new()).expect("実sidecarは検証を通る");
+    let 解決 = モデル
+        .resolve_physics_sidecar(&sidecar, &fbxバイト列)
+        .expect("実fixtureの参照は解決できる");
+    let コンパイル済み = compile_springs(&sidecar, &モデル, &解決, &SpringCompileOptions::new())
+        .expect("実fixtureの鎖はコンパイルできる");
+    // 自前の内訳。末端は制限なしである。
+    let mut 自内訳 = std::collections::HashMap::new();
+    let mut 自総数 = 0usize;
+    for spring in &コンパイル済み.bones.springs {
+        for (索引, 関節) in spring.joints.iter().enumerate() {
+            let 末端 = 索引 + 1 == spring.joints.len();
+            if 末端 {
+                assert!(
+                    関節.limit.is_none(),
+                    "末端には制限を付けない: {}",
+                    spring.name
+                );
+                continue;
+            }
+            let Some(制限) = 関節.limit.as_ref() else {
+                continue;
+            };
+            自総数 += 1;
+            let 種別 = match 制限 {
+                vrctom::vrm::VrmSpringJointLimit::Spherical { .. } => "spherical",
+                vrctom::vrm::VrmSpringJointLimit::Cone { .. } => "cone",
+                vrctom::vrm::VrmSpringJointLimit::Hinge { .. } => "hinge",
+            };
+            *自内訳.entry(種別).or_insert(0usize) += 1;
+        }
+    }
+    let unityバイト列 = std::fs::read(&unity経路).expect("Unity製VRMは読める");
+    let unity_json = glbのjsonを取る(&unityバイト列);
+    let unity_springs = unity_json["extensions"]["VRMC_springBone"]["springs"]
+        .as_array()
+        .expect("Unity製VRMにspringがある");
+    let mut 他内訳 = std::collections::HashMap::new();
+    let mut 他総数 = 0usize;
+    for spring in unity_springs {
+        for 関節 in spring["joints"]
+            .as_array()
+            .expect("Unityの関節は配列である")
+        {
+            let 制限 = &関節["extensions"]["VRMC_springBone_limit"]["limit"];
+            if 制限.is_null() {
+                continue;
+            }
+            他総数 += 1;
+            if 制限.get("spherical").is_some() {
+                *他内訳.entry("spherical").or_insert(0usize) += 1;
+            } else if 制限.get("cone").is_some() {
+                *他内訳.entry("cone").or_insert(0usize) += 1;
+            } else if 制限.get("hinge").is_some() {
+                *他内訳.entry("hinge").or_insert(0usize) += 1;
+            } else {
+                panic!("Unityの制限種別が不明である");
+            }
+        }
+    }
+    eprintln!("角度制限: 自={自総数}件{自内訳:?} 他={他総数}件{他内訳:?}");
+    assert_eq!(自総数, 71, "自前の制限関節数は71である");
+    assert_eq!(他総数, 71, "Unityの制限関節数は71である");
+    assert_eq!(自内訳, 他内訳, "制限の種別内訳は一致する");
+    // 代表値の突き合わせ。角度は完全一致し、回転は欠落カーブの20関節だけずれる。
+    let 許容 = |実: f64, 想: f64| (実 - 想).abs() <= 1e-5 + 1e-4 * 想.abs();
+    let 許容回転 = |実: &[f32; 4], 想: &[f64; 4]| {
+        // 四元数は符号の自由度があるため、符号を合わせて比べる。
+        let 符号 = if (実[0] as f64) * 想[0]
+            + (実[1] as f64) * 想[1]
+            + (実[2] as f64) * 想[2]
+            + (実[3] as f64) * 想[3]
+            >= 0.0
+        {
+            1.0
+        } else {
+            -1.0
+        };
+        実.iter()
+            .enumerate()
+            .all(|(i, v)| (*v as f64 - 符号 * 想[i]).abs() <= 1e-4 + 1e-3 * 想[i].abs())
+    };
+    let mut unity表: std::collections::HashMap<&str, &serde_json::Value> =
+        std::collections::HashMap::new();
+    for spring in unity_springs {
+        let 名前 = spring["name"].as_str().expect("spring名は文字列である");
+        assert!(
+            unity表.insert(名前, spring).is_none(),
+            "Unityのspring名は重ならない"
+        );
+    }
+    let mut 角度合致 = 0usize;
+    let mut 角度総数 = 0usize;
+    let mut 回転合致 = 0usize;
+    let mut 回転総数 = 0usize;
+    let mut 回転不一致: Vec<String> = Vec::new();
+    for spring in &コンパイル済み.bones.springs {
+        let 他 = unity表
+            .get(spring.name.as_str())
+            .unwrap_or_else(|| panic!("Unity出力にspringが無い: {}", spring.name));
+        let 他関節 = 他["joints"].as_array().expect("Unityの関節は配列である");
+        assert_eq!(他関節.len(), spring.joints.len(), "関節数は一致する");
+        for (索引, (関節, 他関節)) in spring.joints.iter().zip(他関節.iter()).enumerate()
+        {
+            let 他制限 = &他関節["extensions"]["VRMC_springBone_limit"]["limit"];
+            let Some(自制限) = 関節.limit.as_ref() else {
+                assert!(
+                    他制限.is_null(),
+                    "自前なしはUnityもなしである: {}[{索引}]",
+                    spring.name
+                );
+                continue;
+            };
+            assert!(
+                !他制限.is_null(),
+                "自前ありはUnityもありである: {}[{索引}]",
+                spring.name
+            );
+            match 自制限 {
+                vrctom::vrm::VrmSpringJointLimit::Spherical {
+                    pitch,
+                    yaw,
+                    rotation,
+                } => {
+                    let 他球 = &他制限["spherical"];
+                    角度総数 += 2;
+                    if 許容(
+                        f64::from(*pitch),
+                        他球["pitch"].as_f64().unwrap_or(f64::NAN),
+                    ) {
+                        角度合致 += 1;
+                    } else {
+                        eprintln!(
+                            "  残差 {}[{索引}] pitch: 自={pitch} 他={}",
+                            spring.name, 他球["pitch"]
+                        );
+                    }
+                    if 許容(f64::from(*yaw), 他球["yaw"].as_f64().unwrap_or(f64::NAN)) {
+                        角度合致 += 1;
+                    } else {
+                        eprintln!(
+                            "  残差 {}[{索引}] yaw: 自={yaw} 他={}",
+                            spring.name, 他球["yaw"]
+                        );
+                    }
+                    let 他回転 = 他球["rotation"]
+                        .as_array()
+                        .expect("Unityの回転は配列である");
+                    let 他回転 = [
+                        他回転[0].as_f64().unwrap_or(f64::NAN),
+                        他回転[1].as_f64().unwrap_or(f64::NAN),
+                        他回転[2].as_f64().unwrap_or(f64::NAN),
+                        他回転[3].as_f64().unwrap_or(f64::NAN),
+                    ];
+                    回転総数 += 1;
+                    if 許容回転(rotation, &他回転) {
+                        回転合致 += 1;
+                    } else {
+                        回転不一致.push(format!("{}[{索引}]", spring.name));
+                    }
+                }
+                vrctom::vrm::VrmSpringJointLimit::Cone { angle, rotation } => {
+                    let 他錐 = &他制限["cone"];
+                    角度総数 += 1;
+                    if 許容(
+                        f64::from(*angle),
+                        他錐["angle"].as_f64().unwrap_or(f64::NAN),
+                    ) {
+                        角度合致 += 1;
+                    } else {
+                        eprintln!(
+                            "  残差 {}[{索引}] cone: 自={angle} 他={}",
+                            spring.name, 他錐["angle"]
+                        );
+                    }
+                    let 他回転 = 他錐["rotation"]
+                        .as_array()
+                        .expect("Unityの回転は配列である");
+                    let 他回転 = [
+                        他回転[0].as_f64().unwrap_or(f64::NAN),
+                        他回転[1].as_f64().unwrap_or(f64::NAN),
+                        他回転[2].as_f64().unwrap_or(f64::NAN),
+                        他回転[3].as_f64().unwrap_or(f64::NAN),
+                    ];
+                    回転総数 += 1;
+                    if 許容回転(rotation, &他回転) {
+                        回転合致 += 1;
+                    } else {
+                        回転不一致.push(format!("{}[{索引}]", spring.name));
+                    }
+                }
+                vrctom::vrm::VrmSpringJointLimit::Hinge { angle, rotation } => {
+                    let 他蝶 = &他制限["hinge"];
+                    角度総数 += 1;
+                    if 許容(
+                        f64::from(*angle),
+                        他蝶["angle"].as_f64().unwrap_or(f64::NAN),
+                    ) {
+                        角度合致 += 1;
+                    } else {
+                        eprintln!(
+                            "  残差 {}[{索引}] hinge: 自={angle} 他={}",
+                            spring.name, 他蝶["angle"]
+                        );
+                    }
+                    let 他回転 = 他蝶["rotation"]
+                        .as_array()
+                        .expect("Unityの回転は配列である");
+                    let 他回転 = [
+                        他回転[0].as_f64().unwrap_or(f64::NAN),
+                        他回転[1].as_f64().unwrap_or(f64::NAN),
+                        他回転[2].as_f64().unwrap_or(f64::NAN),
+                        他回転[3].as_f64().unwrap_or(f64::NAN),
+                    ];
+                    回転総数 += 1;
+                    if 許容回転(rotation, &他回転) {
+                        回転合致 += 1;
+                    } else {
+                        回転不一致.push(format!("{}[{索引}]", spring.name));
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("角度一致: {角度合致}/{角度総数} 回転一致: {回転合致}/{回転総数}");
+    for 差 in 回転不一致.iter().take(25) {
+        eprintln!("  回転残差 {差}");
+    }
+    // 角度は129値（spherical 58×2＋cone 9＋hinge 4）すべて一致する。
+    assert_eq!(角度総数, 58 * 2 + 9 + 4, "角度の総数は129である");
+    assert_eq!(角度合致, 角度総数, "角度は完全一致する");
+    // 回転は欠落カーブの20関節だけずれる。
+    assert_eq!(回転総数, 71, "回転の総数は71である");
+    assert!(
+        回転合致 as f64 / 回転総数 as f64 >= 0.70,
+        "回転一致率が下がった"
+    );
+}
+
 /// collider参照が無いspringは、空配列を出さずに拡張する。
 #[test]
 fn collider参照が無いspringは空配列を出さない() {
@@ -1238,6 +1501,109 @@ fn collider参照が無いspringは空配列を出さない() {
     assert!(拡張.get("colliders").is_none(), "空配列は書かない");
     assert!(拡張.get("colliderGroups").is_none(), "空配列は書かない");
     assert_eq!(拡張["springs"].as_array().expect("springsはある").len(), 1);
+}
+
+/// 角度制限は拡張に載り、使用宣言にも載る。制限なしは載せない。
+#[test]
+fn 角度制限は拡張に載る() {
+    use vrctom::vrm::{VrmSpring, VrmSpringJoint, VrmSpringJointLimit};
+    let mut モデル = 書き出し可能モデルを作る();
+    モデル.spring_bones = VrmSpringBones {
+        springs: vec![VrmSpring {
+            name: "x".to_string(),
+            joints: vec![
+                VrmSpringJoint {
+                    node: 3,
+                    hit_radius: 0.01,
+                    stiffness: 0.5,
+                    gravity_power: 0.0,
+                    gravity_dir: [0.0, -1.0, 0.0],
+                    drag_force: 0.5,
+                    limit: Some(VrmSpringJointLimit::Spherical {
+                        pitch: 0.5,
+                        yaw: 0.25,
+                        rotation: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                },
+                VrmSpringJoint {
+                    node: 4,
+                    hit_radius: 0.01,
+                    stiffness: 0.5,
+                    gravity_power: 0.0,
+                    gravity_dir: [0.0, -1.0, 0.0],
+                    drag_force: 0.5,
+                    limit: None,
+                },
+            ],
+            center: None,
+            collider_groups: Vec::new(),
+        }],
+        colliders: Vec::new(),
+        collider_groups: Vec::new(),
+    };
+    let バイト列 = モデル
+        .to_vrm(&書き出し設定を作る())
+        .expect("制限付きは書き出せる");
+    let json = glbのjsonを取る(&バイト列);
+    let 関節 = json["extensions"]["VRMC_springBone"]["springs"][0]["joints"]
+        .as_array()
+        .expect("jointsは配列である");
+    let 制限 = &関節[0]["extensions"]["VRMC_springBone_limit"];
+    assert_eq!(制限["specVersion"], serde_json::json!("1.0-draft"));
+    assert_eq!(
+        制限["limit"]["spherical"]["pitch"],
+        serde_json::json!(0.5f32)
+    );
+    assert_eq!(
+        制限["limit"]["spherical"]["yaw"],
+        serde_json::json!(0.25f32)
+    );
+    assert!(
+        関節[1].get("extensions").is_none(),
+        "制限なしは拡張を書かない"
+    );
+    let used = json["extensionsUsed"]
+        .as_array()
+        .expect("extensionsUsedは配列である");
+    assert!(used.contains(&serde_json::json!("VRMC_springBone_limit")));
+    let mut モデル2 = 書き出し可能モデルを作る();
+    モデル2.spring_bones = VrmSpringBones {
+        springs: vec![VrmSpring {
+            name: "x".to_string(),
+            joints: vec![
+                VrmSpringJoint {
+                    node: 3,
+                    hit_radius: 0.01,
+                    stiffness: 0.5,
+                    gravity_power: 0.0,
+                    gravity_dir: [0.0, -1.0, 0.0],
+                    drag_force: 0.5,
+                    limit: None,
+                },
+                VrmSpringJoint {
+                    node: 4,
+                    hit_radius: 0.01,
+                    stiffness: 0.5,
+                    gravity_power: 0.0,
+                    gravity_dir: [0.0, -1.0, 0.0],
+                    drag_force: 0.5,
+                    limit: None,
+                },
+            ],
+            center: None,
+            collider_groups: Vec::new(),
+        }],
+        colliders: Vec::new(),
+        collider_groups: Vec::new(),
+    };
+    let バイト列2 = モデル2
+        .to_vrm(&書き出し設定を作る())
+        .expect("制限なしは書き出せる");
+    let json2 = glbのjsonを取る(&バイト列2);
+    let used2 = json2["extensionsUsed"]
+        .as_array()
+        .expect("extensionsUsedは配列である");
+    assert!(!used2.contains(&serde_json::json!("VRMC_springBone_limit")));
 }
 
 /// Sphereは高さがあっても球のままである。

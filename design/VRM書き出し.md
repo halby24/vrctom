@@ -5,7 +5,8 @@
 この文書は、VRM中間モデルからVRM 1.0のGLBバイト列を作る設計を担当する。
 glTFのノード・メッシュ・スキン・材質・モーフターゲットと、
 `VRMC_vrm` 拡張のmeta・humanoid・expressions、`VRMC_springBone` 拡張の
-springs・colliderGroups・collidersを書き出す。
+springs・colliderGroups・colliders、`VRMC_springBone_limit` 拡張の
+関節ごとの角度制限を書き出す。
 材質の内容（Unityの `.mat` からの写像）は [`VRM材質`](VRM材質.md) が担当し、
 表情の選択と差分の作り方は [`VRM表情`](VRM表情.md) が担当し、
 スプリングの中身は [`VRMスプリング`](VRMスプリング.md) が持つ。
@@ -99,6 +100,11 @@ UVはFBXとUnityの左下原点からglTFの左上原点へ合わせるため、
 `springs`・`colliderGroups`・`colliders` を `specVersion: "1.0"` とともに書く。
 空の配列は書式違反（`minItems: 1`）のため省略し、すべて空の場合は
 拡張を付けず、`extensionsUsed` にも加えない。
+関節の角度制限がある場合は、各jointに
+`extensions: {"VRMC_springBone_limit": {"specVersion": "1.0-draft", "limit": {...}}}` を付け、
+`extensionsUsed` に `VRMC_springBone_limit` を加える。
+`spherical` は `{pitch, yaw, rotation}`、`cone`・`hinge` は `{angle, rotation}` を持つ。
+末端・制限なし・rest不明の関節には付けず、1件もない場合は使用宣言にも加えない。
 中身の作り方と近似の範囲は [`VRMスプリング`](VRMスプリング.md) に譲る。
 
 書き出す前に次を検証する。
@@ -108,6 +114,8 @@ UVはFBXとUnityの左下原点からglTFの左上原点へ合わせるため、
 - `hitRadius`・`stiffness`・`gravityPower` は0以上の有限値、
   `dragForce` は0〜1の有限値である。
 - `gravityDir` は正規化して書く。ゼロや非有限は失敗する。
+- 角度制限の角度は有限値で、円錐・蝶番は0〜π、球面のpitchは0〜π・yawは0〜π/2の範囲であり、
+  回転は単位四元数である。範囲外・非有限は失敗する。
 - colliderの半径は0以上の有限値、形状点は3つの有限値である。
 - 空の `colliderGroups` は書かない。書式の `minItems: 1` に従う。
 
@@ -135,8 +143,8 @@ UVはFBXとUnityの左下原点からglTFの左上原点へ合わせるため、
   仕様の必須項目と参照整合を満たす範囲に留める。
 - 材質の見た目を完全に再現することは保証しない。材質の解釈は [`VRM材質`](VRM材質.md)
   の近似に従う。
-- スプリングの完全な再現は保証しない。分岐分割した鎖と第一近似の値だけを出し、
-  制限は [`VRMスプリング`](VRMスプリング.md) に残す。
+- スプリングの完全な再現は保証しない。分岐分割した鎖と第一近似の値・角度制限だけを出し、
+  その他のlimit拡張は [`VRMスプリング`](VRMスプリング.md) に残す。
 - ライセンス内容の妥当性や、利用条件の適法性は判断しない。
 - 凹多角形の三角形化品質は中間モデルの前提を引き継ぐ。
 
