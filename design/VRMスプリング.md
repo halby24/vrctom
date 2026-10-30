@@ -150,7 +150,8 @@ headとして始め、所有するAim先を辿る。端末の骨も関節に含�
 長さの無い骨はheadにならず、前springの端末として終わり、
 そのAim先が次のspringを始める。
 jointにできない未解決ノードが混ざる鎖は落とし、飛ばして接続はしない。
-endpoint生成・平均tail生成・ゼロ長分割・limit・center・曲線の再現はしない。
+endpoint生成・平均tail生成・ゼロ長分割・limit・曲線の再現はしない。
+centerは付ける。pull補正（HoldsImmobileの強い引き）は次単位であり、今回は行わない。
 近似と切り捨ては [`SpringCompileReport`] に残し、CLIのstderrにも主要な件数を出す。
 
 ```mermaid
@@ -177,7 +178,21 @@ flowchart LR
 - `stiffness` は `stiffness` のbase値。Simplifiedでも0にしない。
 - `drag_force` は `clamp01(1 - spring)`。範囲外は丸めて記録する。
 - `gravity_power` は0、`gravity_dir` は `[0,-1,0]`。関節数で記録する。
-- `center` とendpointは付けない。付けなかったspringを記録する。
+- `center` は次の規則で付ける。付けなかったspringは理由別に記録する。
+  - 各PhysBoneのimmobileは `value × curve(t)` で評価する（キーが無ければ `value`）。
+    Tは木の深さ位置（端末が無い鎖は0）である。
+  - `HoldsImmobile`（AllMotionかつ部分的なimmobile）の場合はcenterを付けない。
+    強いpullでの近似は次単位であり、今回は行わない。該当PhysBoneを記録する。
+  - Worldかつchain rootの値が0.5未満の場合はcenterを付けない。該当PhysBoneを記録する。
+  - 候補はAllMotionではchain rootの親、Worldでは鎖の最上位祖先である。
+    実アバタールート（Milfyのようにsidecarに含まれない）は辿れないため、
+    sidecarの最上位（例：Armature）が候補になる。
+  - springごとに候補から上へ辿り、
+    先頭jointの祖先または自身であり、他のspringの先頭jointの部分木に
+    入っていない最初のノードをcenterにする。未解決ノードは飛ばして親へ進む。
+    見つからなければcenterなしとして記録する。
+  - centerは実アバタールートにしない（sidecarに無いため辿りは届かない）。
+- endpointは付けない。付けなかったspringを記録する。
 - `multiChildType` が `Ignore` 以外でも最初の子に畳み、該当springを記録する。
 - colliderはsphere/capsuleだけを出す。`Sphere` は高さを無視して必ず球にし、
   `Capsule` は回転した+Y軸の両端から `height/2 - radius` を詰め、

@@ -111,7 +111,7 @@ pub struct VrmSpring {
     pub name: String,
     /// 関節列。親から子への順である。
     pub joints: Vec<VrmSpringJoint>,
-    /// 中心ノードの索引。今回は `None` である。
+    /// 中心ノードの索引。無い場合は `None`（ワールド空間に従う）である。
     pub center: Option<usize>,
     /// 参照するcolliderグループの索引列。
     pub collider_groups: Vec<usize>,
@@ -1731,7 +1731,7 @@ pub struct SpringCompileReport {
     pub plane_colliders_dropped: Vec<String>,
     /// VRMに写せない指定（`insideBounds`・`bonesAsSpheres`）を持つcolliderの記録。
     pub ignored_collider_options: Vec<String>,
-    /// `center` を付けなかったspringのPhysBone ID。今回は全件である。
+    /// `center` を付けなかったspringのPhysBone ID。springごとに1件である。
     pub center_missing: Vec<String>,
     /// endpointを生成しなかったspringのPhysBone ID。今回は全件である。
     pub no_endpoint: Vec<String>,
@@ -1749,6 +1749,54 @@ pub struct SpringCompileReport {
     pub shared_nodes: Vec<SharedNode>,
     /// `Average` を最初の子で近似したPhysBoneのID。平均tail生成は次段階である。
     pub average_approximated: Vec<String>,
+    /// centerを付けたspringの一覧。
+    pub center_applied: Vec<CenterAssigned>,
+    /// HoldsImmobileのためcenterを付けなかったPhysBoneのID。
+    pub held_immobile: Vec<String>,
+    /// Worldでroot値が0.5未満のためcenterを付けなかったPhysBoneのID。
+    pub weak_world: Vec<String>,
+    /// 合法なcenterが無く付けなかったspringの一覧。
+    pub no_legal_center: Vec<NoCenter>,
+}
+
+/// centerを付けたspring1件。
+#[derive(Debug, Clone)]
+pub struct CenterAssigned {
+    /// PhysBoneのID。
+    pub bone: String,
+    /// spring名。
+    pub spring: String,
+    /// centerのVrmノード索引。
+    pub node: usize,
+    /// centerの種別。
+    pub kind: CenterKind,
+}
+
+/// centerの種別。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CenterKind {
+    /// AllMotion由来。chain rootの親を起点に探す。
+    AllMotion,
+    /// World由来。avatar root直下の最上位祖先を起点に探す。
+    World,
+}
+
+/// 合法なcenterが無く付けなかったspring1件。
+#[derive(Debug, Clone)]
+pub struct NoCenter {
+    /// PhysBoneのID。
+    pub bone: String,
+    /// spring名。
+    pub name: String,
+    /// centerが無い理由。
+    pub reason: NoCenterReason,
+}
+
+/// centerが無い理由。閉じた集合である。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoCenterReason {
+    /// すべての候補が他のspringの内側かavatar rootで尽きた。
+    NoLegalNode,
 }
 
 /// 分岐の分割記録1件。ノードはsidecar IDで指す。
@@ -1896,6 +1944,87 @@ fn to_f32x3(point: [f64; 3], what: &str) -> Result<[f32; 3], VrmError> {
         to_f32_finite(point[1], what)?,
         to_f32_finite(point[2], what)?,
     ])
+}
+
+/// UnityのAnimationCurve相当の評価。未検証のwrapや重み付きは検証済みのはずであり、
+/// ここでは解釈だけを行う。キーは時刻順に並べ替えてから使う。
+/// 1キーならその値を返し、範囲外はwrapに従う。
+fn eval_unity_curve(curve: &SidecarCurve, mut t: f64) -> f64 {
+    if curve.keys.is_empty() {
+        return 1.0;
+    }
+    let mut keys: Vec<&SidecarCurveKey> = curve.keys.iter().collect();
+    keys.sort_by(|a, b| {
+        a.time
+            .partial_cmp(&b.time)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let first = keys[0];
+    let last = keys[keys.len() - 1];
+    if keys.len() == 1 {
+        return first.value;
+    }
+    let span = last.time - first.time;
+    // 範囲外のwrap。範囲内はそのまま評価する。
+    if t < first.time || t > last.time {
+        // 既知のwrap値だけが検証を通る。範囲外の扱いはUnityに従う。
+        // 0:既定・1:Onceは端値、2:Loopは折り返し、4:PingPongは往復、8:ClampForeverは端値。
+        match (t < first.time, curve.pre_wrap_mode, curve.post_wrap_mode) {
+            (true, 2, _) | (false, _, 2) if span > 0.0 => {
+                let mut u = (t - first.time) / span;
+                u -= u.floor();
+                t = first.time + u * span;
+            }
+            (true, 4, _) | (false, _, 4) if span > 0.0 => {
+                let mut u = (t - first.time) / span;
+                let n = u.floor();
+                u -= n;
+                if (n as i64) & 1 == 1 {
+                    u = 1.0 - u;
+                }
+                t = first.time + u * span;
+            }
+            _ => {
+                t = t.clamp(first.time, last.time);
+            }
+        }
+    }
+    // 区間を探す。時刻が等しいキーは0除算を避けて先の値を返す。
+    for pair in keys.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if t < a.time || t > b.time {
+            continue;
+        }
+        let dt = b.time - a.time;
+        if dt <= 0.0 {
+            return a.value;
+        }
+        // Hermite補間。Unityは傾きに区間幅を掛けて使う。
+        let u = (t - a.time) / dt;
+        let u2 = u * u;
+        let u3 = u2 * u;
+        let m0 = a.out_slope * dt;
+        let m1 = b.in_slope * dt;
+        return (2.0 * u3 - 3.0 * u2 + 1.0) * a.value
+            + (u3 - 2.0 * u2 + u) * m0
+            + (-2.0 * u3 + 3.0 * u2) * b.value
+            + (u3 - u2) * m1;
+    }
+    // 丸めで区間に載らない場合は近い方の端値を返す。
+    if (t - first.time).abs() <= (t - last.time).abs() {
+        first.value
+    } else {
+        last.value
+    }
+}
+
+/// カーブ付き設定値の評価。`value × curve(t)` であり、キーが無い場合は `value` である。
+fn eval_curved(curve: &SidecarCurve, t: f64) -> f64 {
+    if curve.keys.is_empty() {
+        curve.value
+    } else {
+        curve.value * eval_unity_curve(curve, t)
+    }
 }
 
 /// sidecarのcolliderをVRMの形状へ換える。
@@ -2146,8 +2275,11 @@ pub fn compile_springs(
     }
     report.shared_nodes.sort_by(|a, b| a.node.cmp(&b.node));
     // springと対応する解決済みPhysBoneの組。
+    // Planごとのspring範囲も記録し、center割当で使う。
     let mut spring_entries: Vec<(&ResolvedPhysBone, VrmSpring)> = Vec::new();
-    for plan in &plans {
+    let mut plan_ranges: Vec<std::ops::Range<usize>> = vec![0..0; plans.len()];
+    for (plan_index, plan) in plans.iter().enumerate() {
+        let spring_start = spring_entries.len();
         let bone = plan.bone;
         let source = plan.source;
         let owned: HashSet<usize> = plan.owned.iter().copied().collect();
@@ -2234,8 +2366,7 @@ pub fn compile_springs(
                 .collect::<Vec<_>>();
             report.joint_count += joints.len();
             report.gravity_zero_joints += joints.len();
-            // centerとendpointは今回は付けない。近似として記録する。
-            report.center_missing.push(bone.id.clone());
+            // endpointは今回は付けない。近似として記録する。
             report.no_endpoint.push(bone.id.clone());
             if source.multi_child_type != SidecarMultiChildType::Ignore
                 && !report.first_child_multichild.contains(&bone.id)
@@ -2266,8 +2397,25 @@ pub fn compile_springs(
                 },
             ));
         }
+        plan_ranges[plan_index] = spring_start..spring_entries.len();
     }
     report.spring_count = spring_entries.len();
+    assign_centers(
+        sidecar,
+        &plans,
+        &plan_ranges,
+        &sidecar_at,
+        &vrm_to_sidecar,
+        &resolution.node_map,
+        &mut spring_entries,
+        &mut report,
+    );
+    // centerが付かなかったspringは記録に残す。
+    for (bone, spring) in spring_entries.iter() {
+        if spring.center.is_none() {
+            report.center_missing.push(bone.id.clone());
+        }
+    }
     // colliderは作ったspringが参照するものだけを、解決順に並べて出力する。
     let created: HashSet<&str> = spring_entries
         .iter()
@@ -2400,13 +2548,15 @@ struct PlanTree {
     at: HashMap<usize, usize>,
 }
 
-/// 木の骨1件。索引はすべてsidecar索引である。
+/// 木の骨1件。索引と深さはsidecar基準である。
 #[derive(Debug)]
 struct TreeBone {
     /// sidecarノード索引。
     node: usize,
     /// 木の親ノード。rootは `None` である。
     parent: Option<usize>,
+    /// rootからの深さ。rootは0である。
+    depth: usize,
     /// Aimする子。無い場合は `None` である。
     aim: Option<usize>,
 }
@@ -2469,8 +2619,8 @@ fn build_plan_tree(
     let mut tree = PlanTree::default();
     // 未訪問だけを積むため、辺は必ず新規ノードへ向かう。
     // 挿入順が位相順になり、循環は起きない。
-    let mut pending: Vec<(usize, Option<usize>)> = vec![(root_sidecar, None)];
-    while let Some((node, parent)) = pending.pop() {
+    let mut pending: Vec<(usize, Option<usize>, usize)> = vec![(root_sidecar, None, 0)];
+    while let Some((node, parent, depth)) = pending.pop() {
         if tree.at.contains_key(&node) {
             continue;
         }
@@ -2534,9 +2684,14 @@ fn build_plan_tree(
             },
         };
         tree.at.insert(node, tree.bones.len());
-        tree.bones.push(TreeBone { node, parent, aim });
+        tree.bones.push(TreeBone {
+            node,
+            parent,
+            depth,
+            aim,
+        });
         for &child in children.iter().rev() {
-            pending.push((child, Some(node)));
+            pending.push((child, Some(node), depth + 1));
         }
     }
     Ok(tree)
@@ -2598,6 +2753,153 @@ impl ChainPlan<'_> {
             }
         }
         heads
+    }
+}
+
+/// centerを割り当てる。springは作り終えた後で、全体を見て決める。
+///
+/// AllMotionはchain rootの親、Worldはavatar root直下の最上位祖先を起点にし、
+/// 先頭jointの祖先であり、他のspringの内側でない最初のノードをcenterにする。
+/// 未解決ノードは飛ばして親へ進む。
+#[allow(clippy::too_many_arguments)]
+fn assign_centers(
+    sidecar: &PhysicsSidecar,
+    plans: &[ChainPlan<'_>],
+    plan_ranges: &[std::ops::Range<usize>],
+    sidecar_at: &HashMap<&str, usize>,
+    vrm_to_sidecar: &HashMap<usize, usize>,
+    node_map: &HashMap<String, usize>,
+    spring_entries: &mut [(&ResolvedPhysBone, VrmSpring)],
+    report: &mut SpringCompileReport,
+) {
+    let parent_of = |index: usize| -> Option<usize> {
+        sidecar.nodes[index]
+            .parent_id
+            .as_deref()
+            .and_then(|id| sidecar_at.get(id))
+            .copied()
+    };
+    let name_of = |index: usize| sidecar.nodes[index].id.clone();
+    // headのsidecar索引。spring順に並べ、LegalCenterの内側判定に使う。
+    // 落とされたspringは無いため、全springが1件ずつ対応する。
+    let head_sidecars: Vec<Option<usize>> = spring_entries
+        .iter()
+        .map(|(_, spring)| {
+            spring
+                .joints
+                .first()
+                .and_then(|joint| vrm_to_sidecar.get(&joint.node).copied())
+        })
+        .collect();
+    for (plan, range) in plans.iter().zip(plan_ranges.iter()) {
+        let owned: HashSet<usize> = plan.owned.iter().copied().collect();
+        let im = plan_immobile(plan, &owned, plan.source);
+        if range.is_empty() {
+            continue;
+        }
+        if !im.uses {
+            continue;
+        }
+        if im.holds {
+            report.held_immobile.push(plan.bone.id.clone());
+            continue;
+        }
+        if im.is_world && im.root_value < WORLD_CENTER_THRESHOLD {
+            report.weak_world.push(plan.bone.id.clone());
+            continue;
+        }
+        // 候補：AllMotionはchain rootの親、Worldは鎖の最上位祖先。
+        // 参照実装のTopmostBelowAvatarRootに相当し、実アバタールート
+        // （Milfyのようにsidecarに含まれない）は辿れないため、
+        // sidecarの最上位（Armatureなど）が候補になる。
+        let candidate = if im.is_world {
+            let mut topmost = None;
+            let mut current = Some(plan.root);
+            let mut seen = HashSet::new();
+            while let Some(node) = current {
+                if !seen.insert(node) {
+                    break;
+                }
+                topmost = Some(node);
+                current = parent_of(node);
+            }
+            topmost
+        } else {
+            parent_of(plan.root)
+        };
+        // LegalCenter相当：先頭jointの祖先であり、他のspringの内側でない
+        // 最初のノードを探す。未解決は飛ばして親へ進む。
+        for index in range.clone() {
+            let Some((_, spring)) = spring_entries.get(index) else {
+                continue;
+            };
+            let Some(head_joint) = spring.joints.first() else {
+                continue;
+            };
+            let Some(&head) = vrm_to_sidecar.get(&head_joint.node) else {
+                continue;
+            };
+            let mut current = candidate;
+            let mut found = None;
+            let mut seen = HashSet::new();
+            while let Some(node) = current {
+                // 除外するのは実アバタールートのみであり、sidecarには無い。
+                // 循環だけを打ち切る。
+                if !seen.insert(node) {
+                    break;
+                }
+                if node_map.contains_key(name_of(node).as_str())
+                    && is_ancestor_or_self(sidecar, sidecar_at, head, node)
+                {
+                    // 他のspringの内側か調べる。
+                    let mut inside = false;
+                    for (other, other_head) in head_sidecars.iter().enumerate() {
+                        if other == index {
+                            continue;
+                        }
+                        let Some(other_head) = *other_head else {
+                            continue;
+                        };
+                        if is_ancestor_or_self(sidecar, sidecar_at, node, other_head) {
+                            inside = true;
+                            break;
+                        }
+                    }
+                    if !inside {
+                        found = Some(node);
+                        break;
+                    }
+                }
+                current = parent_of(node);
+            }
+            match found {
+                Some(node) => {
+                    let vrm = node_map[name_of(node).as_str()];
+                    if let Some((_, spring)) = spring_entries.get_mut(index) {
+                        spring.center = Some(vrm);
+                        report.center_applied.push(CenterAssigned {
+                            bone: plan.bone.id.clone(),
+                            spring: spring.name.clone(),
+                            node: vrm,
+                            kind: if im.is_world {
+                                CenterKind::World
+                            } else {
+                                CenterKind::AllMotion
+                            },
+                        });
+                    }
+                }
+                None => {
+                    if let Some((_, spring)) = spring_entries.get(index) {
+                        report.no_legal_center.push(NoCenter {
+                            bone: plan.bone.id.clone(),
+                            name: spring.name.clone(),
+                            reason: NoCenterReason::NoLegalNode,
+                        });
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2714,4 +3016,89 @@ fn is_zero_length(worlds: &[[f64; 16]], parent: usize, child: usize) -> bool {
     let dy = to[13] - from[13];
     let dz = to[14] - from[14];
     (dx * dx + dy * dy + dz * dz).sqrt() < ZERO_LENGTH_TOLERANCE
+}
+
+/// 木の深さ位置。端末が無い鎖は0になる。
+fn chain_t(depth: usize, max_depth: usize) -> f64 {
+    if max_depth <= 1 {
+        0.0
+    } else {
+        (depth as f64 / (max_depth - 1) as f64).clamp(0.0, 1.0)
+    }
+}
+
+/// Planのimmobile状態。centerを付けるかどうかの判断材料である。
+struct PlanImmobile {
+    /// chain rootのimmobile値（t=0）。
+    root_value: f64,
+    /// いずれかの所有骨でimmobileが非0。
+    uses: bool,
+    /// AllMotionかつ部分的なimmobile。centerの代わりに強いpullで近似する（次単位）。
+    holds: bool,
+    /// World型かどうか。
+    is_world: bool,
+}
+
+/// Planのimmobile状態を求める。Tは深さ位置、値は `value × curve(t)` である。
+fn plan_immobile(
+    plan: &ChainPlan<'_>,
+    owned: &HashSet<usize>,
+    source: &SidecarPhysBone,
+) -> PlanImmobile {
+    let max_depth = plan
+        .tree
+        .bones
+        .iter()
+        .map(|bone| bone.depth)
+        .max()
+        .unwrap_or(0);
+    let root_value = eval_curved(&source.immobile, 0.0);
+    let is_world = source.immobile_type == SidecarImmobileType::World;
+    let mut uses = root_value != 0.0;
+    let mut full = root_value == 1.0;
+    for bone in &plan.tree.bones {
+        if !owned.contains(&bone.node) {
+            continue;
+        }
+        let value = eval_curved(&source.immobile, chain_t(bone.depth, max_depth));
+        uses |= value != 0.0;
+        full &= value == 1.0;
+    }
+    PlanImmobile {
+        root_value,
+        uses,
+        holds: uses && !full && !is_world,
+        is_world,
+    }
+}
+
+/// World immobileがcenterを持つ下限。参照実装と同じ値である。
+const WORLD_CENTER_THRESHOLD: f64 = 0.5;
+
+/// sidecar階層で `node` が `ancestor` の子孫または自身かどうか。
+/// 循環に備えて訪問済みで打ち切る。
+fn is_ancestor_or_self(
+    sidecar: &PhysicsSidecar,
+    at: &HashMap<&str, usize>,
+    mut node: usize,
+    ancestor: usize,
+) -> bool {
+    let mut seen = HashSet::new();
+    loop {
+        if node == ancestor {
+            return true;
+        }
+        if !seen.insert(node) {
+            return false;
+        }
+        let Some(parent) = sidecar.nodes[node]
+            .parent_id
+            .as_deref()
+            .and_then(|id| at.get(id))
+            .copied()
+        else {
+            return false;
+        };
+        node = parent;
+    }
 }

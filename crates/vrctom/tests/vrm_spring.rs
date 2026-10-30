@@ -758,6 +758,26 @@ fn 実fixtureと実sidecarでvrmを生成する() {
         コンパイル済み.report.plane_colliders_dropped.len(),
         コンパイル済み.report.skipped_bones.len(),
     );
+    // center件数はUnity出力と突き合わせる。45spring中43件にcenterが付く。
+    assert_eq!(コンパイル済み.report.spring_count, 45);
+    assert_eq!(関節数, 148);
+    assert_eq!(コンパイル済み.report.collider_count, 11);
+    assert_eq!(コンパイル済み.report.group_count, 4);
+    assert_eq!(コンパイル済み.report.center_applied.len(), 43);
+    assert_eq!(コンパイル済み.report.center_missing.len(), 2);
+    let 代表 = |名: &str| {
+        コンパイル済み
+            .bones
+            .springs
+            .iter()
+            .find(|spring| spring.name == 名)
+            .unwrap_or_else(|| panic!("代表springが無い: {名}"))
+    };
+    let 中心名 = |名: &str| 代表(名).center.map(|索引| モデル.nodes[索引].name.clone());
+    assert_eq!(中心名("Butt.L").as_deref(), Some("Armature"));
+    assert_eq!(中心名("FrontHair_A").as_deref(), Some("Armature"));
+    assert_eq!(中心名("Cheek.L").as_deref(), Some("Head"));
+    assert_eq!(中心名("Breast.L"), None);
 }
 
 /// collider参照が無いspringは、空配列を出さずに拡張する。
@@ -1628,6 +1648,267 @@ fn avatarrootはjointにしない() {
         .map(|関節| 関節.node)
         .collect();
     assert_eq!(関節, vec![1, 2], "avatarの子から始まる");
+}
+
+/// 他springの内側にある候補は祖先へ辿り直す。
+#[test]
+fn 内側の候補は祖先へ辿り直す() {
+    // G-P-{D,Rb-B1} の木。pb:AはP起点でDへ、pb:BはRb起点でB1へ向かう。
+    // pb:Aは他rootを切り、pb:Bの候補Pはpb:Aのspring内にあるためGへ辿る。
+    // 両springともcenterはGになる。
+    let 名前 = ["Top", "G", "Pc", "D", "Rb", "B1"];
+    let 親: Vec<Option<usize>> = vec![None, Some(0), Some(1), Some(2), Some(2), Some(4)];
+    // xは0に保つ。Unity→VRMの鏡像でxが反転するためである。
+    let 位置 = [
+        [0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.3, -0.1],
+        [0.0, 0.3, 0.1],
+        [0.0, 0.3, 0.0],
+    ];
+    let mut 子: Vec<Vec<usize>> = vec![Vec::new(); 名前.len()];
+    for (子索引, 親索引) in 親.iter().enumerate() {
+        if let Some(親索引) = 親索引 {
+            子[*親索引].push(子索引);
+        }
+    }
+    let ノード = 名前
+        .iter()
+        .enumerate()
+        .map(|(索引, 名)| VrmNode {
+            name: (*名).to_string(),
+            parent: 親[索引],
+            children: 子[索引].clone(),
+            local: 平行移動行列(位置[索引]),
+        })
+        .collect();
+    let モデル = VrmModel {
+        root: 単位行列(),
+        nodes: ノード,
+        skins: Vec::new(),
+        meshes: Vec::new(),
+        expressions: VrmExpressions::default(),
+        spring_bones: VrmSpringBones::default(),
+    };
+    let fbxバイト列 = b"fake-fbx";
+    let 道 = [
+        vec!["Top"],
+        vec!["Top", "G"],
+        vec!["Top", "G", "Pc"],
+        vec!["Top", "G", "Pc", "D"],
+        vec!["Top", "G", "Pc", "Rb"],
+        vec!["Top", "G", "Pc", "Rb", "B1"],
+    ];
+    let ノードjson: Vec<serde_json::Value> = 道
+        .iter()
+        .enumerate()
+        .map(|(索引, 通)| {
+            let 親 = if 索引 == 0 {
+                serde_json::Value::Null
+            } else {
+                let 親索引 = モデル.nodes[索引].parent.expect("親がある");
+                serde_json::json!(format!("n:{親索引}"))
+            };
+            ノードjson(
+                &モデル,
+                &format!("n:{索引}"),
+                親.as_str(),
+                索引,
+                &["Milfy"],
+                &通.to_vec(),
+            )
+        })
+        .collect();
+    let mut 文: serde_json::Value = serde_json::from_str(&髪sidecarを作る(
+        fbxバイト列,
+        &書き出し可能モデルを作る(),
+    ))
+    .expect("合成sidecarは読める");
+    文["nodes"] = serde_json::Value::Array(ノードjson);
+    // Pc直下のDを先頭にし、Rbを後に置く。
+    文["nodes"][3]["siblingIndex"] = serde_json::json!(0);
+    文["nodes"][4]["siblingIndex"] = serde_json::json!(1);
+    // pb:AはPc起点でDへ向かい、他root(Rb)を切る。pb:BはRb起点でB1へ向かう。
+    文["physBones"][0]["id"] = serde_json::json!("pb:A");
+    文["physBones"][0]["componentNodeId"] = serde_json::json!("n:2");
+    文["physBones"][0]["rootNodeId"] = serde_json::json!("n:2");
+    文["physBones"][0]["multiChildType"] = serde_json::json!("First");
+    文["physBones"][0]["ignoreOtherPhysBones"] = serde_json::json!(true);
+    文["physBones"][0]["immobile"] =
+        serde_json::json!({"value": 1.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    文["physBones"][0]["immobileType"] = serde_json::json!("AllMotion");
+    let 追加 = serde_json::json!({
+        "id": "pb:B", "componentNodeId": "n:4", "rootNodeId": "n:4", "enabled": true,
+        "version": "1.1", "integrationType": "Simplified", "ignoreNodeIds": [],
+        "ignoreOtherPhysBones": false, "endpointPosition": [0.0, 0.0, 0.0],
+        "multiChildType": "Ignore", "allowCollision": true, "colliderIds": [],
+        "limitType": "None", "limitRotation": [0.0, 0.0, 0.0], "isAnimated": false,
+    });
+    // pb:BもAllMotionでimmobile=1にする。
+    let mut 追加 = 追加;
+    追加["immobile"] =
+        serde_json::json!({"value": 1.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    追加["immobileType"] = serde_json::json!("AllMotion");
+    文["physBones"]
+        .as_array_mut()
+        .expect("physBonesは配列である")
+        .push(追加);
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+    assert_eq!(コンパイル済み.report.spring_count, 2);
+    // pb:Aの鎖は他rootで切れ、pb:Bの候補は内側のためGへ辿る。
+    assert_eq!(コンパイル済み.report.cut_at_other_roots.len(), 1);
+    assert_eq!(コンパイル済み.report.cut_at_other_roots[0].bone, "pb:A");
+    // 両springともcenterはG(n:1 → Vrm索引1)である。
+    for spring in &コンパイル済み.bones.springs {
+        assert_eq!(spring.center, Some(1), "centerはGである: {}", spring.name);
+    }
+    assert_eq!(コンパイル済み.report.center_applied.len(), 2);
+}
+
+/// AllMotionでimmobile=1はchain rootの親をcenterにする。
+#[test]
+fn 全固定は親をcenterにする() {
+    let fbxバイト列 = b"fake-fbx";
+    let モデル = 書き出し可能モデルを作る();
+    let mut 文: serde_json::Value =
+        serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    文["physBones"][0]["immobile"] =
+        serde_json::json!({"value": 1.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    文["physBones"][0]["immobileType"] = serde_json::json!("AllMotion");
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+    assert_eq!(コンパイル済み.report.spring_count, 1);
+    let spring = &コンパイル済み.bones.springs[0];
+    // chain rootはHairA(n:3)で、親はHead(n:2 → Vrm索引2)である。
+    assert_eq!(spring.center, Some(2));
+    assert_eq!(コンパイル済み.report.center_applied.len(), 1);
+    assert_eq!(コンパイル済み.report.center_applied[0].bone, "pb:0");
+    assert_eq!(
+        コンパイル済み.report.center_applied[0].kind,
+        vrctom::vrm::CenterKind::AllMotion
+    );
+    // centerはavatarでもjointでもない。
+    let 関節: Vec<usize> = spring.joints.iter().map(|関節| 関節.node).collect();
+    assert!(!関節.contains(&2));
+    assert_ne!(Some(2), Some(0));
+}
+
+/// Worldでroot値0.5以上は鎖の最上位祖先をcenterにする。
+/// 実アバタールートはsidecarに含まれないため、sidecarの最上位が候補になる。
+#[test]
+fn 世界固定は最上位をcenterにする() {
+    let fbxバイト列 = b"fake-fbx";
+    let モデル = 書き出し可能モデルを作る();
+    let mut 文: serde_json::Value =
+        serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    文["physBones"][0]["immobile"] =
+        serde_json::json!({"value": 1.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    文["physBones"][0]["immobileType"] = serde_json::json!("World");
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+    let spring = &コンパイル済み.bones.springs[0];
+    // 最上位はHips(n:0 → Vrm索引0)であり、実アバタールートはその上にある。
+    assert_eq!(spring.center, Some(0));
+    assert_eq!(コンパイル済み.report.center_applied.len(), 1);
+    assert_eq!(
+        コンパイル済み.report.center_applied[0].kind,
+        vrctom::vrm::CenterKind::World
+    );
+    let 関節: Vec<usize> = spring.joints.iter().map(|関節| 関節.node).collect();
+    assert!(!関節.contains(&0));
+}
+
+/// Worldでroot値0.5未満はcenterなしである。
+#[test]
+fn 世界弱はcenterなしである() {
+    let fbxバイト列 = b"fake-fbx";
+    let モデル = 書き出し可能モデルを作る();
+    let mut 文: serde_json::Value =
+        serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    文["physBones"][0]["immobile"] =
+        serde_json::json!({"value": 0.4, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    文["physBones"][0]["immobileType"] = serde_json::json!("World");
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+    let spring = &コンパイル済み.bones.springs[0];
+    assert_eq!(spring.center, None);
+    assert_eq!(コンパイル済み.report.weak_world, vec!["pb:0".to_string()]);
+    assert!(コンパイル済み.report.center_applied.is_empty());
+}
+
+/// AllMotionで1未満はHoldsImmobileとしてcenterなしである。
+#[test]
+fn 部分固定はholdsでcenterなしである() {
+    let fbxバイト列 = b"fake-fbx";
+    let モデル = 書き出し可能モデルを作る();
+    let mut 文: serde_json::Value =
+        serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    文["physBones"][0]["immobile"] =
+        serde_json::json!({"value": 0.5, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    文["physBones"][0]["immobileType"] = serde_json::json!("AllMotion");
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+    let spring = &コンパイル済み.bones.springs[0];
+    assert_eq!(spring.center, None);
+    assert_eq!(
+        コンパイル済み.report.held_immobile,
+        vec!["pb:0".to_string()]
+    );
+    assert!(コンパイル済み.report.center_applied.is_empty());
+}
+
+/// chain rootの親がsidecarルートでもcenterにする。
+/// 実アバタールートはsidecarの上にあるため、sidecarルートは合法である。
+#[test]
+fn 親がsidecarルートでもcenterにする() {
+    let fbxバイト列 = b"fake-fbx";
+    let モデル = 書き出し可能モデルを作る();
+    let mut 文: serde_json::Value =
+        serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    // rootをSpine(n:1)に移し、親をsidecarルート(n:0)にする。
+    文["physBones"][0]["componentNodeId"] = serde_json::json!("n:1");
+    文["physBones"][0]["rootNodeId"] = serde_json::json!("n:1");
+    文["physBones"][0]["immobile"] =
+        serde_json::json!({"value": 1.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    文["physBones"][0]["immobileType"] = serde_json::json!("AllMotion");
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+    assert!(!コンパイル済み.bones.springs.is_empty());
+    for spring in &コンパイル済み.bones.springs {
+        // sidecarルート(n:0 → Vrm索引0)がcenterになる。
+        assert_eq!(spring.center, Some(0));
+        let 関節: Vec<usize> = spring.joints.iter().map(|関節| 関節.node).collect();
+        assert!(!関節.contains(&0), "jointはcenterにならない");
+    }
+    assert!(コンパイル済み.report.no_legal_center.is_empty());
+}
+
+/// 起点自体がsidecarルートの場合は候補が無くcenterなしである。
+#[test]
+fn 起点がルート自体はcenterなしである() {
+    let fbxバイト列 = b"fake-fbx";
+    let モデル = 書き出し可能モデルを作る();
+    let mut 文: serde_json::Value =
+        serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    // rootをsidecarルート(n:0)に移す。親が無いため候補は無い。
+    文["physBones"][0]["componentNodeId"] = serde_json::json!("n:0");
+    文["physBones"][0]["rootNodeId"] = serde_json::json!("n:0");
+    文["physBones"][0]["immobile"] =
+        serde_json::json!({"value": 1.0, "keys": [], "preWrapMode": 8, "postWrapMode": 8});
+    文["physBones"][0]["immobileType"] = serde_json::json!("AllMotion");
+    let (_, _, コンパイル済み) =
+        文から解決してコンパイルする(&文.to_string(), fbxバイト列, &モデル);
+    assert!(!コンパイル済み.bones.springs.is_empty());
+    for spring in &コンパイル済み.bones.springs {
+        assert_eq!(spring.center, None);
+    }
+    assert_eq!(コンパイル済み.report.no_legal_center.len(), 1);
+    assert_eq!(
+        コンパイル済み.report.no_legal_center[0].reason,
+        vrctom::vrm::NoCenterReason::NoLegalNode
+    );
 }
 
 /// 未マップのノードを含む鎖は落とし、飛ばして接続しない。

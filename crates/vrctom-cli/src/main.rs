@@ -325,13 +325,29 @@ fn export(
         match compile_springs(&sidecar, &model, &resolution, &SpringCompileOptions::new()) {
             Ok(compiled) => {
                 // 主要な近似件数も出し、文書の制限と突き合わせられるようにする。
+                let world = compiled
+                    .report
+                    .center_applied
+                    .iter()
+                    .filter(|entry| entry.kind == vrctom::vrm::CenterKind::World)
+                    .count();
+                let all_motion = compiled
+                    .report
+                    .center_applied
+                    .iter()
+                    .filter(|entry| entry.kind == vrctom::vrm::CenterKind::AllMotion)
+                    .count();
                 let summary = format!(
-                    "スプリング{}件 関節{}件 collider{}件 グループ{}件 分岐{}件 近似(曲線base{} endpoint未生成{} gravity0関節{} first-child{} 平均近似{} 平面落下{}) 共有{}件 スキップ{}件",
+                    "スプリング{}件 関節{}件 collider{}件 グループ{}件 分岐{}件 center{}件（world{} / all-motion{} / なし{}） 近似(曲線base{} endpoint未生成{} gravity0関節{} first-child{} 平均近似{} 平面落下{}) 共有{}件 スキップ{}件",
                     compiled.report.spring_count,
                     compiled.report.joint_count,
                     compiled.report.collider_count,
                     compiled.report.group_count,
                     compiled.report.branch_splits.len(),
+                    compiled.report.center_applied.len(),
+                    world,
+                    all_motion,
+                    compiled.report.center_missing.len(),
                     compiled.report.curve_base_used.len(),
                     compiled.report.no_endpoint.len(),
                     compiled.report.gravity_zero_joints,
