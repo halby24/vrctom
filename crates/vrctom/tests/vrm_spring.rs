@@ -954,10 +954,13 @@ fn 実fixtureと実sidecarでvrmを生成する() {
 /// 許容差は abs 1e-5 + rel 1e-4 であり、重力方向は完全一致とする。
 /// drag・gravity・hitRadius・重力方向は完全一致する。
 /// stiffnessはPolar制限の37関節だけが許容差を超える（0.1〜0.8%、こちらが高い）。
-/// 一致方向の試行で内積が1ちょうどになり、Unity側の単精度丸めが1をわずかに
-/// 下回ると acos が有限の角度を返し、その平方根が冪平均に効くためと見込んでいる。
-/// 写像・順序・式・定数は突き合わせ済みで、入力差分も最大5.5e-7位置・設定値一致と
-/// 確認した。詳細は設計文書に残す。
+/// 単精度36方向ループでは一致率が変わらず、原因は単精度丸めではない。
+/// 28件はsidecar欠落のlimitRotationカーブ（Ribbon A-D L/R・SideHair_A L/R）が主因であり、
+/// 自前ループにUnityスナップショットのカーブ値を入れるとUnity implied値と一致する。
+/// 残り9件は一致方向試行のacos特異性による丸めのくじ引きと見込む。
+/// 残差の内訳は追跡記録からspring名・joint・PhysBone・headT・制限種別・最大角・
+/// 制限回転・rest形状・Rustのlimit/held/stiffness・Unityのstiffnessと差・
+/// 36方向ループの最小/最大/平均（倍精度）をstderrに出す。
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn 実fixtureの関節値はunity出力と一致する() {
@@ -980,8 +983,13 @@ fn 実fixtureの関節値はunity出力と一致する() {
     let 解決 = モデル
         .resolve_physics_sidecar(&sidecar, &fbxバイト列)
         .expect("実fixtureの参照は解決できる");
-    let コンパイル済み = compile_springs(&sidecar, &モデル, &解決, &SpringCompileOptions::new())
-        .expect("実fixtureの鎖はコンパイルできる");
+    let コンパイル済み = compile_springs(
+        &sidecar,
+        &モデル,
+        &解決,
+        &SpringCompileOptions::new().with_joint_trace(true),
+    )
+    .expect("実fixtureの鎖はコンパイルできる");
     let unityバイト列 = std::fs::read(&unity経路).expect("Unity製VRMは読める");
     let unity_json = glbのjsonを取る(&unityバイト列);
     let unity_springs = unity_json["extensions"]["VRMC_springBone"]["springs"]
@@ -1002,7 +1010,33 @@ fn 実fixtureの関節値はunity出力と一致する() {
         std::collections::HashMap::new();
     let mut 代表値: Vec<String> = Vec::new();
     let mut 不一致: Vec<String> = Vec::new();
-    for spring in &コンパイル済み.bones.springs {
+    // 残差の出た (spring順, 関節索引)。追跡記録と突き合わせる。
+    let mut 詳細対象: Vec<(usize, usize)> = Vec::new();
+    // 追跡記録の索引付け。キーは (spring名, spring内の関節索引) である。
+    let mut 追跡表: std::collections::HashMap<(String, usize), usize> =
+        std::collections::HashMap::new();
+    for (i, 追跡) in コンパイル済み.report.joint_traces.iter().enumerate() {
+        let 古 = 追跡表.insert((追跡.spring.clone(), 追跡.joint), i);
+        assert!(古.is_none(), "追跡記録のキーは重ならない");
+    }
+    // Vrm索引からsidecar IDへの逆対応。
+    let mut 逆対応: std::collections::HashMap<usize, &str> = std::collections::HashMap::new();
+    for (id, &vrm) in 解決.node_map.iter() {
+        let 古 = 逆対応.insert(vrm, id.as_str());
+        assert!(古.is_none(), "対応は完全一致のため写像先は重ならない");
+    }
+    // sidecarノードとPhysBoneの索引。
+    let mut 節点表: std::collections::HashMap<&str, _> = std::collections::HashMap::new();
+    for 節点 in &sidecar.nodes {
+        let 古 = 節点表.insert(節点.id.as_str(), 節点);
+        assert!(古.is_none(), "sidecarノードIDは重ならない");
+    }
+    let mut 骨表: std::collections::HashMap<&str, _> = std::collections::HashMap::new();
+    for 骨 in &sidecar.phys_bones {
+        let 古 = 骨表.insert(骨.id.as_str(), 骨);
+        assert!(古.is_none(), "PhysBone IDは重ならない");
+    }
+    for (spring順, spring) in コンパイル済み.bones.springs.iter().enumerate() {
         let 他 = unity表
             .get(spring.name.as_str())
             .unwrap_or_else(|| panic!("Unity出力にspringが無い: {}", spring.name));
@@ -1035,6 +1069,10 @@ fn 実fixtureの関節値はunity出力と一致する() {
                         i = 索引,
                         実 = 実,
                     ));
+                    let 鍵 = (spring順, 索引);
+                    if !詳細対象.contains(&鍵) {
+                        詳細対象.push(鍵);
+                    }
                 }
             }
             全体.1 += 1;
@@ -1052,6 +1090,10 @@ fn 実fixtureの関節値はunity出力と一致する() {
                 全体.0 += 1;
             } else {
                 不一致.push(format!("{}[{索引}].gravityDir: 向きが違う", spring.name));
+                let 鍵 = (spring順, 索引);
+                if !詳細対象.contains(&鍵) {
+                    詳細対象.push(鍵);
+                }
             }
         }
         if [
@@ -1095,6 +1137,65 @@ fn 実fixtureの関節値はunity出力と一致する() {
     }
     for 代表 in &代表値 {
         eprintln!("  代表 {代表}");
+    }
+    // 残差のある関節の内訳。追跡記録から計算入力と36方向ループの統計を出す。
+    for (spring順, 索引) in &詳細対象 {
+        let spring = &コンパイル済み.bones.springs[*spring順];
+        let 関節 = &spring.joints[*索引];
+        let 他 = unity表
+            .get(spring.name.as_str())
+            .unwrap_or_else(|| panic!("Unity出力にspringが無い: {}", spring.name));
+        let 他関節 = 他["joints"].as_array().expect("Unityの関節は配列である");
+        let unity値 = 他関節[*索引]["stiffness"].as_f64().unwrap_or(f64::NAN);
+        let 追跡 = &コンパイル済み.report.joint_traces[追跡表[&(spring.name.clone(), *索引)]];
+        let vrm名 = &モデル.nodes[関節.node].name;
+        let sidecar_id = 逆対応[&関節.node];
+        let 構成節点 = &節点表[骨表[追跡.bone.as_str()].component_node_id.as_str()];
+        let 世界 = 追跡.bone_to_world;
+        let mut 拡大量 = 0.0f64;
+        for 列 in 0..3 {
+            let 長さ2 = 世界[列 * 4] * 世界[列 * 4]
+                + 世界[列 * 4 + 1] * 世界[列 * 4 + 1]
+                + 世界[列 * 4 + 2] * 世界[列 * 4 + 2];
+            if 長さ2 > 拡大量 {
+                拡大量 = 長さ2;
+            }
+        }
+
+        eprintln!(
+            "  診断 {}[{}] VRM節点={} sidecar節点={} PhysBone={}（{}） head={} headT={:.6} tailT={:.6}",
+            spring.name,
+            索引,
+            vrm名,
+            sidecar_id,
+            追跡.bone,
+            構成節点.scene_path.join("/"),
+            追跡.is_head,
+            追跡.head_t,
+            追跡.tail_t,
+        );
+        eprintln!(
+            "    制限種別={:?} 最大角={:?} 制限回転={:?}",
+            追跡.limit_kind, 追跡.max_angle, 追跡.limit_rotation
+        );
+        eprintln!(
+            "    rest boneVector={:?} worldT={:?} worldScale={:.6}",
+            追跡.bone_vector,
+            [世界[12], 世界[13], 世界[14]],
+            拡大量.sqrt(),
+        );
+        eprintln!(
+            "    Rust limit={:.6} held={:.6} stiff={:.6} | Unity stiff={:.6}（差{:+.6}）",
+            追跡.limit,
+            追跡.held,
+            f64::from(関節.stiffness),
+            unity値,
+            f64::from(関節.stiffness) - unity値,
+        );
+        eprintln!(
+            "    36方向[最小 {:.4} 最大 {:.4} 平均 {:.4}]",
+            追跡.loop_min, 追跡.loop_max, 追跡.loop_mean,
+        );
     }
     for 差 in 不一致.iter().take(40) {
         eprintln!("  残差 {差}");

@@ -1746,6 +1746,7 @@ fn check_coordinate_gate(
 #[derive(Debug, Clone)]
 pub struct SpringCompileOptions {
     max_joints: usize,
+    joint_trace: bool,
 }
 
 /// 1springのjoint数の既定上限（64）。
@@ -1758,12 +1759,22 @@ impl SpringCompileOptions {
     pub fn new() -> Self {
         Self {
             max_joints: DEFAULT_MAX_SPRING_JOINTS,
+            joint_trace: false,
         }
     }
 
     /// 1springのjoint数の上限を変更する。1以上である。
     pub fn with_max_joints(mut self, max_joints: usize) -> Self {
         self.max_joints = max_joints;
+        self
+    }
+
+    /// joint計算の追跡記録を残すかどうかを切り替える。
+    /// 参照実装の JointTrace 相当の試験用出入口であり、既定では記録しない。
+    /// 有効にすると `SpringCompileReport::joint_traces` が増えるが、
+    /// springやjointの出力内容は変わらない。
+    pub fn with_joint_trace(mut self, joint_trace: bool) -> Self {
+        self.joint_trace = joint_trace;
         self
     }
 }
@@ -1838,6 +1849,8 @@ pub struct SpringCompileReport {
     pub weak_world: Vec<String>,
     /// 合法なcenterが無く付けなかったspringの一覧。
     pub no_legal_center: Vec<NoCenter>,
+    /// joint計算の追跡。`with_joint_trace(true)` の場合だけ記録する。
+    pub joint_traces: Vec<JointTrace>,
 }
 
 /// centerを付けたspring1件。
@@ -1878,6 +1891,58 @@ pub struct NoCenter {
 pub enum NoCenterReason {
     /// すべての候補が他のspringの内側かavatar rootで尽きた。
     NoLegalNode,
+}
+
+/// joint計算の追跡1件。試験用の診断であり、通常の出力には使わない。
+/// `with_joint_trace(true)` の場合だけ記録する。
+/// 参照実装の `PhysicsJointTrace` に相当する。
+/// 制限角・ループ統計・保持比は倍精度の本計算と同じ値であり、単精度化は行わない。
+/// 一致方向の試行では倍精度でも角度が0に潰れる場合があり、その場合はUnity側の
+/// 単精度丸めだけが有限の角度を返す。差分の分析は設計文書に残す。
+#[derive(Debug, Clone)]
+pub struct JointTrace {
+    /// PhysBoneのID。
+    pub bone: String,
+    /// spring名。
+    pub spring: String,
+    /// spring内の関節索引。
+    pub joint: usize,
+    /// 関節のsidecarノードID。
+    pub node: String,
+    /// headの計算かどうか。末端は直前headの写しである。
+    pub is_head: bool,
+    /// head位置の曲線引数。
+    pub head_t: f64,
+    /// tail位置の半径引数。
+    pub tail_t: f64,
+    /// 制限の種別。
+    pub limit_kind: SidecarLimitType,
+    /// 最大角の評価値 `[X, Z]`（度）。
+    pub max_angle: [f64; 2],
+    /// 制限回転の評価値 `[X, Y, Z]`（度）。
+    pub limit_rotation: [f64; 3],
+    /// Aim先への自空間ベクトル（Unity軸・メートル）。
+    pub bone_vector: [f64; 3],
+    /// 骨のrest世界行列（Unity軸）。
+    pub bone_to_world: [f64; 16],
+    /// 有効制限角（度）。本計算と同じ値である。
+    pub limit: f64,
+    /// 36方向ループの角度の最小・最大・平均（度）。
+    pub loop_min: f64,
+    pub loop_max: f64,
+    pub loop_mean: f64,
+    /// 保持した引き比。本計算と同じ値である。
+    pub held: f64,
+    /// 硬さ。本計算と同じ値である。
+    pub stiffness: f64,
+    /// 抵抗。
+    pub drag: f64,
+    /// 重力の強さ。
+    pub power: f64,
+    /// 当たり半径。
+    pub hit_radius: f64,
+    /// 重力が上向きかどうか。
+    pub gravity_up: bool,
 }
 
 /// 分岐の分割記録1件。ノードはsidecar IDで指す。
@@ -2295,6 +2360,8 @@ struct JointParams {
     gravity_up: bool,
     /// 当たり半径。
     hit_radius: f64,
+    /// 保持した引き比。試験用の追跡記録のために残す。
+    held: f64,
 }
 
 /// 1フレームのVRM pull比。PhysBoneの `share` だけ寄せ、`keep` だけ残す。
@@ -2492,237 +2559,56 @@ fn max_reach(record: &SidecarPhysBone, t: f64, bone_vector: [f64; 3]) -> f64 {
     (vec_angle_deg(bone_vector, axis) + widest).min(180.0)
 }
 
-/// 単精度3要素ベクトルの内積。参照実装と同じ左畳み込みである。
-fn v3dot_f32(a: [f32; 3], b: [f32; 3]) -> f32 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-/// 単精度3要素ベクトルの外積。
-fn v3cross_f32(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
-}
-
-/// 単精度ベクトルの正規化。零ベクトルは零のまま返す。
-fn v3norm_f32(v: [f32; 3]) -> [f32; 3] {
-    let len = v3dot_f32(v, v).sqrt();
-    if len > 0.0 && len.is_finite() {
-        [v[0] / len, v[1] / len, v[2] / len]
-    } else {
-        [0.0; 3]
-    }
-}
-
-/// 単精度2ベクトルの角度（度）。いずれかが零の場合は0を返す。
-fn v3angle_f32(a: [f32; 3], b: [f32; 3]) -> f32 {
-    let denom = v3dot_f32(a, a).sqrt() * v3dot_f32(b, b).sqrt();
-    if denom <= 0.0 || !denom.is_finite() {
-        return 0.0;
-    }
-    (v3dot_f32(a, b) / denom).clamp(-1.0, 1.0).acos() * 180.0 / std::f32::consts::PI
-}
-
-/// 単精度四元数の積。
-fn qmul_f32(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
-    [
-        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
-        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
-        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
-        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
-    ]
-}
-
-/// 単精度軸回転。軸が零の場合は恒等写像を返す。
-fn qaxis_f32(axis: [f32; 3], angle_deg: f32) -> [f32; 4] {
-    let a = v3norm_f32(axis);
-    if v3dot_f32(a, a) <= 0.0 {
-        return [0.0, 0.0, 0.0, 1.0];
-    }
-    let half = angle_deg * std::f32::consts::PI / 360.0;
-    [
-        a[0] * half.sin(),
-        a[1] * half.sin(),
-        a[2] * half.sin(),
-        half.cos(),
-    ]
-}
-
-/// 単精度四元数によるベクトルの回転。
-fn qrot_f32(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
-    let u = [q[0], q[1], q[2]];
-    let uv = v3cross_f32(u, v);
-    let uuv = v3cross_f32(u, uv);
-    [
-        v[0] + 2.0 * (q[3] * uv[0] + uuv[0]),
-        v[1] + 2.0 * (q[3] * uv[1] + uuv[1]),
-        v[2] + 2.0 * (q[3] * uv[2] + uuv[2]),
-    ]
-}
-
-/// 単精度の方向転換。一般経路で求める。
-/// UnityのJointLimit出力と突き合わせると、一致方向でも一般経路を通るため、
-/// 恒等への近道は入れない。反対向きは直交軸の180度回転で返す。
-fn qfromto_f32(from: [f32; 3], to: [f32; 3]) -> [f32; 4] {
-    let f = v3norm_f32(from);
-    let t = v3norm_f32(to);
-    let dot = v3dot_f32(f, t);
-    if dot <= -1.0 + 1e-6 {
-        let mut axis = v3cross_f32(f, [1.0, 0.0, 0.0]);
-        if v3dot_f32(axis, axis) < 1e-12 {
-            axis = v3cross_f32(f, [0.0, 1.0, 0.0]);
-        }
-        return qaxis_f32(v3norm_f32(axis), 180.0);
-    }
-    let c = v3cross_f32(f, t);
-    let mut q = [c[0], c[1], c[2], 1.0 + dot];
-    let len = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
-    if len <= 0.0 || !len.is_finite() {
-        return [0.0, 0.0, 0.0, 1.0];
-    }
-    for v in q.iter_mut() {
-        *v /= len;
-    }
-    q
-}
-
-/// 単精度の制限枠組み。骨ベクトルから上向きへの回転に制限回転を掛ける。
-fn frame_f32(bone: [f32; 3], rot: [f32; 3]) -> [[f32; 3]; 3] {
-    let r = qfromto_f32([0.0, 1.0, 0.0], v3norm_f32(bone));
-    let q = qmul_f32(
-        r,
-        qmul_f32(
-            qaa_f32_z(rot[2]),
-            qmul_f32(qaa_f32_y(rot[1]), qaa_f32_x(rot[0])),
-        ),
-    );
-    [
-        qrot_f32(q, [1.0, 0.0, 0.0]),
-        qrot_f32(q, [0.0, 1.0, 0.0]),
-        qrot_f32(q, [0.0, 0.0, 1.0]),
-    ]
-}
-
-/// 単精度軸回転の軸別版。frame_f32の可読性のために分ける。
-fn qaa_f32_x(deg: f32) -> [f32; 4] {
-    qaxis_f32([1.0, 0.0, 0.0], deg)
-}
-fn qaa_f32_y(deg: f32) -> [f32; 4] {
-    qaxis_f32([0.0, 1.0, 0.0], deg)
-}
-fn qaa_f32_z(deg: f32) -> [f32; 4] {
-    qaxis_f32([0.0, 0.0, 1.0], deg)
-}
-
-/// 単精度の極座標（度）。前方からの方位角と水平面からの仰角である。
-fn cartpol_f32(n: [f32; 3]) -> [f32; 2] {
-    let flat = v3norm_f32([n[0], 0.0, n[2]]);
-    let mut around = flat[2].clamp(-1.0, 1.0).acos() * 180.0 / std::f32::consts::PI;
-    if flat[0] < 0.0 {
-        around = -around;
-    }
-    let height = n[1].clamp(-1.0, 1.0).acos() * 180.0 / std::f32::consts::PI - 90.0;
-    [around, height]
-}
-
-/// 単精度の方向転換。Unityと同じ順序（yawをY軸・pitchをX軸）で掛ける。
-fn euler_yx_f32(yaw_deg: f32, pitch_deg: f32) -> [f32; 4] {
-    qmul_f32(qaa_f32_y(yaw_deg), qaa_f32_x(pitch_deg))
-}
-
-/// 単精度の錐体制限。角度内ならそのまま返す。
-fn clamp_cone_f32(axis: [f32; 3], dir: [f32; 3], max_angle: f32) -> [f32; 3] {
-    if v3angle_f32(axis, dir) <= max_angle {
-        return dir;
-    }
-    qrot_f32(
-        qaxis_f32(v3norm_f32(v3cross_f32(axis, dir)), max_angle),
-        axis,
-    )
-}
-
-/// 単精度の角度制限。SDKの適用と同形（Angle/Hinge/Polar）である。
-fn apply_limit_f32(
+/// 36方向ループの評価。参照実装と同じ構造で `(制限角, 最小角, 最大角, 平均角)` を返す。
+/// 本計算と試験の追跡記録で共有する。単精度化は行わない。
+/// 一致方向の試行では倍精度でも角度が0に潰れる場合があり、その場合はUnity側の
+/// 単精度丸めだけが有限の角度を返す。差分の分析は設計文書に残す。
+fn efflim(
+    bone: [f64; 3],
+    rot: [f64; 3],
+    max: [f64; 2],
     limit_type: &SidecarLimitType,
-    bone: [f32; 3],
-    rot: [f32; 3],
-    max: [f32; 2],
-    dir: [f32; 3],
-) -> [f32; 3] {
-    let f = frame_f32(bone, rot);
-    let (ax, ay) = (f[0], f[1]);
-    match limit_type {
-        SidecarLimitType::None => dir,
-        SidecarLimitType::Angle => clamp_cone_f32(ay, dir, max[0]),
-        SidecarLimitType::Hinge => {
-            let dot = v3dot_f32(ax, dir);
-            let flat = v3norm_f32([
-                dir[0] - ax[0] * dot,
-                dir[1] - ax[1] * dot,
-                dir[2] - ax[2] * dot,
-            ]);
-            clamp_cone_f32(ay, flat, max[0])
-        }
-        SidecarLimitType::Polar => {
-            let az = v3norm_f32(v3cross_f32(ax, ay));
-            let local = v3norm_f32([v3dot_f32(az, dir), v3dot_f32(ax, dir), v3dot_f32(ay, dir)]);
-            let mut p = cartpol_f32(local);
-            p[0] = p[0].clamp(-max[0], max[0]);
-            p[1] = p[1].clamp(-max[1], max[1]);
-            let back = qrot_f32(euler_yx_f32(p[0], p[1]), [0.0, 0.0, 1.0]);
-            v3norm_f32([
-                az[0] * back[0] + ax[0] * back[1] + ay[0] * back[2],
-                az[1] * back[0] + ax[1] * back[1] + ay[1] * back[2],
-                az[2] * back[0] + ax[2] * back[1] + ay[2] * back[2],
-            ])
-        }
+) -> (f64, f64, f64, f64) {
+    let b = vec_normalized_or_zero(bone);
+    let mut across = vec_cross(b, [0.0, 0.0, 1.0]);
+    if vec_dot(across, across) < 1e-6 {
+        across = vec_cross(b, [1.0, 0.0, 0.0]);
     }
-}
-
-/// 単精度の制限下での方向。軸だけの場合は制限の上軸を返す。
-fn limit_dir_f32(
-    limit_type: &SidecarLimitType,
-    bone: [f32; 3],
-    rot: [f32; 3],
-    max: [f32; 2],
-    dir: [f32; 3],
-    axis_only: bool,
-) -> [f32; 3] {
-    if axis_only {
-        let f = frame_f32(bone, rot);
-        return f[1];
-    }
-    apply_limit_f32(limit_type, bone, rot, max, dir)
-}
-
-/// 単精度の有効制限角（度）。参照実装と同じ36方向の冪平均である。
-fn efflim_f32(bone: [f32; 3], rot: [f32; 3], max: [f32; 2], limit_type: &SidecarLimitType) -> f32 {
-    let b = v3norm_f32(bone);
-    let mut across = v3cross_f32(b, [0.0, 0.0, 1.0]);
-    if v3dot_f32(across, across) < 1e-6 {
-        across = v3cross_f32(b, [1.0, 0.0, 0.0]);
-    }
-    let across = v3norm_f32(across);
-    let other = v3cross_f32(b, across);
-    let lrest = limit_dir_f32(limit_type, bone, rot, max, b, false);
-    let tilt = 45.0f32 * std::f32::consts::PI / 180.0;
-    let mut sum = 0.0f32;
+    let across = vec_normalized_or_zero(across);
+    let other = vec_cross(b, across);
+    let lrest = apply_angle_limit(limit_type, bone, rot, max, b);
+    let tilt = LIMIT_REFERENCE_ANGLE * std::f64::consts::PI / 180.0;
+    let mut sum: f64 = 0.0;
+    let mut smallest = f64::INFINITY;
+    let mut largest: f64 = 0.0;
     for i in 0..LIMIT_RESPONSE_STEPS {
-        let around = 2.0 * std::f32::consts::PI * i as f32 / LIMIT_RESPONSE_STEPS as f32;
+        let around = 2.0 * std::f64::consts::PI * i as f64 / LIMIT_RESPONSE_STEPS as f64;
         let pushed = [
             tilt.cos() * b[0] + tilt.sin() * (around.cos() * across[0] + around.sin() * other[0]),
             tilt.cos() * b[1] + tilt.sin() * (around.cos() * across[1] + around.sin() * other[1]),
             tilt.cos() * b[2] + tilt.sin() * (around.cos() * across[2] + around.sin() * other[2]),
         ];
-        let turned = limit_dir_f32(limit_type, bone, rot, max, pushed, false);
-        sum += v3angle_f32(lrest, turned).powf(LIMIT_RESPONSE_POWER as f32);
+        let turned = apply_angle_limit(limit_type, bone, rot, max, pushed);
+        let angle = vec_angle_deg(lrest, turned);
+        smallest = smallest.min(angle);
+        largest = largest.max(angle);
+        sum += angle.powf(LIMIT_RESPONSE_POWER);
     }
-    (sum / LIMIT_RESPONSE_STEPS as f32).powf(1.0 / LIMIT_RESPONSE_POWER as f32)
+    let mean = sum / LIMIT_RESPONSE_STEPS as f64;
+    (
+        mean.powf(1.0 / LIMIT_RESPONSE_POWER),
+        smallest,
+        largest,
+        mean,
+    )
 }
 
 /// 有効制限角（度）。36方向に押した応答の冪平均であり、塞ぐ方向を重く見る。
+/// 倍精度で求めた数学的に正しい値をそのまま使い、単精度化は行わない。
+/// 参照実装は単精度で計算するが、通常の試行では差は無視できる。
+/// 一致方向の試行でだけ単精度側が有限の角度を返す場合があり、
+/// Unity出力との突き合わせと残差の分析は試験と設計文書に残す。
+/// 試験用の内訳が必要な場合は [`efflim`] を使う。
 fn effective_limit_angle(record: &SidecarPhysBone, t: f64, rest: Option<&JointRest>) -> f64 {
     let Some(rest) = rest else {
         return limit_angle(record, t);
@@ -2730,27 +2616,9 @@ fn effective_limit_angle(record: &SidecarPhysBone, t: f64, rest: Option<&JointRe
     if !has_angle_limit(record) {
         return limit_angle(record, t);
     }
-    // 参照実装と同じ単精度で計算する。倍精度との差は通常は無視できるが、
-    // 方向が一致する試行では acos の特異性で差が増幅される場合がある。
-    // Unity出力との突き合わせは試験で行い、残差は設計文書に残す。
-    let bone = [
-        rest.bone_vector[0] as f32,
-        rest.bone_vector[1] as f32,
-        rest.bone_vector[2] as f32,
-    ];
-    let rotation = [
-        finite_or_zero(limit_rotation(record, t)[0]) as f32,
-        finite_or_zero(limit_rotation(record, t)[1]) as f32,
-        finite_or_zero(limit_rotation(record, t)[2]) as f32,
-    ];
-    // max_angles already clamps at zero; cast after.
-    let max = max_angles(record, t);
-    efflim_f32(
-        bone,
-        rotation,
-        [max[0] as f32, max[1] as f32],
-        &record.limit_type,
-    ) as f64
+    let rotation = limit_rotation(record, t);
+    let max_angle = max_angles(record, t);
+    efflim(rest.bone_vector, rotation, max_angle, &record.limit_type).0
 }
 
 /// rest方向から重力への角度（ラジアン）。rest不明時は直角である。
@@ -2977,6 +2845,7 @@ fn joint_parameters(
         power: finite_or_zero(power),
         gravity_up,
         hit_radius: finite_or_zero(hit_radius),
+        held,
     }
 }
 
@@ -3326,6 +3195,17 @@ pub fn compile_springs(
                         .copied()
                         .expect("末端の前にhead関節がある");
                     params_list.push(tail);
+                    // 末端は直前headの写しとして記録する。
+                    if options.joint_trace {
+                        let mut traced = report
+                            .joint_traces
+                            .last()
+                            .cloned()
+                            .expect("末端の前にheadの追跡がある");
+                        traced.joint = index;
+                        traced.is_head = false;
+                        report.joint_traces.push(traced);
+                    }
                     continue;
                 }
                 let entry = plan
@@ -3368,6 +3248,48 @@ pub fn compile_springs(
                     held,
                     rest.as_ref(),
                 ));
+                // 試験用の追跡記録。参照実装の JointTrace 相当にあたり、
+                // 出力内容には影響しない。
+                if options.joint_trace {
+                    let params = params_list
+                        .last()
+                        .copied()
+                        .expect("追跡対象の関節値は直前に求める");
+                    let rotation = limit_rotation(source, head_t);
+                    let max_angle = max_angles(source, head_t);
+                    let (limit, loop_min, loop_max, loop_mean) =
+                        if rest.is_some() && has_angle_limit(source) {
+                            efflim(entry.aim_local, rotation, max_angle, &source.limit_type)
+                        } else {
+                            // ループを実行しない場合は制限角そのものを入れる。
+                            let plain = limit_angle(source, head_t);
+                            (plain, plain, plain, plain)
+                        };
+                    report.joint_traces.push(JointTrace {
+                        bone: bone.id.clone(),
+                        spring: name.clone(),
+                        joint: index,
+                        node: sidecar.nodes[sidecar_joint].id.clone(),
+                        is_head: true,
+                        head_t,
+                        tail_t,
+                        limit_kind: source.limit_type,
+                        max_angle,
+                        limit_rotation: rotation,
+                        bone_vector: entry.aim_local,
+                        bone_to_world: unity_worlds[sidecar_joint],
+                        limit,
+                        loop_min,
+                        loop_max,
+                        loop_mean,
+                        held: params.held,
+                        stiffness: params.stiffness,
+                        drag: params.drag,
+                        power: params.power,
+                        hit_radius: params.hit_radius,
+                        gravity_up: params.gravity_up,
+                    });
+                }
             }
             let joints = vrm_joints
                 .into_iter()
