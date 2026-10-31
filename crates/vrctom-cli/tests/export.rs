@@ -324,6 +324,10 @@ fn physics指定でスプリング入りvrmを書き出せる() {
         stderr.contains("スプリング"),
         "スプリング件数を出す: {stderr}"
     );
+    assert!(
+        stderr.contains("T-ポーズ53件"),
+        "T-ポーズ適用53件を出す: {stderr}"
+    );
     let bytes = fs::read(&destination).expect("出力は読める");
     assert!(
         json塊に含まれるか(&bytes, "\"VRMC_springBone\""),

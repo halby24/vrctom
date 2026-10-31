@@ -113,6 +113,7 @@ public static class PhysicsSidecarExporter
             string json = JsonUtility.ToJson(sidecar, true);
             json = NullParentPattern.Replace(json, "\"parentId\": null");
             json = NullSourcePattern.Replace(json, "\"source\": null");
+            json = NullTPosePattern.Replace(json, "\"tPose\": null");
             Directory.CreateDirectory(Path.GetDirectoryName(outPath));
             // BOM 無し UTF-8 で書き出す。Rust 側の読み取りと差分比較を安定させる。
             File.WriteAllText(outPath, json, new UTF8Encoding(false));
@@ -121,13 +122,14 @@ public static class PhysicsSidecarExporter
                     sidecar.lookAt.eyeLook, sidecar.lookAt.leftEyeNodeId, sidecar.lookAt.rightEyeNodeId)
                 : "none";
             Debug.Log(string.Format(
-                "[PhysicsSidecarExporter] wrote {0} policy={1} (nodes={2} bind={3} scene={4} approx={5} changed={6} maxAngle={7:F4}deg maxPos={8:E2} maxScale={9:E2} physBones={10} colliders={11} constraints={12} unsupported={13} lookAt={14})",
+                "[PhysicsSidecarExporter] wrote {0} policy={1} (nodes={2} bind={3} scene={4} approx={5} changed={6} maxAngle={7:F4}deg maxPos={8:E2} maxScale={9:E2} physBones={10} colliders={11} constraints={12} unsupported={13} lookAt={14} humanoid={15}({16} omit))",
                 outPath, StatePolicyName(policy), sidecar.nodes.Length,
                 stats.BindNodes, stats.SceneFallbacks, stats.ApproxDecomposed, stats.ChangedFromScene,
                 stats.MaxAngleDeg, stats.MaxPosDiff, stats.MaxScaleDiff,
                 sidecar.physBones.Length, sidecar.colliders.Length,
                 sidecar.constraints.Length,
-                sidecar.unsupportedFeatures.Length, lookAtSummary));
+                sidecar.unsupportedFeatures.Length, lookAtSummary,
+                stats.HumanoidBones, stats.OmittedTPose));
             if (stats.ChangedIds.Count > 0)
             {
                 Debug.Log("[PhysicsSidecarExporter] bind changed: "
@@ -234,6 +236,10 @@ public static class PhysicsSidecarExporter
 
         ConstraintDto[] constraints = BuildConstraints(avatarRoot, nodeIndex);
         LookAtDto lookAt = BuildLookAt(avatarRoot, nodeIndex);
+        int omittedTPose;
+        HumanoidDto humanoid = BuildHumanoid(avatarRoot, nodeIndex, out omittedTPose);
+        stats.HumanoidBones = humanoid != null && humanoid.bones != null ? humanoid.bones.Length : 0;
+        stats.OmittedTPose = omittedTPose;
 
         var unsupportedSorted = new List<string>(unsupported);
         unsupportedSorted.Sort(StringComparer.Ordinal);
@@ -260,6 +266,7 @@ public static class PhysicsSidecarExporter
             },
             sourceModels = new List<SourceModelDto>(fbxSources.Values).ToArray(),
             nodes = nodes,
+            humanoid = humanoid,
             physBones = physBones,
             colliders = colliders,
             constraints = constraints,
@@ -444,6 +451,8 @@ public static class PhysicsSidecarExporter
         public float MaxAngleDeg;
         public float MaxPosDiff;
         public float MaxScaleDiff;
+        public int HumanoidBones;
+        public int OmittedTPose;
         public readonly List<string> ChangedIds = new List<string>();
     }
 
@@ -946,6 +955,58 @@ public static class PhysicsSidecarExporter
         };
     }
 
+    // humanoid の T-pose を sidecar 形式で集める。参照実装の capture と同じ取り方であり、
+    // `avatar.humanDescription.skeleton` を Transform 名で引いて
+    // `Animator.GetBoneTransform(HumanBodyBones)` の各骨について記録する。
+    // ノード ID は sidecar の `n:N` 体系であり、スナップショットの `n:0/0/...` とは別物である。
+    // skeleton に無い骨は `tPose` を省き、警告をログに出す (Rust 側は上書きしない)。
+    // 参照姿勢の方針によらず descriptor の生の T-pose を出す。bind-pose の決定性は変えない。
+    private static HumanoidDto BuildHumanoid(
+        GameObject avatarRoot, Dictionary<Transform, int> nodeIndex, out int omittedTPose)
+    {
+        omittedTPose = 0;
+        var dto = new HumanoidDto { isHuman = false, bones = new HumanBoneDto[0] };
+        Animator animator = avatarRoot.GetComponent<Animator>();
+        if (animator == null || animator.avatar == null || !animator.avatar.isHuman) return dto;
+        dto.isHuman = true;
+        var skeleton = new Dictionary<string, SkeletonBone>(StringComparer.Ordinal);
+        foreach (SkeletonBone bone in animator.avatar.humanDescription.skeleton)
+            if (!skeleton.ContainsKey(bone.name)) skeleton.Add(bone.name, bone);
+        var bones = new List<HumanBoneDto>();
+        for (HumanBodyBones human = HumanBodyBones.Hips; human < HumanBodyBones.LastBone; human++)
+        {
+            Transform transform = animator.GetBoneTransform(human);
+            if (transform == null) continue;
+            int index;
+            if (!nodeIndex.TryGetValue(transform, out index)) continue;
+            var record = new HumanBoneDto
+            {
+                bone = human.ToString(),
+                nodeId = "n:" + index,
+                tPose = null,
+            };
+            SkeletonBone tPose;
+            if (skeleton.TryGetValue(transform.name, out tPose))
+            {
+                record.tPose = new HumanTransformDto
+                {
+                    position = Float3(tPose.position),
+                    rotation = Float4(tPose.rotation),
+                    scale = Float3(tPose.scale),
+                };
+            }
+            else
+            {
+                omittedTPose++;
+                Debug.LogWarning("[PhysicsSidecarExporter] humanoid の skeleton に無い骨:"
+                    + human + " (" + transform.name + ") の tPose を省く。");
+            }
+            bones.Add(record);
+        }
+        dto.bones = bones.ToArray();
+        return dto;
+    }
+
     private static string PhysBoneVersionName(VRCPhysBoneBase.Version version)
     {
         const string prefix = "Version_";
@@ -1055,6 +1116,7 @@ public static class PhysicsSidecarExporter
             if (node.source != null && (node.source.path == null || node.source.path.Length == 0))
                 Debug.LogWarning("[PhysicsSidecarExporter] source.path が空:" + node.id);
         }
+        if (sidecar.humanoid != null) ValidateHumanoid(sidecar.humanoid, nodeIds);
         if (sidecar.capture.statePolicy == "bind-pose"
             && (sidecar.capture.bindPoseSource == null || sidecar.capture.bindPoseSource.Length == 0))
             throw new InvalidOperationException("bind-pose の bindPoseSource が空。");
@@ -1116,6 +1178,46 @@ public static class PhysicsSidecarExporter
         }
     }
 
+    // humanoid 記録を検査する。骨名とノード参照の存在、T-pose の位置・拡大率の
+    // 有限値、回転の有限値と非ゼロを確認する。正規化は Rust 側の適用時に行う。
+    // `tPose` が無い骨は skeleton に無い骨であり、適用時に飛ばすため通す。
+    private static void ValidateHumanoid(HumanoidDto humanoid, HashSet<string> nodeIds)
+    {
+        if (humanoid.bones == null) return;
+        foreach (HumanBoneDto bone in humanoid.bones)
+        {
+            if (string.IsNullOrEmpty(bone.bone))
+                throw new InvalidOperationException("humanoid の骨名が空。");
+            if (!nodeIds.Contains(bone.nodeId))
+                throw new InvalidOperationException("humanoid の参照ノードが nodes に無い:" + bone.bone);
+            if (bone.tPose == null) continue;
+            CheckHumanTransform(bone.tPose, bone.bone);
+        }
+    }
+
+    private static void CheckHumanTransform(HumanTransformDto tPose, string name)
+    {
+        foreach (float[] values in new[] { tPose.position, tPose.scale })
+        {
+            if (values == null || values.Length != 3)
+                throw new InvalidOperationException("humanoid の T-pose が3要素でない:" + name);
+            foreach (float component in values)
+                if (!IsFinite(component))
+                    throw new InvalidOperationException("humanoid の T-pose に非有限値がある:" + name);
+        }
+        if (tPose.rotation == null || tPose.rotation.Length != 4)
+            throw new InvalidOperationException("humanoid の T-pose 回転が4要素でない:" + name);
+        float squared = 0f;
+        foreach (float component in tPose.rotation)
+        {
+            if (!IsFinite(component))
+                throw new InvalidOperationException("humanoid の T-pose 回転に非有限値がある:" + name);
+            squared += component * component;
+        }
+        if (!(squared >= 1e-8f))
+            throw new InvalidOperationException("humanoid の T-pose 回転がゼロである:" + name);
+    }
+
     private static bool IsFinite(float value)
     {
         return !float.IsNaN(value) && !float.IsInfinity(value);
@@ -1140,6 +1242,11 @@ public static class PhysicsSidecarExporter
     private static readonly Regex NullSourcePattern = new Regex(
         "\"source\": \\{\\s*\"modelId\": \"\",\\s*\"path\": \\[\\],\\s*\"assetGuid\": \"\",\\s*\"localId\": 0\\s*\\}");
 
+    // skeleton に無い骨の `tPose: null` が展開された残骸に戻す正規表現。
+    // null の float[] は `[]` に展開される (source.path と同じ約束)。
+    private static readonly Regex NullTPosePattern = new Regex(
+        "\"tPose\": \\{\\s*\"position\": \\[\\],\\s*\"rotation\": \\[\\],\\s*\"scale\": \\[\\]\\s*\\}");
+
     // 以下、JsonUtility 用 DTO。フィールド順が JSON の順序になる。
     [Serializable]
     private sealed class SidecarDto
@@ -1150,6 +1257,7 @@ public static class PhysicsSidecarExporter
         public CaptureDto capture;
         public SourceModelDto[] sourceModels;
         public NodeDto[] nodes;
+        public HumanoidDto humanoid;
         public PhysBoneDto[] physBones;
         public ColliderDto[] colliders;
         public ConstraintDto[] constraints;
@@ -1310,6 +1418,33 @@ public static class PhysicsSidecarExporter
         public bool linked;
         public float[] left;
         public float[] right;
+    }
+
+    // humanoid の T-pose 記録。参照実装の capture と同じく
+    // `avatar.humanDescription.skeleton` を Transform 名で引いたものであり、
+    // 位置・拡大率は適用せず回転だけを使う。skeleton に無い骨は `tPose: null`
+    // になり、Rust 側は上書きしない。`nodeId` は sidecar の `n:N` 体系である。
+    [Serializable]
+    private sealed class HumanoidDto
+    {
+        public bool isHuman;
+        public HumanBoneDto[] bones;
+    }
+
+    [Serializable]
+    private sealed class HumanBoneDto
+    {
+        public string bone;
+        public string nodeId;
+        public HumanTransformDto tPose;
+    }
+
+    [Serializable]
+    private sealed class HumanTransformDto
+    {
+        public float[] position;
+        public float[] rotation;
+        public float[] scale;
     }
 
     [Serializable]

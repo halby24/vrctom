@@ -76,7 +76,8 @@ VRCTOM_PHYSICS_OUT=/tmp/out/physics.json \
 （保存せずに）開いて再探索する。
 
 成功時は出力パスと件数をログに出し、バッチでは終了コード 0 で終わる。
-成功ログには視線の要約（`lookAt=eyeLook... left=... right=...`）も出す。
+成功ログには視線の要約（`lookAt=eyeLook... left=... right=...`）と
+humanoid の要約（`humanoid=骨数(tPose省略数)`）も出す。
 失敗時は `Debug.LogError` して終了コード 1。
 
 ## 参照姿勢 (statePolicy)
@@ -161,6 +162,22 @@ VRCTOM_PHYSICS_OUT=/tmp/out/physics.json \
   姿勢は `{linked, left[4], right[4]}` であり、値は正規化しない生値、
   `linked` が真の場合は左の値を両目に使う。未初期化の姿勢は非 linked の恒等回転になる。
   Rust 側は目の参照の存在と姿勢の有限値・4要素を検査し、正規化は測定時に行う。
+- `humanoid`: humanoid の T-pose 記録。
+  `{isHuman, bones[{bone, nodeId, tPose}]}` の形式であり、
+  参照姿勢の方針によらず descriptor の生の T-pose を出す。
+  参照実装の capture と同じく `avatar.humanDescription.skeleton` を
+  Transform 名で引いて `Animator.GetBoneTransform(HumanBodyBones)` の
+  各骨について記録する。`bone` は Unity の `HumanBodyBones` 名、
+  `nodeId` はノードと同じ `n:N` のID体系であり、スナップショットの
+  `n:0/0/...` とは別物である。`tPose` は `{position[3], rotation[4], scale[3]}` であり、
+  参照実装の `RigCompiler.Humanoid.PoseHumanoid` と同じく回転だけを使う。
+  Rust 側は参照姿勢からの差分δを右から掛けて適用するため、
+  `Armature` の -90度X を焼き込まないこちらのフレームでも同じ姿勢変化になる。
+  `skeleton` に無い骨は `tPose` を省き（JSON では `null`）、警告をログに出す。
+  Rust 側はその骨を上書きしない。`isHuman` は
+  `avatar != null && avatar.isHuman` の写しである。
+  Rust 側は骨名とノード参照の存在、T-pose の位置・拡大率の有限値、
+  回転の有限値と非ゼロを検査し、正規化は適用時に行う。
 - `unsupportedFeatures[]`: VRM に持っていけない要素の記録（ソート済み）。
   `plane-colliders`（Plane コライダーあり）、
   `stretch-motion:pb:N`、`allow-grabbing:pb:N:値`、`allow-posing:pb:N:値`、

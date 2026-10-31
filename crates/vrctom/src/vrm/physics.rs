@@ -321,9 +321,54 @@ pub struct PhysicsSidecar {
     /// 視線記録。無い旧形式の場合は `None` として扱い、後方互換を保つ。
     #[serde(rename = "lookAt", default)]
     pub look_at: Option<super::look_at::SidecarLookAt>,
+    /// humanoidのT-pose記録。無い旧形式の場合は `None` として扱い、
+    /// 後方互換を保つ。ある場合は [`apply_humanoid_t_pose`] で
+    /// 各骨のローカル回転だけを上書きする。
+    #[serde(default)]
+    pub humanoid: Option<SidecarHumanoid>,
     /// 未対応機能の名残。今回は検証せず保持する。
     #[serde(rename = "unsupportedFeatures", default)]
     pub unsupported_features: Vec<String>,
+}
+
+/// humanoidのT-pose記録。Unityヘルパが `avatar.humanDescription.skeleton` と
+/// `Animator.GetBoneTransform` の突き合わせから作ったものである。
+///
+/// 参照実装の `RigCompiler.Humanoid` と同じく、capture時の姿勢ではなく
+/// humanoidのT-pose（`skeleton` のローカルTRS）を各骨の `tPose` に持つ。
+/// `skeleton` に無い骨は `tPose` を持たず、Rust側はその骨を上書きしない。
+#[derive(Debug, Clone, Deserialize)]
+pub struct SidecarHumanoid {
+    /// humanoidとして有効かどうか。`avatar.isHuman` の写しである。
+    #[serde(rename = "isHuman", default)]
+    pub is_human: bool,
+    /// 骨列。`Animator.GetBoneTransform` の列挙順である。
+    #[serde(default)]
+    pub bones: Vec<SidecarHumanBone>,
+}
+
+/// humanoidの骨1件。
+#[derive(Debug, Clone, Deserialize)]
+pub struct SidecarHumanBone {
+    /// 骨名。Unityの `HumanBodyBones` 名である。
+    pub bone: String,
+    /// 対応するsidecarノードのID（`n:N` 体系）である。
+    #[serde(rename = "nodeId")]
+    pub node_id: String,
+    /// T-poseのローカルTRS。`skeleton` に無い骨は `None` である。
+    #[serde(rename = "tPose", default)]
+    pub t_pose: Option<SidecarHumanTransform>,
+}
+
+/// T-poseのローカルTRS。Unity空間（左手系）の生値である。
+#[derive(Debug, Clone, Deserialize)]
+pub struct SidecarHumanTransform {
+    /// 平行移動。
+    pub position: [f64; 3],
+    /// 回転（四元数 `[x, y, z, w]`）。
+    pub rotation: [f64; 4],
+    /// 拡大率。
+    pub scale: [f64; 3],
 }
 
 /// ヘルパの情報。
@@ -1054,6 +1099,13 @@ impl PhysicsSidecar {
         if let Some(look) = self.look_at.as_ref() {
             super::look_at::validate_sidecar_look_at(look, &node_at)?;
         }
+        // humanoid記録は任意であり、無い旧形式は検証しない。ある場合は
+        // 骨名とノード参照、T-poseの有限値と回転の非ゼロを確認する。
+        // 正規化は適用時に行うためここでは求めない。重複ノードの検出は
+        // 適用時（[`apply_humanoid_t_pose`]）に行う。
+        if let Some(humanoid) = self.humanoid.as_ref() {
+            validate_sidecar_humanoid(humanoid, &node_at)?;
+        }
         let mut key_total = 0usize;
         for bone in &self.phys_bones {
             check_node_ref(&node_at, &bone.component_node_id, &bone.id, "付属ノード")?;
@@ -1218,6 +1270,58 @@ fn check_node_ref(
             VrmErrorKind::InvalidPhysicsSidecar,
             format!("{what}の参照が無い: {owner} -> {target}"),
         ));
+    }
+    Ok(())
+}
+
+/// humanoid記録を検証する。[`PhysicsSidecar::validate`] から呼び出す。
+///
+/// 骨名とノード参照の存在、T-poseの位置・拡大率の有限値、回転の有限値と
+/// 非ゼロを確認する。正規化と重複ノードの検出は適用時に行うため、
+/// ここでは求めない。`tPose` が無い骨は `skeleton` に無い骨であり、
+/// 適用時に飛ばすため検証では通す。
+///
+/// # Errors
+///
+/// 骨名の空・ノード参照の欠落・T-poseの非有限値やゼロ回転の場合に返す。
+fn validate_sidecar_humanoid(
+    humanoid: &SidecarHumanoid,
+    node_at: &HashMap<&str, usize>,
+) -> Result<(), VrmError> {
+    for bone in &humanoid.bones {
+        if bone.bone.is_empty() {
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidPhysicsSidecar,
+                "humanoidの骨名が空である",
+            ));
+        }
+        check_node_ref(
+            node_at,
+            &bone.node_id,
+            bone.bone.as_str(),
+            "humanoidの参照ノード",
+        )?;
+        let Some(t_pose) = bone.t_pose.as_ref() else {
+            continue;
+        };
+        check_vec3_finite(&t_pose.position, "humanoidのT-pose位置")?;
+        check_vec3_finite(&t_pose.scale, "humanoidのT-pose拡大率")?;
+        if !t_pose.rotation.iter().all(|v| v.is_finite()) {
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidPhysicsSidecar,
+                format!("humanoidのT-pose回転に非有限値がある: {}", bone.bone),
+            ));
+        }
+        let squared = t_pose.rotation[0] * t_pose.rotation[0]
+            + t_pose.rotation[1] * t_pose.rotation[1]
+            + t_pose.rotation[2] * t_pose.rotation[2]
+            + t_pose.rotation[3] * t_pose.rotation[3];
+        if !squared.is_finite() || squared < 1e-8 {
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidPhysicsSidecar,
+                format!("humanoidのT-pose回転がゼロである: {}", bone.bone),
+            ));
+        }
     }
     Ok(())
 }
@@ -1651,13 +1755,15 @@ fn hex_nibble(value: u8) -> char {
 
 /// TRSから列優先の4x4行列を作る。`T * R * S` の順である。
 fn trs_to_matrix(trs: &SidecarTrs) -> [f64; 16] {
-    let (x, y, z, w) = (
-        trs.rotation[0],
-        trs.rotation[1],
-        trs.rotation[2],
-        trs.rotation[3],
-    );
-    let (sx, sy, sz) = (trs.scale[0], trs.scale[1], trs.scale[2]);
+    compose_trs(trs.position, trs.rotation, trs.scale)
+}
+
+/// 位置・回転（四元数 `[x, y, z, w]`）・拡大率から列優先の4x4行列を作る。
+/// `T * R * S` の順であり、回転は正規化済みを想定する（正規化は行わない）。
+/// sidecarのTRSとVRMローカルの再合成で共有する。
+fn compose_trs(position: [f64; 3], rotation: [f64; 4], scale: [f64; 3]) -> [f64; 16] {
+    let (x, y, z, w) = (rotation[0], rotation[1], rotation[2], rotation[3]);
+    let (sx, sy, sz) = (scale[0], scale[1], scale[2]);
     // 正規化済みの四元数から回転行列を作り、列ごとに拡大率を掛ける。
     let xx = x * x;
     let yy = y * y;
@@ -1690,9 +1796,9 @@ fn trs_to_matrix(trs: &SidecarTrs) -> [f64; 16] {
         r12 * sz,
         r22 * sz,
         0.0, //
-        trs.position[0],
-        trs.position[1],
-        trs.position[2],
+        position[0],
+        position[1],
+        position[2],
         1.0, //
     ]
 }
@@ -4684,6 +4790,276 @@ fn is_ancestor_or_self(
         };
         node = parent;
     }
+}
+
+/// humanoidのT-pose適用で上書きした骨1件。
+#[derive(Debug, Clone)]
+pub struct AppliedHumanoidBone {
+    /// 骨名。Unityの `HumanBodyBones` 名である。
+    pub bone: String,
+    /// 上書きしたVRMノードの索引。
+    pub node: usize,
+}
+
+/// humanoidのT-pose適用で飛ばした骨1件。
+#[derive(Debug, Clone)]
+pub struct SkippedHumanoidBone {
+    /// 骨名。Unityの `HumanBodyBones` 名である。
+    pub bone: String,
+    /// 対応するsidecarノードのID。
+    pub node_id: String,
+    /// 飛ばした理由。
+    pub reason: SkippedHumanoidReason,
+}
+
+/// humanoidのT-pose適用で飛ばした理由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkippedHumanoidReason {
+    /// `skeleton` に無い骨であり `tPose` が無い場合。
+    /// 参照実装が `node.reference` をT-poseに使う場合に相当し、
+    /// こちらはノードの姿勢をそのまま残す。
+    MissingTPose,
+    /// sidecarノードIDが対応表やsidecar自体に無い場合。
+    UnresolvedNode,
+    /// 対応表の指すVRMノードがモデルに無い場合。
+    MissingModelNode,
+}
+
+impl std::fmt::Display for SkippedHumanoidReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingTPose => write!(f, "T-poseが無い"),
+            Self::UnresolvedNode => write!(f, "ノードが解決できない"),
+            Self::MissingModelNode => write!(f, "モデルにノードが無い"),
+        }
+    }
+}
+
+/// humanoidのT-pose適用の報告。CLIの記録と試験の観測に使う。
+#[derive(Debug, Clone, Default)]
+pub struct HumanoidPoseReport {
+    /// 上書きした骨列。sidecarの骨順である。
+    pub applied: Vec<AppliedHumanoidBone>,
+    /// 飛ばした骨列。sidecarの骨順である。
+    pub skipped: Vec<SkippedHumanoidBone>,
+    /// 差分δの角度が0.01度以上の骨列。sidecarの骨順である。
+    /// 参照姿勢とT-poseが実質的に違う骨だけが残る。
+    pub changed: Vec<ChangedHumanoidBone>,
+}
+
+/// humanoidのT-pose適用で差分が0.01度以上あった骨1件。
+#[derive(Debug, Clone)]
+pub struct ChangedHumanoidBone {
+    /// 骨名。Unityの `HumanBodyBones` 名である。
+    pub bone: String,
+    /// 上書きしたVRMノードの索引。
+    pub node: usize,
+    /// 差分δの角度（度）。`inverse(reference) * tPose` の回転角である。
+    pub delta_deg: f64,
+}
+
+/// 参照姿勢とT-poseの差分を「変化あり」とみなす角度（度）。
+/// 参照実装の計測で0.01度以上違った8骨（肩・親指・中指）を捉える目安であり、
+/// f32由来の丸め（1e-5度程度）を拾わない大きさである。
+const HUMANOID_CHANGED_DEGREES: f64 = 0.01;
+
+/// 適用する差分δが恒等とみなせる角度（ラジアン）。
+/// これ未満の骨は行列を触らず、丸めを入れない。1e-12ラジアンは約1e-10度である。
+const HUMANOID_IDENTITY_DELTA_RAD: f64 = 1e-12;
+
+/// sidecarのhumanoid記録（T-pose）を [`VrmModel`] のローカル回転へ適用する。
+///
+/// 参照実装の `RigCompiler.Humanoid.PoseHumanoid` はリグのローカル回転を
+/// `tPose` で置換する。こちらは参照実装とフレームが違うため（`Armature` の
+/// -90度Xを根元に焼き込まない等）、置換ではなく参照姿勢からの差分δを
+/// 右から掛ける。`δ = inverse(reference_local) * tPose`（Unity空間）を
+/// 鏡像規則（四元数の `(x, -y, -z, w)`）でVRM空間へ変換し、正規化してから
+/// `local' = local * R(δ)` とする。3x3の列ベクトルを回転させ、平行移動は
+/// そのまま残す。分解・再構成はしないため、シアー（直交しない基底）を
+/// 持つ行列も壊さない。こちらとUnityのワールド回転は鏡像 `M` で結ばれるため
+/// （`W_our = M(W_u)`）、`W_u' = W_u * δ` に対して
+/// `W_our' = M(W_u) * M(δ)` となり、同じ姿勢変化になる。
+/// δが `HUMANOID_IDENTITY_DELTA_RAD` 未満の骨は行列を触らず、
+/// `applied` にだけ記録して丸めを入れない。
+/// `tPose` が無い骨・解決できないノード・モデルに無いノードは記録して飛ばし、
+/// 失敗にはしない。`humanoid` が `None` の旧形式sidecarでは何もせず空の報告を
+/// 返す。呼び出し側は [`compile_springs`] より前に呼ぶ（参照実装もリグ構築直後に
+/// T-poseを当ててから物理を解決するため）。適用は全件の検証が通ってから
+/// 一括で行い、部分更新はしない。同じVRMノードに2件の骨が対応する場合は失敗する。
+///
+/// # Errors
+///
+/// T-poseや参照姿勢の回転の非有限値やゼロ・
+/// 同じノードへの重複の場合に返す。この場合モデルは変更しない。
+pub fn apply_humanoid_t_pose(
+    sidecar: &PhysicsSidecar,
+    model: &mut VrmModel,
+    resolution: &PhysicsResolution,
+    humanoid: Option<&SidecarHumanoid>,
+) -> Result<HumanoidPoseReport, VrmError> {
+    let Some(humanoid) = humanoid else {
+        return Ok(HumanoidPoseReport::default());
+    };
+    let sidecar_at: HashMap<&str, &SidecarNode> = sidecar
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect();
+    // 先に全件を検証し、適用計画だけを作る。失敗時は部分更新しない。
+    // 差分δはUnity空間の参照姿勢から求め、VRM空間へ鏡像して正規化する。
+    let mut planned: Vec<(String, usize, [f64; 4], f64)> = Vec::with_capacity(humanoid.bones.len());
+    let mut report = HumanoidPoseReport::default();
+    let mut seen_nodes: HashSet<usize> = HashSet::new();
+    for bone in &humanoid.bones {
+        let Some(t_pose) = bone.t_pose.as_ref() else {
+            report.skipped.push(SkippedHumanoidBone {
+                bone: bone.bone.clone(),
+                node_id: bone.node_id.clone(),
+                reason: SkippedHumanoidReason::MissingTPose,
+            });
+            continue;
+        };
+        let (Some(&index), Some(sidecar_node)) = (
+            resolution.node_map.get(bone.node_id.as_str()),
+            sidecar_at.get(bone.node_id.as_str()),
+        ) else {
+            report.skipped.push(SkippedHumanoidBone {
+                bone: bone.bone.clone(),
+                node_id: bone.node_id.clone(),
+                reason: SkippedHumanoidReason::UnresolvedNode,
+            });
+            continue;
+        };
+        if model.nodes.get(index).is_none() {
+            report.skipped.push(SkippedHumanoidBone {
+                bone: bone.bone.clone(),
+                node_id: bone.node_id.clone(),
+                reason: SkippedHumanoidReason::MissingModelNode,
+            });
+            continue;
+        }
+        if !seen_nodes.insert(index) {
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidPhysicsSidecar,
+                format!("humanoidのT-poseが同じノードに重複する: {}", bone.node_id),
+            ));
+        }
+        // 検証済みのDTOを直接受け取る場合もあるため、ここでも有限値と
+        // 非ゼロを確認する。失敗時は適用前のため部分更新は起きない。
+        let reference = normalize_humanoid_quat(
+            &sidecar_node.reference_local.rotation,
+            bone.bone.as_str(),
+            "参照姿勢",
+        )?;
+        let t_pose = normalize_humanoid_quat(&t_pose.rotation, bone.bone.as_str(), "T-pose")?;
+        let delta = quat_mul(quat_inverse(reference), t_pose);
+        let delta_deg = quat_angle_deg(delta);
+        // 差分をVRM空間へ鏡像して正規化する。鏡像は群同型のため、
+        // 往復で厳密に戻り、角度も保つ。
+        let mirrored = normalize_mirrored_quat(&mirror_quat(delta), bone.bone.as_str())?;
+        planned.push((bone.bone.clone(), index, mirrored, delta_deg));
+    }
+    // 検証が全件通ってから一括で適用する。差分はローカル行列に右から掛け、
+    // 平行移動は自動的に保つ（回転行列の平行移動成分がゼロのため）。
+    // 恒等に近い差分の骨は行列を触らず、丸めを入れない。
+    for (bone, index, delta, delta_deg) in &planned {
+        if delta_deg.to_radians() >= HUMANOID_IDENTITY_DELTA_RAD {
+            let local = model.nodes[*index].local;
+            model.nodes[*index].local = matrix::mul(&local, &rotation_matrix(delta));
+        }
+        report.applied.push(AppliedHumanoidBone {
+            bone: bone.clone(),
+            node: *index,
+        });
+        if *delta_deg >= HUMANOID_CHANGED_DEGREES {
+            report.changed.push(ChangedHumanoidBone {
+                bone: bone.clone(),
+                node: *index,
+                delta_deg: *delta_deg,
+            });
+        }
+    }
+    Ok(report)
+}
+
+/// 単位四元数から回転のみの4x4行列（列優先）を作る。平行移動はゼロである。
+fn rotation_matrix(rotation: &[f64; 4]) -> [f64; 16] {
+    let (x, y, z, w) = (rotation[0], rotation[1], rotation[2], rotation[3]);
+    let r00 = 1.0 - 2.0 * (y * y + z * z);
+    let r10 = 2.0 * (x * y + z * w);
+    let r20 = 2.0 * (x * z - y * w);
+    let r01 = 2.0 * (x * y - z * w);
+    let r11 = 1.0 - 2.0 * (x * x + z * z);
+    let r21 = 2.0 * (y * z + x * w);
+    let r02 = 2.0 * (x * z + y * w);
+    let r12 = 2.0 * (y * z - x * w);
+    let r22 = 1.0 - 2.0 * (x * x + y * y);
+    [
+        r00, r10, r20, 0.0, //
+        r01, r11, r21, 0.0, //
+        r02, r12, r22, 0.0, //
+        0.0, 0.0, 0.0, 1.0, //
+    ]
+}
+
+/// humanoidの姿勢四元数を正規化する。有限値と非ゼロを確認する。
+///
+/// # Errors
+///
+/// 非有限値やゼロ（ノルム2乗が `1e-8` 未満）の場合に返す。
+fn normalize_humanoid_quat(
+    rotation: &[f64; 4],
+    bone: &str,
+    what: &str,
+) -> Result<[f64; 4], VrmError> {
+    if !rotation.iter().all(|v| v.is_finite()) {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPhysicsSidecar,
+            format!("humanoidの{what}回転に非有限値がある: {bone}"),
+        ));
+    }
+    normalize_mirrored_quat(rotation, bone).map_err(|_| {
+        VrmError::new(
+            VrmErrorKind::InvalidPhysicsSidecar,
+            format!("humanoidの{what}回転がゼロである: {bone}"),
+        )
+    })
+}
+
+/// 鏡像済みの四元数を正規化する。有限値であることは呼び出し側で確認済みとする。
+///
+/// # Errors
+///
+/// ゼロ（ノルム2乗が `1e-8` 未満）の場合に返す。
+fn normalize_mirrored_quat(rotation: &[f64; 4], bone: &str) -> Result<[f64; 4], VrmError> {
+    let squared = rotation[0] * rotation[0]
+        + rotation[1] * rotation[1]
+        + rotation[2] * rotation[2]
+        + rotation[3] * rotation[3];
+    if !squared.is_finite() || squared < 1e-8 {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPhysicsSidecar,
+            format!("humanoidのT-pose回転がゼロである: {bone}"),
+        ));
+    }
+    let length = squared.sqrt();
+    Ok([
+        rotation[0] / length,
+        rotation[1] / length,
+        rotation[2] / length,
+        rotation[3] / length,
+    ])
+}
+
+/// 単位四元数の逆元。共役である。
+fn quat_inverse(q: [f64; 4]) -> [f64; 4] {
+    [-q[0], -q[1], -q[2], q[3]]
+}
+
+/// 単位四元数の回転角（度）。符号は同一視し、非単位の入力は正規化しない。
+/// 呼び出し側は正規化済みの値を渡す。
+fn quat_angle_deg(q: [f64; 4]) -> f64 {
+    2.0 * q[3].abs().clamp(0.0, 1.0).acos().to_degrees()
 }
 
 #[cfg(test)]

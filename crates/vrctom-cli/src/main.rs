@@ -15,7 +15,7 @@ use vrctom::vrm::{
     HumanoidBones, MaterialOptions, PhysicsLimits, PhysicsSidecar, SpringCompileOptions,
     VrmAvatarPermission, VrmCommercialUsage, VrmCreditNotation, VrmExportOptions,
     VrmExpressionProfile, VrmMaterials, VrmMeta, VrmModel, VrmModification, VrmOptions,
-    compile_springs, resolve_look_at,
+    apply_humanoid_t_pose, compile_springs, resolve_look_at,
 };
 
 #[derive(Debug, Parser)]
@@ -469,6 +469,32 @@ fn export(
                 return 1;
             }
         };
+        // humanoidのrest姿勢はsidecarのT-poseを優先する。無い骨は
+        // ノードの姿勢のまま残す。参照実装もリグ構築直後にT-poseを当ててから
+        // 物理を解決するため、視線の測定とスプリングの生成より前に適用する。
+        // 失敗時はモデルを部分更新せず打ち切る。
+        let (tpose_applied, tpose_skipped) = match apply_humanoid_t_pose(
+            &sidecar,
+            &mut model,
+            &resolution,
+            sidecar.humanoid.as_ref(),
+        ) {
+            Ok(report) => {
+                for skipped in &report.skipped {
+                    eprintln!(
+                        "T-ポーズのスキップ: {} {}: {}",
+                        escape_diag(&skipped.bone),
+                        escape_diag(&skipped.node_id),
+                        skipped.reason,
+                    );
+                }
+                (report.applied.len(), report.skipped.len())
+            }
+            Err(error) => {
+                diagnose_stage("T-ポーズの適用に失敗した", &error);
+                return 1;
+            }
+        };
         // 視線の解決。sidecarに視線記録が無い旧形式では何もしない。
         // 測定も既定もここで確定する。モデルは変更しないため、
         // 失敗時は部分更新なく打ち切る。humanoidの検出は鎖の生成より前に行い、
@@ -530,7 +556,7 @@ fn export(
                     0.0
                 };
                 let summary = format!(
-                    "スプリング{}件 関節{}件 collider{}件 グループ{}件 分岐{}件 center{}件（world{} / all-motion{} / なし{}） 近似(endpoint未生成{} gravity0関節{} first-child{} 平均近似{} 平面落下{}) 関節値(硬さ平均{:.3} 重力あり{}件) 共有{}件 スキップ{}件 制約{}件 制約スキップ{}件",
+                    "スプリング{}件 関節{}件 collider{}件 グループ{}件 分岐{}件 center{}件（world{} / all-motion{} / なし{}） 近似(endpoint未生成{} gravity0関節{} first-child{} 平均近似{} 平面落下{}) 関節値(硬さ平均{:.3} 重力あり{}件) 共有{}件 スキップ{}件 制約{}件 制約スキップ{}件 T-ポーズ{}件",
                     compiled.report.spring_count,
                     compiled.report.joint_count,
                     compiled.report.collider_count,
@@ -551,7 +577,11 @@ fn export(
                     compiled.report.skipped_bones.len(),
                     model.node_constraints.len(),
                     compiled.report.skipped_constraints.len(),
+                    tpose_applied,
                 );
+                if tpose_skipped > 0 {
+                    eprintln!("T-ポーズのスキップ: {tpose_skipped}件");
+                }
                 model.spring_bones = compiled.bones;
                 spring_summary = Some(summary);
                 // 視線は鎖の生成が通ってから代入する。失敗時はモデルを更新しない。

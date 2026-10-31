@@ -68,6 +68,23 @@ VRChat に bound された Unity 制約は二重に出さない。実 fixture �
 `unsupportedFeatures` は `stretch`・`external-colliders`・`plane-colliders`
 などの文字列を運ぶだけで、今回は検証しない。
 
+`humanoid` は humanoid の T-pose 記録であり、無い旧形式の sidecar は
+後方互換で扱う（Rust 側は何もしない）。`{isHuman, bones[{bone, nodeId, tPose}]}` の
+形式であり、`bone` は Unity の `HumanBodyBones` 名、`nodeId` はノードと同じ
+`n:N` のID体系である。`tPose` は `{position[3], rotation[4], scale[3]}` であり、
+参照実装の capture と同じく `avatar.humanDescription.skeleton` を Transform 名で
+引いた humanoid の T-pose（capture 時の姿勢ではない）を持つ。
+出所は skeleton のローカルTRSであり、回転の差分δ
+（`inverse(reference_local) * tPose`）だけを
+[`apply_humanoid_t_pose`](VRM書き出し.md) で各骨に右から掛ける
+（位置・拡大率は適用しない）。参照実装の置換と同じ姿勢変化になるが、
+こちらは `Armature` の -90度X を根元に焼き込まないため、置換ではなく
+差分適用でフレーム差を吸収する。
+`skeleton` に無い骨は `tPose` を省き（JSON では `null`）、Rust 側はその骨を
+上書きせず飛ばして記録する。Rust 側は骨名とノード参照の存在、T-pose の
+位置・拡大率の有限値、回転の有限値と非ゼロを検査し、正規化と重複ノードの
+検出は適用時に行う。適用時は参照姿勢の回転も有限値・非ゼロか確かめる。
+
 ## IDとパスの規則
 
 IDは `n:`・`pb:`・`c:` の接頭辞を持ち、sidecar全体で一意である。
@@ -103,6 +120,11 @@ IDは `n:`・`pb:`・`c:` の接頭辞を持ち、sidecar全体で一意であ�
 `PhysicsResolution` はsidecarノードIDからVrmノード索引への対応表・
 未解決の追加ノード・PhysBoneとcolliderの参照・座標変換行列を持つ。
 [`compile_springs`] が最小出力に使う。
+
+対応解決の後、スプリングの生成より前に [`apply_humanoid_t_pose`](VRM書き出し.md)
+で humanoid の rest 姿勢（参照姿勢からの差分δ）を各骨のローカル回転に右から掛ける。
+無い骨はノードの姿勢のまま残す。参照実装もリグ構築直後に T-pose を当ててから
+物理を解決するため、同じ順序にする。
 
 ## 座標ゲート
 

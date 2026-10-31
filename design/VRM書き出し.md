@@ -37,6 +37,17 @@ JSONは空白、BINは0で4バイト境界まで埋める。
 省略する。中間モデルのローカル行列はglTFの列優先と同じ配列であるため、
 f32へ変換するだけでよい。メッシュノードは頂点をベイク済みでローカル行列が単位行列である。
 
+humanoid の rest 姿勢は sidecar の T-pose を優先し、無い骨はノードの姿勢を使う。
+`--physics` 指定時は解決直後に [`apply_humanoid_t_pose`](../../crates/vrctom/src/vrm/physics.rs)
+で参照姿勢からの差分δ（`inverse(reference_local) * tPose`）だけを
+各骨のローカル回転に右から掛け（位置・拡大率は触らない）、
+視線の測定とスプリングの生成より前に適用する。参照実装の置換と同じ姿勢変化に
+なるが、こちらは `Armature` の -90度X を根元に焼き込まないため、
+置換ではなく差分適用でフレーム差を吸収する（Hips が動かず world 姿勢を保つ）。
+T-pose が無い旧形式の sidecar では何もしない。適用の検証（ID解決・有限値・
+非ゼロ回転・重複検出）は [`PhysicsSidecar::parse`](../../crates/vrctom/src/vrm/physics.rs)
+と適用時に行い、参照姿勢の回転も確かめ、失敗時はモデルを部分更新しない。
+
 ## humanoid
 
 VRM 1.0の必須骨は hips・spine・head・左右の upperArm/lowerArm/hand、
