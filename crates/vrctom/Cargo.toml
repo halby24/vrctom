@@ -13,6 +13,8 @@ gltf = { version = "1.4", default-features = false, features = ["extensions", "e
 yaml_serde = "0.10"
 # wasmでも使う純粋パーサのため、zlib展開はrust_backendで共通依存にする。
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# MMD標準フェイシャルモーフ名の突き合わせに使うNFKC正規化。純Rustでwasmでも動く。
+unicode-normalization = "0.1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tempfile = "3"

@@ -1917,12 +1917,13 @@ fn 表情最小ファイル(
         (2, bind_matrix(1.0, 2.0, 3.0)),
     ];
     binds.extend_from_slice(extra_binds);
-    objs.push(束ねノード(40, b"Blend\x00\x01Deformer"));
+    // 形状・チャンネルのIDは数百件のダミーでも固定IDと衝突しないよう離れた基数から採る。
+    objs.push(束ねノード(3000, b"Blend\x00\x01Deformer"));
     for (offset, (channel_name, shape_name, indexes, deltas, deform, weights)) in
         channels.iter().enumerate()
     {
-        let shape_id = 20 + offset as i64;
-        let channel_id = 30 + offset as i64;
+        let shape_id = 1000 + offset as i64;
+        let channel_id = 2000 + offset as i64;
         let mut channel_full = channel_name.as_bytes().to_vec();
         channel_full.extend_from_slice(b"\x00\x01SubDeformer");
         let mut shape_full = shape_name.as_bytes().to_vec();
@@ -1930,8 +1931,8 @@ fn 表情最小ファイル(
         objs.push(形状(shape_id, &shape_full, indexes, deltas));
         objs.push(伝達子(channel_id, &channel_full, *deform, *weights));
         conns.push(conn(shape_id, channel_id));
-        conns.push(conn(channel_id, 40));
-        conns.push(conn(40, 10));
+        conns.push(conn(channel_id, 3000));
+        conns.push(conn(3000, 10));
     }
     objs.extend(extra_objects);
     conns.extend(extra_connections);
@@ -1999,7 +2000,7 @@ fn 同名ターゲットの重複は失敗する() {
             形状(50, b"t1-dup\x00\x01Shape", &[1], &[0.0, 0.5, 0.0]),
             伝達子(60, b"t1\x00\x01SubDeformer", Some(0.0), None),
         ],
-        vec![conn(50, 60), conn(60, 40)],
+        vec![conn(50, 60), conn(60, 3000)],
         &[],
     );
     let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("重複があっても読める");
@@ -2024,7 +2025,7 @@ fn 単一フレームでないチャンネルは失敗する() {
             &[1],
             &[0.0, 0.5, 0.0],
         )],
-        vec![conn(50, 30)],
+        vec![conn(50, 2000)],
         &[],
     );
     let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("複数形状でも読める");
@@ -2128,6 +2129,244 @@ fn 空と100と長い全100の重み率は受理する() {
     let options = VrmOptions::new().with_expressions(profile);
     let (model, _) = VrmModel::from_fbx(&parsed, &options).expect("全100は受理する");
     assert_eq!(model.meshes[0].targets.len(), 3);
+}
+
+/// 互換形状の絞り込みはFBX順に束ね参照・`vrc.`・MMD名だけを残す。
+///
+/// 667件相当のダミー（体形スライダ名600件を含む）から、束ね参照・大小文字混在の
+/// `vrc.*`・MMD名・NFKC差（半角カタカナ・全角数字）がFBX順に残り、
+/// 体形スライダ・ARKit形状名・その他の名前が落ちることを確かめる。
+/// 顔追跡を書かないためARKit名は残さない。
+#[test]
+fn 互換形状だけがfbx順に残り体形スライダは落ちる() {
+    // 残す名前と落とす名前を混ぜてFBX順に並べる。真偽は残すかどうかである。
+    let mut names: Vec<(String, bool)> = Vec::new();
+    for i in 0..600 {
+        names.push((format!("スライダ_身長_{i:03}"), false));
+    }
+    for i in 0..44 {
+        names.push((format!("スライダ_体重_{i:03}"), false));
+    }
+    names.extend(
+        [
+            ("my_special_blink", true),
+            ("vrc.v_aa", true),
+            ("VRC.V_OU", true),
+            ("eyeBlinkLeft", false),
+            ("笑い", true),
+            ("jawOpen", false),
+            ("ウィンク", true),
+            ("mouthOpenCustom", false),
+            ("ｳｨﾝｸ２右", true),
+            ("スライダ_体重", false),
+            ("ｷﾘｯ", true),
+            ("Body_Slim", false),
+            ("あ2", true),
+            ("てへぺろ２", true),
+            ("にやり２", true),
+            ("瞳縦潰れ", true),
+            ("ハイライト消", true),
+            ("映り込み消", true),
+            ("∧", true),
+            ("前", true),
+            ("ω□", true),
+            ("口角上げ", true),
+            ("まばたき", true),
+        ]
+        .iter()
+        .map(|(name, keep)| ((*name).to_owned(), *keep)),
+    );
+    assert_eq!(names.len(), 667, "667件相当のダミーである");
+    const INDEXES: &[i32] = &[0];
+    const DELTAS: &[f64] = &[0.5, 0.0, 0.0];
+    let channels: Vec<表情チャンネル<'_>> = names
+        .iter()
+        .map(|(name, _)| (name.as_str(), "shape", INDEXES, DELTAS, Some(0.0), None))
+        .collect();
+    let bytes = 表情最小ファイル(&channels, vec![], vec![], &[]);
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("667件相当は読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "vrc.v_aa"), 束ね("blink", "my_special_blink")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    let (model, report) = VrmModel::from_fbx(&parsed, &options).expect("絞り込みは通る");
+    // 残す名前だけがFBX順に並ぶ。
+    let want: Vec<&str> = names
+        .iter()
+        .filter(|(_, keep)| *keep)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let mesh = &model.meshes[0];
+    assert_eq!(mesh.targets.len(), want.len(), "残す名前だけが残る");
+    for (target, name) in mesh.targets.iter().zip(want.iter()) {
+        assert_eq!(&target.name, name);
+    }
+    // 束ねはプロファイル順であり、絞り込み後の索引を名前で指す。
+    assert_eq!(model.expressions.preset.len(), 2);
+    for (preset, target) in [("aa", "vrc.v_aa"), ("blink", "my_special_blink")] {
+        let entry = model
+            .expressions
+            .preset
+            .iter()
+            .find(|entry| entry.name == preset)
+            .expect("式がある");
+        assert_eq!(entry.morph_target_binds.len(), 1);
+        let bind = &entry.morph_target_binds[0];
+        let index = want
+            .iter()
+            .position(|name| *name == target)
+            .expect("束ね先は残る");
+        assert_eq!(bind.mesh, 0);
+        assert_eq!(bind.target, index);
+        assert_eq!(bind.weight, 1.0);
+    }
+    assert_eq!(report.morph_target_count, want.len());
+    assert_eq!(report.expression_count, 2);
+}
+
+/// Unity出力と同じ57件のターゲット名（`milfy-unity.vrm` の `Body` の `targetNames`）。
+const UNITY_TARGET_NAMES_57: &[&str] = &[
+    "vrc.v_sil",
+    "vrc.v_pp",
+    "vrc.v_aa",
+    "vrc.v_oh",
+    "vrc.v_ou",
+    "vrc.v_ih",
+    "vrc.v_th",
+    "vrc.v_nn",
+    "vrc.v_dd",
+    "vrc.v_kk",
+    "vrc.v_ff",
+    "vrc.v_e",
+    "vrc.v_ch",
+    "vrc.v_rr",
+    "vrc.v_ss",
+    "vrc.blink",
+    "vrc.looking_up",
+    "vrc.looking_down",
+    "あ",
+    "い",
+    "う",
+    "え",
+    "お",
+    "まばたき",
+    "なごみ",
+    "笑い",
+    "ウィンク",
+    "ウィンク右",
+    "ウィンク２",
+    "ｳｨﾝｸ２右",
+    "はぅ",
+    "びっくり",
+    "じと目",
+    "ｷﾘｯ",
+    "星目",
+    "はぁと",
+    "瞳小",
+    "光下",
+    "▲",
+    "ワ",
+    "ω",
+    "ω□",
+    "□",
+    "ん",
+    "ぺろっ",
+    "にやり",
+    "にっこり",
+    "口角上げ",
+    "口角下げ",
+    "口横広げ",
+    "真面目",
+    "困る",
+    "にこり",
+    "怒り",
+    "上",
+    "下",
+    "はちゅ目",
+];
+
+/// 実fixtureの表情はUnityと同じ57件のターゲットと8式の束ねを持つ。
+///
+/// ターゲット集合がUnityの `targetNames` と完全一致し、8式の束ねが
+/// （メッシュ・ターゲット名・重み1.0）でUnityと一致することを確かめる。
+/// 順序はUnityと異なりFBXのチャンネル順であるため、束ねは名前で突き合わせ、
+/// 順序自体がFBX順であることも確かめる。
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn 実fixtureの表情はunityと同じ57件と8束ねを持つ() {
+    let Ok(path) = std::env::var("VRCTOM_FBX_FIXTURE") else {
+        eprintln!("VRCTOM_FBX_FIXTUREが未設定のため跳ばす");
+        return;
+    };
+    let bytes = std::fs::read(&path).expect("実fixtureは読める");
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("実fixtureは読める");
+    let options = VrmOptions::new().with_expressions(VrmExpressionProfile::vrchat());
+    let (model, report) =
+        VrmModel::from_fbx(&parsed, &options).expect("実fixtureは表情付きで変換できる");
+    assert_eq!(report.morph_target_count, 57);
+    assert_eq!(report.expression_count, 8);
+    // 表情を持つメッシュは1件だけである。
+    let 表情あり: Vec<usize> = model
+        .meshes
+        .iter()
+        .enumerate()
+        .filter(|(_, mesh)| !mesh.targets.is_empty())
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(表情あり.len(), 1, "表情を持つメッシュは1件である");
+    let mesh_index = 表情あり[0];
+    let mesh = &model.meshes[mesh_index];
+    // 集合がUnityの57件と完全一致する。
+    let got: std::collections::HashSet<&str> = mesh
+        .targets
+        .iter()
+        .map(|target| target.name.as_str())
+        .collect();
+    let want: std::collections::HashSet<&str> = UNITY_TARGET_NAMES_57.iter().copied().collect();
+    assert_eq!(got, want, "targetNamesの集合がUnityと一致する");
+    // 順序はFBXのチャンネル順である。重複は無い。
+    assert_eq!(got.len(), mesh.targets.len(), "ターゲット名に重複は無い");
+    let all: Vec<String> = parsed
+        .blend_shape_channels(mesh.geometry)
+        .iter()
+        .map(|channel| channel.name.clone())
+        .collect();
+    eprintln!(
+        "expression_channels_total={} kept={}",
+        all.len(),
+        mesh.targets.len()
+    );
+    let mut last: Option<usize> = None;
+    for target in &mesh.targets {
+        let pos = all
+            .iter()
+            .position(|name| name == &target.name)
+            .expect("ターゲットはFBXのチャンネルにある");
+        if let Some(prev) = last {
+            assert!(prev < pos, "ターゲット順はFBX順である: {}", target.name);
+        }
+        last = Some(pos);
+    }
+    // 8式の束ねが（メッシュ・ターゲット名・重み）でUnityと一致する。
+    assert_eq!(model.expressions.preset.len(), 8);
+    for binding in &VrmExpressionProfile::vrchat().bindings {
+        let entry = model
+            .expressions
+            .preset
+            .iter()
+            .find(|entry| entry.name == binding.expression)
+            .expect("8式がある");
+        assert_eq!(entry.morph_target_binds.len(), 1);
+        let bind = &entry.morph_target_binds[0];
+        assert_eq!(bind.mesh, mesh_index);
+        let index = mesh
+            .targets
+            .iter()
+            .position(|target| target.name == binding.target)
+            .expect("束ね先は残る");
+        assert_eq!(bind.target, index);
+        assert_eq!(bind.weight, 1.0);
+    }
 }
 
 #[test]

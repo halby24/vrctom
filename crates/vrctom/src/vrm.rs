@@ -462,11 +462,94 @@ fn check_unit_scale(file: &FbxFile<'_>) -> Result<[f64; 16], VrmError> {
 /// 実データの値はちょうど100と0のため、テキスト由来の丸めの吸収用である。
 const FULL_WEIGHT_TOLERANCE: f64 = 1e-6;
 
-/// 解決済みの表情選択。対象メッシュと選択順のチャンネルデルタを持つ。
+/// 互換形状名のうちMMD標準フェイシャルモーフ名の一覧。
+///
+/// 参照実装（SoulFlame VRM Exporter）の `CompatibleShapeNames.Mmd` をそのまま移植した48件である。
+/// 突き合わせは[`is_mmd_shape_name`] がNFKC正規化後に行うため、半角カタカナ
+/// （`ｳｨﾝｸ２右`→`ウィンク２右`・`ｷﾘｯ`→`キリッ`）や全角数字の表記揺れも一致する。
+/// 出力するターゲット名はFBXの元の表記のまま保つ。
+const MMD_COMPATIBLE_NAMES: &[&str] = &[
+    "まばたき",
+    "笑い",
+    "ウィンク",
+    "ウィンク右",
+    "ウィンク２",
+    "ウィンク２右",
+    "なごみ",
+    "はぅ",
+    "びっくり",
+    "じと目",
+    "キリッ",
+    "はちゅ目",
+    "星目",
+    "はぁと",
+    "瞳小",
+    "瞳縦潰れ",
+    "光下",
+    "ハイライト消",
+    "映り込み消",
+    "あ",
+    "い",
+    "う",
+    "え",
+    "お",
+    "あ２",
+    "ん",
+    "▲",
+    "∧",
+    "□",
+    "ワ",
+    "ω",
+    "ω□",
+    "にやり",
+    "にやり２",
+    "にっこり",
+    "ぺろっ",
+    "てへぺろ",
+    "てへぺろ２",
+    "口角上げ",
+    "口角下げ",
+    "口横広げ",
+    "真面目",
+    "困る",
+    "にこり",
+    "怒り",
+    "上",
+    "下",
+    "前",
+];
+
+/// VRChatのviseme・まぶた形状名（`vrc.` 始まり。大文字小文字を無視する）かどうかを返す。
+///
+/// 参照実装の `CompatibleShapeNames.IsVrchat` と同値である。
+fn is_vrchat_shape_name(name: &str) -> bool {
+    name.as_bytes()
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"vrc."))
+}
+
+/// MMD標準フェイシャルモーフ名（NFKC正規化後に比較）かどうかを返す。
+///
+/// 参照実装の `CompatibleShapeNames.IsMmd` と同値であり、半角カタカナや全角数字の
+/// 表記揺れも一致する。変換表は初回に1度だけ作る。
+fn is_mmd_shape_name(name: &str) -> bool {
+    use std::sync::OnceLock;
+    use unicode_normalization::UnicodeNormalization;
+    static KEYS: OnceLock<HashSet<String>> = OnceLock::new();
+    let keys = KEYS.get_or_init(|| {
+        MMD_COMPATIBLE_NAMES
+            .iter()
+            .map(|name| name.nfkc().collect::<String>())
+            .collect()
+    });
+    keys.contains(&name.nfkc().collect::<String>())
+}
+
+/// 解決済みの表情選択。対象メッシュとFBX順に絞ったチャンネルデルタを持つ。
 struct ResolvedPlan {
     /// 表情対象のメッシュGeometry。
     geometry: ObjectId,
-    /// 要求順に重複を除いたチャンネル。名前と形状デルタを持つ。
+    /// 残す条件（束ね参照・`vrc.`・MMD名）に当てはまるチャンネル。FBXの出現順を保つ。
     channels: Vec<ResolvedChannel>,
     /// プロファイル順の式束ね。重複ターゲットは1つにまとめた索引を指す。
     bindings: Vec<VrmExpressionBinding>,
@@ -484,10 +567,14 @@ struct ResolvedChannel {
 ///
 /// 要求された全ターゲット名を含むメッシュがちょうど1つであることを要求する。
 /// 候補が無い場合は見つからない名前を挙げて、複数ある場合はメッシュ名を挙げて失敗する。
-/// 対象メッシュの所有モデルが無い場合も失敗する。後段の変換で束ねが宙に浮くためである。
-/// 選択したチャンネルは単一フレーム条件（形状1件・有限かつ全100の重み率・
+/// 対象メッシュに所有モデルが無い場合も失敗する。後段の変換で束ねが宙に浮くためである。
+/// 対象メッシュの選定後、そのメッシュのチャンネルをFBX順に絞る。残すのは束ねが指す名前・
+/// `vrc.` 始まり（大文字小文字を無視）・MMD名（NFKC比較）のいずれかに当てはまる場合だけであり、
+/// 参照実装の `PruneBlendShapes` と同値である。束ねが指す名前の重複だけは
+/// 解決先が定まらないため失敗し、参照されない名前の重複はそのまま並べる。
+/// 残したチャンネルは単一フレーム条件（形状1件・有限かつ全100の重み率・
 /// 有限かつゼロの初期値）を満たすことを要求し、満たさない場合は未対応として失敗する。
-/// 選択していないチャンネルの複数フレームや非100の重み率は拒否しない。
+/// 落ちたチャンネルの複数フレームや非100の重み率は拒否しない。
 /// 他アバターの未使用チャンネルを壊さないためである。
 fn resolve_expressions(
     file: &FbxFile<'_>,
@@ -570,7 +657,49 @@ fn resolve_expressions(
         )
         .with_object(geometry));
     }
-    if wanted.len() > options.max_morph_targets {
+    // 対象メッシュのチャンネルをFBX順に絞る。残すのは束ねが指す名前・`vrc.` 始まり
+    // （大文字小文字を無視）・MMD名（NFKC比較）のいずれかに当てはまる場合だけであり、
+    // 参照実装の `PruneBlendShapes` と同値である。束ねが指す名前の重複だけを失敗させる。
+    let channels = mesh_channels
+        .iter()
+        .find(|(id, _)| *id == geometry)
+        .map(|(_, channels)| channels)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let bound: HashSet<&str> = wanted.iter().copied().collect();
+    let mut kept: Vec<&crate::fbx::BlendShapeChannel> = Vec::new();
+    for channel in channels {
+        if !(bound.contains(channel.name.as_str())
+            || is_vrchat_shape_name(&channel.name)
+            || is_mmd_shape_name(&channel.name))
+        {
+            continue;
+        }
+        // 束ねが指す名前だけは重複を許さない。どちらを指すか決められないためである。
+        // 参照されない名前の重複は、参照実装と同じくそのまま並べて出す。
+        if bound.contains(channel.name.as_str())
+            && kept.iter().any(|kept| kept.name == channel.name)
+        {
+            return Err(VrmError::new(
+                VrmErrorKind::AmbiguousExpressionTarget,
+                format!("同じ表情ターゲット名が重複する: {}", channel.name),
+            )
+            .with_object(geometry));
+        }
+        kept.push(channel);
+    }
+    // 選定で含むことを確認した束ね参照は、絞り込み後にも残る。
+    for want in &wanted {
+        if !kept.iter().any(|channel| channel.name.as_str() == *want) {
+            // 選定と絞り込みは同じ名前集合で判定するため、ここには到達しない。
+            return Err(VrmError::new(
+                VrmErrorKind::MissingExpressionTarget,
+                format!("表情ターゲットが見つからない: {want}"),
+            )
+            .with_object(geometry));
+        }
+    }
+    if kept.len() > options.max_morph_targets {
         return Err(VrmError::new(
             VrmErrorKind::LimitExceeded,
             "モーフターゲット数が上限を超えた",
@@ -583,7 +712,7 @@ fn resolve_expressions(
         .mesh(geometry)
         .map(|mesh| mesh.corner_count)
         .unwrap_or(usize::MAX);
-    let upper_bytes = wanted
+    let upper_bytes = kept
         .len()
         .checked_mul(corner_count)
         .and_then(|count| count.checked_mul(12))
@@ -595,35 +724,14 @@ fn resolve_expressions(
         )
         .with_object(geometry));
     }
-    let channels = mesh_channels
-        .iter()
-        .find(|(id, _)| *id == geometry)
-        .map(|(_, channels)| channels)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    let mut resolved = Vec::with_capacity(wanted.len());
-    for want in &wanted {
-        let mut matched = channels.iter().filter(|c| c.name.as_str() == *want);
-        let Some(channel) = matched.next() else {
-            // 候補探索で含むことを確認済みのため、ここには到達しない。
-            return Err(VrmError::new(
-                VrmErrorKind::MissingExpressionTarget,
-                format!("表情ターゲットが見つからない: {want}"),
-            )
-            .with_object(geometry));
-        };
-        if matched.next().is_some() {
-            return Err(VrmError::new(
-                VrmErrorKind::AmbiguousExpressionTarget,
-                format!("同じ表情ターゲット名が重複する: {want}"),
-            )
-            .with_object(geometry));
-        }
+    let mut resolved = Vec::with_capacity(kept.len());
+    for channel in kept {
+        let name = channel.name.as_str();
         if channel.shapes.len() != 1 {
             return Err(VrmError::new(
                 VrmErrorKind::UnsupportedBlendShape,
                 format!(
-                    "単一フレームでないチャンネルがある: {want}（形状数{}）",
+                    "単一フレームでないチャンネルがある: {name}（形状数{}）",
                     channel.shapes.len()
                 ),
             )
@@ -634,7 +742,7 @@ fn resolve_expressions(
             _ => {
                 return Err(VrmError::new(
                     VrmErrorKind::UnsupportedBlendShape,
-                    format!("初期値がゼロでないチャンネルがある: {want}"),
+                    format!("初期値がゼロでないチャンネルがある: {name}"),
                 )
                 .with_object(channel.id));
             }
@@ -649,7 +757,7 @@ fn resolve_expressions(
             if !all_full {
                 return Err(VrmError::new(
                     VrmErrorKind::UnsupportedBlendShape,
-                    format!("重み率が全100でないチャンネルがある: {want}"),
+                    format!("重み率が全100でないチャンネルがある: {name}"),
                 )
                 .with_object(channel.id));
             }
@@ -658,7 +766,7 @@ fn resolve_expressions(
             .shape_data(channel.shapes[0].shape)
             .map_err(wrap_fbx_error)?;
         resolved.push(ResolvedChannel {
-            name: (*want).to_owned(),
+            name: name.to_owned(),
             data,
         });
     }
