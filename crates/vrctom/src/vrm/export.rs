@@ -27,6 +27,95 @@ const DEFAULT_LICENSE_URL: &str = "https://vrm.dev/licenses/1.0/";
 /// 実データの数百MBが収まる大きさにし、上限の変更は `with_` で始まるメソッドで行う。
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
+/// VRM 1.0のmetaのアバター権限。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VrmAvatarPermission {
+    /// アバターの人格権を持つ本人のみが利用できる。Unityの既定値である。
+    #[default]
+    OnlyAuthor,
+    /// 別途ライセンスを得た者のみが利用できる。
+    OnlySeparatelyLicensedPerson,
+    /// 誰でも利用できる。
+    Everyone,
+}
+
+impl VrmAvatarPermission {
+    /// VRM 1.0のmeta文字列を返す。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OnlyAuthor => "onlyAuthor",
+            Self::OnlySeparatelyLicensedPerson => "onlySeparatelyLicensedPerson",
+            Self::Everyone => "everyone",
+        }
+    }
+}
+
+/// VRM 1.0のmetaの商用利用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VrmCommercialUsage {
+    /// 非営利の個人利用のみ。Unityの既定値である。
+    #[default]
+    PersonalNonProfit,
+    /// 営利の個人利用まで許す。
+    PersonalProfit,
+    /// 法人利用まで許す。
+    Corporation,
+}
+
+impl VrmCommercialUsage {
+    /// VRM 1.0のmeta文字列を返す。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PersonalNonProfit => "personalNonProfit",
+            Self::PersonalProfit => "personalProfit",
+            Self::Corporation => "corporation",
+        }
+    }
+}
+
+/// VRM 1.0のmetaのクレジット表記。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VrmCreditNotation {
+    /// 表記が必要。Unityの既定値である。
+    #[default]
+    Required,
+    /// 表記が不要。
+    Unnecessary,
+}
+
+impl VrmCreditNotation {
+    /// VRM 1.0のmeta文字列を返す。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Unnecessary => "unnecessary",
+        }
+    }
+}
+
+/// VRM 1.0のmetaの改変許可。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VrmModification {
+    /// 改変を禁止する。Unityの既定値である。
+    #[default]
+    Prohibited,
+    /// 改変は許すが再配布は許さない。
+    AllowModification,
+    /// 改変と再配布を許す。
+    AllowModificationRedistribution,
+}
+
+impl VrmModification {
+    /// VRM 1.0のmeta文字列を返す。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Prohibited => "prohibited",
+            Self::AllowModification => "allowModification",
+            Self::AllowModificationRedistribution => "allowModificationRedistribution",
+        }
+    }
+}
+
 /// VRMメタ情報。
 #[derive(Debug, Clone)]
 pub struct VrmMeta {
@@ -46,10 +135,30 @@ pub struct VrmMeta {
     pub references: Vec<String>,
     /// 第三者ライセンス。`Some` の場合だけ書く。
     pub third_party_licenses: Option<String>,
+    /// アバター権限。Unityと同じ既定値（`onlyAuthor`）で常に書く。
+    pub avatar_permission: VrmAvatarPermission,
+    /// 商用利用。Unityと同じ既定値（`personalNonProfit`）で常に書く。
+    pub commercial_usage: VrmCommercialUsage,
+    /// クレジット表記。Unityと同じ既定値（`required`）で常に書く。
+    pub credit_notation: VrmCreditNotation,
+    /// 改変許可。Unityと同じ既定値（`prohibited`）で常に書く。
+    pub modification: VrmModification,
+    /// 再配布の許可。Unityと同じ既定値（偽）で常に書く。
+    pub allow_redistribution: bool,
+    /// 過度な暴力表現での利用許可。Unityと同じ既定値（偽）で常に書く。
+    pub allow_excessively_violent_usage: bool,
+    /// 過度な性的表現での利用許可。Unityと同じ既定値（偽）で常に書く。
+    pub allow_excessively_sexual_usage: bool,
+    /// 政治・宗教利用の許可。Unityと同じ既定値（偽）で常に書く。
+    pub allow_political_or_religious_usage: bool,
+    /// 反社会的・憎悪利用の許可。Unityと同じ既定値（偽）で常に書く。
+    pub allow_antisocial_or_hate_usage: bool,
 }
 
 impl VrmMeta {
     /// メタ情報を作る。ライセンスURLはVRM 1.0の既定値になる。
+    /// 権限9項目はUnityと同じ既定値（`onlyAuthor`・`personalNonProfit`・`required`・
+    /// `prohibited`・許可5件は偽）で初期化する。
     pub fn new(name: impl Into<String>, authors: Vec<String>) -> Self {
         Self {
             name: name.into(),
@@ -60,6 +169,15 @@ impl VrmMeta {
             contact_information: None,
             references: Vec::new(),
             third_party_licenses: None,
+            avatar_permission: VrmAvatarPermission::default(),
+            commercial_usage: VrmCommercialUsage::default(),
+            credit_notation: VrmCreditNotation::default(),
+            modification: VrmModification::default(),
+            allow_redistribution: false,
+            allow_excessively_violent_usage: false,
+            allow_excessively_sexual_usage: false,
+            allow_political_or_religious_usage: false,
+            allow_antisocial_or_hate_usage: false,
         }
     }
 
@@ -82,6 +200,44 @@ impl VrmMeta {
                 VrmExportErrorKind::InvalidMeta,
                 "metaのlicenseUrlが空である",
             ));
+        }
+        // 列挙型で担保するが、書き出し時の文字列がVRM 1.0の既知集合か実際に確かめる。
+        // 将来の列挙追加時の書式漏れを実行時に捉えるためである。
+        match self.avatar_permission.as_str() {
+            "onlyAuthor" | "onlySeparatelyLicensedPerson" | "everyone" => {}
+            _ => {
+                return Err(VrmExportError::new(
+                    VrmExportErrorKind::InvalidMeta,
+                    "metaのavatarPermissionが未知の値である",
+                ));
+            }
+        }
+        match self.commercial_usage.as_str() {
+            "personalNonProfit" | "personalProfit" | "corporation" => {}
+            _ => {
+                return Err(VrmExportError::new(
+                    VrmExportErrorKind::InvalidMeta,
+                    "metaのcommercialUsageが未知の値である",
+                ));
+            }
+        }
+        match self.credit_notation.as_str() {
+            "required" | "unnecessary" => {}
+            _ => {
+                return Err(VrmExportError::new(
+                    VrmExportErrorKind::InvalidMeta,
+                    "metaのcreditNotationが未知の値である",
+                ));
+            }
+        }
+        match self.modification.as_str() {
+            "prohibited" | "allowModification" | "allowModificationRedistribution" => {}
+            _ => {
+                return Err(VrmExportError::new(
+                    VrmExportErrorKind::InvalidMeta,
+                    "metaのmodificationが未知の値である",
+                ));
+            }
         }
         Ok(())
     }
@@ -1069,6 +1225,43 @@ impl<'a> GlbWriter<'a> {
                 serde_json::Value::String(licenses.clone()),
             );
         }
+        // 権限9項目はUnityと同じキー集合で常に書く。値は列挙の文字列とboolである。
+        meta_value.insert(
+            "avatarPermission".to_string(),
+            serde_json::Value::String(meta.avatar_permission.as_str().to_string()),
+        );
+        meta_value.insert(
+            "allowExcessivelyViolentUsage".to_string(),
+            serde_json::Value::Bool(meta.allow_excessively_violent_usage),
+        );
+        meta_value.insert(
+            "allowExcessivelySexualUsage".to_string(),
+            serde_json::Value::Bool(meta.allow_excessively_sexual_usage),
+        );
+        meta_value.insert(
+            "commercialUsage".to_string(),
+            serde_json::Value::String(meta.commercial_usage.as_str().to_string()),
+        );
+        meta_value.insert(
+            "allowPoliticalOrReligiousUsage".to_string(),
+            serde_json::Value::Bool(meta.allow_political_or_religious_usage),
+        );
+        meta_value.insert(
+            "allowAntisocialOrHateUsage".to_string(),
+            serde_json::Value::Bool(meta.allow_antisocial_or_hate_usage),
+        );
+        meta_value.insert(
+            "creditNotation".to_string(),
+            serde_json::Value::String(meta.credit_notation.as_str().to_string()),
+        );
+        meta_value.insert(
+            "allowRedistribution".to_string(),
+            serde_json::Value::Bool(meta.allow_redistribution),
+        );
+        meta_value.insert(
+            "modification".to_string(),
+            serde_json::Value::String(meta.modification.as_str().to_string()),
+        );
         let mut human_bones = serde_json::Map::new();
         for (bone, node) in self.bones {
             human_bones.insert(bone.name().to_string(), serde_json::json!({ "node": node }));

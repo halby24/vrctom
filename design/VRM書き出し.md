@@ -99,6 +99,24 @@ licenseUrlの既定値はVRM 1.0の `https://vrm.dev/licenses/1.0/` である。
 thirdPartyLicensesは指定された場合だけ書く。
 nameが空、authorsが空、licenseUrlが空の場合は失敗する。
 
+権限9項目はUnityと同じキー集合で常に書く。既定値はUnityと同じである。
+上書きはCLI（`--avatar-permission`・`--commercial-usage`・
+`--credit-notation`・`--modification`・`--allow-*` の5件）か
+`VrmMeta` の欄への代入で行い、`--meta-version` 相当は今回の範囲外である。
+
+- `avatarPermission`: `onlyAuthor`（既定）・`onlySeparatelyLicensedPerson`・`everyone`
+- `commercialUsage`: `personalNonProfit`（既定）・`personalProfit`・`corporation`
+- `creditNotation`: `required`（既定）・`unnecessary`
+- `modification`: `prohibited`（既定）・`allowModification`・`allowModificationRedistribution`
+- `allowRedistribution`・`allowExcessivelyViolentUsage`・
+  `allowExcessivelySexualUsage`・`allowPoliticalOrReligiousUsage`・
+  `allowAntisocialOrHateUsage` はいずれも既定で偽
+
+書き出す前に文字列がVRM 1.0の既知集合かを実際に確かめる。
+型で担保するが、将来の列挙追加時の書式漏れを実行時に捉えるためである。
+CLIの値はkebab-case（`allow-modification` など）で受け取り、JSONへは
+camelCase（`allowModification`）で書く。
+
 ## 材質
 
 `VrmExportOptions` に `VrmMaterials` が渡された場合、FBXの材質スロット名で

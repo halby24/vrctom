@@ -26,7 +26,10 @@ mod mesh;
 pub mod physics;
 
 pub use error::{VrmError, VrmErrorKind};
-pub use export::{VrmExportError, VrmExportErrorKind, VrmExportOptions, VrmMeta};
+pub use export::{
+    VrmAvatarPermission, VrmCommercialUsage, VrmCreditNotation, VrmExportError, VrmExportErrorKind,
+    VrmExportOptions, VrmMeta, VrmModification,
+};
 pub use humanoid::{HUMANOID_BONE_NAMES, HumanoidBone, HumanoidBones, is_known_humanoid_bone_name};
 pub use look_at::{
     LookAtReport, SidecarEyePose, SidecarLookAt, VrmLookAt, VrmLookAtRange, resolve_look_at,

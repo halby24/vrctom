@@ -13,7 +13,8 @@ use vrctom::fbx::{FbxFile, FbxOptions};
 use vrctom::unitypackage::{UnpackOptions, unpack_to};
 use vrctom::vrm::{
     HumanoidBones, MaterialOptions, PhysicsLimits, PhysicsSidecar, SpringCompileOptions,
-    VrmExportOptions, VrmExpressionProfile, VrmMaterials, VrmMeta, VrmModel, VrmOptions,
+    VrmAvatarPermission, VrmCommercialUsage, VrmCreditNotation, VrmExportOptions,
+    VrmExpressionProfile, VrmMaterials, VrmMeta, VrmModel, VrmModification, VrmOptions,
     compile_springs, resolve_look_at,
 };
 
@@ -60,6 +61,33 @@ enum Command {
         /// 物理sidecar（JSON）のパス。指定時はスプリングをコンパイルして載せる。
         #[arg(long, value_name = "FILE")]
         physics: Option<PathBuf>,
+        /// アバターの人格権の扱い。既定は `only-author`。
+        #[arg(long, value_enum, value_name = "PERMISSION")]
+        avatar_permission: Option<AvatarPermissionArg>,
+        /// 商用利用の範囲。既定は `personal-non-profit`。
+        #[arg(long, value_enum, value_name = "USAGE")]
+        commercial_usage: Option<CommercialUsageArg>,
+        /// クレジット表記の要否。既定は `required`。
+        #[arg(long, value_enum, value_name = "NOTATION")]
+        credit_notation: Option<CreditNotationArg>,
+        /// 改変の許可範囲。既定は `prohibited`。
+        #[arg(long, value_enum, value_name = "MODIFICATION")]
+        modification: Option<ModificationArg>,
+        /// 再配布を許可する。既定は不許可。
+        #[arg(long)]
+        allow_redistribution: bool,
+        /// 過度な暴力表現での利用を許可する。既定は不許可。
+        #[arg(long)]
+        allow_excessively_violent_usage: bool,
+        /// 過度な性的表現での利用を許可する。既定は不許可。
+        #[arg(long)]
+        allow_excessively_sexual_usage: bool,
+        /// 政治・宗教目的の利用を許可する。既定は不許可。
+        #[arg(long)]
+        allow_political_or_religious_usage: bool,
+        /// 反社会的・憎悪目的の利用を許可する。既定は不許可。
+        #[arg(long)]
+        allow_antisocial_or_hate_usage: bool,
     },
 }
 
@@ -68,6 +96,93 @@ enum Command {
 enum ExpressionProfile {
     /// VRChat向けの8件（あいうえお・瞬き・視線上下）。
     Vrc,
+}
+
+/// アバター権限のCLI指定。VRM 1.0の3値をそのまま表す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AvatarPermissionArg {
+    /// 本人のみ利用可（Unityの既定値）。
+    OnlyAuthor,
+    /// 別途許諾者のみ利用可。
+    OnlySeparatelyLicensedPerson,
+    /// 誰でも利用可。
+    Everyone,
+}
+
+impl AvatarPermissionArg {
+    /// 書き出し側の列挙へ写す。
+    fn into_vrm(self) -> VrmAvatarPermission {
+        match self {
+            Self::OnlyAuthor => VrmAvatarPermission::OnlyAuthor,
+            Self::OnlySeparatelyLicensedPerson => VrmAvatarPermission::OnlySeparatelyLicensedPerson,
+            Self::Everyone => VrmAvatarPermission::Everyone,
+        }
+    }
+}
+
+/// 商用利用のCLI指定。VRM 1.0の3値をそのまま表す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CommercialUsageArg {
+    /// 非営利の個人利用のみ（Unityの既定値）。
+    PersonalNonProfit,
+    /// 営利の個人利用まで許す。
+    PersonalProfit,
+    /// 法人利用まで許す。
+    Corporation,
+}
+
+impl CommercialUsageArg {
+    /// 書き出し側の列挙へ写す。
+    fn into_vrm(self) -> VrmCommercialUsage {
+        match self {
+            Self::PersonalNonProfit => VrmCommercialUsage::PersonalNonProfit,
+            Self::PersonalProfit => VrmCommercialUsage::PersonalProfit,
+            Self::Corporation => VrmCommercialUsage::Corporation,
+        }
+    }
+}
+
+/// クレジット表記のCLI指定。VRM 1.0の2値をそのまま表す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CreditNotationArg {
+    /// 表記が必要（Unityの既定値）。
+    Required,
+    /// 表記が不要。
+    Unnecessary,
+}
+
+impl CreditNotationArg {
+    /// 書き出し側の列挙へ写す。
+    fn into_vrm(self) -> VrmCreditNotation {
+        match self {
+            Self::Required => VrmCreditNotation::Required,
+            Self::Unnecessary => VrmCreditNotation::Unnecessary,
+        }
+    }
+}
+
+/// 改変許可のCLI指定。VRM 1.0の3値をそのまま表す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ModificationArg {
+    /// 改変を禁止する（Unityの既定値）。
+    Prohibited,
+    /// 改変は許すが再配布は許さない。
+    AllowModification,
+    /// 改変と再配布を許す。
+    AllowModificationRedistribution,
+}
+
+impl ModificationArg {
+    /// 書き出し側の列挙へ写す。
+    fn into_vrm(self) -> VrmModification {
+        match self {
+            Self::Prohibited => VrmModification::Prohibited,
+            Self::AllowModification => VrmModification::AllowModification,
+            Self::AllowModificationRedistribution => {
+                VrmModification::AllowModificationRedistribution
+            }
+        }
+    }
 }
 
 fn main() {
@@ -99,7 +214,35 @@ fn main() {
             assets,
             expressions,
             physics,
-        } => export(input, output, name, author, assets, expressions, physics),
+            avatar_permission,
+            commercial_usage,
+            credit_notation,
+            modification,
+            allow_redistribution,
+            allow_excessively_violent_usage,
+            allow_excessively_sexual_usage,
+            allow_political_or_religious_usage,
+            allow_antisocial_or_hate_usage,
+        } => export(
+            input,
+            output,
+            name,
+            author,
+            assets,
+            expressions,
+            physics,
+            ExportMetaArgs {
+                avatar_permission,
+                commercial_usage,
+                credit_notation,
+                modification,
+                allow_redistribution,
+                allow_excessively_violent_usage,
+                allow_excessively_sexual_usage,
+                allow_political_or_religious_usage,
+                allow_antisocial_or_hate_usage,
+            },
+        ),
     };
     std::process::exit(code);
 }
@@ -231,6 +374,8 @@ fn unpack(package: PathBuf, output: Option<PathBuf>) -> i32 {
 /// 可視エスケープして返す（[`main`] が扱う）。
 /// 標準出力には何も出さず、要約と診断は標準エラーに出す。
 /// 既存の出力先は上書きせず、作成の競合も失敗として1を返す。
+// 引数はCLI配線の束ねであり、分割より呼び出し側の見通しを優先するため許す。
+#[allow(clippy::too_many_arguments)]
 fn export(
     input: PathBuf,
     output: Option<PathBuf>,
@@ -239,6 +384,7 @@ fn export(
     assets: Option<PathBuf>,
     expressions: Option<ExpressionProfile>,
     physics: Option<PathBuf>,
+    meta_args: ExportMetaArgs,
 ) -> i32 {
     // 既定出力先は入力の拡張子を `vrm` に変えたパスとする。
     let destination = match output {
@@ -435,7 +581,8 @@ fn export(
             }
         }
     }
-    let meta = VrmMeta::new(meta_name, meta_authors);
+    let mut meta = VrmMeta::new(meta_name, meta_authors);
+    apply_meta_args(&mut meta, meta_args);
     // 材質の読み取り。指定時はその配置、省略時はFBXの祖先の `Assets` から求める。
     let explicit_assets = assets.is_some();
     let assets_root = match assets {
@@ -514,6 +661,40 @@ fn export(
         eprintln!("物理: {summary}");
     }
     0
+}
+
+/// meta権限9項目のCLI上書き指定。指定が無い列挙は既定値のままにする。
+struct ExportMetaArgs {
+    avatar_permission: Option<AvatarPermissionArg>,
+    commercial_usage: Option<CommercialUsageArg>,
+    credit_notation: Option<CreditNotationArg>,
+    modification: Option<ModificationArg>,
+    allow_redistribution: bool,
+    allow_excessively_violent_usage: bool,
+    allow_excessively_sexual_usage: bool,
+    allow_political_or_religious_usage: bool,
+    allow_antisocial_or_hate_usage: bool,
+}
+
+/// `VrmMeta` にCLIの権限上書きを反映する。指定が無い項目は既定値のままにする。
+fn apply_meta_args(meta: &mut VrmMeta, args: ExportMetaArgs) {
+    if let Some(value) = args.avatar_permission {
+        meta.avatar_permission = value.into_vrm();
+    }
+    if let Some(value) = args.commercial_usage {
+        meta.commercial_usage = value.into_vrm();
+    }
+    if let Some(value) = args.credit_notation {
+        meta.credit_notation = value.into_vrm();
+    }
+    if let Some(value) = args.modification {
+        meta.modification = value.into_vrm();
+    }
+    meta.allow_redistribution = args.allow_redistribution;
+    meta.allow_excessively_violent_usage = args.allow_excessively_violent_usage;
+    meta.allow_excessively_sexual_usage = args.allow_excessively_sexual_usage;
+    meta.allow_political_or_religious_usage = args.allow_political_or_religious_usage;
+    meta.allow_antisocial_or_hate_usage = args.allow_antisocial_or_hate_usage;
 }
 
 /// 明示指定の材質配置から走査元を求める。末尾が `Assets` ならその親を使う。

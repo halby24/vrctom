@@ -6,11 +6,12 @@
 
 use vrctom::fbx::{FbxFile, FbxOptions, ObjectId};
 use vrctom::vrm::{
-    HumanoidBone, HumanoidBones, MaterialOptions, VrmAlphaMode, VrmExportErrorKind,
-    VrmExportOptions, VrmExpression, VrmExpressionOverride, VrmExpressions, VrmImage, VrmImageMime,
-    VrmMaterial, VrmMaterialEntry, VrmMaterials, VrmMesh, VrmMeta, VrmModel, VrmMorphTarget,
-    VrmMorphTargetBind, VrmMtoonParameters, VrmNode, VrmOutlineWidthMode, VrmPrimitive, VrmSampler,
-    VrmSkin, VrmVertices,
+    HumanoidBone, HumanoidBones, MaterialOptions, VrmAlphaMode, VrmAvatarPermission,
+    VrmCommercialUsage, VrmCreditNotation, VrmExportErrorKind, VrmExportOptions, VrmExpression,
+    VrmExpressionOverride, VrmExpressions, VrmImage, VrmImageMime, VrmMaterial, VrmMaterialEntry,
+    VrmMaterials, VrmMesh, VrmMeta, VrmModel, VrmModification, VrmMorphTarget, VrmMorphTargetBind,
+    VrmMtoonParameters, VrmNode, VrmOutlineWidthMode, VrmPrimitive, VrmSampler, VrmSkin,
+    VrmVertices,
 };
 
 // テスト名は日本語で書く（テストは仕様・契約であるため）。
@@ -708,6 +709,112 @@ fn metaの必須項目の欠落で失敗する() {
         .to_vrm(&VrmExportOptions::new(空許諾))
         .expect_err("空のlicenseUrlは失敗する");
     assert_eq!(失敗.kind(), VrmExportErrorKind::InvalidMeta);
+}
+
+#[test]
+fn metaの権限9項目が既定値で書かれる() {
+    let モデル = 合成モデルを作る();
+    let バイト列 = モデル
+        .to_vrm(&書き出し設定を作る())
+        .expect("合成モデルは書き出せる");
+    let (値, _) = glbを分解する(&バイト列);
+    let meta = 値
+        .get("extensions")
+        .and_then(|値| 値.get("VRMC_vrm"))
+        .and_then(|値| 値.get("meta"))
+        .expect("metaがある");
+    // Unityと同じ既定値の9項目がキーと値ともに一致する。
+    let 既定 = [
+        ("avatarPermission", serde_json::json!("onlyAuthor")),
+        ("commercialUsage", serde_json::json!("personalNonProfit")),
+        ("creditNotation", serde_json::json!("required")),
+        ("modification", serde_json::json!("prohibited")),
+        ("allowRedistribution", serde_json::json!(false)),
+        ("allowExcessivelyViolentUsage", serde_json::json!(false)),
+        ("allowExcessivelySexualUsage", serde_json::json!(false)),
+        ("allowPoliticalOrReligiousUsage", serde_json::json!(false)),
+        ("allowAntisocialOrHateUsage", serde_json::json!(false)),
+    ];
+    for (鍵, 期待) in 既定 {
+        assert_eq!(meta.get(鍵), Some(&期待), "metaの{鍵}が既定値である");
+    }
+    // 列挙の全文字列がVRM 1.0の既知集合である。
+    assert_eq!(
+        [
+            VrmAvatarPermission::OnlyAuthor.as_str(),
+            VrmAvatarPermission::OnlySeparatelyLicensedPerson.as_str(),
+            VrmAvatarPermission::Everyone.as_str(),
+        ],
+        ["onlyAuthor", "onlySeparatelyLicensedPerson", "everyone"]
+    );
+    assert_eq!(
+        [
+            VrmCommercialUsage::PersonalNonProfit.as_str(),
+            VrmCommercialUsage::PersonalProfit.as_str(),
+            VrmCommercialUsage::Corporation.as_str(),
+        ],
+        ["personalNonProfit", "personalProfit", "corporation"]
+    );
+    assert_eq!(
+        [
+            VrmCreditNotation::Required.as_str(),
+            VrmCreditNotation::Unnecessary.as_str(),
+        ],
+        ["required", "unnecessary"]
+    );
+    assert_eq!(
+        [
+            VrmModification::Prohibited.as_str(),
+            VrmModification::AllowModification.as_str(),
+            VrmModification::AllowModificationRedistribution.as_str(),
+        ],
+        [
+            "prohibited",
+            "allowModification",
+            "allowModificationRedistribution"
+        ]
+    );
+}
+
+#[test]
+fn metaの権限9項目の上書きが反映される() {
+    let モデル = 合成モデルを作る();
+    let mut meta = VrmMeta::new("試験", vec!["作者".to_string()]);
+    meta.avatar_permission = VrmAvatarPermission::Everyone;
+    meta.commercial_usage = VrmCommercialUsage::Corporation;
+    meta.credit_notation = VrmCreditNotation::Unnecessary;
+    meta.modification = VrmModification::AllowModificationRedistribution;
+    meta.allow_redistribution = true;
+    meta.allow_excessively_violent_usage = true;
+    meta.allow_excessively_sexual_usage = true;
+    meta.allow_political_or_religious_usage = true;
+    meta.allow_antisocial_or_hate_usage = true;
+    let バイト列 = モデル
+        .to_vrm(&VrmExportOptions::new(meta))
+        .expect("上書きしたmetaは書き出せる");
+    let (値, _) = glbを分解する(&バイト列);
+    let meta = 値
+        .get("extensions")
+        .and_then(|値| 値.get("VRMC_vrm"))
+        .and_then(|値| 値.get("meta"))
+        .expect("metaがある");
+    let 上書き = [
+        ("avatarPermission", serde_json::json!("everyone")),
+        ("commercialUsage", serde_json::json!("corporation")),
+        ("creditNotation", serde_json::json!("unnecessary")),
+        (
+            "modification",
+            serde_json::json!("allowModificationRedistribution"),
+        ),
+        ("allowRedistribution", serde_json::json!(true)),
+        ("allowExcessivelyViolentUsage", serde_json::json!(true)),
+        ("allowExcessivelySexualUsage", serde_json::json!(true)),
+        ("allowPoliticalOrReligiousUsage", serde_json::json!(true)),
+        ("allowAntisocialOrHateUsage", serde_json::json!(true)),
+    ];
+    for (鍵, 期待) in 上書き {
+        assert_eq!(meta.get(鍵), Some(&期待), "metaの{鍵}が上書きされる");
+    }
 }
 
 #[test]
