@@ -738,10 +738,30 @@ impl<'a> GlbWriter<'a> {
             .emissive_image
             .map(|image| self.texture_info(image))
             .transpose()?;
+        let normal_texture = vrm
+            .normal_image
+            .map(|image| {
+                self.texture_info(image)
+                    .map(|texture| gltf::json::material::NormalTexture {
+                        index: texture.index,
+                        scale: vrm.normal_scale,
+                        tex_coord: texture.tex_coord,
+                        extensions: None,
+                        extras: Default::default(),
+                    })
+            })
+            .transpose()?;
         let extensions = match &vrm.mtoon {
             Some(parameters) => {
                 self.wrote_mtoon = true;
-                Some(mtoon_extension(parameters, &self.image_textures)?)
+                let mut others = mtoon_extension(parameters, &self.image_textures)?;
+                // MToon材質は常に非発光（unlit）として描く。
+                // 参照実装のUniVRM書き出し（`glTF_KHR_materials_unlit`）と対応する。
+                others.others.insert(
+                    "KHR_materials_unlit".to_string(),
+                    serde_json::Value::Object(serde_json::Map::new()),
+                );
+                Some(others)
             }
             None => None,
         };
@@ -757,6 +777,7 @@ impl<'a> GlbWriter<'a> {
                 roughness_factor: gltf::json::material::StrengthFactor(1.0),
                 ..Default::default()
             },
+            normal_texture,
             emissive_factor: gltf::json::material::EmissiveFactor(vrm.emissive_factor),
             emissive_texture,
             extensions,
@@ -1317,6 +1338,7 @@ impl<'a> GlbWriter<'a> {
         let mut used = vec!["VRMC_vrm".to_string()];
         if self.wrote_mtoon {
             used.push("VRMC_materials_mtoon".to_string());
+            used.push("KHR_materials_unlit".to_string());
         }
         if wrote_spring_bone {
             used.push("VRMC_springBone".to_string());
@@ -2295,6 +2317,34 @@ fn mtoon_extension(
     mtoon.insert(
         "outlineLightingMixFactor".to_string(),
         serde_json::json!(parameters.outline_lighting_mix_factor),
+    );
+    mtoon.insert(
+        "parametricRimColorFactor".to_string(),
+        serde_json::json!(parameters.parametric_rim_color_factor),
+    );
+    mtoon.insert(
+        "parametricRimFresnelPowerFactor".to_string(),
+        serde_json::json!(parameters.parametric_rim_fresnel_power_factor),
+    );
+    mtoon.insert(
+        "parametricRimLiftFactor".to_string(),
+        serde_json::json!(parameters.parametric_rim_lift_factor),
+    );
+    mtoon.insert(
+        "rimLightingMixFactor".to_string(),
+        serde_json::json!(parameters.rim_lighting_mix_factor),
+    );
+    mtoon.insert(
+        "uvAnimationScrollXSpeedFactor".to_string(),
+        serde_json::json!(parameters.uv_animation_scroll_x_speed_factor),
+    );
+    mtoon.insert(
+        "uvAnimationScrollYSpeedFactor".to_string(),
+        serde_json::json!(parameters.uv_animation_scroll_y_speed_factor),
+    );
+    mtoon.insert(
+        "uvAnimationRotationSpeedFactor".to_string(),
+        serde_json::json!(parameters.uv_animation_rotation_speed_factor),
     );
     let mut others = serde_json::Map::new();
     others.insert(

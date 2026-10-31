@@ -37,7 +37,7 @@ FBXの材質スロット名は `.fbx.meta` の `externalObjects` が持つ
 
 `.mat` はUnity YAMLとして読み、`Material` の代表型を使う。
 `m_Shader` のGUIDは、索引に `.shader` があればその先頭行のシェーダ名で、
-無ければ既知のlilToonのGUID表で系列を判定する。
+無ければ既知のlilToonのGUID表で系列と能力を判定する。
 
 | 系列 | 透明度 | 例 |
 |---|---|---|
@@ -50,6 +50,17 @@ Lite版（`Hidden/lilToonLite*`）も同じ系列として扱う。
 GUIDが未知で `_lilToonVersion` を持つ場合は、`_DstBlend` が0なら不透明、
 それ以外は半透明と推定し、カットアウトは判定できないものとして警告する。
 lilToonのプロパティを持たないシェーダは未対応とし、灰色材質へ落として警告する。
+
+シェーダ名からは系列に加えて能力（アウトライン描画路の有無・
+Multi系・Lite系）も読む。アウトライン描画路は名前に `Outline` を含み
+`OutlineOnly` を含まない場合に持ち、GUID表ではlilToon 2.3.4の
+`.shader.meta` で裏付けした6件（`lilToonOutline`・`lilToonCutoutOutline`・
+`lilToonTransparentOutline` とそのLite版）で判定する。
+Multi系（`Multi` を含む）は `_TransparentMode`
+（0不透明・1カットアウト・2半透明）で系列が決まり、
+それ以外（屈折・宝石・ファー）は未対応として灰色材質へ落とす。
+`m_CustomRenderQueue` が-1（未設定）の場合は系列の既定
+（不透明2000・カットアウト2450・半透明3000）を実効描画順とする。
 
 ## 色空間
 
@@ -90,16 +101,41 @@ RGBだけをsRGBから線形へ変換する。アルファは変換しない。
   `lo = clamp(b - w/2)`, `hi = clamp(b + w/2)` を作り、
   `shadingToonyFactor = 1 - max(hi - lo, 0.001)`、
   `shadingShiftFactor = 1 - (lo + hi)` とする。
-- `_UseMatCap` が真なら `_MatCapTex` を `matcapTexture`、`_MatCapColor` のRGBを
-  `matcapFactor` にする。lilToonのアルファ（混ぜ具合）は表せない。
-- `_UseOutline` が真なら `outlineWidthMode` を `worldCoordinates` にし、
-  `outlineWidthFactor = max(_OutlineWidth, 0)`、
-  `outlineColorFactor = _OutlineColor`、`outlineWidthMultiplyTexture = _OutlineWidthMask`
-  を書く。lilToonの幅はオブジェクト空間の値であり、ルートの単位換算は掛けない。
+- `_UseMatCap` が真で `_MatCapTex` の割り当てがある場合だけ
+  `matcapTexture` を書き、`matcapFactor` は
+  `_MatCapColor.rgb × (_MatCapBlend × saturate(_MatCapColor.a))`
+  （参照実装の `MatcapWeight`）にする。無効時は `[0, 0, 0]` とする。
+  どのMatCapを枠に入れるかは参照実装の `SlotMatcapPrefix` と対応するが、
+  MatCap2ndの発光への折り込みは次の段であり、折り込まれる場合は警告して省く。
+  lilToonのアルファ（混ぜ具合）は重みにだけ反映し、乗算系の減光は近似である。
+- アウトラインはOutline系の変種では `_UseOutline` に関係なく描画し、
+  Multi系のときだけ `_UseOutline` を見る（参照実装の `ReadOutline`）。
+  有効な場合は `outlineWidthMode` を `worldCoordinates` にし、
+  `outlineWidthFactor = _OutlineWidth × 0.01`（m）、
+  `outlineColorFactor = _OutlineColor`（線形化、未設定時は線形の既定値）、
+  `outlineLightingMixFactor = _OutlineEnableLighting`（既定1）、
+  `outlineWidthMultiplyTexture = _OutlineWidthMask` を書く。
+  lilToonの幅はオブジェクト空間の値であり、ルートの単位換算は掛けない。
   実データのルート換算が1のときはメートルとして一致する近似である。
+- `_UseBumpMap` が真の場合だけ `_BumpMap` を `normalTexture` にし、
+  `normalTexture.scale = _BumpScale` を書く。2nd法線は次の段の対応とする。
+- `KHR_materials_unlit` をMToon材質の全件に付け、`extensionsUsed` へ加える。
+  参照実装のUniVRM書き出しと対応する。
 - `transparentWithZWrite` は半透明かつ `_ZWrite` が真のときだけ真にする。
-- `renderQueueOffsetNumber` は0に固定する。シェーダ既定の描画順が分からず、
-  材質ごとの差分を決められないためである。
+- `renderQueueOffsetNumber` は実効描画順の相対順から決める。
+  不透明・カットアウトは0、半透明かつZ書き込みありは描画順の昇順に0から、
+  半透明かつZ書き込みなしは描画順の降順に0から下げる。
+  範囲はMToon仕様（Z書き込みありは0〜9、なしは-9〜0）に収める。
+  参照実装の `RenderQueueOffsets::Assign` と対応する。
+- リムが無効な場合は `parametricRimColorFactor [0, 0, 0]`・
+  `parametricRimFresnelPowerFactor 5`・`parametricRimLiftFactor 0`・
+  `rimLightingMixFactor 1` を書く。有効な場合は色（通常lilToonは
+  `RimColor.a` を重みに掛け、Lite系は掛けない）・`RimFresnelPower`（既定3.5）・
+  `RimEnableLighting`（既定1）を入れ、境界・ぼかしの合わせ込み
+  （参照実装の `RimFit`）と色テクスチャ・マスクは次の段として警告する。
+- UVアニメは `_MainTex_ScrollRotate` の横・縦・回転を読み、
+  縦はglTFのV向き（Unityと逆）に直し、回転はラジアン毎秒のまま書く。
+  MToonは全テクスチャを動かすため、動作時は近似として警告する。
 - `giEqualizationFactor` は0.9にする。
 
 ## テクスチャ
@@ -155,15 +191,25 @@ MToonは材質ごとに1つのUV変換しか持てず、UVの反転と組み合�
 
 ## 保証しないこと
 
-- lilToonの見た目を完全に再現しない。バックライト・リム・2ndカラー・
-  バンプマップ・アルファマスク・グラデーション・UVスクロール・アウトラインの
-  UVモード・頂点色は写像しない。検出できるバックライト・リム・バンプマップ・
+- lilToonの見た目を完全に再現しない。バックライト・2ndカラー・
+  アルファマスク・グラデーション・UVスクロールの適用範囲・アウトラインの
+  UVモード・頂点色は写像しない。検出できるバックライト・
   アルファマスク・グラデーション・2ndカラー・UVスクロールは使用時に警告する。
-- 影色テクスチャのアルファ合成、マットキャップの混ぜ具合、アウトライン幅の
+- 影色テクスチャのアルファ合成、アウトライン幅の
   オブジェクト空間依存は近似である。
 - テクスチャの再エンコードや縮小はしない。元の解像度と形式のまま埋め込む。
-- 材質の描画順（`renderQueueOffsetNumber`）は常に0である。
 - 異なるシェーダ（Poiyomi・URP・Standardなど）の見た目は再現しない。
+
+## 未対応（次の段）
+
+- 基準色・陰影・発光・アウトライン幅のピクセルベイク
+  （`BaseColor`・`ShadeMultiply`・`Emissive`・`OutlineWidthMultiply` の焼き込み）はしない。
+  テクスチャがある場合もそのまま載せ、重ね合わせの合成は次の段の対応とする。
+- MatCap2ndの発光への折り込みはしない。折り込まれる材質は警告して省く。
+- リムの色テクスチャ・マスク（`rimMultiplyTexture`）、リムの境界・ぼかしの
+  合わせ込み（`RimFit` による `FresnelPower`・`Lift` の当てはめ）はしない。
+- 2nd法線マップの合成はしない。使用時は警告する。
+- UVアニメの実値の扱いは枠の値だけを書き、他テクスチャへの波及は近似とする。
 
 ## 外した選択肢
 

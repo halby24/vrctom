@@ -114,6 +114,9 @@ pub struct Material {
     pub name: String,
     /// シェーダへの参照。
     pub shader: ObjectRef,
+    /// Unityの実効描画順。`m_CustomRenderQueue` であり、
+    /// 未設定の場合は-1（シェーダ既定を使う意味）である。
+    pub custom_render_queue: i32,
     /// テクスチャ環境の一覧。順序と重複を保つ。
     pub tex_envs: Vec<NamedProperty<TextureEnvironment>>,
     /// 浮動小数点プロパティの一覧。順序と重複を保つ。
@@ -618,11 +621,29 @@ fn decode_material(document: &Document, mapping: &Mapping) -> Result<Material, U
     Ok(Material {
         name: read_name(document, required(document, mapping, "m_Name")?, "m_Name")?,
         shader: read_ref(document, mapping, "m_Shader")?,
+        custom_render_queue: read_custom_render_queue(document, mapping)?,
         tex_envs,
         floats,
         ints,
         colors,
     })
+}
+
+/// `m_CustomRenderQueue` を読む。欠落時は-1（シェーダ既定）にする。
+///
+/// 実効描画順の判定に使い、型が整数でない場合だけ読み取り失敗にする。
+fn read_custom_render_queue(document: &Document, mapping: &Mapping) -> Result<i32, UnityError> {
+    let Some(value) = mapping.get("m_CustomRenderQueue") else {
+        return Ok(-1);
+    };
+    match value {
+        Value::Number(number) => number
+            .as_i64()
+            .and_then(|queue| i32::try_from(queue).ok())
+            .ok_or_else(|| shape_error(document, "m_CustomRenderQueue", "整数でない")),
+        Value::Null => Ok(-1),
+        _ => Err(shape_error(document, "m_CustomRenderQueue", "整数でない")),
+    }
 }
 
 /// MonoBehaviourの共通欄を読む。独自欄は汎用データのまま残す。

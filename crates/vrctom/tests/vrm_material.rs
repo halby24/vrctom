@@ -28,6 +28,8 @@ const PNG_1X1: &[u8] = &[
 
 /// 不透明lilToonシェーダのGUID。
 const SHADER_OPAQUE: &str = "df12117ecd77c31469c224178886498e";
+/// アウトライン描画路を持つ不透明lilToonシェーダのGUID。
+const SHADER_OUTLINE_OPAQUE: &str = "efa77a80ca0344749b4f19fdd5891cbe";
 /// カットアウトlilToonシェーダのGUID。
 const SHADER_MASK: &str = "85d6126cae43b6847aff4b13f4adb8ec";
 /// 半透明lilToonシェーダのGUID。
@@ -244,7 +246,8 @@ fn スロット解決と色の線形化とテクスチャと陰影値を読め�
     assert!((mtoon.shading_shift_factor - 0.0).abs() < 1e-6);
     assert!((mtoon.shading_toony_factor - 0.9).abs() < 1e-6);
     assert_eq!(mtoon.gi_equalization_factor, 0.9);
-    assert_eq!(mtoon.matcap_factor, [1.0, 1.0, 1.0]);
+    // MatCapを使わない場合の係数は `[0, 0, 0]` である。
+    assert_eq!(mtoon.matcap_factor, [0.0, 0.0, 0.0]);
     assert_eq!(mtoon.matcap_image, None);
     assert_eq!(mtoon.outline_width_mode, VrmOutlineWidthMode::None);
     assert_eq!(mtoon.outline_color_factor, [0.0, 0.0, 0.0]);
@@ -784,7 +787,6 @@ fn 未対応機能の使用は警告する() {
     for 期待 in [
         "バックライト",
         "リムライト",
-        "バンプマップ",
         "色相",
         "アルファマスク",
         "グラデーション",
@@ -800,7 +802,8 @@ fn 未対応機能の使用は警告する() {
 
 #[test]
 fn 発光とマットキャップとアウトラインを読める() {
-    let (_guard, root, mat, tex) = 最小配置を作る(SHADER_OPAQUE);
+    // アウトラインは描画路を持つ変種（Outline系）でのみ有効になる。
+    let (_guard, root, mat, tex) = 最小配置を作る(SHADER_OUTLINE_OPAQUE);
     let mut 浮動 = 基本浮動小数();
     for (名, 値) in &mut 浮動 {
         match *名 {
@@ -824,7 +827,7 @@ fn 発光とマットキャップとアウトラインを読める() {
         "Assets/Materials/Body.mat",
         &mat,
         "Body",
-        Some(SHADER_OPAQUE),
+        Some(SHADER_OUTLINE_OPAQUE),
         &[
             ("_MainTex", 参照::割当(&tex)),
             ("_EmissionMap", 参照::割当(&tex)),
@@ -862,7 +865,8 @@ fn 発光とマットキャップとアウトラインを読める() {
         mtoon.outline_width_mode,
         VrmOutlineWidthMode::WorldCoordinates
     );
-    assert!((mtoon.outline_width_factor - 0.05).abs() < f32::EPSILON);
+    // アウトライン幅は `_OutlineWidth × 0.01`（m）で書く。
+    assert!((mtoon.outline_width_factor - 0.0005).abs() < 1e-7);
     assert!(
         report
             .warnings()
@@ -1110,7 +1114,8 @@ fn 不正な材質値は灰色材質に落ちる() {
     );
 
     // アウトライン幅の範囲外でも同様に落ちる。
-    let (_guard, root, mat, _tex) = 最小配置を作る(SHADER_OPAQUE);
+    // Outline系の変種でのみ幅を読むため、アウトライン描画路で確かめる。
+    let (_guard, root, mat, _tex) = 最小配置を作る(SHADER_OUTLINE_OPAQUE);
     let mut 浮動 = 基本浮動小数();
     for (名, 値) in &mut 浮動 {
         if *名 == "_UseOutline" {
@@ -1123,7 +1128,7 @@ fn 不正な材質値は灰色材質に落ちる() {
         "Assets/Materials/Body.mat",
         &mat,
         "Body",
-        Some(SHADER_OPAQUE),
+        Some(SHADER_OUTLINE_OPAQUE),
         &[],
         &浮動,
         &基本色(),
@@ -1375,4 +1380,366 @@ fn 実fixtureの全スロットを材質に解決する() {
         materials.images().len(),
         report.warnings().len()
     );
+}
+
+/// Outline系の変種は `_UseOutline` に関係なく描画し、幅は百分の1（m）になる。
+#[test]
+fn outline変種はトグルに関係なく有効で幅は百分の1になる() {
+    let (_guard, root, mat, tex) = 最小配置を作る(SHADER_OUTLINE_OPAQUE);
+    // `_UseOutline` は既定の0のままにし、幅だけ3cmに変える。
+    let mut 浮動 = 基本浮動小数();
+    for (名, 値) in &mut 浮動 {
+        if *名 == "_OutlineWidth" {
+            *値 = 0.03;
+        }
+    }
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OUTLINE_OPAQUE),
+        &[("_MainTex", 参照::割当(&tex))],
+        &浮動,
+        &基本色(),
+    );
+    let (materials, _) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let mtoon = materials
+        .expect("ある")
+        .get("Body")
+        .expect("ある")
+        .mtoon
+        .clone()
+        .expect("ある");
+    assert_eq!(
+        mtoon.outline_width_mode,
+        VrmOutlineWidthMode::WorldCoordinates
+    );
+    assert!(
+        (mtoon.outline_width_factor - 0.0003).abs() < 1e-7,
+        "幅は0.03×0.01である: {}",
+        mtoon.outline_width_factor
+    );
+}
+
+/// Multi系は `_TransparentMode` で系列が決まり、アウトラインは `_UseOutline` で切り替わる。
+#[test]
+fn multiは描画方式で系列が決まりトグルでアウトラインが切り替わる() {
+    let 判定 = |トグル: f64| {
+        let (_guard, root) = 作業域を作る();
+        let mat = guid(0x11);
+        let shader = guid(0x44);
+        fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+        資産を書く(
+            &root,
+            "Assets/Shaders/Multi.shader",
+            b"Shader \"_lil/lilToonMulti\"\n{\n}\n",
+        );
+        メタを書く(
+            &root,
+            "Assets/Shaders/Multi.shader",
+            &shader,
+            "ShaderImporter",
+            "  externalObjects: {}\n",
+        );
+        let mut 浮動 = 基本浮動小数();
+        浮動.push(("_TransparentMode", 2.0));
+        // `_UseOutline` は既定列にあるため値を変える（同名は最初の1件が勝つ）。
+        for (名, 値) in &mut 浮動 {
+            if *名 == "_UseOutline" {
+                *値 = トグル;
+            }
+        }
+        マテリアルを書く(
+            &root,
+            "Assets/Materials/Body.mat",
+            &mat,
+            "Body",
+            Some(&shader),
+            &[],
+            &浮動,
+            &基本色(),
+        );
+        let (materials, _) = VrmMaterials::load(
+            &root,
+            &root.join("Assets/Model.fbx"),
+            &MaterialOptions::new(),
+        )
+        .expect("読める");
+        materials
+            .expect("ある")
+            .get("Body")
+            .expect("ある")
+            .mtoon
+            .clone()
+            .expect("ある")
+    };
+    // `_UseOutline` が0の場合は描画しない。
+    let 無し = 判定(0.0);
+    assert_eq!(無し.outline_width_mode, VrmOutlineWidthMode::None);
+    assert_eq!(無し.outline_width_factor, 0.0);
+    // `_UseOutline` が真の場合は描画し、幅は百分の1になる。
+    let 有り = 判定(1.0);
+    assert_eq!(
+        有り.outline_width_mode,
+        VrmOutlineWidthMode::WorldCoordinates
+    );
+    assert!(
+        (有り.outline_width_factor - 0.0005).abs() < 1e-7,
+        "幅は0.05×0.01である: {}",
+        有り.outline_width_factor
+    );
+}
+
+/// MatCapの重みは `_MatCapColor.rgb × (_MatCapBlend × saturate(a))` になる。
+#[test]
+fn matcap重みは混合率とアルファを掛ける() {
+    let (_guard, root, mat, tex) = 最小配置を作る(SHADER_OPAQUE);
+    let mut 浮動 = 基本浮動小数();
+    for (名, 値) in &mut 浮動 {
+        if *名 == "_UseMatCap" {
+            *値 = 1.0;
+        }
+    }
+    // `_MatCapBlend` は既定列に無いため追加する。
+    浮動.push(("_MatCapBlend", 0.5));
+    let mut 色 = 基本色();
+    for (名, 値) in &mut 色 {
+        if *名 == "_MatCapColor" {
+            *値 = [0.5, 0.25, 0.125, 0.5];
+        }
+    }
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[
+            ("_MainTex", 参照::割当(&tex)),
+            ("_MatCapTex", 参照::割当(&tex)),
+        ],
+        &浮動,
+        &色,
+    );
+    let (materials, _) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let mtoon = materials
+        .expect("ある")
+        .get("Body")
+        .expect("ある")
+        .mtoon
+        .clone()
+        .expect("ある");
+    // 重みは0.5×0.5=0.25であり、RGBは線形化してから掛ける。
+    // 線形(0.5)≒0.214、線形(0.25)≒0.051、線形(0.125)≒0.013である。
+    let 期待 = [0.214 * 0.25, 0.051 * 0.25, 0.013 * 0.25];
+    for (実測, 目標) in mtoon.matcap_factor.iter().zip(期待.iter()) {
+        assert!(
+            (実測 - 目標).abs() < 0.003,
+            "重みが合わない: {実測:?} と {期待:?}",
+            実測 = mtoon.matcap_factor,
+            期待 = 期待
+        );
+    }
+    assert_eq!(mtoon.matcap_image, Some(0));
+}
+
+/// `_MatCapTex` の割り当てが無い場合はMatCap無効で係数はゼロになる。
+#[test]
+fn matcapテクスチャ無しは無効で係数はゼロになる() {
+    let (_guard, root, mat, tex) = 最小配置を作る(SHADER_OPAQUE);
+    let mut 浮動 = 基本浮動小数();
+    for (名, 値) in &mut 浮動 {
+        if *名 == "_UseMatCap" {
+            *値 = 1.0;
+        }
+    }
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[("_MainTex", 参照::割当(&tex)), ("_MatCapTex", 参照::Null)],
+        &浮動,
+        &基本色(),
+    );
+    let (materials, _) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let mtoon = materials
+        .expect("ある")
+        .get("Body")
+        .expect("ある")
+        .mtoon
+        .clone()
+        .expect("ある");
+    assert_eq!(mtoon.matcap_factor, [0.0, 0.0, 0.0]);
+    assert_eq!(mtoon.matcap_image, None);
+}
+
+/// `_BumpMap` は `_UseBumpMap` が真のときだけ法線に写像し、強さは `_BumpScale` になる。
+#[test]
+fn バンプマップは使う場合だけ法線に写像する() {
+    let 判定 = |使う: f64| {
+        let (_guard, root, mat, tex) = 最小配置を作る(SHADER_OPAQUE);
+        let mut 浮動 = 基本浮動小数();
+        浮動.push(("_UseBumpMap", 使う));
+        浮動.push(("_BumpScale", 0.6));
+        マテリアルを書く(
+            &root,
+            "Assets/Materials/Body.mat",
+            &mat,
+            "Body",
+            Some(SHADER_OPAQUE),
+            &[
+                ("_MainTex", 参照::割当(&tex)),
+                ("_BumpMap", 参照::割当(&tex)),
+            ],
+            &浮動,
+            &基本色(),
+        );
+        let (materials, _) = VrmMaterials::load(
+            &root,
+            &root.join("Assets/Model.fbx"),
+            &MaterialOptions::new(),
+        )
+        .expect("読める");
+        materials.expect("ある").get("Body").expect("ある").clone()
+    };
+    let 使う = 判定(1.0);
+    assert_eq!(使う.normal_image, Some(0));
+    assert!((使う.normal_scale - 0.6).abs() < f32::EPSILON);
+    let 使わない = 判定(0.0);
+    assert_eq!(使わない.normal_image, None);
+}
+
+/// 描画順差分は実効描画順の相対順から決まる。
+#[test]
+fn 描画順差分は半透明の相対順から決まる() {
+    let (_guard, root) = 作業域を作る();
+    let 順序付きで書く = |mat: &str, スロット: &str, 描画順: Option<i32>, z書き込み: f64| {
+        let mut 浮動 = 基本浮動小数();
+        for (名, 値) in &mut 浮動 {
+            if *名 == "_ZWrite" {
+                *値 = z書き込み;
+            }
+        }
+        マテリアルを書く(
+            &root,
+            &format!("Assets/Materials/{スロット}.mat"),
+            mat,
+            スロット,
+            Some(SHADER_BLEND),
+            &[],
+            &浮動,
+            &基本色(),
+        );
+        // `m_CustomRenderQueue` は共通欄に無いため、後から差し込む。
+        if let Some(順序) = 描画順 {
+            let 場所 = root.join(format!("Assets/Materials/{スロット}.mat"));
+            let 本文 = fs::read_to_string(&場所).expect("matは読める");
+            let 本文 = 本文.replacen(
+                "  m_Shader:",
+                &format!("  m_CustomRenderQueue: {順序}\n  m_Shader:"),
+                1,
+            );
+            fs::write(&場所, 本文.as_bytes()).expect("matは書ける");
+        }
+    };
+    let a = guid(0x11);
+    let b = guid(0x12);
+    let c = guid(0x13);
+    let d = guid(0x14);
+    fbxメタを書く(
+        &root,
+        &guid(0x99),
+        &[
+            ("A", Some(&a)),
+            ("B", Some(&b)),
+            ("C", Some(&c)),
+            ("D", Some(&d)),
+        ],
+    );
+    for (mat, スロット) in [(&a, "A"), (&b, "B"), (&c, "C"), (&d, "D")] {
+        メタを書く(
+            &root,
+            &format!("Assets/Materials/{スロット}.mat"),
+            mat,
+            "NativeFormatImporter",
+            "  externalObjects: {}\n  userData: \n",
+        );
+    }
+    // AはZ書き込みあり・既定3000、BはZ書き込みあり・2900、
+    // CはZ書き込みなし・2900、DはZ書き込みなし・2800である。
+    順序付きで書く(&a, "A", None, 1.0);
+    順序付きで書く(&b, "B", Some(2900), 1.0);
+    順序付きで書く(&c, "C", Some(2900), 0.0);
+    順序付きで書く(&d, "D", Some(2800), 0.0);
+    let (materials, _) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let materials = materials.expect("ある");
+    let 差分 = |スロット: &str| {
+        materials
+            .get(スロット)
+            .expect("ある")
+            .mtoon
+            .clone()
+            .expect("ある")
+            .render_queue_offset
+    };
+    // Z書き込みありは昇順に0から数える。B(2900)が0、A(3000)が1である。
+    assert_eq!(差分("A"), 1);
+    assert_eq!(差分("B"), 0);
+    // Z書き込みなしは降順に0から下げる。C(2900)が0、D(2800)が-1である。
+    assert_eq!(差分("C"), 0);
+    assert_eq!(差分("D"), -1);
+}
+
+/// リム無効時とUVアニメ停止時の既定値を読める。
+#[test]
+fn リムとuvアニメの既定値を読める() {
+    let (_guard, root, _mat, _tex) = 最小配置を作る(SHADER_OPAQUE);
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    assert!(
+        report.warnings().is_empty(),
+        "警告は無い: {:?}",
+        report.warnings()
+    );
+    let mtoon = materials
+        .expect("ある")
+        .get("Body")
+        .expect("ある")
+        .mtoon
+        .clone()
+        .expect("ある");
+    assert_eq!(mtoon.parametric_rim_color_factor, [0.0, 0.0, 0.0]);
+    assert!((mtoon.parametric_rim_fresnel_power_factor - 5.0).abs() < f32::EPSILON);
+    assert_eq!(mtoon.parametric_rim_lift_factor, 0.0);
+    assert!((mtoon.rim_lighting_mix_factor - 1.0).abs() < f32::EPSILON);
+    assert_eq!(mtoon.uv_animation_scroll_x_speed_factor, 0.0);
+    assert_eq!(mtoon.uv_animation_scroll_y_speed_factor, 0.0);
+    assert_eq!(mtoon.uv_animation_rotation_speed_factor, 0.0);
 }

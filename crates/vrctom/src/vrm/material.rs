@@ -84,6 +84,35 @@ const BLEND_SHADER_GUIDS: [&str; 4] = [
     "1c12a37046f07ac4486881deaf0187ea",
 ];
 
+/// アウトライン描画路を持つlilToonシェーダのGUID表（小文字）。
+///
+/// lilToon 2.3.4の `.shader.meta` で裏付けした6件であり、
+/// シリーズ判定の表と直交する。参照実装の `HasOutline`
+/// （名前に `Outline` を含み `OutlineOnly` を含まない）と対応する。
+#[cfg(not(target_arch = "wasm32"))]
+const OUTLINE_SHADER_GUIDS: [&str; 6] = [
+    "efa77a80ca0344749b4f19fdd5891cbe",
+    "583a88005abb81a4ebbce757b4851a0d",
+    "3b4aa19949601f046a20ca8bdaee929f",
+    "8cf5267d397b04846856f6d3d9561da0",
+    "3c79b10c7e0b2784aaa4c2f8dd17d55e",
+    "1c12a37046f07ac4486881deaf0187ea",
+];
+
+/// lilToon Lite系シェーダのGUID表（小文字）。
+///
+/// リム色のアルファ重み付けが通常lilToonと異なるため区別する。
+/// 参照実装の `IsLite`（名前に `Lite` を含む）と対応する。
+#[cfg(not(target_arch = "wasm32"))]
+const LITE_SHADER_GUIDS: [&str; 6] = [
+    "381af8ba8e1740a41b9768ccfb0416c2",
+    "583a88005abb81a4ebbce757b4851a0d",
+    "b957dce3d03ff5445ac989f8de643c7f",
+    "8cf5267d397b04846856f6d3d9561da0",
+    "0e3ece1bd59542743bccadb21f68318e",
+    "1c12a37046f07ac4486881deaf0187ea",
+];
+
 /// PNGの先頭バイト。
 #[cfg(not(target_arch = "wasm32"))]
 const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
@@ -232,6 +261,7 @@ impl VrmMaterials {
         for entry in &remaps {
             context.load_slot(entry)?;
         }
+        context.assign_render_queue_offsets();
         let materials = VrmMaterials::new(
             std::mem::take(&mut context.entries),
             std::mem::take(&mut context.images),
@@ -269,6 +299,10 @@ pub struct VrmMaterial {
     pub emissive_factor: [f32; 3],
     /// 発光テクスチャの画像索引。無い場合は `None` である。
     pub emissive_image: Option<usize>,
+    /// 法線テクスチャの画像索引。`_UseBumpMap` が真で割り当てがある場合だけ `Some` である。
+    pub normal_image: Option<usize>,
+    /// 法線の強さ。`_BumpScale` であり、テクスチャが無い場合も書く。
+    pub normal_scale: f32,
     /// MToonとして解釈できた場合だけ `Some` である。
     /// `None` は灰色PBRへ落ちた材質である。
     pub mtoon: Option<VrmMtoonParameters>,
@@ -290,7 +324,7 @@ pub enum VrmAlphaMode {
 pub struct VrmMtoonParameters {
     /// 半透明かつZ書き込みするかどうか。
     pub transparent_with_z_write: bool,
-    /// 描画順の差分。常に0である。
+    /// 描画順の差分。アバター内の相対順から求める。
     pub render_queue_offset: i32,
     /// 陰影色。線形である。
     pub shade_color_factor: [f32; 3],
@@ -302,7 +336,7 @@ pub struct VrmMtoonParameters {
     pub shading_toony_factor: f32,
     /// 全方位照明の均一化係数。常に0.9である。
     pub gi_equalization_factor: f32,
-    /// マットキャップの色。線形である。
+    /// マットキャップの色。線形であり、無効時は `[0, 0, 0]` である。
     pub matcap_factor: [f32; 3],
     /// マットキャップテクスチャの画像索引。無い場合は `None` である。
     pub matcap_image: Option<usize>,
@@ -314,14 +348,29 @@ pub struct VrmMtoonParameters {
     pub outline_width_multiply_image: Option<usize>,
     /// アウトラインの色。線形である。
     pub outline_color_factor: [f32; 3],
-    /// アウトラインの光照混合係数。常に1である。
+    /// アウトラインの光照混合係数。
     pub outline_lighting_mix_factor: f32,
+    /// パラメトリックリムの色。線形であり、無効時は `[0, 0, 0]` である。
+    pub parametric_rim_color_factor: [f32; 3],
+    /// パラメトリックリムのフレネル強さ。無効時は5である。
+    pub parametric_rim_fresnel_power_factor: f32,
+    /// パラメトリックリムの持ち上げ。無効時は0である。
+    pub parametric_rim_lift_factor: f32,
+    /// リム照明の混合係数。常に1である。
+    pub rim_lighting_mix_factor: f32,
+    /// UVスクロールの横速度。UnityのUV単位毎秒である。
+    pub uv_animation_scroll_x_speed_factor: f32,
+    /// UVスクロールの縦速度。glTFのV向き（Unityと逆）に直した値である。
+    pub uv_animation_scroll_y_speed_factor: f32,
+    /// UV回転の角速度。ラジアン毎秒である。
+    pub uv_animation_rotation_speed_factor: f32,
 }
 
 impl Default for VrmMtoonParameters {
     /// 仕様既定のMToon値を作る。
     ///
-    /// 影色は白、境界は中間、GI均一化は0.9、アウトラインは無しである。
+    /// 影色は白、境界は中間、GI均一化は0.9、アウトライン・
+    /// マットキャップ・リム・UVアニメは無しである。
     fn default() -> Self {
         Self {
             transparent_with_z_write: false,
@@ -331,13 +380,20 @@ impl Default for VrmMtoonParameters {
             shading_shift_factor: 0.0,
             shading_toony_factor: 0.9,
             gi_equalization_factor: 0.9,
-            matcap_factor: [1.0, 1.0, 1.0],
+            matcap_factor: [0.0, 0.0, 0.0],
             matcap_image: None,
             outline_width_mode: VrmOutlineWidthMode::None,
             outline_width_factor: 0.0,
             outline_width_multiply_image: None,
             outline_color_factor: [0.0, 0.0, 0.0],
             outline_lighting_mix_factor: 1.0,
+            parametric_rim_color_factor: [0.0, 0.0, 0.0],
+            parametric_rim_fresnel_power_factor: 5.0,
+            parametric_rim_lift_factor: 0.0,
+            rim_lighting_mix_factor: 1.0,
+            uv_animation_scroll_x_speed_factor: 0.0,
+            uv_animation_scroll_y_speed_factor: 0.0,
+            uv_animation_rotation_speed_factor: 0.0,
         }
     }
 }
@@ -606,6 +662,8 @@ pub(crate) fn placeholder(slot: &str) -> VrmMaterial {
         base_color_image: None,
         emissive_factor: [0.0, 0.0, 0.0],
         emissive_image: None,
+        normal_image: None,
+        normal_scale: 1.0,
         mtoon: None,
     }
 }
@@ -622,6 +680,25 @@ enum ShaderSeries {
     Blend,
 }
 
+/// lilToonシェーダの能力。系列・アウトライン描画路・Multiかどうかを持つ。
+///
+/// 系列は透過方式、アウトライン描画路は `_UseOutline` に関係なく
+/// 描画するかどうか、Multiは描画方式を使うかどうかに使う。
+/// 参照実装の `ShaderCapabilityResult`（`RenderMode`・`HasOutline`・
+/// `IsMulti`）と対応する。
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShaderCapability {
+    /// 透明度系列。
+    series: ShaderSeries,
+    /// アウトライン描画路を持つかどうか。
+    has_outline: bool,
+    /// Multi系（描画方式が `_TransparentMode` で決まる）かどうか。
+    is_multi: bool,
+    /// Lite系（リム色にアルファを掛けない）かどうか。
+    is_lite: bool,
+}
+
 /// 読み取り作業域。警告・材質・画像と重複排除表を持つ。
 #[cfg(not(target_arch = "wasm32"))]
 struct LoadContext<'a> {
@@ -631,6 +708,8 @@ struct LoadContext<'a> {
     warnings: Vec<String>,
     entries: Vec<VrmMaterialEntry>,
     seen_slots: HashSet<String>,
+    /// 材質列と同じ順序の実効描画順。描画順差分の割り当てに使う。
+    queues: Vec<i32>,
     images: Vec<VrmImage>,
     image_at: HashMap<Guid, usize>,
     total_image_bytes: u64,
@@ -646,6 +725,7 @@ impl<'a> LoadContext<'a> {
             warnings: Vec::new(),
             entries: Vec::new(),
             seen_slots: HashSet::new(),
+            queues: Vec::new(),
             images: Vec::new(),
             image_at: HashMap::new(),
             total_image_bytes: 0,
@@ -683,37 +763,88 @@ impl<'a> LoadContext<'a> {
                 format!("材質数が上限を超えた: {}", self.entries.len() + 1),
             ));
         }
-        let material = self.resolve_material(entry, &slot)?;
+        let (material, queue) = self.resolve_material(entry, &slot)?;
         self.entries.push(VrmMaterialEntry { slot, material });
+        self.queues.push(queue);
         Ok(())
     }
 
+    /// 全材質の描画順差分を割り当てる。
+    ///
+    /// 参照実装の `RenderQueueOffsets::Assign` と対応する。絶対値ではなく
+    /// 実効描画順の相対順だけを使い、不透明・カットアウトは0、
+    /// 半透明かつZ書き込みありは描画順の昇順に0から、
+    /// 半透明かつZ書き込みなしは描画順の降順に0から下げる。
+    /// 範囲はMToon仕様（Z書き込みありは0〜9、なしは-9〜0）に収める。
+    fn assign_render_queue_offsets(&mut self) {
+        let mut zwrite: Vec<i32> = Vec::new();
+        let mut nozwrite: Vec<i32> = Vec::new();
+        for (entry, queue) in self.entries.iter().zip(self.queues.iter()) {
+            let Some(mtoon) = entry.material.mtoon.as_ref() else {
+                continue;
+            };
+            if entry.material.alpha_mode != VrmAlphaMode::Blend {
+                continue;
+            }
+            if mtoon.transparent_with_z_write {
+                if !zwrite.contains(queue) {
+                    zwrite.push(*queue);
+                }
+            } else if !nozwrite.contains(queue) {
+                nozwrite.push(*queue);
+            }
+        }
+        zwrite.sort_unstable();
+        nozwrite.sort_unstable();
+        for (entry, queue) in self.entries.iter_mut().zip(self.queues.iter()) {
+            let Some(mtoon) = entry.material.mtoon.as_mut() else {
+                continue;
+            };
+            if entry.material.alpha_mode != VrmAlphaMode::Blend {
+                continue;
+            }
+            if mtoon.transparent_with_z_write {
+                let rank = zwrite.iter().position(|known| known == queue).unwrap_or(0);
+                mtoon.render_queue_offset = rank.min(9) as i32;
+            } else {
+                let rank = nozwrite
+                    .iter()
+                    .position(|known| known == queue)
+                    .unwrap_or(0);
+                mtoon.render_queue_offset = (rank as i32 - (nozwrite.len() as i32 - 1)).max(-9);
+            }
+        }
+    }
+
     /// 置換表1件から材質を作る。未対応は灰色材質へ落として警告する。
+    ///
+    /// 描画順の算出に使う実効描画順も返す。灰色材質へ落ちた場合は-1であり、
+    /// 描画順の割り当てでは使わない。
     fn resolve_material(
         &mut self,
         entry: &crate::unity::ExternalObjectEntry,
         slot: &str,
-    ) -> Result<VrmMaterial, MaterialError> {
+    ) -> Result<(VrmMaterial, i32), MaterialError> {
         // null参照は置換なしと同じ扱いにする。
         if entry.replacement.is_null() {
             self.warn(format!("材質の置換先がnullのため灰色材質にする: {slot}"));
-            return Ok(placeholder(slot));
+            return Ok((placeholder(slot), -1));
         }
         let Some(guid) = entry.replacement.guid.clone() else {
             self.warn(format!("材質の置換先GUIDがないため灰色材質にする: {slot}"));
-            return Ok(placeholder(slot));
+            return Ok((placeholder(slot), -1));
         };
         let Some(record) = self.index.get(&guid) else {
             self.warn(format!(
                 "材質の置換先が索引にないため灰色材質にする: {slot}"
             ));
-            return Ok(placeholder(slot));
+            return Ok((placeholder(slot), -1));
         };
         if record.kind != AssetKind::Material {
             self.warn(format!(
                 "材質の置換先が材質でないため灰色材質にする: {slot}"
             ));
-            return Ok(placeholder(slot));
+            return Ok((placeholder(slot), -1));
         };
         let path = record.path.clone();
         let bytes = match read_limited(&self.root.join(&path), MAX_MATERIAL_BYTES) {
@@ -744,7 +875,7 @@ impl<'a> LoadContext<'a> {
                 self.warn(format!(
                     "材質のYAMLが読めないため灰色材質にする: {slot}: {error}"
                 ));
-                return Ok(placeholder(slot));
+                return Ok((placeholder(slot), -1));
             }
         };
         let mut found = None;
@@ -756,41 +887,46 @@ impl<'a> LoadContext<'a> {
         }
         let Some(material) = found else {
             self.warn(format!("材質文書がないため灰色材質にする: {slot}: {path}"));
-            return Ok(placeholder(slot));
+            return Ok((placeholder(slot), -1));
         };
         // 写像時の `clamp01` や `.max(0.0)` が非有限を正常値に潰す前に検出する。
         // 写像後の `validate_material` は有限の範囲外だけを拾う役割に残す。
         if has_non_finite(&material) {
             self.warn(format!("材質に非有限値があるため灰色材質にする: {slot}"));
-            return Ok(placeholder(slot));
+            return Ok((placeholder(slot), -1));
         }
-        let Some(series) = self.shader_series(&material, slot) else {
+        let Some(capability) = self.shader_capability(&material, slot) else {
             self.warn(format!(
                 "未対応シェーダのため灰色材質にする: {slot}: {}",
                 material.name
             ));
-            return Ok(placeholder(slot));
+            return Ok((placeholder(slot), effective_queue(&material, None)));
         };
-        let mapped = self.map_material(&material, slot, series)?;
+        let queue = effective_queue(&material, Some(capability.series));
+        let mapped = self.map_material(&material, slot, capability)?;
         if let Err(field) = validate_material(&mapped) {
             self.warn(format!("材質値が不正なため灰色材質にする: {slot}: {field}"));
-            return Ok(placeholder(slot));
+            return Ok((placeholder(slot), queue));
         }
-        Ok(mapped)
+        Ok((mapped, queue))
     }
 
-    /// シェーダ参照から透明度系列を求める。lilToonでなければ `None` である。
+    /// シェーダ参照から能力（系列・アウトライン・Multi/Lite）を求める。
+    /// lilToonでなければ `None` である。
     ///
     /// `.shader` が索引にあれば先頭のシェーダ名で判定し、無ければ既知のGUID表で
     /// 判定する。`.shader` が読めない・上限を超える・UTF-8でない場合は
     /// 名前判定を諦めてGUID表へ進み、その旨を警告する。
     /// どちらも不明で `_lilToonVersion` を持つ場合だけ、描画状態から
     /// 不透明か半透明かを推定する（カットアウトは判定できない）。
-    fn shader_series(
+    /// アウトライン描画路は名前に `Outline` を含み `OutlineOnly` を含まない
+    /// 場合に持ち、Multi系は `_UseOutline` で切り替える。
+    /// 参照実装の `ShaderCapability::ClassifyLilToon` と対応する。
+    fn shader_capability(
         &mut self,
         material: &crate::unity::Material,
         slot: &str,
-    ) -> Option<ShaderSeries> {
+    ) -> Option<ShaderCapability> {
         if !material.shader.is_null()
             && let Some(guid) = material.shader.guid.clone()
         {
@@ -801,9 +937,9 @@ impl<'a> LoadContext<'a> {
                     Ok(bytes) => match std::str::from_utf8(&bytes) {
                         Ok(text) => {
                             if let Some(name) = first_shader_name(text)
-                                && let Some(series) = series_of_name(&name)
+                                && let Some(capability) = capability_of_name(&name, material)
                             {
-                                return Some(series);
+                                return Some(capability);
                             }
                         }
                         Err(_) => {
@@ -816,14 +952,22 @@ impl<'a> LoadContext<'a> {
                 }
             }
             let guid_text = guid.as_str();
-            if OPAQUE_SHADER_GUIDS.contains(&guid_text) {
-                return Some(ShaderSeries::Opaque);
-            }
-            if MASK_SHADER_GUIDS.contains(&guid_text) {
-                return Some(ShaderSeries::Mask);
-            }
-            if BLEND_SHADER_GUIDS.contains(&guid_text) {
-                return Some(ShaderSeries::Blend);
+            let series = if OPAQUE_SHADER_GUIDS.contains(&guid_text) {
+                Some(ShaderSeries::Opaque)
+            } else if MASK_SHADER_GUIDS.contains(&guid_text) {
+                Some(ShaderSeries::Mask)
+            } else if BLEND_SHADER_GUIDS.contains(&guid_text) {
+                Some(ShaderSeries::Blend)
+            } else {
+                None
+            };
+            if let Some(series) = series {
+                return Some(ShaderCapability {
+                    series,
+                    has_outline: OUTLINE_SHADER_GUIDS.contains(&guid_text),
+                    is_multi: false,
+                    is_lite: LITE_SHADER_GUIDS.contains(&guid_text),
+                });
             }
         }
         // GUIDが未知の場合だけ版数で推定する。カットアウトは区別できない。
@@ -832,10 +976,15 @@ impl<'a> LoadContext<'a> {
                 "シェーダ系列を判定できないため描画状態から推定しカットアウトは区別しない: {slot}"
             ));
             let dst = number(material, "_DstBlend").unwrap_or(0.0);
-            return Some(if dst == 0.0 {
-                ShaderSeries::Opaque
-            } else {
-                ShaderSeries::Blend
+            return Some(ShaderCapability {
+                series: if dst == 0.0 {
+                    ShaderSeries::Opaque
+                } else {
+                    ShaderSeries::Blend
+                },
+                has_outline: false,
+                is_multi: false,
+                is_lite: false,
             });
         }
         None
@@ -849,7 +998,7 @@ impl<'a> LoadContext<'a> {
         &mut self,
         material: &crate::unity::Material,
         slot: &str,
-        series: ShaderSeries,
+        capability: ShaderCapability,
     ) -> Result<VrmMaterial, MaterialError> {
         let base = color(material, "_Color").unwrap_or([1.0, 1.0, 1.0, 1.0]);
         let base_rgb = [
@@ -857,7 +1006,7 @@ impl<'a> LoadContext<'a> {
             srgb_to_linear(base[1]),
             srgb_to_linear(base[2]),
         ];
-        let alpha_mode = match series {
+        let alpha_mode = match capability.series {
             ShaderSeries::Opaque => VrmAlphaMode::Opaque,
             ShaderSeries::Mask => VrmAlphaMode::Mask,
             ShaderSeries::Blend => VrmAlphaMode::Blend,
@@ -870,6 +1019,16 @@ impl<'a> LoadContext<'a> {
         }
         let zwrite = number(material, "_ZWrite").unwrap_or(1.0) != 0.0;
         let base_color_image = self.resolve_texture(material, slot, "_MainTex")?;
+
+        // 参照実装の `ReadNormal` と対応する。`_UseBumpMap` が真のときだけ読み、
+        // 2nd法線は次の段の対応として警告する。
+        let use_bump = number(material, "_UseBumpMap").unwrap_or(0.0) != 0.0;
+        let normal_image = if use_bump {
+            self.resolve_texture(material, slot, "_BumpMap")?
+        } else {
+            None
+        };
+        let normal_scale = number(material, "_BumpScale").unwrap_or(1.0) as f32;
 
         let use_shadow = number(material, "_UseShadow").unwrap_or(1.0) != 0.0;
         // MToonの影側は `shadeColorFactor × shadeMultiplyTexture` のため、
@@ -912,22 +1071,36 @@ impl<'a> LoadContext<'a> {
                 }
             };
 
-        let use_matcap = number(material, "_UseMatCap").unwrap_or(0.0) != 0.0;
-        let matcap_image = if use_matcap {
-            self.resolve_texture(material, slot, "_MatCapTex")?
-        } else {
-            None
+        // 参照実装の `ReadMatcap` のうち一段の写像に対応する。MToonの枠は
+        // ひとつだけであり、MatCapは `_UseMatCap` が真で `_MatCapTex` の
+        // 割り当てがある場合だけ有効になる。重みは
+        // `_MatCapColor.rgb × (_MatCapBlend × saturate(_MatCapColor.a))`
+        // （参照実装の `MatcapWeight`）であり、無効時は `[0, 0, 0]` とする。
+        // どのMatCapを枠に入れるかの判定は `SlotMatcapPrefix` と対応する。
+        // MatCap2ndの発光への折り込みは次の段であり、折り込まれる場合は警告する。
+        let matcap_slot = matcap_slot(material);
+        let (matcap_factor, matcap_image) = match matcap_slot {
+            MatcapSlot::First => {
+                let weight = matcap_weight(material, "_MatCap");
+                (weight, self.resolve_texture(material, slot, "_MatCapTex")?)
+            }
+            MatcapSlot::Second => {
+                let weight = matcap_weight(material, "_MatCap2nd");
+                (
+                    weight,
+                    self.resolve_texture(material, slot, "_MatCap2ndTex")?,
+                )
+            }
+            MatcapSlot::None => ([0.0, 0.0, 0.0], None),
         };
-        let matcap_factor = if use_matcap {
-            let cap = color(material, "_MatCapColor").unwrap_or([1.0, 1.0, 1.0, 1.0]);
-            [
-                srgb_to_linear(cap[0]),
-                srgb_to_linear(cap[1]),
-                srgb_to_linear(cap[2]),
-            ]
-        } else {
-            [1.0, 1.0, 1.0]
-        };
+        if matcap_slot == MatcapSlot::First
+            && has_matcap(material, "_MatCap2nd")
+            && matcap_contributes(material, "_MatCap2nd")
+        {
+            self.warn(format!(
+                "MatCap2ndは発光への折り込みが必要なため次の段の対応として省く: {slot}"
+            ));
+        }
 
         let use_emission = number(material, "_UseEmission").unwrap_or(0.0) != 0.0;
         let (emissive_factor, emissive_image) = if use_emission {
@@ -959,29 +1132,85 @@ impl<'a> LoadContext<'a> {
             ([0.0, 0.0, 0.0], None)
         };
 
-        let use_outline = number(material, "_UseOutline").unwrap_or(0.0) != 0.0;
+        // 参照実装の `ReadOutline` と対応する。Outline系の変種は
+        // `_UseOutline` に関係なく描画し、Multi系のときだけ
+        // `_UseOutline` を見る。幅は `_OutlineWidth × 0.01`（m）であり、
+        // MToonの世界座標幅として書く。
+        let outline_enabled = if capability.is_multi {
+            number(material, "_UseOutline").unwrap_or(0.0) != 0.0
+        } else {
+            capability.has_outline
+        };
         let (
             outline_width_mode,
             outline_width_factor,
             outline_color_factor,
             outline_width_multiply_image,
-        ) = if use_outline {
-            let width = number(material, "_OutlineWidth").unwrap_or(0.05).max(0.0);
-            // lilToonの既定アウトライン色（`_OutlineColor` 未設定時の代替値）。
-            let outline = color(material, "_OutlineColor").unwrap_or([0.6, 0.56, 0.73, 1.0]);
+            outline_lighting_mix_factor,
+        ) = if outline_enabled {
+            let width = number(material, "_OutlineWidth").unwrap_or(0.08).max(0.0);
+            // 参照実装の代替値は線形で宣言されているため、sRGB復号しない。
+            let outline = linear_color_or(material, "_OutlineColor", [0.6, 0.56, 0.73]);
             (
                 VrmOutlineWidthMode::WorldCoordinates,
-                width as f32,
-                [
-                    srgb_to_linear(outline[0]),
-                    srgb_to_linear(outline[1]),
-                    srgb_to_linear(outline[2]),
-                ],
+                (width * 0.01) as f32,
+                outline,
                 self.resolve_texture(material, slot, "_OutlineWidthMask")?,
+                clamp01(number(material, "_OutlineEnableLighting").unwrap_or(1.0)) as f32,
             )
         } else {
-            (VrmOutlineWidthMode::None, 0.0, [0.0, 0.0, 0.0], None)
+            (VrmOutlineWidthMode::None, 0.0, [0.0, 0.0, 0.0], None, 1.0)
         };
+
+        // 参照実装の `ReadRim` のうち直接値に対応する。リムが無効な場合は
+        // 既定（色 `[0, 0, 0]`・フレネル5・持ち上げ0・混合1）を書く。
+        // 有効な場合は色・フレネル・混合を入れ、境界・ぼかしの合わせ込み
+        // （参照実装の `RimFit`）と色テクスチャ・マスクは次の段として警告する。
+        let use_rim = number(material, "_UseRim").unwrap_or(0.0) != 0.0;
+        let (
+            parametric_rim_color_factor,
+            parametric_rim_fresnel_power_factor,
+            rim_lighting_mix_factor,
+        ) = if use_rim {
+            // 参照実装の代替値は線形で宣言されている。
+            let rim = linear_color_or(material, "_RimColor", [0.66, 0.5, 0.48]);
+            let alpha = color(material, "_RimColor").map_or(1.0, |rim| rim[3]);
+            // 通常lilToonは `RimColor.a` を重みに掛け、Lite系は掛けない。
+            let weight = if capability.is_lite {
+                1.0
+            } else {
+                clamp01(alpha)
+            } as f32;
+            self.warn(format!(
+                "リムライトの境界・ぼかしの合わせ込みは近似し、色テクスチャ・マスクは写像しない: {slot}"
+            ));
+            (
+                [rim[0] * weight, rim[1] * weight, rim[2] * weight],
+                number(material, "_RimFresnelPower").unwrap_or(3.5).max(0.0) as f32,
+                clamp01(number(material, "_RimEnableLighting").unwrap_or(1.0)) as f32,
+            )
+        } else {
+            ([0.0, 0.0, 0.0], 5.0, 1.0)
+        };
+
+        // 参照実装の `ReadBase` のUVアニメと `MapUvAnimation` に対応する。
+        // `_MainTex_ScrollRotate` の横・縦・回転を読み、縦はglTFのV向き
+        // （Unityと逆）に直す。回転はラジアン毎秒のまま書く。
+        // MToonは全テクスチャを動かすため、動作時は近似として警告する。
+        let scroll = color(material, "_MainTex_ScrollRotate").unwrap_or([0.0, 0.0, 0.0, 0.0]);
+        let uv_animation_scroll_x_speed_factor = scroll[0] as f32;
+        // `-0.0` を出さないため、0はそのままにする。
+        let uv_animation_scroll_y_speed_factor = if scroll[1] == 0.0 {
+            0.0
+        } else {
+            -(scroll[1] as f32)
+        };
+        let uv_animation_rotation_speed_factor = scroll[3] as f32;
+        if scroll[0] != 0.0 || scroll[1] != 0.0 || scroll[3] != 0.0 {
+            self.warn(format!(
+                "UVスクロール・回転はMToonでは全テクスチャに適用されるため近似する: {slot}"
+            ));
+        }
 
         self.warn_unsupported_features(material, slot);
 
@@ -994,8 +1223,11 @@ impl<'a> LoadContext<'a> {
             base_color_image,
             emissive_factor,
             emissive_image,
+            normal_image,
+            normal_scale,
             mtoon: Some(VrmMtoonParameters {
-                transparent_with_z_write: matches!(series, ShaderSeries::Blend) && zwrite,
+                transparent_with_z_write: matches!(capability.series, ShaderSeries::Blend)
+                    && zwrite,
                 render_queue_offset: 0,
                 shade_color_factor,
                 shade_multiply_image,
@@ -1008,7 +1240,14 @@ impl<'a> LoadContext<'a> {
                 outline_width_factor,
                 outline_width_multiply_image,
                 outline_color_factor,
-                outline_lighting_mix_factor: 1.0,
+                outline_lighting_mix_factor,
+                parametric_rim_color_factor,
+                parametric_rim_fresnel_power_factor,
+                parametric_rim_lift_factor: 0.0,
+                rim_lighting_mix_factor,
+                uv_animation_scroll_x_speed_factor,
+                uv_animation_scroll_y_speed_factor,
+                uv_animation_rotation_speed_factor,
             }),
         })
     }
@@ -1021,11 +1260,12 @@ impl<'a> LoadContext<'a> {
         if number(material, "_UseBacklight").unwrap_or(0.0) != 0.0 {
             self.warn(format!("バックライトは写像しない: {slot}"));
         }
-        if number(material, "_UseRim").unwrap_or(0.0) != 0.0 {
-            self.warn(format!("リムライトは写像しない: {slot}"));
-        }
-        if number(material, "_UseBumpMap").unwrap_or(0.0) != 0.0 {
-            self.warn(format!("バンプマップは写像しない: {slot}"));
+        // リムは直接値を写像し、合わせ込みの近似は写像側で警告する。
+        // 2nd法線はひとつの法線に焼く必要があり、次の段の対応として警告する。
+        if number(material, "_UseBump2ndMap").unwrap_or(0.0) != 0.0
+            && has_texture(material, "_Bump2ndMap")
+        {
+            self.warn(format!("2nd法線マップは写像しない: {slot}"));
         }
         // `_MainTexHSVG` は `m_Colors` のベクトルとして書かれる。
         if let Some(hsvg) = color(material, "_MainTexHSVG")
@@ -1046,12 +1286,6 @@ impl<'a> LoadContext<'a> {
             && has_texture(material, "_Main2ndTex")
         {
             self.warn(format!("2ndテクスチャは写像しない: {slot}"));
-        }
-        // `_MainTex_ScrollRotate` は `m_Colors` のベクトルとして書かれる。
-        if let Some(scroll) = color(material, "_MainTex_ScrollRotate")
-            && scroll != [0.0, 0.0, 0.0, 0.0]
-        {
-            self.warn(format!("UVスクロール・回転は写像しない: {slot}"));
         }
     }
 
@@ -1173,6 +1407,139 @@ impl<'a> LoadContext<'a> {
     }
 }
 
+/// MToonのひとつのMatCap枠に入れるlilToon MatCap。
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatcapSlot {
+    /// ひとつ目のMatCap（`_MatCap` 系）。
+    First,
+    /// ふたつ目のMatCap（`_MatCap2nd` 系）。
+    Second,
+    /// 無効。MToonの係数は `[0, 0, 0]` になる。
+    None,
+}
+
+/// `_UseXXX` が真でテクスチャの割り当てがあるかどうか。
+#[cfg(not(target_arch = "wasm32"))]
+fn has_matcap(material: &crate::unity::Material, prefix: &str) -> bool {
+    let bare = prefix.trim_start_matches('_');
+    let toggle = format!("_Use{bare}");
+    let tex = format!("{prefix}Tex");
+    number(material, &toggle).unwrap_or(0.0) != 0.0 && has_texture(material, &tex)
+}
+
+/// lilToonのMatCapが色を変えるかどうか。
+///
+/// 重み（`_MatCapBlend × saturate(_MatCapColor.a)`）が0より大きく、
+/// 加算・スクリーン系なら最大輝度が0より大きい場合に真になる。
+/// 参照実装の `Contributes` と対応する。
+#[cfg(not(target_arch = "wasm32"))]
+fn matcap_contributes(material: &crate::unity::Material, prefix: &str) -> bool {
+    let blend = format!("{prefix}Blend");
+    let color_name = format!("{prefix}Color");
+    let blend_value = number(material, &blend).unwrap_or(1.0);
+    let color = color(material, &color_name).unwrap_or([1.0, 1.0, 1.0, 1.0]);
+    if blend_value * clamp01(color[3]) <= 0.0 {
+        return false;
+    }
+    // 混合方式1は加算であり、0置換・3乗算は常に色を変える。
+    // 2スクリーンは加算と同様に扱う。
+    let mode = number(material, &format!("{prefix}BlendMode")).unwrap_or(1.0) as i64;
+    mode == 0 || mode == 3 || color[0].max(color[1]).max(color[2]) > 0.0
+}
+
+/// lilToonのMatCapが乗算でマスク越しに掛かるかどうか。
+///
+/// MToonのMatCapは加算だけであり、均一な減光は表せても
+/// マスク越しの乗算は表せない。参照実装の `LeftOut` と対応する。
+#[cfg(not(target_arch = "wasm32"))]
+fn matcap_left_out(material: &crate::unity::Material, prefix: &str) -> bool {
+    let mode = number(material, &format!("{prefix}BlendMode")).unwrap_or(1.0) as i64;
+    mode == 3 && has_texture(material, &format!("{prefix}BlendMask"))
+}
+
+/// MToonのMatCap枠が2ndに空いているかどうか。
+///
+/// ひとつ目が無い・色を変えない・枠から外れる（`LeftOut`）場合に真になる。
+/// 参照実装の `SlotFreeFor2nd` と対応する。
+#[cfg(not(target_arch = "wasm32"))]
+fn matcap_slot_free_for_2nd(material: &crate::unity::Material) -> bool {
+    !has_matcap(material, "_MatCap")
+        || !matcap_contributes(material, "_MatCap")
+        || matcap_left_out(material, "_MatCap") && !matcap_left_out(material, "_MatCap2nd")
+}
+
+/// 2ndのMatCapをMToonの枠に入れるとリムを損なうかどうか。
+///
+/// MToonはリム倍率テクスチャをMatCapにも掛けるため、
+/// マスク付きの2ndは色テクスチャ・マスク付きのリムを損なう。
+/// 参照実装の `CostsTheRim` と対応する。
+#[cfg(not(target_arch = "wasm32"))]
+fn matcap_costs_the_rim(material: &crate::unity::Material) -> bool {
+    if !has_texture(material, "_MatCap2ndBlendMask") {
+        return false;
+    }
+    if number(material, "_UseRim").unwrap_or(0.0) == 0.0 {
+        return false;
+    }
+    let rim = linear_color_or(material, "_RimColor", [0.66, 0.5, 0.48]);
+    rim[0].max(rim[1]).max(rim[2]) > 0.0
+}
+
+/// MToonのMatCap枠に入れるlilToon MatCapを決める。
+///
+/// 参照実装の `SlotMatcapPrefix` と対応する。2ndが色を変える場合だけ
+/// 枠を争い、枠が空いていてリムを損なわない場合に2ndが入る。
+/// 2ndが枠から外れる（`LeftOut`）場合は2ndを返し、呼び出し側で省く。
+#[cfg(not(target_arch = "wasm32"))]
+fn matcap_slot(material: &crate::unity::Material) -> MatcapSlot {
+    let first = if has_matcap(material, "_MatCap") {
+        Some(MatcapSlot::First)
+    } else {
+        None
+    };
+    if !has_matcap(material, "_MatCap2nd")
+        || !matcap_contributes(material, "_MatCap2nd")
+        || !matcap_slot_free_for_2nd(material)
+    {
+        return first.unwrap_or(MatcapSlot::None);
+    }
+    if matcap_costs_the_rim(material) && !matcap_left_out(material, "_MatCap2nd") {
+        return first.unwrap_or(MatcapSlot::None);
+    }
+    MatcapSlot::Second
+}
+
+/// lilToonのMatCap重みを求める。
+///
+/// `_MatCapColor.rgb × (_MatCapBlend × saturate(_MatCapColor.a))` であり、
+/// 参照実装の `MatcapWeight` と対応する。RGBは線形、重みはそのまま掛ける。
+#[cfg(not(target_arch = "wasm32"))]
+fn matcap_weight(material: &crate::unity::Material, prefix: &str) -> [f32; 3] {
+    let color_name = format!("{prefix}Color");
+    let blend_name = format!("{prefix}Blend");
+    let linear = linear_color_or(material, &color_name, [1.0, 1.0, 1.0]);
+    let alpha = color(material, &color_name).map_or(1.0, |color| color[3]);
+    let weight = (number(material, &blend_name).unwrap_or(1.0) * clamp01(alpha)) as f32;
+    [linear[0] * weight, linear[1] * weight, linear[2] * weight]
+}
+
+/// 色プロパティを線形で読む。未設定の場合は線形の代替値をそのまま使う。
+///
+/// 参照実装の代替値は線形で宣言されているため、sRGB復号しない。
+/// 呼び出し側は代替値を線形で渡す。
+#[cfg(not(target_arch = "wasm32"))]
+fn linear_color_or(material: &crate::unity::Material, name: &str, fallback: [f32; 3]) -> [f32; 3] {
+    match color(material, name) {
+        Some(value) => [
+            srgb_to_linear(value[0]),
+            srgb_to_linear(value[1]),
+            srgb_to_linear(value[2]),
+        ],
+        None => fallback,
+    }
+}
+
 /// シェーダ本文の先頭の `Shader "..."` 名を返す。
 #[cfg(not(target_arch = "wasm32"))]
 fn first_shader_name(text: &str) -> Option<String> {
@@ -1183,20 +1550,58 @@ fn first_shader_name(text: &str) -> Option<String> {
     })
 }
 
-/// シェーダ名から透明度系列を求める。lilToon名でなければ `None` である。
+/// シェーダ名から能力を求める。lilToon名でなければ `None` である。
 #[cfg(not(target_arch = "wasm32"))]
-fn series_of_name(name: &str) -> Option<ShaderSeries> {
+fn capability_of_name(name: &str, material: &crate::unity::Material) -> Option<ShaderCapability> {
     // `Cutout`/`Transparent` を含む他社シェーダをlilToonとして扱わないため、
     // 名前に `lilToon` を含むものだけを対象にする。
     if !name.contains("lilToon") {
         return None;
     }
-    if name.contains("Cutout") {
-        Some(ShaderSeries::Mask)
+    let is_multi = name.contains("Multi");
+    let has_outline = name.contains("Outline") && !name.contains("OutlineOnly");
+    let is_lite = name.contains("Lite");
+    // Multi系は描画方式（`_TransparentMode`）で系列が決まる。
+    // 0不透明・1カットアウト・2半透明以外（屈折・宝石・ファー）は扱わない。
+    // 参照実装の `ApplyMultiTransparentMode` と対応する。
+    let series = if is_multi {
+        match number(material, "_TransparentMode").unwrap_or(0.0) as i64 {
+            0 => ShaderSeries::Opaque,
+            1 => ShaderSeries::Mask,
+            2 => ShaderSeries::Blend,
+            _ => return None,
+        }
+    } else if name.contains("Cutout") {
+        ShaderSeries::Mask
     } else if name.contains("Transparent") {
-        Some(ShaderSeries::Blend)
+        ShaderSeries::Blend
     } else {
-        Some(ShaderSeries::Opaque)
+        ShaderSeries::Opaque
+    };
+    Some(ShaderCapability {
+        series,
+        has_outline,
+        is_multi,
+        is_lite,
+    })
+}
+
+/// `.mat` から実効描画順を求める。
+///
+/// `m_CustomRenderQueue` が-1（未設定）の場合はシェーダ系列の既定
+/// （不透明2000・カットアウト2450・半透明3000）を使い、Unityの
+/// `material.renderQueue`（未設定時はシェーダ既定を返す）と対応させる。
+/// 系列が不明な場合は-1であり、描画順の割り当てでは使わない。
+#[cfg(not(target_arch = "wasm32"))]
+fn effective_queue(material: &crate::unity::Material, series: Option<ShaderSeries>) -> i32 {
+    if material.custom_render_queue != -1 {
+        return material.custom_render_queue;
+    }
+    match series {
+        Some(ShaderSeries::Opaque) => 2000,
+        Some(ShaderSeries::Mask) => 2450,
+        Some(ShaderSeries::Blend) => 3000,
+        None => -1,
     }
 }
 
@@ -1269,6 +1674,31 @@ pub(crate) fn validate_material(material: &VrmMaterial) -> Result<(), &'static s
     }
     if !finite01(mtoon.outline_lighting_mix_factor) {
         return Err("outline_lighting_mix_factor");
+    }
+    for value in mtoon.parametric_rim_color_factor {
+        if !finite01(value) {
+            return Err("parametric_rim_color_factor");
+        }
+    }
+    if !(mtoon.parametric_rim_fresnel_power_factor.is_finite()
+        && mtoon.parametric_rim_fresnel_power_factor >= 0.0)
+    {
+        return Err("parametric_rim_fresnel_power_factor");
+    }
+    if !mtoon.parametric_rim_lift_factor.is_finite() {
+        return Err("parametric_rim_lift_factor");
+    }
+    if !finite01(mtoon.rim_lighting_mix_factor) {
+        return Err("rim_lighting_mix_factor");
+    }
+    if !mtoon.uv_animation_scroll_x_speed_factor.is_finite()
+        || !mtoon.uv_animation_scroll_y_speed_factor.is_finite()
+        || !mtoon.uv_animation_rotation_speed_factor.is_finite()
+    {
+        return Err("uv_animation_speed_factor");
+    }
+    if !material.normal_scale.is_finite() {
+        return Err("normal_scale");
     }
     if !(-9..=9).contains(&mtoon.render_queue_offset) {
         return Err("render_queue_offset");

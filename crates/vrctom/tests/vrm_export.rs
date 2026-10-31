@@ -648,6 +648,8 @@ fn 非有限の基準色で失敗する() {
                 base_color_image: None,
                 emissive_factor: [0.0, 0.0, 0.0],
                 emissive_image: None,
+                normal_image: None,
+                normal_scale: 1.0,
                 mtoon: None,
             },
         }],
@@ -674,6 +676,8 @@ fn 範囲外のカットオフで失敗する() {
                 base_color_image: None,
                 emissive_factor: [0.0, 0.0, 0.0],
                 emissive_image: None,
+                normal_image: None,
+                normal_scale: 1.0,
                 mtoon: None,
             },
         }],
@@ -1163,6 +1167,8 @@ fn mtoon材質を作る(
                 base_color_image: Some(0),
                 emissive_factor: [0.0, 1.0, 0.0],
                 emissive_image: Some(0),
+                normal_image: None,
+                normal_scale: 1.0,
                 mtoon: Some(mtoon),
             },
         }],
@@ -1818,4 +1824,137 @@ fn 表情名の空と重複を拒否する() {
             "names={names:?}"
         );
     }
+}
+
+#[test]
+fn mtoon材質はunlitと法線と既定値を書き出す() {
+    let モデル = 合成モデルを作る();
+    // 法線テクスチャあり・強さ0.5のMToon材質を作る。
+    // 既定値（リム・UVアニメなし）のまま確認する。
+    let mtoon = VrmMtoonParameters {
+        outline_width_mode: VrmOutlineWidthMode::WorldCoordinates,
+        outline_width_factor: 0.0003,
+        ..Default::default()
+    };
+    let 材質 = VrmMaterials::new(
+        vec![VrmMaterialEntry {
+            slot: "Body".to_string(),
+            material: VrmMaterial {
+                name: "Bodyの材質".to_string(),
+                alpha_mode: VrmAlphaMode::Opaque,
+                alpha_cutoff: 0.5,
+                double_sided: true,
+                base_color_factor: [1.0, 0.0, 0.0, 1.0],
+                base_color_image: Some(0),
+                emissive_factor: [0.0, 1.0, 0.0],
+                emissive_image: Some(0),
+                normal_image: Some(0),
+                normal_scale: 0.5,
+                mtoon: Some(mtoon),
+            },
+        }],
+        vec![VrmImage {
+            name: "Body".to_string(),
+            mime: VrmImageMime::Png,
+            data: PNG_1X1.to_vec(),
+            sampler: VrmSampler::default(),
+        }],
+    );
+    let 設定 = 書き出し設定を作る().with_materials(材質);
+    let バイト列 = モデル.to_vrm(&設定).expect("MToon材質は書き出せる");
+    let (値, _) = glbを分解する(&バイト列);
+    検証報告が空であることを確かめる(&json塊を取り出す(&バイト列));
+    // `extensionsUsed` にMToonとunlitが入る。
+    let 使用拡張 = 値
+        .get("extensionsUsed")
+        .and_then(serde_json::Value::as_array)
+        .expect("extensionsUsedがある");
+    assert!(
+        使用拡張
+            .iter()
+            .any(|値| 値.as_str() == Some("VRMC_materials_mtoon")),
+        "VRMC_materials_mtoonを使う"
+    );
+    assert!(
+        使用拡張
+            .iter()
+            .any(|値| 値.as_str() == Some("KHR_materials_unlit")),
+        "KHR_materials_unlitを使う: {使用拡張:?}"
+    );
+    let 材質 = 値
+        .get("materials")
+        .and_then(serde_json::Value::as_array)
+        .expect("materialsがある");
+    // KHR_materials_unlitは空の拡張として付く。
+    assert_eq!(
+        材質[0]
+            .get("extensions")
+            .and_then(|値| 値.get("KHR_materials_unlit")),
+        Some(&serde_json::json!({})),
+        "unlit拡張がある"
+    );
+    // 法線テクスチャは画像0を指し、強さ0.5が入る。
+    let 法線 = 材質[0].get("normalTexture").expect("normalTextureがある");
+    assert_eq!(
+        法線.get("index").and_then(serde_json::Value::as_u64),
+        Some(0),
+        "法線は画像0である"
+    );
+    assert_eq!(
+        法線.get("scale").and_then(serde_json::Value::as_f64),
+        Some(0.5),
+        "法線の強さは0.5である"
+    );
+    // リム・UVアニメの既定値が入る。
+    let 拡張 = 材質[0]
+        .get("extensions")
+        .and_then(|値| 値.get("VRMC_materials_mtoon"))
+        .expect("MToon拡張がある");
+    assert_eq!(
+        拡張.get("parametricRimColorFactor"),
+        Some(&serde_json::json!([0.0, 0.0, 0.0])),
+        "リム色の既定値がある"
+    );
+    assert_eq!(
+        拡張
+            .get("parametricRimFresnelPowerFactor")
+            .and_then(serde_json::Value::as_f64),
+        Some(5.0),
+        "リムフレネルの既定値がある"
+    );
+    assert_eq!(
+        拡張
+            .get("parametricRimLiftFactor")
+            .and_then(serde_json::Value::as_f64),
+        Some(0.0),
+        "リム持ち上げの既定値がある"
+    );
+    assert_eq!(
+        拡張
+            .get("rimLightingMixFactor")
+            .and_then(serde_json::Value::as_f64),
+        Some(1.0),
+        "リム混合の既定値がある"
+    );
+    assert_eq!(
+        拡張
+            .get("uvAnimationScrollXSpeedFactor")
+            .and_then(serde_json::Value::as_f64),
+        Some(0.0),
+        "UVスクロール横の既定値がある"
+    );
+    assert_eq!(
+        拡張
+            .get("uvAnimationScrollYSpeedFactor")
+            .and_then(serde_json::Value::as_f64),
+        Some(0.0),
+        "UVスクロール縦の既定値がある"
+    );
+    assert_eq!(
+        拡張
+            .get("uvAnimationRotationSpeedFactor")
+            .and_then(serde_json::Value::as_f64),
+        Some(0.0),
+        "UV回転の既定値がある"
+    );
 }
