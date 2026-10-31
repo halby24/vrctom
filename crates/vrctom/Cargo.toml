@@ -19,6 +19,11 @@ unicode-normalization = "0.1"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tempfile = "3"
 tar = "0.4"
+# テクスチャのベイクで使う画像コーデック。wasmでは使わない。
+# PNGは8bit RGBA/RGB・グレースケール・16bit・パレットを受け、JPEGは
+# グレースケールとRGB（CMYKは対象外）を受ける。どちらも純Rustである。
+png = "0.18"
+zune-jpeg = "0.5"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 opfs = "0.3"

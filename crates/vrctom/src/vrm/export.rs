@@ -2295,6 +2295,9 @@ fn mtoon_extension(
     if let Some(texture) = texture_of(parameters.matcap_image)? {
         mtoon.insert("matcapTexture".to_string(), texture);
     }
+    if let Some(texture) = texture_of(parameters.rim_multiply_image)? {
+        mtoon.insert("rimMultiplyTexture".to_string(), texture);
+    }
     let outline_width_mode = match parameters.outline_width_mode {
         super::material::VrmOutlineWidthMode::None => "none",
         super::material::VrmOutlineWidthMode::WorldCoordinates => "worldCoordinates",

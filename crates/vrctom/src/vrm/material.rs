@@ -13,13 +13,15 @@
 //!     map --> mat[".mat の読み取り<br/>lilToonプロパティ"]
 //!     mat --> conv["MToonへの写像"]
 //!     mat --> tex["テクスチャ解決<br/>.meta と画像バイト"]
-//!     tex --> images["VrmImage列"]
+//!     tex --> shrink["取り込み上限へ縮小<br/>maxTextureSize・NPOT"]
+//!     shrink --> images["VrmImage列"]
 //!     conv --> materials["VrmMaterials"]
 //!     images --> materials
 //! ```
 //!
-//! 画像のデコード・再エンコード、テクスチャのベイク、lilToon以外のシェーダの解釈は
-//! 行わない。MIMEは先頭バイトで判定し、PNGとJPEGだけを受け付ける。
+//! 画像のデコード・再エンコードは取り込み上限の縮小の範囲で行い、
+//! テクスチャのベイク、lilToon以外のシェーダの解釈は行わない。
+//! MIMEは先頭バイトで判定し、PNGとJPEGだけを受け付ける。
 
 use crate::escape_diag;
 
@@ -27,6 +29,17 @@ use crate::escape_diag;
 use std::collections::{HashMap, HashSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
+#[cfg(not(target_arch = "wasm32"))]
+use std::rc::Rc;
+
+#[cfg(not(target_arch = "wasm32"))]
+use super::bake::{
+    AlphaMaskInput, BakeChannel, BakeImage, BakeInput, BakeSize, BakeSt, BaseColorJob, EmissionJob,
+    EmissionMask, NormalJob, NpotScale, RepackJob, ShadeJob, bake_base_color, bake_channel_repack,
+    bake_emission, bake_normal, bake_output_size, bake_shade, downscale_bake_image,
+    encode_color_png, encode_data_png, encode_rgba_png, import_fitted_size, load_bake_image,
+    matcap_disc_average, shade_layer_weights,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::unity::{
@@ -340,6 +353,11 @@ pub struct VrmMtoonParameters {
     pub matcap_factor: [f32; 3],
     /// マットキャップテクスチャの画像索引。無い場合は `None` である。
     pub matcap_image: Option<usize>,
+    /// リム乗算テクスチャの画像索引。無い場合は `None` である。
+    ///
+    /// リム光とMatCapに掛かる共通の倍率であり、単一の素朴なマスクだけを
+    /// 直載せする（`RimMultiplyComposite` の焼きは対象外）。
+    pub rim_multiply_image: Option<usize>,
     /// アウトライン幅の方式。
     pub outline_width_mode: VrmOutlineWidthMode,
     /// アウトライン幅。メートルである。
@@ -382,6 +400,7 @@ impl Default for VrmMtoonParameters {
             gi_equalization_factor: 0.9,
             matcap_factor: [0.0, 0.0, 0.0],
             matcap_image: None,
+            rim_multiply_image: None,
             outline_width_mode: VrmOutlineWidthMode::None,
             outline_width_factor: 0.0,
             outline_width_multiply_image: None,
@@ -713,6 +732,12 @@ struct LoadContext<'a> {
     images: Vec<VrmImage>,
     image_at: HashMap<Guid, usize>,
     total_image_bytes: u64,
+    /// 焼き用に復号した画像の共有表。復号失敗時は `None` を覚えて直載せへ落とす。
+    /// キーはGUIDと色・データ区分の対であり、同じGUIDでも用途区分が違えば
+    /// 別の版（縮小の色空間が違う）として持つ。同じ対は1回だけ復号する。
+    baked_inputs: HashMap<(Guid, bool), Option<Rc<BakeImage>>>,
+    /// 焼き出力の内容ハッシュ（SHA-256）から画像索引への表。
+    baked_outputs: HashMap<[u8; 32], usize>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -729,6 +754,8 @@ impl<'a> LoadContext<'a> {
             images: Vec::new(),
             image_at: HashMap::new(),
             total_image_bytes: 0,
+            baked_inputs: HashMap::new(),
+            baked_outputs: HashMap::new(),
         }
     }
 
@@ -1018,57 +1045,71 @@ impl<'a> LoadContext<'a> {
             self.warn(format!("前面カリングは両面で近似する: {slot}"));
         }
         let zwrite = number(material, "_ZWrite").unwrap_or(1.0) != 0.0;
-        let base_color_image = self.resolve_texture(material, slot, "_MainTex")?;
+        // 主テクスチャの `_ST`。焼きの入力はこれとの合成で読む。
+        // 焼きを伴う合成は単位変換の共有を前提にするため、
+        // 非単位の場合は焼かずに直載せへ落とす（警告は解決側が出す）。
+        let main_st = bake_st_of(texture(material, "_MainTex"));
+        let st_clean = main_st.is_identity();
+
+        // 参照実装の `ReadBase` と対応する。焼きの対象は
+        // `BaseColorBake` が再現する入力（アルファマスク）だけであり、
+        // 色調補正や2nd・3rd・グラデーションが有効な場合は焼かずに直載せする。
+        let hsvg_active =
+            color(material, "_MainTexHSVG").is_some_and(|hsvg| hsvg != [0.0, 1.0, 1.0, 1.0]);
+        let alpha_bake = matches!(
+            number(material, "_AlphaMaskMode").unwrap_or(0.0) as i64,
+            1..=4
+        ) && has_texture(material, "_AlphaMask");
+        let layers_active = number(material, "_UseMain2ndTex").unwrap_or(0.0) != 0.0
+            && has_texture(material, "_Main2ndTex")
+            || number(material, "_UseMain3rdTex").unwrap_or(0.0) != 0.0
+                && has_texture(material, "_Main3rdTex");
+        let base_bake = alpha_bake && !hsvg_active && !layers_active && st_clean;
+        if alpha_bake && !base_bake {
+            self.warn(format!(
+                "アルファマスクを含む基準色の焼き込みは未対応のため基準色テクスチャを直載せする: {slot}"
+            ));
+        }
+        let (base_color_image, baked_albedo) = if base_bake {
+            let (index, albedo) = self.bake_base_image(material, slot, &main_st)?;
+            (Some(index), albedo)
+        } else {
+            (self.resolve_texture(material, slot, "_MainTex")?, None)
+        };
 
         // 参照実装の `ReadNormal` と対応する。`_UseBumpMap` が真のときだけ読み、
-        // 2nd法線は次の段の対応として警告する。
+        // 2nd法線は `NormalComposite` で合成する。
         let use_bump = number(material, "_UseBumpMap").unwrap_or(0.0) != 0.0;
-        let normal_image = if use_bump {
-            self.resolve_texture(material, slot, "_BumpMap")?
+        let bump2nd = number(material, "_UseBump2ndMap").unwrap_or(0.0) != 0.0
+            && has_texture(material, "_Bump2ndMap");
+        let (normal_image, normal_scale) = if bump2nd {
+            self.bake_normal_image(material, slot, &main_st)?
+        } else if use_bump {
+            (
+                self.resolve_texture(material, slot, "_BumpMap")?,
+                number(material, "_BumpScale").unwrap_or(1.0) as f32,
+            )
         } else {
-            None
+            (None, number(material, "_BumpScale").unwrap_or(1.0) as f32)
         };
-        let normal_scale = number(material, "_BumpScale").unwrap_or(1.0) as f32;
 
         let use_shadow = number(material, "_UseShadow").unwrap_or(1.0) != 0.0;
         // MToonの影側は `shadeColorFactor × shadeMultiplyTexture` のため、
-        // 影を使わない場合と影色テクスチャが無い場合は基準色テクスチャを落とさず、
-        // 影色と基準色の積にする。
+        // 焼かない場合は影色テクスチャの有無で従来の近似へ落とす。
+        // 焼く場合は係数を白にし、参照実装と同じく報告は省く。
         let (shade_color_factor, shading_shift_factor, shading_toony_factor, shade_multiply_image) =
             if !use_shadow {
                 // 影を使わない場合、陰影は基準色と同じにし、境界は見せない。
                 (base_rgb, 0.0, 0.9, base_color_image)
             } else {
-                let border = clamp01(number(material, "_ShadowBorder").unwrap_or(0.5));
-                let blur = clamp01(number(material, "_ShadowBlur").unwrap_or(0.1));
-                let low = clamp01(border - blur / 2.0);
-                let high = clamp01(border + blur / 2.0);
-                // MToonのlinearstepは幅0で割れないため、硬い境界は中心まわりに広げる。
-                let toony = 1.0 - (high - low).max(0.001);
-                let shift = 1.0 - (low + high);
-                let strength = clamp01(number(material, "_ShadowStrength").unwrap_or(1.0));
-                // lilToonの既定影色（`_ShadowColor` 未設定時の代替値）。
-                let shadow = color(material, "_ShadowColor").unwrap_or([0.82, 0.76, 0.85, 1.0]);
-                let tint = [
-                    (1.0 - (1.0 - f64::from(srgb_to_linear(shadow[0]))) * strength) as f32,
-                    (1.0 - (1.0 - f64::from(srgb_to_linear(shadow[1]))) * strength) as f32,
-                    (1.0 - (1.0 - f64::from(srgb_to_linear(shadow[2]))) * strength) as f32,
-                ];
-                let shadow_image = self.resolve_texture(material, slot, "_ShadowColorTex")?;
-                if let Some(image) = shadow_image {
-                    self.warn(format!(
-                        "影色テクスチャは基準色との混合ではなく乗算として近似する: {slot}"
-                    ));
-                    (tint, shift as f32, toony as f32, Some(image))
-                } else {
-                    // 影色テクスチャが無い場合、影色と基準色の積を影側の色にする。
-                    let mixed = [
-                        tint[0] * base_rgb[0],
-                        tint[1] * base_rgb[1],
-                        tint[2] * base_rgb[2],
-                    ];
-                    (mixed, shift as f32, toony as f32, base_color_image)
-                }
+                self.map_shade(
+                    material,
+                    slot,
+                    &base,
+                    base_color_image,
+                    baked_albedo.clone(),
+                    &main_st,
+                )?
             };
 
         // 参照実装の `ReadMatcap` のうち一段の写像に対応する。MToonの枠は
@@ -1077,7 +1118,7 @@ impl<'a> LoadContext<'a> {
         // `_MatCapColor.rgb × (_MatCapBlend × saturate(_MatCapColor.a))`
         // （参照実装の `MatcapWeight`）であり、無効時は `[0, 0, 0]` とする。
         // どのMatCapを枠に入れるかの判定は `SlotMatcapPrefix` と対応する。
-        // MatCap2ndの発光への折り込みは次の段であり、折り込まれる場合は警告する。
+        // Normal・Multiply混合の減光（`Covers`）は近似せず警告する。
         let matcap_slot = matcap_slot(material);
         let (matcap_factor, matcap_image) = match matcap_slot {
             MatcapSlot::First => {
@@ -1093,44 +1134,19 @@ impl<'a> LoadContext<'a> {
             }
             MatcapSlot::None => ([0.0, 0.0, 0.0], None),
         };
-        if matcap_slot == MatcapSlot::First
-            && has_matcap(material, "_MatCap2nd")
-            && matcap_contributes(material, "_MatCap2nd")
-        {
-            self.warn(format!(
-                "MatCap2ndは発光への折り込みが必要なため次の段の対応として省く: {slot}"
-            ));
+        if matcap_image.is_some() {
+            let prefix = match matcap_slot {
+                MatcapSlot::First => "_MatCap",
+                MatcapSlot::Second => "_MatCap2nd",
+                MatcapSlot::None => "",
+            };
+            if !prefix.is_empty() && matcap_covers(material, prefix) > 0.0 {
+                self.warn(format!("MatCapの減光は写像しない: {slot}"));
+            }
         }
 
-        let use_emission = number(material, "_UseEmission").unwrap_or(0.0) != 0.0;
-        let (emissive_factor, emissive_image) = if use_emission {
-            let emission = color(material, "_EmissionColor").unwrap_or([1.0, 1.0, 1.0, 1.0]);
-            // 丸め前の線形値で1超を検出し、警告してから丸める。
-            let raw = [
-                srgb_to_linear_raw(emission[0]),
-                srgb_to_linear_raw(emission[1]),
-                srgb_to_linear_raw(emission[2]),
-            ];
-            let mut factor = [0.0f32; 3];
-            let mut clamped = false;
-            for (channel, value) in factor.iter_mut().zip(raw.iter()) {
-                if *value > 1.0 {
-                    *channel = 1.0;
-                    clamped = true;
-                } else {
-                    *channel = clamp01(*value) as f32;
-                }
-            }
-            if clamped {
-                self.warn(format!("発光色が1を超えるため1に丸める: {slot}"));
-            }
-            (
-                factor,
-                self.resolve_texture(material, slot, "_EmissionMap")?,
-            )
-        } else {
-            ([0.0, 0.0, 0.0], None)
-        };
+        let (emissive_factor, emissive_image) =
+            self.map_emission(material, slot, &main_st, &base, baked_albedo)?;
 
         // 参照実装の `ReadOutline` と対応する。Outline系の変種は
         // `_UseOutline` に関係なく描画し、Multi系のときだけ
@@ -1151,11 +1167,21 @@ impl<'a> LoadContext<'a> {
             let width = number(material, "_OutlineWidth").unwrap_or(0.08).max(0.0);
             // 参照実装の代替値は線形で宣言されているため、sRGB復号しない。
             let outline = linear_color_or(material, "_OutlineColor", [0.6, 0.56, 0.73]);
+            if has_texture(material, "_OutlineTex") {
+                self.warn(format!("アウトライン色テクスチャは写像しない: {slot}"));
+            }
+            // 参照実装の `MapOutline` と対応する。幅マスクはMToonが読むGへ
+            // `ChannelRepack` で載せ替える。直載せはしない。
+            let mask = if has_texture(material, "_OutlineWidthMask") {
+                self.bake_outline_width(material, slot)?
+            } else {
+                None
+            };
             (
                 VrmOutlineWidthMode::WorldCoordinates,
                 (width * 0.01) as f32,
                 outline,
-                self.resolve_texture(material, slot, "_OutlineWidthMask")?,
+                mask,
                 clamp01(number(material, "_OutlineEnableLighting").unwrap_or(1.0)) as f32,
             )
         } else {
@@ -1166,6 +1192,8 @@ impl<'a> LoadContext<'a> {
         // 既定（色 `[0, 0, 0]`・フレネル5・持ち上げ0・混合1）を書く。
         // 有効な場合は色・フレネル・混合を入れ、境界・ぼかしの合わせ込み
         // （参照実装の `RimFit`）と色テクスチャ・マスクは次の段として警告する。
+        // リム倍率テクスチャは、単一の素朴なMatCapマスクだけを直載せする
+        // （参照実装の `BindRimMultiply` の直接載せと対応）。
         let use_rim = number(material, "_UseRim").unwrap_or(0.0) != 0.0;
         let (
             parametric_rim_color_factor,
@@ -1214,6 +1242,11 @@ impl<'a> LoadContext<'a> {
 
         self.warn_unsupported_features(material, slot);
 
+        // リム倍率テクスチャは単一の素朴なMatCapマスクだけを直載せする。
+        // 参照実装の `BindRimMultiply` の直接載せと対応し、焼きが必要な
+        // 場合は対象外として警告する。
+        let rim_multiply_image = self.map_rim_multiply(material, slot, use_rim, matcap_image);
+
         Ok(VrmMaterial {
             name: material.name.clone(),
             alpha_mode,
@@ -1236,6 +1269,7 @@ impl<'a> LoadContext<'a> {
                 gi_equalization_factor: 0.9,
                 matcap_factor,
                 matcap_image,
+                rim_multiply_image,
                 outline_width_mode,
                 outline_width_factor,
                 outline_width_multiply_image,
@@ -1260,22 +1294,14 @@ impl<'a> LoadContext<'a> {
         if number(material, "_UseBacklight").unwrap_or(0.0) != 0.0 {
             self.warn(format!("バックライトは写像しない: {slot}"));
         }
-        // リムは直接値を写像し、合わせ込みの近似は写像側で警告する。
-        // 2nd法線はひとつの法線に焼く必要があり、次の段の対応として警告する。
-        if number(material, "_UseBump2ndMap").unwrap_or(0.0) != 0.0
-            && has_texture(material, "_Bump2ndMap")
-        {
-            self.warn(format!("2nd法線マップは写像しない: {slot}"));
-        }
+        // 2nd法線は `NormalComposite` で合成するため、ここでは警告しない。
+        // アルファマスクは単独では基準色へ焼き込むため、ここでは警告しない。
+        // 焼けない組み合わせの警告は写像側が出す。
         // `_MainTexHSVG` は `m_Colors` のベクトルとして書かれる。
         if let Some(hsvg) = color(material, "_MainTexHSVG")
             && hsvg != [0.0, 1.0, 1.0, 1.0]
         {
             self.warn(format!("色相・彩度・明度の調整は写像しない: {slot}"));
-        }
-        let mask_mode = number(material, "_AlphaMaskMode").unwrap_or(0.0);
-        if (1.0..=4.0).contains(&mask_mode) && has_texture(material, "_AlphaMask") {
-            self.warn(format!("アルファマスクは写像しない: {slot}"));
         }
         if number(material, "_MainGradationStrength").unwrap_or(0.0) > 0.0 {
             self.warn(format!("グラデーションは写像しない: {slot}"));
@@ -1366,20 +1392,8 @@ impl<'a> LoadContext<'a> {
         };
         // PNGは付加チャンクを落としてから埋め込む。JPEGはそのまま扱う。
         // チャンク構造が読めないPNGは壊さず元のまま残し、警告する。
-        // 合計バイト数と `VrmImage.data` は除去後のバイト列で数える。
-        let bytes = if mime == VrmImageMime::Png {
-            match strip_png_ancillary_chunks(&bytes) {
-                Some(stripped) => stripped,
-                None => {
-                    self.warn(format!(
-                        "PNGのチャンク構造が読めないためそのまま埋め込む: {slot}: {property}"
-                    ));
-                    bytes
-                }
-            }
-        } else {
-            bytes
-        };
+        // 合計バイト数と `VrmImage.data` は縮小後・除去後のバイト列で数える。
+        let (bytes, mime) = self.shrink_passthrough(slot, property, bytes, mime, &record.meta);
         let total = self.total_image_bytes.saturating_add(bytes.len() as u64);
         if total > self.options.max_total_image_bytes {
             return Err(MaterialError::new(
@@ -1405,6 +1419,1174 @@ impl<'a> LoadContext<'a> {
         self.total_image_bytes = total;
         Ok(Some(index))
     }
+
+    /// 直載せ画像を取り込み後の寸法に縮小する。
+    ///
+    /// Unityの取り込み（`TextureImporter`）と同じく、長辺を上限以内に収め、
+    /// NPOTを適用する。縮小が必要な場合だけ復号・再符号化し、
+    /// 縮小後はRGBAのPNGとして埋め込む（JPEGの縮小もPNGになる）。
+    /// 取り込み上限が無い場合と復号できない画像は、付加チャンクだけを落とした
+    /// 元のバイト列のまま残す（警告は増やさない）。
+    fn shrink_passthrough(
+        &mut self,
+        slot: &str,
+        property: &str,
+        bytes: Vec<u8>,
+        mime: VrmImageMime,
+        meta: &crate::unity::AssetMeta,
+    ) -> (Vec<u8>, VrmImageMime) {
+        let (max_size, npot, unknown_npot) = import_limit_of(meta);
+        if unknown_npot {
+            self.warn(format!(
+                "NPOT指定が読めないためそのままの寸法で扱う: {slot}: {property}"
+            ));
+        }
+        if (max_size.is_some() || npot != NpotScale::None)
+            && let Ok(image) = load_bake_image(&bytes, mime, srgb_of(meta), sampler_of(meta))
+        {
+            let (fitted_w, fitted_h) =
+                import_fitted_size(image.width(), image.height(), max_size, npot);
+            if (fitted_w, fitted_h) != (image.width(), image.height()) {
+                let linear = !is_color_property(property);
+                let small = downscale_bake_image(&image, fitted_w, fitted_h, linear);
+                return (
+                    encode_rgba_png(
+                        small.pixels(),
+                        BakeSize {
+                            width: fitted_w,
+                            height: fitted_h,
+                        },
+                    ),
+                    VrmImageMime::Png,
+                );
+            }
+        }
+        // PNGは画素に影響しない付加チャンクを落としてから埋め込む。JPEGはそのまま扱う。
+        // チャンク構造が読めないPNGは壊さず元のまま残し、警告する。
+        if mime == VrmImageMime::Png {
+            match strip_png_ancillary_chunks(&bytes) {
+                Some(stripped) => (stripped, mime),
+                None => {
+                    self.warn(format!(
+                        "PNGのチャンク構造が読めないためそのまま埋め込む: {slot}: {property}"
+                    ));
+                    (bytes, mime)
+                }
+            }
+        } else {
+            (bytes, mime)
+        }
+    }
+
+    /// 焼きの入力1件を復号して共有する。
+    ///
+    /// 復号失敗は警告して `None`、同じGUIDの画像は1回だけ復号し、
+    /// 参照数で共有する。`st` はUV0に対する `_ST` である。
+    // 引数は `BakeInput` の組み立てにそのまま使うため束ねない。
+    #[allow(clippy::too_many_arguments)]
+    fn bake_input(
+        &mut self,
+        slot: &str,
+        property: &str,
+        guid: Option<Guid>,
+        bytes: Vec<u8>,
+        mime: VrmImageMime,
+        srgb: bool,
+        sampler: VrmSampler,
+        st: BakeSt,
+        channel: BakeChannel,
+        invert: bool,
+        max_size: Option<u32>,
+        npot: NpotScale,
+    ) -> Result<Option<BakeInput>, MaterialError> {
+        let Some(guid) = guid else {
+            self.warn(format!(
+                "テクスチャの参照先が解決できないため省く: {slot}: {property}"
+            ));
+            return Ok(None);
+        };
+        // 色は符号化済み空間で、データ（マスク・法線）は線形空間で縮小する。
+        // 同じGUIDでも用途区分が違えば別の版として持つ。
+        let linear = !is_color_property(property);
+        let key = (guid.clone(), linear);
+        if let Some(cached) = self.baked_inputs.get(&key) {
+            return Ok(cached.clone().map(|image| BakeInput {
+                image,
+                st,
+                channel,
+                invert,
+            }));
+        }
+        let image = match load_bake_image(&bytes, mime, srgb, sampler) {
+            Ok(image) => {
+                // 焼きの入力も取り込み後の寸法にし、焼きの出力は縮小後の
+                // 入力に従う（`bake_output_size` は縮小後を見る）。
+                let (fitted_w, fitted_h) =
+                    import_fitted_size(image.width(), image.height(), max_size, npot);
+                if (fitted_w, fitted_h) == (image.width(), image.height()) {
+                    Rc::new(image)
+                } else {
+                    Rc::new(downscale_bake_image(&image, fitted_w, fitted_h, linear))
+                }
+            }
+            Err(error) => {
+                self.warn(format!(
+                    "焼き用に復号できないため直載せする: {slot}: {property}: {error}"
+                ));
+                self.baked_inputs.insert(key, None);
+                return Ok(None);
+            }
+        };
+        self.baked_inputs.insert(key, Some(Rc::clone(&image)));
+        Ok(Some(BakeInput {
+            image,
+            st,
+            channel,
+            invert,
+        }))
+    }
+
+    /// テクスチャ環境から焼きの入力を読む。未割り当ては `None` である。
+    ///
+    /// `_ST` は環境の値そのまま（主変換との合成は呼び出し側で行う）。
+    /// 画像の形式判定・sRGB旗・サンプラは `.meta` と先頭バイトから求める。
+    /// 索引外・形式外は警告して `None`、読み込み失敗・上限超過は失敗させる。
+    fn bake_input_of(
+        &mut self,
+        material: &crate::unity::Material,
+        slot: &str,
+        property: &str,
+        channel: BakeChannel,
+        invert: bool,
+    ) -> Result<Option<BakeInput>, MaterialError> {
+        let Some(environment) = texture(material, property) else {
+            return Ok(None);
+        };
+        if environment.texture.is_null() {
+            return Ok(None);
+        }
+        let guid = environment.texture.guid.clone();
+        let st = BakeSt {
+            scale: environment.scale,
+            offset: environment.offset,
+        };
+        let snapshot = environment
+            .texture
+            .guid
+            .clone()
+            .and_then(|guid| self.index.get(&guid).cloned());
+        let record = match snapshot {
+            Some(record) if record.kind == AssetKind::Texture => record,
+            Some(_) => {
+                self.warn(format!(
+                    "テクスチャの参照先が画像でないため省く: {slot}: {property}"
+                ));
+                return Ok(None);
+            }
+            None => {
+                self.warn(format!(
+                    "テクスチャが索引にないため省く: {slot}: {property}"
+                ));
+                return Ok(None);
+            }
+        };
+        // 上限を超える分は読む前に打ち切り、超過は失敗として返す。
+        let path = record.path.clone();
+        let bytes = match read_limited(&self.root.join(&path), self.options.max_image_bytes) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                return Err(MaterialError::new(
+                    MaterialErrorKind::LimitExceeded,
+                    format!("画像が上限を超えた: {slot}: {property}"),
+                )
+                .with_path(path)
+                .with_source(error));
+            }
+            Err(error) => {
+                return Err(MaterialError::new(
+                    MaterialErrorKind::Io,
+                    format!(
+                        "画像を読めない: {slot}: {property}: {}",
+                        crate::escape_diag(&error.to_string())
+                    ),
+                )
+                .with_path(path)
+                .with_source(error));
+            }
+        };
+        let Some(mime) = sniff_mime(&bytes) else {
+            self.warn(format!(
+                "未対応の画像形式のため省く: {slot}: {property}: {path}"
+            ));
+            return Ok(None);
+        };
+        let srgb = srgb_of(&record.meta);
+        let sampler = sampler_of(&record.meta);
+        let (max_size, npot, unknown_npot) = import_limit_of(&record.meta);
+        if unknown_npot {
+            self.warn(format!(
+                "NPOT指定が読めないためそのままの寸法で扱う: {slot}: {property}"
+            ));
+        }
+        self.bake_input(
+            slot, property, guid, bytes, mime, srgb, sampler, st, channel, invert, max_size, npot,
+        )
+    }
+
+    /// 焼き出力を画像列へ載せ、索引を返す。同じ内容は共有する。
+    ///
+    /// 名前は `bake:{slot}:{用途}` であり、決定的である。
+    /// 内容ハッシュ（SHA-256）が一致する出力は同じ索引を共有する。
+    fn push_baked_image(
+        &mut self,
+        slot: &str,
+        target: &str,
+        bytes: Vec<u8>,
+    ) -> Result<usize, MaterialError> {
+        use sha2::Digest as _;
+        let mut hash = sha2::Sha256::new();
+        hash.update(&bytes);
+        let digest: [u8; 32] = hash.finalize().into();
+        if let Some(&index) = self.baked_outputs.get(&digest) {
+            return Ok(index);
+        }
+        let total = self.total_image_bytes.saturating_add(bytes.len() as u64);
+        if total > self.options.max_total_image_bytes {
+            return Err(MaterialError::new(
+                MaterialErrorKind::LimitExceeded,
+                format!("画像の合計が上限を超えた: {slot}: 焼き込み"),
+            ));
+        }
+        let index = self.images.len();
+        self.images.push(VrmImage {
+            name: format!("bake:{slot}:{target}"),
+            mime: VrmImageMime::Png,
+            data: bytes,
+            sampler: VrmSampler::default(),
+        });
+        self.baked_outputs.insert(digest, index);
+        self.total_image_bytes = total;
+        Ok(index)
+    }
+
+    /// 基準色を焼いて画像索引を返す（`BaseColorComposite` と対応）。
+    ///
+    /// 主入力とアルファマスクだけを合成する。色調補正・カラーレイヤー・
+    /// デカールは対象外であり、呼び出し側が焼かない判断をする。
+    fn bake_base_image(
+        &mut self,
+        material: &crate::unity::Material,
+        slot: &str,
+        main_st: &BakeSt,
+    ) -> Result<(usize, Option<Rc<BakeImage>>), MaterialError> {
+        let source = self.bake_input_of(material, slot, "_MainTex", BakeChannel::Rgb, false)?;
+        let mask_mode = number(material, "_AlphaMaskMode").unwrap_or(0.0) as i64;
+        let alpha_mask =
+            match self.bake_input_of(material, slot, "_AlphaMask", BakeChannel::R, false)? {
+                Some(mask) => {
+                    let own = bake_st_of(texture(material, "_AlphaMask"));
+                    let composed = compose_st(main_st, &own);
+                    if !composed.is_identity() {
+                        self.warn(format!(
+                            "アルファマスクのスケール・オフセットは反映しない: {slot}"
+                        ));
+                    }
+                    Some(AlphaMaskInput {
+                        mask: BakeInput {
+                            st: composed,
+                            ..mask
+                        },
+                        mode: mask_mode,
+                        scale: number(material, "_AlphaMaskScale").unwrap_or(1.0) as f32,
+                        value: number(material, "_AlphaMaskValue").unwrap_or(0.0) as f32,
+                    })
+                }
+                None => None,
+            };
+        let mut extents = Vec::new();
+        if let Some(source) = &source {
+            extents.push((
+                source.image.width(),
+                source.image.height(),
+                source.st.scale[0].abs(),
+                source.st.scale[1].abs(),
+            ));
+        }
+        if let Some(alpha) = &alpha_mask {
+            extents.push((
+                alpha.mask.image.width(),
+                alpha.mask.image.height(),
+                alpha.mask.st.scale[0].abs(),
+                alpha.mask.st.scale[1].abs(),
+            ));
+        }
+        let output_id = format!("bake:{slot}:BaseColor");
+        let size = bake_output_size(&extents, &output_id)?;
+        let pixels = bake_base_color(&BaseColorJob {
+            source,
+            base_tint: [1.0, 1.0, 1.0, 1.0],
+            hsvg: None,
+            color_adjust_mask: None,
+            alpha_mask,
+            target: [1.0, 1.0, 0.0, 0.0],
+            size,
+        });
+        let bytes = encode_color_png(&pixels, size);
+        let index = self.push_baked_image(slot, "BaseColor", bytes.clone())?;
+        // 焼き結果の復号は後の陰影・発光のアルベド入力に使い回す。
+        // 埋め込んだバイト列そのものを復号するため、参照実装が焼き済み
+        // テクスチャを読むのと同じ内容になる。
+        let albedo = load_bake_image(&bytes, VrmImageMime::Png, true, VrmSampler::default())
+            .map(Rc::new)
+            .ok();
+        Ok((index, albedo))
+    }
+
+    /// 陰影を写像する（`MapShade` と対応）。
+    ///
+    /// 焼く場合は係数を白にして焼き画像を返し、焼かない場合は
+    /// 従来どおり係数へ載せる。
+    fn map_shade(
+        &mut self,
+        material: &crate::unity::Material,
+        slot: &str,
+        base: &[f64; 4],
+        base_color_image: Option<usize>,
+        baked_albedo: Option<Rc<BakeImage>>,
+        main_st: &BakeSt,
+    ) -> Result<([f32; 3], f32, f32, Option<usize>), MaterialError> {
+        let border = clamp01(number(material, "_ShadowBorder").unwrap_or(0.5));
+        let blur = clamp01(number(material, "_ShadowBlur").unwrap_or(0.1));
+        let low = clamp01(border - blur / 2.0);
+        let high = clamp01(border + blur / 2.0);
+        // MToonのlinearstepは幅0で割れないため、硬い境界は中心まわりに広げる。
+        let toony = 1.0 - (high - low).max(0.001);
+        let shift = 1.0 - (low + high);
+        let strength = clamp01(number(material, "_ShadowStrength").unwrap_or(1.0));
+        // lilToonの既定影色（`_ShadowColor` 未設定時の代替値）。
+        let shadow = color(material, "_ShadowColor").unwrap_or([0.82, 0.76, 0.85, 1.0]);
+        let shadow_lin = [
+            srgb_to_linear(shadow[0]),
+            srgb_to_linear(shadow[1]),
+            srgb_to_linear(shadow[2]),
+        ];
+        // 参照実装の `BlendedShadeColor` と対応する。2層目以降は
+        // アルファが引き込み量であり、色テクスチャは色で代用する。
+        let extra = shade_extra_layers(material);
+        let weights = shade_layer_weights(
+            border as f32,
+            blur as f32,
+            &extra
+                .iter()
+                .map(|layer| (layer.border, layer.blur, layer.alpha))
+                .collect::<Vec<_>>(),
+        );
+        let mut blended = shadow_lin;
+        if !extra.is_empty() {
+            let first = weights[0] as f32;
+            let mut rest = [0.0f32; 3];
+            for (layer, weight) in extra.iter().zip(weights.iter().skip(1)) {
+                rest[0] += *weight as f32 * layer.color[0];
+                rest[1] += *weight as f32 * layer.color[1];
+                rest[2] += *weight as f32 * layer.color[2];
+            }
+            blended = [
+                shadow_lin[0] * first + rest[0],
+                shadow_lin[1] * first + rest[1],
+                shadow_lin[2] * first + rest[2],
+            ];
+        }
+        let tint = [
+            (1.0 - (1.0 - blended[0]) * strength as f32),
+            (1.0 - (1.0 - blended[1]) * strength as f32),
+            (1.0 - (1.0 - blended[2]) * strength as f32),
+        ];
+        // 参照実装の `ReadShadowMask` と対応する。Flatは陰影を平らにせず、
+        // SDFは通常陰影として扱い、強さだけAチャンネルで読む。
+        let mask_type = number(material, "_ShadowMaskType").unwrap_or(0.0) as i64;
+        let strength_mask = match mask_type {
+            1 => {
+                if has_texture(material, "_ShadowStrengthMask") {
+                    self.warn(format!("Flatマスクは通常陰影として写像する: {slot}"));
+                }
+                None
+            }
+            2 => {
+                let version = number(material, "_lilToonVersion").unwrap_or(0.0) as i64;
+                self.warn(format!("SDFマスクは通常陰影として写像する: {slot}"));
+                if version >= 45 {
+                    self.bake_input_of(
+                        material,
+                        slot,
+                        "_ShadowStrengthMask",
+                        BakeChannel::A,
+                        false,
+                    )?
+                } else {
+                    None
+                }
+            }
+            _ => {
+                self.bake_input_of(material, slot, "_ShadowStrengthMask", BakeChannel::R, false)?
+            }
+        };
+        let main_strength = number(material, "_ShadowMainStrength").unwrap_or(0.0) as f32;
+        let shadow_tex = has_texture(material, "_ShadowColorTex");
+        let bake =
+            strength_mask.is_some() || main_strength != 0.0 || (shadow_tex && !extra.is_empty());
+        if !bake {
+            if shadow_tex {
+                self.warn(format!(
+                    "影色テクスチャは基準色との混合ではなく乗算として近似する: {slot}"
+                ));
+                let image = self.resolve_texture(material, slot, "_ShadowColorTex")?;
+                return Ok((tint, shift as f32, toony as f32, image));
+            }
+            // 影色テクスチャが無い場合、影色と基準色の積を影側の色にする。
+            let mixed = [
+                tint[0] * base[0] as f32,
+                tint[1] * base[1] as f32,
+                tint[2] * base[2] as f32,
+            ];
+            return Ok((mixed, shift as f32, toony as f32, base_color_image));
+        }
+        if !main_st.is_identity() {
+            self.warn(format!(
+                "陰影の焼き込みに未対応の変換があるため係数へ載せる: {slot}"
+            ));
+            if shadow_tex {
+                let image = self.resolve_texture(material, slot, "_ShadowColorTex")?;
+                return Ok((tint, shift as f32, toony as f32, image));
+            }
+            let mixed = [
+                tint[0] * base[0] as f32,
+                tint[1] * base[1] as f32,
+                tint[2] * base[2] as f32,
+            ];
+            return Ok((mixed, shift as f32, toony as f32, base_color_image));
+        }
+        // 焼く場合のアルベドは焼いた基準色があればそれを使い、
+        // なければ主テクスチャをそのまま読む（参照実装の `AlbedoInput` と対応）。
+        // 焼いた基準色を使う場合は係数も白にする（`AlbedoColor` と対応）。
+        let (albedo, albedo_color) = match baked_albedo {
+            Some(image) => (
+                Some(BakeInput {
+                    image,
+                    st: BakeSt::identity(),
+                    channel: BakeChannel::Rgb,
+                    invert: false,
+                }),
+                [1.0, 1.0, 1.0, 1.0],
+            ),
+            None => (
+                self.bake_input_of(material, slot, "_MainTex", BakeChannel::Rgb, false)?,
+                [
+                    base[0] as f32,
+                    base[1] as f32,
+                    base[2] as f32,
+                    base[3] as f32,
+                ],
+            ),
+        };
+        let source =
+            self.bake_input_of(material, slot, "_ShadowColorTex", BakeChannel::Rgb, false)?;
+        let mut extents = Vec::new();
+        for input in [&source, &albedo, &strength_mask].into_iter().flatten() {
+            extents.push((
+                input.image.width(),
+                input.image.height(),
+                input.st.scale[0].abs(),
+                input.st.scale[1].abs(),
+            ));
+        }
+        let output_id = format!("bake:{slot}:ShadeMultiply");
+        let size = bake_output_size(&extents, &output_id)?;
+        let first_weight = if extra.is_empty() {
+            1.0
+        } else {
+            weights[0] as f32
+        };
+        let mut rest = [0.0f32; 3];
+        for (layer, weight) in extra.iter().zip(weights.iter().skip(1)) {
+            rest[0] += *weight as f32 * layer.color[0];
+            rest[1] += *weight as f32 * layer.color[1];
+            rest[2] += *weight as f32 * layer.color[2];
+        }
+        let shadow_color_lin = color(material, "_ShadowColor").unwrap_or([0.82, 0.76, 0.85, 1.0]);
+        let pixels = bake_shade(&ShadeJob {
+            source,
+            albedo,
+            albedo_color,
+            shadow_color: [
+                srgb_to_linear(shadow_color_lin[0]),
+                srgb_to_linear(shadow_color_lin[1]),
+                srgb_to_linear(shadow_color_lin[2]),
+                shadow_color_lin[3] as f32,
+            ],
+            strength: strength as f32,
+            shadow_weight: first_weight,
+            shadow_extra: rest,
+            main_strength,
+            strength_mask,
+            target: [1.0, 1.0, 0.0, 0.0],
+            size,
+        });
+        let bytes = encode_color_png(&pixels, size);
+        let image = self.push_baked_image(slot, "ShadeMultiply", bytes)?;
+        Ok(([1.0, 1.0, 1.0], shift as f32, toony as f32, Some(image)))
+    }
+
+    /// 発光を写像する（`MapEmission` と `MapEmissionWithMatcap` に対応）。
+    ///
+    /// 焼く場合は係数を白にして焼き画像を返し、焼かない場合は
+    /// 従来どおり係数へ載せる。
+    fn map_emission(
+        &mut self,
+        material: &crate::unity::Material,
+        slot: &str,
+        main_st: &BakeSt,
+        base: &[f64; 4],
+        baked_albedo: Option<Rc<BakeImage>>,
+    ) -> Result<([f32; 3], Option<usize>), MaterialError> {
+        let use_emission = number(material, "_UseEmission").unwrap_or(0.0) != 0.0;
+        let fold = self.matcap_fold(material, slot, main_st, use_emission)?;
+        // 焼いた基準色があればアルベドに使い、係数は白にする。
+        let baked_albedo_input = baked_albedo.map(|image| BakeInput {
+            image,
+            st: BakeSt::identity(),
+            channel: BakeChannel::Rgb,
+            invert: false,
+        });
+        let albedo_color = if baked_albedo_input.is_some() {
+            [1.0, 1.0, 1.0, 1.0]
+        } else {
+            [
+                base[0] as f32,
+                base[1] as f32,
+                base[2] as f32,
+                base[3] as f32,
+            ]
+        };
+        if let Some(fold) = fold {
+            // 参照実装の `MapEmissionWithMatcap` と対応する。発光が無効な場合は
+            // 始点を定数にするため、発光マップは読まない。
+            let source = if use_emission {
+                self.bake_input_of(material, slot, "_EmissionMap", BakeChannel::Rgb, false)?
+            } else {
+                None
+            };
+            let main_strength = number(material, "_EmissionMainStrength").unwrap_or(0.0) as f32;
+            // 参照実装の `ApplyEmissionInput` と対応する。アルベドは主強度がある
+            // 場合だけ結び、焼きの寸法にもその場合だけ数える。
+            let albedo = if main_strength != 0.0 {
+                match baked_albedo_input.clone() {
+                    Some(input) => Some(input),
+                    None => {
+                        self.bake_input_of(material, slot, "_MainTex", BakeChannel::Rgb, false)?
+                    }
+                }
+            } else {
+                None
+            };
+            let mask = self
+                .bake_input_of(
+                    material,
+                    slot,
+                    "_EmissionBlendMask",
+                    BakeChannel::Rgb,
+                    false,
+                )?
+                .map(|input| EmissionMask {
+                    input,
+                    scalar: false,
+                });
+            // 参照実装の `SizeFrom` と対応する。折り込むMatCap本体の寸法は
+            // 視線で標本するため数えず、混合マスクだけを数える。
+            let mut extents = Vec::new();
+            for input in [&source, &albedo].into_iter().flatten() {
+                extents.push((
+                    input.image.width(),
+                    input.image.height(),
+                    input.st.scale[0].abs(),
+                    input.st.scale[1].abs(),
+                ));
+            }
+            if let Some(mask) = &mask {
+                extents.push((
+                    mask.input.image.width(),
+                    mask.input.image.height(),
+                    mask.input.st.scale[0].abs(),
+                    mask.input.st.scale[1].abs(),
+                ));
+            }
+            if let Some(fold_mask) = &fold.mask {
+                extents.push((
+                    fold_mask.image.width(),
+                    fold_mask.image.height(),
+                    fold_mask.st.scale[0].abs(),
+                    fold_mask.st.scale[1].abs(),
+                ));
+            }
+            let output_id = format!("bake:{slot}:Emissive");
+            let size = bake_output_size(&extents, &output_id)?;
+            let (emission_factor, clamped) = emission_linear(material);
+            if clamped {
+                self.warn(format!("発光色が1を超えるため1に丸める: {slot}"));
+            }
+            let emission_tint = if use_emission {
+                emission_factor
+            } else {
+                [0.0, 0.0, 0.0]
+            };
+            let peak = (fold.color[0] + emission_tint[0])
+                .max(fold.color[1] + emission_tint[1])
+                .max(fold.color[2] + emission_tint[2]);
+            if peak > 1.0 {
+                self.warn(format!("発光の焼き込みは1で頭打ちになる: {slot}"));
+            }
+            let pixels = bake_emission(&EmissionJob {
+                source,
+                emission_tint,
+                albedo,
+                albedo_color,
+                main_strength,
+                mask,
+                scale: None,
+                fold_color: Some(fold.color),
+                fold_mask: fold.mask.map(|input| EmissionMask {
+                    input,
+                    scalar: false,
+                }),
+                target: [1.0, 1.0, 0.0, 0.0],
+                size,
+            });
+            let bytes = encode_color_png(&pixels, size);
+            let image = self.push_baked_image(slot, "Emissive", bytes)?;
+            return Ok(([1.0, 1.0, 1.0], Some(image)));
+        }
+        if !use_emission {
+            return Ok(([0.0, 0.0, 0.0], None));
+        }
+        let main_strength = number(material, "_EmissionMainStrength").unwrap_or(0.0);
+        let blend_mask = has_texture(material, "_EmissionBlendMask");
+        if (main_strength != 0.0 || blend_mask) && main_st.is_identity() {
+            let source =
+                self.bake_input_of(material, slot, "_EmissionMap", BakeChannel::Rgb, false)?;
+            // 参照実装の `ApplyEmissionInput` と対応する。アルベドは主強度がある
+            // 場合だけ結び、焼きの寸法にもその場合だけ数える。
+            let albedo = if main_strength != 0.0 {
+                match baked_albedo_input.clone() {
+                    Some(input) => Some(input),
+                    None => {
+                        self.bake_input_of(material, slot, "_MainTex", BakeChannel::Rgb, false)?
+                    }
+                }
+            } else {
+                None
+            };
+            let mask = self
+                .bake_input_of(
+                    material,
+                    slot,
+                    "_EmissionBlendMask",
+                    BakeChannel::Rgb,
+                    false,
+                )?
+                .map(|input| EmissionMask {
+                    input,
+                    scalar: false,
+                });
+            // 焼かない係数に色を残す場合、焼きの発光色は白である
+            // （`BakeRequest.EmissionTint` が空の場合と対応）。
+            // 寸法は参照実装の `SizeFrom` と同じく始点・強さ・混合マスクだけを数える。
+            let mut extents = Vec::new();
+            for input in [&source, &albedo].into_iter().flatten() {
+                extents.push((
+                    input.image.width(),
+                    input.image.height(),
+                    input.st.scale[0].abs(),
+                    input.st.scale[1].abs(),
+                ));
+            }
+            if let Some(mask) = &mask {
+                extents.push((
+                    mask.input.image.width(),
+                    mask.input.image.height(),
+                    mask.input.st.scale[0].abs(),
+                    mask.input.st.scale[1].abs(),
+                ));
+            }
+            let output_id = format!("bake:{slot}:Emissive");
+            let size = bake_output_size(&extents, &output_id)?;
+            let pixels = bake_emission(&EmissionJob {
+                source,
+                emission_tint: [1.0, 1.0, 1.0],
+                albedo,
+                albedo_color,
+                main_strength: main_strength as f32,
+                mask,
+                scale: None,
+                fold_color: None,
+                fold_mask: None,
+                target: [1.0, 1.0, 0.0, 0.0],
+                size,
+            });
+            let bytes = encode_color_png(&pixels, size);
+            let image = self.push_baked_image(slot, "Emissive", bytes)?;
+            let (factor, clamped) = emission_linear(material);
+            if clamped {
+                self.warn(format!("発光色が1を超えるため1に丸める: {slot}"));
+            }
+            return Ok((factor, Some(image)));
+        }
+        let (factor, clamped) = emission_linear(material);
+        if clamped {
+            self.warn(format!("発光色が1を超えるため1に丸める: {slot}"));
+        }
+        let image = self.resolve_texture(material, slot, "_EmissionMap")?;
+        Ok((factor, image))
+    }
+
+    /// 発光へ折り込むMatCap2ndを求める（`FoldMatcap2nd` と対応）。
+    ///
+    /// 枠が空いている場合や乗算・発光超過で折り込めない場合は `None` を返し、
+    /// 省く理由を警告する。発光が無効でも折り込みは行う。
+    fn matcap_fold(
+        &mut self,
+        material: &crate::unity::Material,
+        slot: &str,
+        main_st: &BakeSt,
+        use_emission: bool,
+    ) -> Result<Option<MatcapFold>, MaterialError> {
+        if matcap_slot(material) != MatcapSlot::First
+            || !has_matcap(material, "_MatCap2nd")
+            || !matcap_contributes(material, "_MatCap2nd")
+        {
+            return Ok(None);
+        }
+        // 枠の所有権・リムとの両立・混合方式・発光超過の順に判定する。
+        if matcap_costs_the_rim(material) && !matcap_left_out(material, "_MatCap2nd") {
+            self.warn(format!("MatCap2ndはリムと両立しないため省く: {slot}"));
+            return Ok(None);
+        }
+        let mode = number(material, "_MatCap2ndBlendMode").unwrap_or(1.0) as i64;
+        if mode == 3 {
+            self.warn(format!(
+                "MatCap2ndの乗算は発光へ折り込めないため省く: {slot}"
+            ));
+            return Ok(None);
+        }
+        if use_emission {
+            let (factor, _) = emission_linear(material);
+            let strength = number(material, "_EmissionBlend").unwrap_or(1.0);
+            if factor[0] * strength as f32 > 1.0
+                || factor[1] * strength as f32 > 1.0
+                || factor[2] * strength as f32 > 1.0
+            {
+                self.warn(format!(
+                    "発光が1を超えるためMatCap2ndは折り込まない: {slot}"
+                ));
+                return Ok(None);
+            }
+        }
+        let source =
+            self.bake_input_of(material, slot, "_MatCap2ndTex", BakeChannel::Rgb, false)?;
+        let Some(fold_texture) = source else {
+            return Ok(None);
+        };
+        let weight = matcap_weight(material, "_MatCap2nd");
+        let average = matcap_disc_average(&fold_texture.image, &fold_texture.st);
+        let color = [
+            average[0] * weight[0],
+            average[1] * weight[1],
+            average[2] * weight[2],
+        ];
+        let mask = match self.bake_input_of(
+            material,
+            slot,
+            "_MatCap2ndBlendMask",
+            BakeChannel::Rgb,
+            false,
+        )? {
+            Some(input) => {
+                let own = bake_st_of(texture(material, "_MatCap2ndBlendMask"));
+                let composed = compose_st(main_st, &own);
+                Some(BakeInput {
+                    st: composed,
+                    ..input
+                })
+            }
+            None => None,
+        };
+        Ok(Some(MatcapFold { color, mask }))
+    }
+
+    /// リム倍率テクスチャを写像する（`BindRimMultiply` の直接載せと対応）。
+    ///
+    /// 単一の素朴なマスクだけを直載せし、焼きが必要な場合や
+    /// リム有効時は対象外として警告して省く。
+    fn map_rim_multiply(
+        &mut self,
+        material: &crate::unity::Material,
+        slot: &str,
+        use_rim: bool,
+        matcap_image: Option<usize>,
+    ) -> Option<usize> {
+        matcap_image?;
+        let prefix = match matcap_slot(material) {
+            MatcapSlot::First => "_MatCap",
+            MatcapSlot::Second => "_MatCap2nd",
+            MatcapSlot::None => return None,
+        };
+        if use_rim {
+            self.warn(format!(
+                "リム倍率テクスチャの焼き込みは未対応のため省く: {slot}"
+            ));
+            return None;
+        }
+        if mode_of(material, &format!("{prefix}MainStrength")) != 0.0 {
+            self.warn(format!(
+                "リム倍率テクスチャの焼き込みは未対応のため省く: {slot}"
+            ));
+            return None;
+        }
+        if !has_texture(material, &format!("{prefix}BlendMask")) {
+            return None;
+        }
+        let weight = matcap_weight(material, prefix);
+        if weight[0] > 1.0 || weight[1] > 1.0 || weight[2] > 1.0 {
+            self.warn(format!(
+                "リム倍率テクスチャの焼き込みは未対応のため省く: {slot}"
+            ));
+            return None;
+        }
+        match self.resolve_texture(material, slot, &format!("{prefix}BlendMask")) {
+            Ok(image) => image,
+            Err(_) => {
+                self.warn(format!("リム倍率テクスチャを読めないため省く: {slot}"));
+                None
+            }
+        }
+    }
+
+    /// アウトライン幅マスクをGへ載せ替える（`MapOutline` と対応）。
+    ///
+    /// 割り当てがあるのに読めない場合は警告して省き、書き出しは続ける。
+    fn bake_outline_width(
+        &mut self,
+        material: &crate::unity::Material,
+        slot: &str,
+    ) -> Result<Option<usize>, MaterialError> {
+        let source =
+            self.bake_input_of(material, slot, "_OutlineWidthMask", BakeChannel::R, false)?;
+        let Some(source) = source else {
+            self.warn(format!("アウトライン幅マスクを読めないため省く: {slot}"));
+            return Ok(None);
+        };
+        let output_id = format!("bake:{slot}:OutlineWidthMultiply");
+        let size = bake_output_size(
+            &[(
+                source.image.width(),
+                source.image.height(),
+                source.st.scale[0].abs(),
+                source.st.scale[1].abs(),
+            )],
+            &output_id,
+        )?;
+        let pixels = bake_channel_repack(&RepackJob {
+            source,
+            target: [1.0, 1.0, 0.0, 0.0],
+            size,
+        });
+        let bytes = encode_data_png(&pixels, size);
+        Ok(Some(self.push_baked_image(
+            slot,
+            "OutlineWidthMultiply",
+            bytes,
+        )?))
+    }
+
+    /// 2nd法線を合成して画像索引を返す（`NormalComposite` と対応）。
+    ///
+    /// 2ndが読めない場合は1stの直載せへ落とし、両方読めない場合は省く。
+    fn bake_normal_image(
+        &mut self,
+        material: &crate::unity::Material,
+        slot: &str,
+        main_st: &BakeSt,
+    ) -> Result<(Option<usize>, f32), MaterialError> {
+        let first = self.bake_input_of(material, slot, "_BumpMap", BakeChannel::Rgb, false)?;
+        let first_scale = first
+            .as_ref()
+            .map(|_| number(material, "_BumpScale").unwrap_or(1.0) as f32)
+            .unwrap_or(1.0);
+        let second = self.bake_input_of(material, slot, "_Bump2ndMap", BakeChannel::Rgb, false)?;
+        // 2ndが読めない場合は `NormalComposite` を組まず、1stの直載せへ落とす
+        // （参照実装は失敗させるが、書き出しを止めない方を選ぶ）。
+        let Some(second) = second else {
+            self.warn(format!(
+                "2nd法線マップを読めないため1stを直載せする: {slot}"
+            ));
+            let image = self.resolve_texture(material, slot, "_BumpMap")?;
+            let scale = number(material, "_BumpScale").unwrap_or(1.0) as f32;
+            return Ok((image, scale));
+        };
+        let second_scale = number(material, "_Bump2ndScale").unwrap_or(1.0) as f32;
+        let scale_mask =
+            match self.bake_input_of(material, slot, "_Bump2ndScaleMask", BakeChannel::R, false)? {
+                Some(input) => {
+                    let own = bake_st_of(texture(material, "_Bump2ndScaleMask"));
+                    let composed = compose_st(main_st, &own);
+                    Some(BakeInput {
+                        st: composed,
+                        ..input
+                    })
+                }
+                None => None,
+            };
+        let second_opt = Some(second);
+        let mut extents = Vec::new();
+        for input in [&first, &second_opt].into_iter().flatten() {
+            extents.push((
+                input.image.width(),
+                input.image.height(),
+                input.st.scale[0].abs(),
+                input.st.scale[1].abs(),
+            ));
+        }
+        if let Some(mask) = &scale_mask {
+            extents.push((
+                mask.image.width(),
+                mask.image.height(),
+                mask.st.scale[0].abs(),
+                mask.st.scale[1].abs(),
+            ));
+        }
+        let output_id = format!("bake:{slot}:Normal");
+        let size = bake_output_size(&extents, &output_id)?;
+        let pixels = bake_normal(&NormalJob {
+            first,
+            first_scale,
+            second: second_opt,
+            second_scale,
+            scale_mask,
+            target: [1.0, 1.0, 0.0, 0.0],
+            size,
+        });
+        let bytes = encode_data_png(&pixels, size);
+        let index = self.push_baked_image(slot, "Normal", bytes)?;
+        Ok((Some(index), 1.0))
+    }
+}
+
+/// 発光へ折り込むMatCap2ndの内容。
+#[cfg(not(target_arch = "wasm32"))]
+struct MatcapFold {
+    /// 平均色×重み（線形）。
+    color: [f32; 3],
+    /// 平均色に掛けるマスク（RGB）。
+    mask: Option<BakeInput>,
+}
+
+/// 陰影の2層目以降1層分（`ShadeLayer` と対応）。
+#[cfg(not(target_arch = "wasm32"))]
+struct ShadeExtraLayer {
+    /// 境界・ぼかし。
+    border: f32,
+    /// ぼかし。
+    blur: f32,
+    /// 引き込み量（色のアルファ）。
+    alpha: f32,
+    /// 層の色（線形RGB）。
+    color: [f32; 3],
+}
+
+/// 陰影の2層目以降を読む（`ReadShadowLayer` と対応）。
+///
+/// アルファが0より大きい層だけを2層目・3層目の順に返す。
+/// 色テクスチャは色で代用するため読まない。
+#[cfg(not(target_arch = "wasm32"))]
+fn shade_extra_layers(material: &crate::unity::Material) -> Vec<ShadeExtraLayer> {
+    let mut layers = Vec::new();
+    for (prefix, border_default, blur_default) in [
+        ("_Shadow2ndColor", 0.15, 0.1),
+        ("_Shadow3rdColor", 0.25, 0.1),
+    ] {
+        let color = color(material, prefix).unwrap_or([0.0, 0.0, 0.0, 0.0]);
+        if color[3] <= 0.0 {
+            continue;
+        }
+        let border_name = prefix.replace("Color", "Border");
+        let blur_name = prefix.replace("Color", "Blur");
+        layers.push(ShadeExtraLayer {
+            border: number(material, &border_name).unwrap_or(border_default) as f32,
+            blur: number(material, &blur_name).unwrap_or(blur_default) as f32,
+            alpha: color[3] as f32,
+            color: [
+                srgb_to_linear(color[0]),
+                srgb_to_linear(color[1]),
+                srgb_to_linear(color[2]),
+            ],
+        });
+    }
+    layers
+}
+
+/// 発光色を線形で読む。1超の有無も返す（`ReadEmission` の係数と対応）。
+#[cfg(not(target_arch = "wasm32"))]
+fn emission_linear(material: &crate::unity::Material) -> ([f32; 3], bool) {
+    let emission = color(material, "_EmissionColor").unwrap_or([1.0, 1.0, 1.0, 1.0]);
+    let raw = [
+        srgb_to_linear_raw(emission[0]),
+        srgb_to_linear_raw(emission[1]),
+        srgb_to_linear_raw(emission[2]),
+    ];
+    let mut factor = [0.0f32; 3];
+    let mut clamped = false;
+    for (channel, value) in factor.iter_mut().zip(raw.iter()) {
+        if *value > 1.0 {
+            *channel = 1.0;
+            clamped = true;
+        } else {
+            *channel = clamp01(*value) as f32;
+        }
+    }
+    (factor, clamped)
+}
+
+/// 浮動小数点プロパティを読む。整数も受け付ける。無ければ `default` である。
+#[cfg(not(target_arch = "wasm32"))]
+fn mode_of(material: &crate::unity::Material, name: &str) -> f64 {
+    number(material, name).unwrap_or(0.0)
+}
+
+/// MatCapが下の色をどれだけ取るか（`Matcap.Covers` と対応）。
+///
+/// Normal・Multiply混合だけが0より大きくなり、加算系は0である。
+#[cfg(not(target_arch = "wasm32"))]
+fn matcap_covers(material: &crate::unity::Material, prefix: &str) -> f32 {
+    let mode = number(material, &format!("{prefix}BlendMode")).unwrap_or(1.0) as i64;
+    if mode != 0 && mode != 3 {
+        return 0.0;
+    }
+    let color = color(material, &format!("{prefix}Color")).unwrap_or([1.0, 1.0, 1.0, 1.0]);
+    (number(material, &format!("{prefix}Blend")).unwrap_or(1.0) * clamp01(color[3])) as f32
+}
+
+/// テクスチャ環境から `_ST` を読む。環境が無ければ単位変換である。
+#[cfg(not(target_arch = "wasm32"))]
+fn bake_st_of(environment: Option<&crate::unity::TextureEnvironment>) -> BakeSt {
+    match environment {
+        Some(environment) => BakeSt {
+            scale: environment.scale,
+            offset: environment.offset,
+        },
+        None => BakeSt::identity(),
+    }
+}
+
+/// 主変換の後に個別変換を合成する（`BakeJobBuilder.Compose` と対応）。
+#[cfg(not(target_arch = "wasm32"))]
+fn compose_st(main: &BakeSt, own: &BakeSt) -> BakeSt {
+    BakeSt {
+        scale: [main.scale[0] * own.scale[0], main.scale[1] * own.scale[1]],
+        offset: [
+            main.offset[0] * own.scale[0] + own.offset[0],
+            main.offset[1] * own.scale[1] + own.offset[1],
+        ],
+    }
+}
+
+/// `.meta` からsRGB旗を読む。無ければ真（Unityの既定）に倒す。
+#[cfg(not(target_arch = "wasm32"))]
+fn srgb_of(meta: &crate::unity::AssetMeta) -> bool {
+    let srgb = meta
+        .importer()
+        .settings
+        .as_mapping()
+        .and_then(|mapping| mapping.get("mipmaps"))
+        .and_then(|value| value.as_mapping())
+        .and_then(|mapping| mapping.get("sRGBTexture"));
+    match srgb {
+        Some(yaml_serde::Value::Bool(flag)) => *flag,
+        Some(yaml_serde::Value::Number(number)) => number.as_i64().is_some_and(|value| value != 0),
+        _ => true,
+    }
+}
+
+/// `.meta` のTextureImporter設定から取り込み上限を読む。
+///
+/// `platformSettings` の `DefaultTexturePlatform` を既定に使い、無ければ
+/// グローバル値を使う。プラットフォーム上書き（Standaloneなど）は使わない。
+/// 戻り値は（上限、NPOT、不明なNPOT値があったか）である。
+/// 上限 `None` は制限なし（0・未設定の場合）を表し、
+/// 不明なNPOT値は `None` として扱う。警告は呼び出し側が出す。
+#[cfg(not(target_arch = "wasm32"))]
+fn import_limit_of(meta: &crate::unity::AssetMeta) -> (Option<u32>, NpotScale, bool) {
+    let settings = meta.importer().settings.as_mapping();
+    let global = settings
+        .and_then(|mapping| mapping.get("maxTextureSize"))
+        .and_then(as_u32);
+    let mut platform_default = None;
+    if let Some(sequence) = settings
+        .and_then(|mapping| mapping.get("platformSettings"))
+        .and_then(|value| value.as_sequence())
+    {
+        for item in sequence {
+            let Some(mapping) = item.as_mapping() else {
+                continue;
+            };
+            let is_default = mapping
+                .get("buildTarget")
+                .and_then(|value| value.as_str())
+                .is_some_and(|target| target == "DefaultTexturePlatform");
+            if is_default {
+                platform_default = mapping.get("maxTextureSize").and_then(as_u32);
+                break;
+            }
+        }
+    }
+    let max = platform_default.or(global).filter(|size| *size > 0);
+    // 実キーは `nPOTScale` であり、文書表記の `npotScale` も受け付ける。
+    let raw = settings
+        .and_then(|mapping| {
+            mapping
+                .get("nPOTScale")
+                .or_else(|| mapping.get("npotScale"))
+        })
+        .and_then(|value| value.as_i64());
+    let (npot, unknown) = match raw {
+        None | Some(0) => (NpotScale::None, false),
+        Some(1) => (NpotScale::ToNearest, false),
+        Some(2) => (NpotScale::ToLarger, false),
+        Some(3) => (NpotScale::ToSmaller, false),
+        Some(_) => (NpotScale::None, true),
+    };
+    (max, npot, unknown)
+}
+
+/// 汎用YAML値から非負整数を読む。数値以外・負値・範囲外は `None` である。
+#[cfg(not(target_arch = "wasm32"))]
+fn as_u32(value: &yaml_serde::Value) -> Option<u32> {
+    value.as_i64().and_then(|number| u32::try_from(number).ok())
+}
+
+/// 縮小で色（符号化済み空間で平均）とデータ（線形空間で平均）を分ける。
+///
+/// 色は基準色・発光・MatCap・影色、データはマスク・法線・幅などである。
+/// 焼きの入力と直載せの両方で同じ区分を使い、Unityの取り込みに近づける。
+#[cfg(not(target_arch = "wasm32"))]
+fn is_color_property(property: &str) -> bool {
+    matches!(
+        property,
+        "_MainTex"
+            | "_Main2ndTex"
+            | "_Main3rdTex"
+            | "_ShadowColorTex"
+            | "_EmissionMap"
+            | "_MatCapTex"
+            | "_MatCap2ndTex"
+    )
 }
 
 /// MToonのひとつのMatCap枠に入れるlilToon MatCap。

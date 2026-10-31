@@ -856,10 +856,10 @@ fn 発光とマットキャップとアウトラインを読める() {
         report.warnings()
     );
     let mtoon = material.mtoon.expect("ある");
-    // 同じGUIDの画像は共有する。
+    // 同じGUIDの画像は共有する。幅マスクだけはGへ載せ替えて焼くため別画像になる。
     assert_eq!(mtoon.matcap_image, Some(0));
     assert_eq!(mtoon.shade_multiply_image, Some(0));
-    assert_eq!(mtoon.outline_width_multiply_image, Some(0));
+    assert_eq!(mtoon.outline_width_multiply_image, Some(1));
     assert_eq!(mtoon.matcap_factor, [1.0, 0.0, 0.0]);
     assert_eq!(
         mtoon.outline_width_mode,
@@ -1742,4 +1742,207 @@ fn リムとuvアニメの既定値を読める() {
     assert_eq!(mtoon.uv_animation_scroll_x_speed_factor, 0.0);
     assert_eq!(mtoon.uv_animation_scroll_y_speed_factor, 0.0);
     assert_eq!(mtoon.uv_animation_rotation_speed_factor, 0.0);
+}
+
+/// R=x*64・G=y*64・B=128・A=255の模様のRGBA8のPNGバイト列を作る。
+fn 模様pngを作る(幅: u32, 高さ: u32) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(幅 as usize * 高さ as usize * 4);
+    for y in 0..高さ {
+        for x in 0..幅 {
+            raw.extend_from_slice(&[((x * 64) % 256) as u8, ((y * 64) % 256) as u8, 128, 255]);
+        }
+    }
+    let mut out = Vec::new();
+    let mut encoder = png::Encoder::new(&mut out, 幅, 高さ);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().expect("PNGは書ける");
+    writer.write_image_data(&raw).expect("画素は書ける");
+    drop(writer);
+    out
+}
+
+/// 取り込み上限付きのテクスチャ資産と `.meta` を書く。
+/// `上限部` は `TextureImporter:` の直下に置くYAML断片である。
+fn 上限テクスチャを書く(
+    root: &Path, 相対: &str, guid: &str, 内容: &[u8], 上限部: &str
+) {
+    資産を書く(root, 相対, 内容);
+    メタを書く(
+        root,
+        相対,
+        guid,
+        "TextureImporter",
+        &format!("  externalObjects: {{}}\n{上限部}"),
+    );
+}
+
+/// PNGバイト列をRGBA8へ復号する。寸法と画素列を返す。
+fn pngを復号する(バイト列: &[u8]) -> (u32, u32, Vec<u8>) {
+    let decoder = png::Decoder::new(std::io::Cursor::new(バイト列));
+    let mut reader = decoder.read_info().expect("PNGは読める");
+    let mut raw = vec![0u8; reader.output_buffer_size().expect("寸法は読める")];
+    let info = reader.next_frame(&mut raw).expect("画素は読める");
+    assert_eq!(info.color_type, png::ColorType::Rgba);
+    assert_eq!(info.bit_depth, png::BitDepth::Eight);
+    (info.width, info.height, raw)
+}
+
+/// 基準色の直載せに使う上限付き配置を作る。`上限部` は `.meta` の断片である。
+fn 上限配置を作る(上限部: &str) -> (tempfile::TempDir, PathBuf) {
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    let tex = guid(0x22);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    上限テクスチャを書く(
+        &root,
+        "Assets/Textures/Body.png",
+        &tex,
+        &模様pngを作る(4, 4),
+        上限部,
+    );
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[("_MainTex", 参照::割当(&tex))],
+        &基本浮動小数(),
+        &基本色(),
+    );
+    (_guard, root)
+}
+
+/// 取り込み上限で直載せ画像が縮小され、Standalone上書きを使わない。
+#[test]
+fn 取り込み上限で直載せ画像が縮小される() {
+    // Default 2（Standalone 2048は使わない）で4x4を2x2へ縮める。
+    // 縮小結果が2x2であることが、Default優先の証拠になる。
+    let (_guard, root) = 上限配置を作る(
+        "  maxTextureSize: 2048\n  nPOTScale: 1\n  textureSettings:\n    filterMode: 1\n    wrapU: 0\n    wrapV: 0\n  mipmaps:\n    enableMipMap: 1\n    sRGBTexture: 1\n  platformSettings:\n  - buildTarget: DefaultTexturePlatform\n    maxTextureSize: 2\n  - buildTarget: Standalone\n    maxTextureSize: 2048\n",
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    assert!(
+        report.warnings().is_empty(),
+        "警告は無い: {:?}",
+        report.warnings()
+    );
+    let 所有 = materials.expect("ある");
+    assert_eq!(所有.images().len(), 1);
+    let image = &所有.images()[0];
+    assert_eq!(image.mime, VrmImageMime::Png);
+    assert_eq!(image.name, "Body");
+    let (幅, 高さ, 画素) = pngを復号する(&image.data);
+    assert_eq!((幅, 高さ), (2, 2));
+    // 面積平均（符号化済み）の手計算と合う。Rは列平均（32・160）、Gは行平均である。
+    assert_eq!(
+        画素,
+        vec![
+            32, 32, 128, 255, //
+            160, 32, 128, 255, //
+            32, 160, 128, 255, //
+            160, 160, 128, 255, //
+        ],
+        "{画素:?}"
+    );
+}
+
+/// グローバル上限がDefault欠落時の代替になり、拡大はしない。
+#[test]
+fn グローバル上限が欠落時の代替になる() {
+    // platformSettingsが無い場合はグローバル値を使い、上限以下では拡大しない。
+    let (_guard, root) = 上限配置を作る(
+        "  maxTextureSize: 2\n  nPOTScale: 1\n  textureSettings:\n    filterMode: 1\n    wrapU: 0\n    wrapV: 0\n  mipmaps:\n    enableMipMap: 1\n    sRGBTexture: 1\n",
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    assert!(
+        report.warnings().is_empty(),
+        "警告は無い: {:?}",
+        report.warnings()
+    );
+    let 所有 = materials.expect("ある");
+    let (幅, 高さ, _) = pngを復号する(&所有.images()[0].data);
+    assert_eq!((幅, 高さ), (2, 2));
+}
+
+/// 不明なNPOT値は警告して等倍として扱う。
+#[test]
+fn 不明なnpot値は警告して等倍になる() {
+    let (_guard, root) = 上限配置を作る(
+        "  nPOTScale: 9\n  textureSettings:\n    filterMode: 1\n    wrapU: 0\n    wrapV: 0\n  mipmaps:\n    enableMipMap: 1\n    sRGBTexture: 1\n",
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    assert!(
+        report.warnings().iter().any(|警告| 警告.contains("NPOT")),
+        "警告: {:?}",
+        report.warnings()
+    );
+    let 所有 = materials.expect("ある");
+    let (幅, 高さ, _) = pngを復号する(&所有.images()[0].data);
+    assert_eq!((幅, 高さ), (4, 4));
+}
+
+/// 焼きの出力寸法は縮小後の入力に従う。
+#[test]
+fn 焼きの出力は縮小後の入力に従う() {
+    // 主とアルファマスクを同じ4x4・上限2にし、基準色の焼きが2x2になることを確かめる。
+    // 用途区分（色とデータ）が違うため、同じGUIDでも別の版として縮小する。
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    let tex = guid(0x22);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    上限テクスチャを書く(
+        &root,
+        "Assets/Textures/Body.png",
+        &tex,
+        &模様pngを作る(4, 4),
+        "  maxTextureSize: 2\n  nPOTScale: 0\n  textureSettings:\n    filterMode: 1\n    wrapU: 0\n    wrapV: 0\n  mipmaps:\n    enableMipMap: 1\n    sRGBTexture: 1\n",
+    );
+    let mut 浮動 = 基本浮動小数();
+    浮動.push(("_AlphaMaskMode", 1.0));
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[
+            ("_MainTex", 参照::割当(&tex)),
+            ("_AlphaMask", 参照::割当(&tex)),
+        ],
+        &浮動,
+        &基本色(),
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    assert!(
+        report.warnings().is_empty(),
+        "警告は無い: {:?}",
+        report.warnings()
+    );
+    let 所有 = materials.expect("ある");
+    let material = 所有.get("Body").expect("ある");
+    let 索引 = material.base_color_image.expect("焼いた基準色がある");
+    let (幅, 高さ, _) = pngを復号する(&所有.images()[索引].data);
+    assert_eq!((幅, 高さ), (2, 2));
 }

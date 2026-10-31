@@ -16,6 +16,8 @@
 //!     meshes --> out
 //! ```
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod bake;
 mod error;
 mod export;
 mod humanoid;
