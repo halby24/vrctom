@@ -40,18 +40,56 @@ f32へ変換するだけでよい。メッシュノードは頂点をベイク�
 ## humanoid
 
 VRM 1.0の必須骨は hips・spine・head・左右の upperArm/lowerArm/hand、
-左右の upperLeg/lowerLeg/foot の15個である。任意の chest・neck・肩・目・足先も
-名前から対応付ける。指は対応付けない。
+左右の upperLeg/lowerLeg/foot の15個である。任意の chest・neck・肩・目・足先に加え、
+指30骨（親指は metacarpal・proximal・distal、
+index・middle・ring・little は proximal・intermediate・distal、左右）も
+名前から対応付ける。指は必須でない。`jaw` は書式に含まれるが対応手段が無い。
 
 対応付けはノード名の正規化で行い、同じ骨名が複数ノードに一致した場合は
 曖昧として失敗する。必須骨が無い場合も失敗する。呼び出し側は
 `HumanoidBones` を明示的に渡すこともでき、その場合は名前の推測を使わない。
+
+正規化は小文字化のうえ空白・`_`・`.`・`-` を除去する。
+側は先頭の `left`/`right`、または語幹が既知の場合の末尾 `l`/`r`
+（`Thumb Proximal.L` の `l` など）で判定する。
+指の語幹は `thumbmetacarpal`・`thumbproximal`・`thumbintermediate`・
+`thumbdistal`・`indexproximal`・`indexintermediate`・`indexdistal`・
+`middleproximal`・`middleintermediate`・`middledistal`・
+`ringproximal`・`ringintermediate`・`ringdistal`・
+`littleproximal`・`littleintermediate`・`littledistal` であり、
+番号別名 `thumb1/2/3`・`index1/2/3`・`middle1/2/3`・`ring1/2/3`・
+`little1/2/3` を対応付ける。`pinky` 系（`pinkyproximal`・`pinky1` など）は
+小指（little）として扱う。側の無い指名（`thumbproximal` 単体など）には
+対応付けない。
+
+親指は3本鎖であり、最初の骨は中手骨に当たる。
+そのため Unity の `Thumb Proximal`（`thumbproximal`・`thumb1` を含む）は
+VRM の `thumbMetacarpal` に、`Thumb Intermediate`（`thumbintermediate`・
+`thumb2` を含む）は `thumbProximal` に、`Thumb Distal`（`thumbdistal`・
+`thumb3` を含む）は `thumbDistal` に対応付ける。
+VRM 1.0に `thumbIntermediate` は存在しない。
+明示的な `thumbmetacarpal` 名を持つモデルで `thumbproximal` 名も併存する場合は、
+どちらも同じ `ThumbMetacarpal` に一致するため重複として失敗する。
+この制限を避ける手段は無い（3本の親指では最初の骨が中手骨になるため）。
+
+指の親子規則は、親指の `Metacarpal` と他の指の `Proximal` の親は同側の `Hand`、
+親指の `Proximal` の親は同側の `Metacarpal`、
+親指の `Distal` の親は同側の `Proximal`、
+他の指の `Intermediate` の親は同側の `Proximal`、
+`Distal` の親は同側の `Intermediate` である。
+同側への置き換えは既存の `allowed_parents_for`
+の仕組みで行い、親が想定外（例: `Thumb Distal` の親が `Hand`）の場合は
+既存どおり失敗する。重複検出も指に効く。
 
 書き出す前に次を検証する。
 
 - 必須骨がすべて存在し、同じノードが複数の骨に割り当てられていない。
 - 各骨の最も近いhumanoid祖先が、仕様の親子関係と許される省略に一致する。
 - humanoid骨のローカル行列の拡大率が正で、鏡像でない。
+- 書き出すhumanoidの骨キーがVRM 1.0の骨名55件のいずれかである。
+  未知のキーは書式違反として失敗する。
+  55件の一覧と書式の対応は単体試験で数と代表名（`thumbMetacarpal` あり・
+  `thumbIntermediate` なし・`jaw` あり）で固定する。
 
 ## meta
 
@@ -180,7 +218,7 @@ UVはFBXとUnityの左下原点からglTFの左上原点へ合わせるため、
 
 ## 失敗と上限
 
-- humanoidの欠落・重複・親子不一致・非正の拡大率は失敗する。
+- humanoidの欠落・重複・親子不一致・非正の拡大率・未知の骨名は失敗する。
 - metaの必須項目が空の場合は失敗する。
 - ノード・メッシュ・スキン・材質・アクセサの索引が範囲外の場合は失敗する。
 - 出力バイト数の上限を設け、超過は失敗する。

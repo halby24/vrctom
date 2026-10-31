@@ -8,7 +8,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::VrmModel;
-use super::humanoid::{HumanoidBone, HumanoidBones, allowed_parents_for};
+use super::humanoid::{
+    HumanoidBone, HumanoidBones, allowed_parents_for, is_known_humanoid_bone_name,
+};
 use super::material::{
     VrmAlphaMode, VrmFilter, VrmMaterial, VrmMaterials, VrmMtoonParameters, VrmSampler, VrmWrap,
     placeholder,
@@ -266,6 +268,8 @@ type NodeMeshMap = HashMap<
 /// 明示指定でも名前検出と同じ検証を行い、必須の存在・索引範囲・重複割当・
 /// 最も近いhumanoid祖先・ローカル行列の拡大率を確かめる。
 /// 任意骨が無い場合はその検証を飛ばす。
+/// 書き出すキーがVRM 1.0の骨名55件のいずれかであることも確かめ、
+/// 未知のキーは書式違反として失敗する。
 fn validate_humanoid(
     model: &VrmModel,
     humanoid: &HumanoidBones,
@@ -291,6 +295,16 @@ fn validate_humanoid(
             return Err(VrmExportError::new(
                 VrmExportErrorKind::DuplicateHumanoidBone,
                 "同じノードに複数の骨が割り当てられた",
+            )
+            .with_bone(bone)
+            .with_node(node));
+        }
+        // 列挙子とキー名の取り違え（例: 旧 `thumbIntermediate`）を残さないため、
+        // VRM 1.0の骨名55件に無いキーはここで失敗する。
+        if !is_known_humanoid_bone_name(bone.name()) {
+            return Err(VrmExportError::new(
+                VrmExportErrorKind::InvalidStructure,
+                "humanoid骨の名前がVRM 1.0の骨名でない",
             )
             .with_bone(bone)
             .with_node(node));

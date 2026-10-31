@@ -407,6 +407,148 @@ fn 区切り付き名をhumanoidに対応付けられる() {
     assert!(上書き.iter().all(|(_, 索引)| 索引 < モデル.nodes.len()));
 }
 
+/// 指ノードを追加し索引を返す。親の子列も更新する。
+fn 指ノードを追加する(モデル: &mut VrmModel, 名: &str, 親: usize) -> usize {
+    let 索引 = モデル.nodes.len();
+    モデル.nodes.push(VrmNode {
+        name: 名.to_string(),
+        parent: Some(親),
+        children: Vec::new(),
+        local: 単位行列(),
+    });
+    モデル.nodes[親].children.push(索引);
+    索引
+}
+
+#[test]
+fn 指の骨を名前から対応付けられる() {
+    let mut モデル = 合成モデルを作る();
+    // 左手の下にUnity式・VRM式・番号別名の鎖を作る。親子関係は正しい。
+    // 親指は3本鎖であり、最初の骨（`Thumb Proximal`）は中手骨に当たる。
+    let 左親指中手骨 = 指ノードを追加する(&mut モデル, "Thumb Proximal.L", 13);
+    let 左親指基節 = 指ノードを追加する(&mut モデル, "Thumb Intermediate.L", 左親指中手骨);
+    let 左親指末節 = 指ノードを追加する(&mut モデル, "Thumb Distal.L", 左親指基節);
+    let 左示指付け根 = 指ノードを追加する(&mut モデル, "LeftIndexProximal", 13);
+    let 左示指中節 =
+        指ノードを追加する(&mut モデル, "LeftIndexIntermediate", 左示指付け根);
+    let 左示指先端 = 指ノードを追加する(&mut モデル, "LeftIndexDistal", 左示指中節);
+    let 右親指中手骨 = 指ノードを追加する(&mut モデル, "thumb1.R", 14);
+    let 右親指基節 = 指ノードを追加する(&mut モデル, "thumb2.R", 右親指中手骨);
+    let 右親指末節 = 指ノードを追加する(&mut モデル, "thumb3.R", 右親指基節);
+    let 右小指付け根 = 指ノードを追加する(&mut モデル, "pinky1.R", 14);
+    let 右小指中節 = 指ノードを追加する(&mut モデル, "pinky2.R", 右小指付け根);
+    let 右小指先端 = 指ノードを追加する(&mut モデル, "pinky3.R", 右小指中節);
+    let 骨 = HumanoidBones::detect(&モデル).expect("指の別名は対応付けられる");
+    assert_eq!(
+        骨.get(HumanoidBone::LeftThumbMetacarpal),
+        Some(左親指中手骨)
+    );
+    assert_eq!(骨.get(HumanoidBone::LeftThumbProximal), Some(左親指基節));
+    assert_eq!(骨.get(HumanoidBone::LeftThumbDistal), Some(左親指末節));
+    assert_eq!(骨.get(HumanoidBone::LeftIndexProximal), Some(左示指付け根));
+    assert_eq!(
+        骨.get(HumanoidBone::LeftIndexIntermediate),
+        Some(左示指中節)
+    );
+    assert_eq!(骨.get(HumanoidBone::LeftIndexDistal), Some(左示指先端));
+    assert_eq!(
+        骨.get(HumanoidBone::RightThumbMetacarpal),
+        Some(右親指中手骨)
+    );
+    assert_eq!(骨.get(HumanoidBone::RightThumbProximal), Some(右親指基節));
+    assert_eq!(骨.get(HumanoidBone::RightThumbDistal), Some(右親指末節));
+    assert_eq!(
+        骨.get(HumanoidBone::RightLittleProximal),
+        Some(右小指付け根)
+    );
+    assert_eq!(
+        骨.get(HumanoidBone::RightLittleIntermediate),
+        Some(右小指中節)
+    );
+    assert_eq!(骨.get(HumanoidBone::RightLittleDistal), Some(右小指先端));
+    // 既存23骨に指12骨が加わる。指は必須でない。
+    assert_eq!(骨.iter().count(), 35, "既存23骨に指12骨が加わる");
+    assert!(
+        !HumanoidBone::LeftThumbProximal.is_required(),
+        "指は任意である"
+    );
+    assert!(
+        !HumanoidBone::RightLittleDistal.is_required(),
+        "指は任意である"
+    );
+    assert_eq!(
+        HumanoidBone::LeftThumbMetacarpal.name(),
+        "leftThumbMetacarpal"
+    );
+    assert_eq!(HumanoidBone::RightLittleDistal.name(), "rightLittleDistal");
+    // 親子関係が正しいため書き出せる。
+    let バイト列 = モデル
+        .to_vrm(&書き出し設定を作る())
+        .expect("正しい指の親子関係は書き出せる");
+    let (値, _) = glbを分解する(&バイト列);
+    let 骨表 = 値
+        .get("extensions")
+        .and_then(|値| 値.get("VRMC_vrm"))
+        .and_then(|値| 値.get("humanoid"))
+        .and_then(|値| 値.get("humanBones"))
+        .and_then(serde_json::Value::as_object)
+        .expect("humanBonesがある");
+    assert_eq!(骨表.len(), 35, "humanBonesは既存23件に指12件が加わる");
+    // 書き出すキーはすべてVRM 1.0の骨名55件のいずれかである。
+    // 旧 `thumbIntermediate` のような未知キーは残さない。
+    for キー in 骨表.keys() {
+        assert!(
+            vrctom::vrm::is_known_humanoid_bone_name(キー),
+            "humanBonesのキーはVRM 1.0の骨名である: {キー}"
+        );
+    }
+    assert!(
+        骨表.contains_key("leftThumbMetacarpal"),
+        "親指の最初の骨は中手骨として書く"
+    );
+    assert!(
+        !骨表.contains_key("leftThumbIntermediate"),
+        "中間骨のキー名は書かない"
+    );
+}
+
+#[test]
+fn 指の重複で失敗する() {
+    let mut モデル = 合成モデルを作る();
+    // 明示的な中手骨名と `Thumb Proximal` が同じ中手骨に一致する。
+    指ノードを追加する(&mut モデル, "ThumbMetacarpal.L", 13);
+    指ノードを追加する(&mut モデル, "Thumb Proximal.L", 13);
+    let 失敗 = モデル
+        .to_vrm(&書き出し設定を作る())
+        .expect_err("指の重複は失敗する");
+    assert_eq!(失敗.kind(), VrmExportErrorKind::DuplicateHumanoidBone);
+    assert_eq!(失敗.bone(), Some(HumanoidBone::LeftThumbMetacarpal));
+}
+
+#[test]
+fn 指の親子不一致で失敗する() {
+    let mut モデル = 合成モデルを作る();
+    // 末節骨の親が手であり、基節骨を飛ばす。
+    指ノードを追加する(&mut モデル, "LeftThumbDistal", 13);
+    let 失敗 = モデル
+        .to_vrm(&書き出し設定を作る())
+        .expect_err("指の親子不一致は失敗する");
+    assert_eq!(失敗.kind(), VrmExportErrorKind::InvalidHumanoidParent);
+    assert_eq!(失敗.bone(), Some(HumanoidBone::LeftThumbDistal));
+}
+
+#[test]
+fn 親指の基節骨は中手骨の下に付く() {
+    let mut モデル = 合成モデルを作る();
+    // 基節骨の親が手であり、中手骨を飛ばす。
+    指ノードを追加する(&mut モデル, "Thumb Intermediate.L", 13);
+    let 失敗 = モデル
+        .to_vrm(&書き出し設定を作る())
+        .expect_err("親指の親子不一致は失敗する");
+    assert_eq!(失敗.kind(), VrmExportErrorKind::InvalidHumanoidParent);
+    assert_eq!(失敗.bone(), Some(HumanoidBone::LeftThumbProximal));
+}
+
 #[test]
 fn 必須骨の欠落で失敗する() {
     let mut モデル = 合成モデルを作る();
