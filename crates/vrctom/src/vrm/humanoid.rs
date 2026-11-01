@@ -4,7 +4,7 @@
 //! 呼び出し側は [`HumanoidBones`] を明示指定して名前推測を使わないこともできる。
 //! 親子・拡大率の検証は書き出し時に行い、ここでは対応付けだけを担う。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::VrmModel;
 use super::export::VrmExportError;
@@ -524,6 +524,7 @@ impl HumanoidBones {
     /// ノード名から対応付ける。
     ///
     /// 名前は英字の大文字小文字を無視し、空白・`_`・`.`・`-` を除去して比べる。
+    /// `mixamorig:Hips` のような名前空間接頭辞（`:` より前）は取り除く。
     /// 側は末尾の区切り付き `L`/`R`、または先頭の `left`/`right` で判定する。
     /// 指の番号別名（`thumb1` など）と `pinky` 系は小指として扱う。
     /// 親指は3本鎖であり、最初の骨（例: `Thumb Proximal`）は中手骨に当たる。
@@ -532,16 +533,23 @@ impl HumanoidBones {
     /// 明示的な `thumbmetacarpal` 名と `thumbproximal` 名が併存する場合は
     /// 同じ骨への重複として失敗する。
     ///
+    /// 対応付けは2パスで行う。1パス目は正確名だけを対応付け、重複は失敗する。
+    /// 2パス目はMixamo由来の別名（`arm`・`forearm`・`upleg`・`leg`・`toebase`）を、
+    /// 正確名で埋まらなかった枠にだけ適用する。正確名で埋まった枠への別名は
+    /// 無視し、正確名が勝つ。同じ枠に別名が複数当たる場合は推測せず、
+    /// 重複として失敗する（先勝ちにしない）。
+    ///
     /// # Errors
     ///
     /// 同じ骨に複数ノードが一致した場合・必須骨が無い場合に返す。
     pub fn detect(model: &VrmModel) -> Result<Self, VrmExportError> {
         let mut bones = Self::new();
+        let mut exact_matched = vec![false; model.nodes.len()];
         for (index, node) in model.nodes.iter().enumerate() {
             let Some(bone) = match_bone(&node.name) else {
                 continue;
             };
-            if let Some(_previous) = bones.get(bone) {
+            if bones.get(bone).is_some() {
                 return Err(VrmExportError::duplicate_bone(
                     bone,
                     index,
@@ -549,6 +557,29 @@ impl HumanoidBones {
                 ));
             }
             bones.set(bone, index);
+            exact_matched[index] = true;
+        }
+        let mut alias_filled: BTreeSet<HumanoidBone> = BTreeSet::new();
+        for (index, node) in model.nodes.iter().enumerate() {
+            if exact_matched[index] {
+                continue;
+            }
+            let Some(bone) = match_alias_bone(&node.name) else {
+                continue;
+            };
+            if bones.get(bone).is_some() {
+                if alias_filled.contains(&bone) {
+                    return Err(VrmExportError::duplicate_bone(
+                        bone,
+                        index,
+                        "同じ骨に複数の別名ノードが一致した",
+                    ));
+                }
+                // 正確名で埋まった枠への別名は無視し、正確名が勝つ。
+                continue;
+            }
+            bones.set(bone, index);
+            alias_filled.insert(bone);
         }
         for bone in HumanoidBone::all() {
             if bone.is_required() && bones.get(bone).is_none() {
@@ -559,17 +590,16 @@ impl HumanoidBones {
     }
 }
 
-/// ノード名から骨を求める。一致しない場合は `None` である。
+/// ノード名から正確名の骨を求める。一致しない場合は `None` である。
 ///
-/// 正規化は小文字化のうえ区切り（空白・`_`・`.`・`-`）の除去であり、
+/// 正規化は名前空間接頭辞（`mixamorig:` など）の除去、小文字化、
+/// 区切り（空白・`_`・`.`・`-`）の除去であり、
 /// 側の接尾辞だけでは中央骨の語尾と区別できないため、接尾辞の候補語幹が
 /// 既知の語幹の場合だけ側として扱う。
+/// Mixamo由来の別名（`arm` など）は含まず、[`match_alias_bone`] が担う。
+/// 正確名と別名の語幹集合は重ならないため、1つの名前が両方に一致しない。
 fn match_bone(name: &str) -> Option<HumanoidBone> {
-    let normalized: String = name
-        .to_lowercase()
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '_' && *c != '.' && *c != '-')
-        .collect();
+    let normalized = normalize_name(name);
     if normalized.is_empty() {
         return None;
     }
@@ -658,6 +688,52 @@ fn match_bone(name: &str) -> Option<HumanoidBone> {
     })
 }
 
+/// ノード名を比較用の小文字・区切りなしに正規化する。
+///
+/// `mixamorig:Hips` のような名前空間接頭辞は `:` より前を取り除く。
+/// FBXの名前空間付き名に対応するための措置であり、`:` を骨名の一部に
+/// 使う命名は想定しない。`:` を含まない名前はそのまま正規化する。
+fn normalize_name(name: &str) -> String {
+    let without_namespace = match name.rsplit_once(':') {
+        Some((_, tail)) => tail,
+        None => name,
+    };
+    without_namespace
+        .to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '_' && *c != '.' && *c != '-')
+        .collect()
+}
+
+/// ノード名からMixamo由来の別名の骨を求める。一致しない場合は `None` である。
+///
+/// 正規化と側の判定は正確名と同じ規則に従う。対応は `arm` が上腕・
+/// `forearm` が前腕・`upleg` が大腿・`leg` が下腿・`toebase` が足先である。
+/// 短い語幹（特に `leg`）の誤検出を避けるため、呼び出し側（[`HumanoidBones::detect`]）
+/// が正確名で埋まらなかった枠にだけ適用し、正確名と別名の語幹集合は
+/// 重ならないように保つ。同じ枠に別名が複数当たる場合は呼び出し側が
+/// 推測せず失敗する。
+fn match_alias_bone(name: &str) -> Option<HumanoidBone> {
+    let normalized = normalize_name(name);
+    if normalized.is_empty() {
+        return None;
+    }
+    let (side, stem) = split_side(&normalized)?;
+    Some(match (side, stem) {
+        (Some(Side::Left), "arm") => HumanoidBone::LeftUpperArm,
+        (Some(Side::Right), "arm") => HumanoidBone::RightUpperArm,
+        (Some(Side::Left), "forearm") => HumanoidBone::LeftLowerArm,
+        (Some(Side::Right), "forearm") => HumanoidBone::RightLowerArm,
+        (Some(Side::Left), "upleg") => HumanoidBone::LeftUpperLeg,
+        (Some(Side::Right), "upleg") => HumanoidBone::RightUpperLeg,
+        (Some(Side::Left), "leg") => HumanoidBone::LeftLowerLeg,
+        (Some(Side::Right), "leg") => HumanoidBone::RightLowerLeg,
+        (Some(Side::Left), "toebase") => HumanoidBone::LeftToes,
+        (Some(Side::Right), "toebase") => HumanoidBone::RightToes,
+        _ => return None,
+    })
+}
+
 /// 正規化名を側と語幹に分ける。語幹が空の場合は `None` である。
 fn split_side(normalized: &str) -> Option<(Option<Side>, &str)> {
     if let Some(stem) = normalized.strip_prefix("left") {
@@ -689,6 +765,12 @@ fn split_side(normalized: &str) -> Option<(Option<Side>, &str)> {
 }
 
 /// 側の接尾辞を受け付ける語幹かどうかを返す。
+///
+/// 正確名の語幹に加え、Mixamo由来の別名語幹（`arm`・`forearm`・
+/// `upleg`・`leg`・`toebase`）も受け付ける。`Shoulder_L` のような
+/// 区切り付き接尾辞の命名に対応するためである。
+/// 別名語幹の追加で正確名の対応は変わらない。正確名と別名の語幹集合が
+/// 重ならないため、接尾辞の有無で一致先が変わることは無い。
 fn is_side_stem(stem: &str) -> bool {
     matches!(
         stem,
@@ -702,6 +784,11 @@ fn is_side_stem(stem: &str) -> bool {
             | "foot"
             | "toe"
             | "toes"
+            | "arm"
+            | "forearm"
+            | "upleg"
+            | "leg"
+            | "toebase"
             | "thumbmetacarpal"
             | "thumbproximal"
             | "thumbintermediate"
@@ -886,6 +973,80 @@ mod tests {
         assert_eq!(
             match_bone("thumbmetacarpal.R"),
             Some(HumanoidBone::RightThumbMetacarpal)
+        );
+    }
+
+    #[test]
+    fn 混合由来の別名は必須骨の枠に対応する() {
+        // Mixamo由来の命名（Shaonなど）を正確名なしで対応付ける。
+        assert_eq!(
+            match_alias_bone("LeftArm"),
+            Some(HumanoidBone::LeftUpperArm)
+        );
+        assert_eq!(
+            match_alias_bone("RightArm"),
+            Some(HumanoidBone::RightUpperArm)
+        );
+        assert_eq!(
+            match_alias_bone("LeftForeArm"),
+            Some(HumanoidBone::LeftLowerArm)
+        );
+        assert_eq!(
+            match_alias_bone("mixamorig:RightForeArm"),
+            Some(HumanoidBone::RightLowerArm)
+        );
+        assert_eq!(
+            match_alias_bone("LeftUpLeg"),
+            Some(HumanoidBone::LeftUpperLeg)
+        );
+        assert_eq!(
+            match_alias_bone("LeftLeg"),
+            Some(HumanoidBone::LeftLowerLeg)
+        );
+        assert_eq!(
+            match_alias_bone("RightLeg"),
+            Some(HumanoidBone::RightLowerLeg)
+        );
+        assert_eq!(
+            match_alias_bone("LeftToeBase"),
+            Some(HumanoidBone::LeftToes)
+        );
+        // 区切り付き接尾辞の命名（`Arm_L` など）にも対応する。
+        assert_eq!(match_alias_bone("Arm_L"), Some(HumanoidBone::LeftUpperArm));
+        assert_eq!(match_alias_bone("ToeBase_R"), Some(HumanoidBone::RightToes));
+    }
+
+    #[test]
+    fn 別名の語幹は正確名の一致を変えない() {
+        // 正確名と別名の語幹集合は重ならない。短い別名語幹（特に `leg`）が
+        // 正確名（`upperleg`・`lowerleg`）を奪わない。
+        assert_eq!(match_bone("LeftArm"), None);
+        assert_eq!(match_bone("LeftUpperArm"), Some(HumanoidBone::LeftUpperArm));
+        assert_eq!(match_bone("LeftLeg"), None);
+        assert_eq!(match_bone("LeftLowerLeg"), Some(HumanoidBone::LeftLowerLeg));
+        assert_eq!(match_bone("LeftToeBase"), None);
+        assert_eq!(match_bone("LeftToes"), Some(HumanoidBone::LeftToes));
+        // 装飾骨（ツイスト・末端・指の4本鎖）は別名でも対応付けない。
+        assert_eq!(match_bone("UpperArm_twist_L"), None);
+        assert_eq!(match_alias_bone("UpperArm_twist_L"), None);
+        assert_eq!(match_alias_bone("LeftToeBase_end"), None);
+        assert_eq!(match_alias_bone("LeftHandThumb1"), None);
+        // 他モデルの足先綴り（Quicheの `Bese`）は推測しない。
+        assert_eq!(match_bone("Bese_L"), None);
+        assert_eq!(match_alias_bone("Bese_L"), None);
+    }
+
+    #[test]
+    fn 名前空間接頭辞は正確名と別名の両方で取り除かれる() {
+        // `mixamorig:Hips` のようなFBXの名前空間付き名に対応する。
+        assert_eq!(match_bone("mixamorig:Hips"), Some(HumanoidBone::Hips));
+        assert_eq!(
+            match_alias_bone("mixamorig:LeftArm"),
+            Some(HumanoidBone::LeftUpperArm)
+        );
+        assert_eq!(
+            match_bone("mixamorig:LeftUpperArm"),
+            Some(HumanoidBone::LeftUpperArm)
         );
     }
 }

@@ -73,6 +73,35 @@ index・middle・ring・little は proximal・intermediate・distal、左右）�
 小指（little）として扱う。側の無い指名（`thumbproximal` 単体など）には
 対応付けない。
 
+名前空間接頭辞は取り除く。Mixamo由来のFBXは `mixamorig:Hips` のように
+`名前空間:名前` の形を持つため、`:` より前を取り除いてから比べる。
+`:` を骨名の一部に使う命名は想定しない。
+
+Mixamo由来の別名は正確名で埋まらない枠にだけ2パス目として適用する。
+対応は `arm` が上腕（UpperArm）・`forearm` が前腕（LowerArm）・
+`upleg` が大腿（UpperLeg）・`leg` が下腿（LowerLeg）・
+`toebase` が足先（Toes）であり、側の判定は正確名と同じ規則に従う
+（`Arm_L`・`ToeBase_R` のような区切り付き接尾辞を含む）。
+正確名と別名の語幹集合は重ならないため、1つの名前が両方に一致しない。
+`leg` が `upperleg`・`lowerleg` を奪うことは無い。
+
+競合の規則は次のとおり。誤検出を避けるため、別名側では推測しない。
+
+- 正確名で埋まった枠への別名は無視し、正確名が勝つ。
+  例: `LeftUpperArm` と `LeftArm` が併存する場合は前者を使う。
+- 同じ枠に別名が複数当たる場合（例: `LeftArm` と `Arm_L` の併存）は
+  先勝ちにせず、重複として失敗する。
+- 正確名同士の重複（例: 明示的な `thumbmetacarpal` と `thumbproximal` の
+  併存）は従来どおり失敗する。別名の導入で変わらない。
+
+対象外として推測しないもの。必須骨の充足に要らないため、対応付けない。
+
+- 指の4本鎖（`LeftHandThumb1` など）。VRMの親指は3本であり、
+  4区分の写像は一意に決まらない。
+- `Spine1`・`Spine2` のような中間脊椎の写像（`Chest`・`UpperChest` の
+  割当は推測になる）。
+- `Bese` のような綴りのゆれ。足先は必須でないため欠落のままでよい。
+
 親指は3本鎖であり、最初の骨は中手骨に当たる。
 そのため Unity の `Thumb Proximal`（`thumbproximal`・`thumb1` を含む）は
 VRM の `thumbMetacarpal` に、`Thumb Intermediate`（`thumbintermediate`・

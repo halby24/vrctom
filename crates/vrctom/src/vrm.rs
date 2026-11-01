@@ -870,6 +870,77 @@ fn build_expressions(
     Ok(VrmExpressions { preset })
 }
 
+/// 同一関節の `TransformLink` 候補を同一とみなす平行移動の許容差（メートル）。
+///
+/// FBXの行列値は `UnitScaleFactor` 単位（通常はセンチメートル）であり、
+/// 比較前にメートルへ換算して評価する。実測（Shaon）はスキン間で最大
+/// 2.3e-5（FBX単位、メートル換算 2.3e-7 m）の成分差があり、float32 の半 ulp
+/// （約 6e-8 の相対精度）に由来する丸めに収まる。1e-6 m（1μm）は実測最大の
+/// 約4倍であり、丸めを吸収しつつ有意なずれ（1 mm など）を通さない。
+const BIND_LINK_TRANSLATION_TOLERANCE_M: f64 = 1e-6;
+
+/// 同一関節の `TransformLink` 候補を同一とみなす線形部（回転・拡大縮小）の許容差（無次元）。
+///
+/// 実測（Shaon）は回転差 7e-6 度・倍率差 1e-13・せん断なしであり、float32 の
+/// 半 ulp 由来の丸めに収まる。1e-5 は実測を十分に上回り、1 度の回転
+/// （成分差 約 1.7e-2）を通さない。平行移動の大きさに引きずられないよう、
+/// 単一の相対誤差指標ではなく線形部と平行移動を分けて評価する。
+/// 行列の平均化はせず、代表値をそのまま使う。
+const BIND_LINK_LINEAR_TOLERANCE: f64 = 1e-5;
+
+/// 列ベクトル規約における平行移動の成分番号。FBX行優先の 3・7・11 と同じ値である。
+const BIND_LINK_TRANSLATION_INDICES: [usize; 3] = [12, 13, 14];
+
+/// 列ベクトル規約におけるw行の成分番号。アフィン行列では `[0, 0, 0, 1]` である。
+/// 0 と 1 は float32 でも正確に表せるため丸めの余地がなく、完全一致を求める。
+const BIND_LINK_AFFINE_INDICES: [usize; 4] = [3, 7, 11, 15];
+
+/// 同一関節の `TransformLink` の代表候補。決定的に選んだ最初の候補を持つ。
+struct LinkFirst {
+    /// 代表の行列。スキンID昇順・クラスタ出現順で最初の候補である。
+    matrix: [f64; 16],
+    /// 代表が出たスキンのID。許容超過の報告に使う。
+    skin: i64,
+}
+
+/// 2つの `TransformLink` 候補を比べ、許容を超える最初の不一致の説明を返す。
+///
+/// 許容内の場合は `None` を返す。平行移動（12〜14番）はメートル換算で
+/// [`BIND_LINK_TRANSLATION_TOLERANCE_M`] と比べ、線形部（3x3）は無次元で
+/// [`BIND_LINK_LINEAR_TOLERANCE`] と比べる。w行（3・7・11・15番）は正確な
+/// `[0, 0, 0, 1]` を求める。いずれも有限であることを呼び出し側で確かめる。
+fn link_candidate_mismatch(
+    first: &[f64; 16],
+    next: &[f64; 16],
+    unit_to_meter: f64,
+) -> Option<String> {
+    for index in 0..16 {
+        let (prev, curr) = (first[index], next[index]);
+        if BIND_LINK_TRANSLATION_INDICES.contains(&index) {
+            let diff_m = (curr - prev).abs() * unit_to_meter;
+            if diff_m > BIND_LINK_TRANSLATION_TOLERANCE_M {
+                return Some(format!(
+                    "成分[{index}]の平行移動差 {diff_m} m が許容 {BIND_LINK_TRANSLATION_TOLERANCE_M} m を超える（{prev} に対して {curr}）"
+                ));
+            }
+        } else if BIND_LINK_AFFINE_INDICES.contains(&index) {
+            if prev != curr {
+                return Some(format!(
+                    "成分[{index}]のw行が一致しない（{prev} に対して {curr}）"
+                ));
+            }
+        } else {
+            let diff = (curr - prev).abs();
+            if diff > BIND_LINK_LINEAR_TOLERANCE {
+                return Some(format!(
+                    "成分[{index}]の線形部差 {diff} が許容 {BIND_LINK_LINEAR_TOLERANCE} を超える（{prev} に対して {curr}）"
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// 全モデルのバインド世界行列と、どの経路で求めたかの内訳。
 struct BindWorlds {
     /// `models()` 順のバインド世界行列。
@@ -890,6 +961,10 @@ struct BindWorlds {
 /// 代替を使った場合は件数を [`BindWorlds`] に残し、呼び出し側が報告に載せる。
 /// `BindPose` 自体が1件も無い場合は、バインド姿勢の手掛かりが無いため
 /// 従来どおり [`VrmErrorKind::MissingBindPose`] で失敗する。
+/// 同一関節の `TransformLink` がスキンごとに微小に異なる場合（float32由来の
+/// 丸め）は、平行移動をメートル換算で・線形部を無次元で許容差の範囲に収まる
+/// 候補を同一とみなし、スキンID昇順・クラスタ出現順の最初の候補を代表値に
+/// 使う。許容を超える差・非有限の候補は失敗のままにする。
 /// 退化（行列が特異・成分が有限でない・参照が循環）は失敗のままにする。
 fn bind_world_matrices(file: &FbxFile<'_>) -> Result<BindWorlds, VrmError> {
     let nodes = file.bind_pose_nodes().map_err(|error| {
@@ -930,9 +1005,16 @@ fn bind_world_matrices(file: &FbxFile<'_>) -> Result<BindWorlds, VrmError> {
         .with_object(models[0].id));
     }
     // クラスタが指す `TransformLink` を関節ごとに1つにまとめる。
-    // 複数のクラスタが同じ関節に異なる行列を持つ場合は、どれが正か決められない。
-    let mut links: HashMap<i64, [f64; 16]> = HashMap::new();
-    for skin in file.skins() {
+    // 同一関節の候補がスキンごとに微小に異なる場合（float32由来の丸め）は
+    // 許容差の範囲で同一とみなし、代表値（スキンID昇順・クラスタ出現順の
+    // 最初の候補）をそのまま使う。行列の平均化はしない。
+    // 許容を超える差はどれが正か決められないため、関節・スキン・成分・差を
+    // 添えて失敗する。`HashMap` の列挙順には依存しない。
+    let unit_to_meter = file.unit_scale_factor() / 100.0;
+    let mut ordered: Vec<_> = file.skins().iter().collect();
+    ordered.sort_by_key(|skin| skin.id.value());
+    let mut links: HashMap<i64, LinkFirst> = HashMap::new();
+    for skin in ordered {
         let binds = file
             .cluster_bind_matrices(skin.id)
             .map_err(wrap_fbx_error)?;
@@ -940,17 +1022,40 @@ fn bind_world_matrices(file: &FbxFile<'_>) -> Result<BindWorlds, VrmError> {
             let Some(link) = bind.transform_link else {
                 continue;
             };
+            if !link.iter().all(|v| v.is_finite()) {
+                return Err(VrmError::new(
+                    VrmErrorKind::InvalidStructure,
+                    "結合モデルのバインド時行列が有限でない",
+                )
+                .with_object(bind.cluster));
+            }
             match links.get(&bind.joint.value()) {
-                Some(&prev) if prev != link => {
-                    return Err(VrmError::new(
-                        VrmErrorKind::InvalidStructure,
-                        "結合モデルのバインド時行列が一致しない",
-                    )
-                    .with_object(bind.cluster));
+                Some(first) => {
+                    if let Some(reason) =
+                        link_candidate_mismatch(&first.matrix, &link, unit_to_meter)
+                    {
+                        return Err(VrmError::new(
+                            VrmErrorKind::InvalidStructure,
+                            format!(
+                                "結合モデルのバインド時行列が一致しない: 関節 {} の候補が許容を超える（{}。代表スキン {} に対するスキン {} のクラスタ {}）",
+                                bind.joint.value(),
+                                reason,
+                                first.skin,
+                                skin.id.value(),
+                                bind.cluster.value(),
+                            ),
+                        )
+                        .with_object(bind.cluster));
+                    }
                 }
-                Some(_) => {}
                 None => {
-                    links.insert(bind.joint.value(), link);
+                    links.insert(
+                        bind.joint.value(),
+                        LinkFirst {
+                            matrix: link,
+                            skin: skin.id.value(),
+                        },
+                    );
                 }
             }
         }
@@ -975,9 +1080,9 @@ fn bind_world_matrices(file: &FbxFile<'_>) -> Result<BindWorlds, VrmError> {
             worlds.push(*matrix);
             pose_models += 1;
         } else if joints.contains(&model.id.value())
-            && let Some(link) = links.get(&model.id.value())
+            && let Some(first) = links.get(&model.id.value())
         {
-            worlds.push(*link);
+            worlds.push(first.matrix);
             link_models += 1;
         } else {
             // `needs_rest` が真の場合だけここに来る。到達しないはずだが、
