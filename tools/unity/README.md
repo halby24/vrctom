@@ -203,3 +203,137 @@ humanoid の要約（`humanoid=骨数(tPose省略数)`）も出す。
 - bind-pose の復元は Unity 空間（インポート適用後）の行列で行う。FBX 生値との突合せは
   Rust 側の座標ゲートで行う。回転の正規化はこちらで済ませて出す。
 - SMR の `bones` と `bindposes` の数が合わないメッシュはエラー終了する（壊れたメッシュ扱い）。
+
+---
+
+# RendererSidecarExporter
+
+Unity 2022.3 のプロジェクトで、アバター Prefab を実体化して得られる
+レンダラ割当の sidecar JSON
+(`format: vrctom.renderers`, `schemaVersion: 1`) を書き出すエディタヘルパ。
+Rust 側が材質割当と出力対象レンダラを正確に再現するための入力である。
+購入アバターの材質割当は Prefab にあり、`.fbx.meta` の置換表だけでは足りないため、
+Unity が解決した結果をそのまま受け取る。シーンや Prefab の保存・変更はしない。
+edit-mode の初期状態を採取する（Play Mode・Animator・VRChat 実行時は対象外）。
+
+## 置き場所
+
+- `tools/unity/RendererSidecarExporter.cs` が正本。検証プロジェクトへのコピーは
+  `references/unity-milfy-vrm-check/Assets/Editor/Renderers/` にある
+  （`references/` は gitignore 対象のため、正式な置き場は `tools/unity/`）。
+
+## 導入手順
+
+1. `tools/unity/RendererSidecarExporter.cs` を対象プロジェクトの
+   `Assets/Editor/Renderers/RendererSidecarExporter.cs` に置く。
+2. その `Assets/Editor/` が asmdef の支配下にある場合（`MilfyAutoExport.asmdef` のように
+   `autoReferenced: false` の独自アセンブリなど）は、同フォルダに Editor 専用の asmdef を置く。
+   支配下にない場合は asmdef 不要。例:
+
+    ```json
+    {
+        "name": "vrctom.Renderers.Editor",
+        "rootNamespace": "vrctom.Renderers",
+        "references": [],
+        "includePlatforms": ["Editor"],
+        "excludePlatforms": [],
+        "allowUnsafeCode": false,
+        "overrideReferences": false,
+        "precompiledReferences": [],
+        "autoReferenced": true,
+        "defineConstraints": [],
+        "versionDefines": [],
+        "noEngineReferences": false
+    }
+    ```
+
+3. Unity がスクリプトを再コンパイルするのを待つ。
+
+要件: Unity 2022.3。
+
+## 実行方法
+
+GUI: メニュー `Tools/vrctom/Export Renderer Sidecar`（エディタは終了しない）。
+
+バッチ (`unity run` が `-executeMethod` に転送する):
+
+```sh
+VRCTOM_RENDERERS_PREFAB=Assets/MANUKA/Prefab/MANUKA_lilToon.prefab \
+VRCTOM_RENDERERS_OUT=/tmp/out/renderers.json \
+  unity run references/unity-milfy-vrm-check -- -executeMethod RendererSidecarExporter.Run
+```
+
+`-quit` は渡さない（ラッパが管理していてエラーになる。スクリプト内で
+`EditorApplication.Exit(0)` する）。
+
+- `VRCTOM_RENDERERS_PREFAB`（必須）: 採取する Prefab のパス。
+  空シーンへ `PrefabUtility.InstantiatePrefab` で実体化する。シーンは保存しない。
+- `VRCTOM_RENDERERS_OUT`（必須）: 出力 JSON パス。
+- 失敗時は `Debug.LogError` して終了コード 1。成功で 0。
+
+## 採取手順
+
+1. Prefab を空シーンへ実体化する。
+2. インスタンス配下の全 `Renderer`（`Renderer` 派生: SkinnedMeshRenderer /
+   MeshRenderer / ParticleSystemRenderer など）をシーン走査順に列挙する。
+   対応しない種類（SkinnedMeshRenderer / MeshRenderer 以外）も「未対応」として
+   必ず記録し、黙って飛ばさない（`supported: false`、`mesh: null`、
+   `materials: []`、`note` に理由）。
+3. `enabled` と `activeInHierarchy` を記録する。
+   除外判定は Rust 側で行うので、無効も全部出す。
+
+## スキーマ (sidecar v1)
+
+- `format: "vrctom.renderers"`、`schemaVersion: 1`。
+- `unityVersion`: Unity のバージョン。
+- `sourcePrefab`: `{path, guid}`。採取した Prefab。
+- `models[]`: レンダラの所有ノードとメッシュが参照する FBX ごとの
+  `{path, guid, sha256}`（`path` 順にソート）。
+  `sha256` はファイルの生バイトの SHA-256（小文字 hex 64桁）。
+- `renderers[]`: シーン走査順に `index: 0..`。
+  - `rootPath` / `path`: Prefab インスタンスのルートからのパス（`/` 区切り）。
+    両者は同じ値である（複数ルート対応のためインスタンス基準で統一）。
+  - `type`: レンダラの型名（`SkinnedMeshRenderer` など）。
+  - `supported`: SkinnedMeshRenderer / MeshRenderer のとき真。
+  - `enabled` / `activeInHierarchy`: 除外判定前の生値。
+  - `model`: どの FBX のものか。`{path, guid, nodePath}`。
+    `nodePath` は FBX 内の所有ノードのパス（後述）。判定できなければ `null`。
+  - `mesh`: `{name, path, guid, fileID, subMeshCount, vertexCount, boneCount}`。
+    `fileID` は 64bit（丸めない。浮動小数や指数表記にしない）。
+    `boneCount` は SkinnedMeshRenderer の `bones` 長、MeshRenderer では 0。
+    `sharedMesh` が無ければ `null`。
+    MeshRenderer のメッシュは `MeshFilter.sharedMesh` から取る。
+  - `materials`: `sharedMaterials` をサブメッシュ順に。
+    要素は `{name, guid, fileID, path, shader}`、null は明示的な `null`。
+    未対応種類では `[]`。
+  - `note`: 未対応・判定不能の理由など。無ければ `null`。
+- JSON は決定的に（並びは renderer のシーン走査順、キー順固定、インデント2）。
+  時刻は入れない。
+
+### `model.nodePath` の決め方
+
+Rust 側は FBX 内のノードパスでメッシュを照合する
+（Unity の fileID は FBX の ObjectId と無関係）。
+
+- レンダラの GameObject から親をたどり、どのモデル（FBX アセット）に属するかを
+  `PrefabUtility.GetCorrespondingObjectFromSource` と
+  `AssetDatabase.GetAssetPath` で判定する。
+  シーン→Prefab→FBX と対応元を遡り、最も外側の FBX 由来オブジェクトを使う。
+  Prefab YAML からは解決できない形（FBX 本体を source にする PrefabInstance）も
+  Unity の解決結果として受け取る。
+- そのモデルのルート（Unity が FBX から生成するルート GameObject）を特定し、
+  そこからの相対パスを `/` 区切りで出す。
+- ルートが特定できない場合（Prefab 直付け・シーン追加のノード、
+  最外対応元が FBX でない、自身が FBX ルート等）は `model` を null にし、
+  `note` に理由を書く。推測したパスを出さない。
+- 同じ FBX が複数インスタンス化されている場合は `nodePath` が重複し得る。
+  その事実は Rust 側で検出させるため、重複を潰さずそのまま出す。
+
+## 制限（次単位としないもの）
+
+- 収録対象はインスタンス配下の全 `Renderer`。有効・無効を問わず収録し、
+  `enabled` / `activeInHierarchy` で区別する（選別は Rust 側）。
+- 決定性: レンダラは `GetComponentsInChildren` の走査順、
+  `models` は `path` 順。同じ状態からはバイト同一の JSON になる。
+- `materials` の `guid` / `fileID` が取れない組み込み材質等は
+  `guid: ""`・`fileID: 0` で出す。
