@@ -23,7 +23,7 @@ mod export;
 mod humanoid;
 mod look_at;
 mod material;
-mod matrix;
+pub(crate) mod matrix;
 mod mesh;
 pub mod physics;
 
@@ -264,8 +264,16 @@ pub struct VrmReport {
     pub mirrored_meshes: usize,
     /// 全メッシュのモーフターゲット数。
     pub morph_target_count: usize,
+    /// 長さ0の法線を面法線で補った頂点数。
+    pub degenerate_normals: usize,
     /// プリセット式の数。
     pub expression_count: usize,
+    /// `BindPose` の行列を使ったモデル数。
+    pub bind_pose_models: usize,
+    /// `BindPose` に無くクラスタの `TransformLink` で補った関節モデル数。
+    pub bind_cluster_models: usize,
+    /// いずれも無くrestのワールド行列で補ったモデル数。
+    pub bind_rest_models: usize,
 }
 
 /// 中間モデル生成の資源上限。
@@ -407,11 +415,15 @@ impl VrmModel {
         let bind = bind_world_matrices(file)?;
         // 関節の集合を先に求め、非関節ルートの正規化判定に使う。
         let joints = joint_model_ids(file);
-        let nodes = build_nodes(file, &bind, &joints)?;
-        let skins = build_skins(file, &bind)?;
+        let nodes = build_nodes(file, &bind.worlds, &joints)?;
+        let skins = build_skins(file, &bind.worlds)?;
         // 表情の選択はメッシュ変換の前に確定させ、対象メッシュの変換時に差分を配る。
         let plan = resolve_expressions(file, options)?;
-        let (meshes, report, expression_mesh) = build_meshes(file, options, &bind, plan.as_ref())?;
+        let (meshes, mut report, expression_mesh) =
+            build_meshes(file, options, &bind.worlds, plan.as_ref())?;
+        report.bind_pose_models = bind.pose_models;
+        report.bind_cluster_models = bind.link_models;
+        report.bind_rest_models = bind.rest_models;
         let expressions = build_expressions(&meshes, plan.as_ref(), expression_mesh)?;
         let model = Self {
             root,
@@ -858,10 +870,28 @@ fn build_expressions(
     Ok(VrmExpressions { preset })
 }
 
+/// 全モデルのバインド世界行列と、どの経路で求めたかの内訳。
+struct BindWorlds {
+    /// `models()` 順のバインド世界行列。
+    worlds: Vec<[f64; 16]>,
+    /// `BindPose` の行列を使ったモデル数。
+    pose_models: usize,
+    /// クラスタの `TransformLink` で補った関節モデル数。
+    link_models: usize,
+    /// restのワールド行列で補ったモデル数。
+    rest_models: usize,
+}
+
 /// 全モデルのバインド世界行列をモデルID順ではなく `models()` 順に返す。
 ///
-/// 全モデルにバインド行列が必要であり、無いモデルがある場合は失敗する。
-fn bind_world_matrices(file: &FbxFile<'_>) -> Result<Vec<[f64; 16]>, VrmError> {
+/// `BindPose` にあるモデルはその行列を使い、無いモデルは代替で補う。
+/// 関節モデルはクラスタの `TransformLink`（結合モデルのバインド時世界行列）を、
+/// それ以外のモデルはrest（ローカル変換の合成）のワールド行列を使う。
+/// 代替を使った場合は件数を [`BindWorlds`] に残し、呼び出し側が報告に載せる。
+/// `BindPose` 自体が1件も無い場合は、バインド姿勢の手掛かりが無いため
+/// 従来どおり [`VrmErrorKind::MissingBindPose`] で失敗する。
+/// 退化（行列が特異・成分が有限でない・参照が循環）は失敗のままにする。
+fn bind_world_matrices(file: &FbxFile<'_>) -> Result<BindWorlds, VrmError> {
     let nodes = file.bind_pose_nodes().map_err(|error| {
         // 読み取り層の検査結果を引き継ぎ、構造破損として扱う。
         // 資源上限の超過だけは種別を保つ。
@@ -883,18 +913,167 @@ fn bind_world_matrices(file: &FbxFile<'_>) -> Result<Vec<[f64; 16]>, VrmError> {
         .into_iter()
         .map(|node| (node.model.value(), node.matrix))
         .collect();
-    file.models()
+    let models = file.models();
+    if models.is_empty() {
+        return Ok(BindWorlds {
+            worlds: Vec::new(),
+            pose_models: 0,
+            link_models: 0,
+            rest_models: 0,
+        });
+    }
+    if by_model.is_empty() {
+        return Err(VrmError::new(
+            VrmErrorKind::MissingBindPose,
+            "バインド行列が無いモデルがある",
+        )
+        .with_object(models[0].id));
+    }
+    // クラスタが指す `TransformLink` を関節ごとに1つにまとめる。
+    // 複数のクラスタが同じ関節に異なる行列を持つ場合は、どれが正か決められない。
+    let mut links: HashMap<i64, [f64; 16]> = HashMap::new();
+    for skin in file.skins() {
+        let binds = file
+            .cluster_bind_matrices(skin.id)
+            .map_err(wrap_fbx_error)?;
+        for bind in binds {
+            let Some(link) = bind.transform_link else {
+                continue;
+            };
+            match links.get(&bind.joint.value()) {
+                Some(&prev) if prev != link => {
+                    return Err(VrmError::new(
+                        VrmErrorKind::InvalidStructure,
+                        "結合モデルのバインド時行列が一致しない",
+                    )
+                    .with_object(bind.cluster));
+                }
+                Some(_) => {}
+                None => {
+                    links.insert(bind.joint.value(), link);
+                }
+            }
+        }
+    }
+    let joints = joint_model_ids(file);
+    // restが必要なモデルが1つでもある場合だけ、階層全体のrestを求める。
+    let needs_rest = models.iter().any(|model| {
+        !(by_model.contains_key(&model.id.value())
+            || joints.contains(&model.id.value()) && links.contains_key(&model.id.value()))
+    });
+    let rest = if needs_rest {
+        Some(rest_world_matrices(file)?)
+    } else {
+        None
+    };
+    let mut worlds = Vec::with_capacity(models.len());
+    let mut pose_models = 0usize;
+    let mut link_models = 0usize;
+    let mut rest_models = 0usize;
+    for (index, model) in models.iter().enumerate() {
+        if let Some(matrix) = by_model.get(&model.id.value()) {
+            worlds.push(*matrix);
+            pose_models += 1;
+        } else if joints.contains(&model.id.value())
+            && let Some(link) = links.get(&model.id.value())
+        {
+            worlds.push(*link);
+            link_models += 1;
+        } else {
+            // `needs_rest` が真の場合だけここに来る。到達しないはずだが、
+            // panicにせず構造破損として失敗する。
+            let rest = rest.as_ref().ok_or_else(|| {
+                VrmError::new(VrmErrorKind::InvalidStructure, "restの世界行列が無い")
+                    .with_object(model.id)
+            })?;
+            worlds.push(rest[index]);
+            rest_models += 1;
+        }
+    }
+    Ok(BindWorlds {
+        worlds,
+        pose_models,
+        link_models,
+        rest_models,
+    })
+}
+
+/// 全モデルのrestのワールド行列を `models()` 順に返す。
+///
+/// ローカル変換の合成（[`crate::fbx::LocalTransform::local_matrix`]）を
+/// `InheritType` に従って親から積む（[`crate::fbx::inherit_world_matrix`]）。
+/// `BindPose` に無いモデル（Blenderが出力しない末端ボーンなど）の代替に使う。
+/// 循環・非有限・分解失敗は構造破損として失敗する。
+fn rest_world_matrices(file: &FbxFile<'_>) -> Result<Vec<[f64; 16]>, VrmError> {
+    let models = file.models();
+    let at: HashMap<i64, usize> = models
         .iter()
-        .map(|model| {
-            by_model.get(&model.id.value()).copied().ok_or_else(|| {
-                VrmError::new(
-                    VrmErrorKind::MissingBindPose,
-                    "バインド行列が無いモデルがある",
-                )
-                .with_object(model.id)
-            })
-        })
-        .collect()
+        .enumerate()
+        .map(|(index, model)| (model.id.value(), index))
+        .collect();
+    let mut worlds: Vec<Option<[f64; 16]>> = vec![None; models.len()];
+    let mut visiting = vec![false; models.len()];
+    // 親より子が先に並ぶ場合もあるため、必要になった節点から再帰的に求める。
+    // 親子は読み取り時に循環検査済みだが、ここでも循環を検出して失敗する。
+    fn visit(
+        file: &FbxFile<'_>,
+        at: &HashMap<i64, usize>,
+        worlds: &mut [Option<[f64; 16]>],
+        visiting: &mut [bool],
+        index: usize,
+    ) -> Result<[f64; 16], VrmError> {
+        if let Some(world) = worlds[index] {
+            return Ok(world);
+        }
+        if visiting[index] {
+            return Err(
+                VrmError::new(VrmErrorKind::InvalidStructure, "モデルの親子に循環がある")
+                    .with_object(file.models()[index].id),
+            );
+        }
+        visiting[index] = true;
+        let model = &file.models()[index];
+        let local = model.transform.local_matrix().map_err(|error| {
+            let mut out = wrap_fbx_error(error);
+            if out.object_id().is_none() {
+                out = out.with_object(model.id);
+            }
+            out
+        })?;
+        let world = match model.parent {
+            None => local,
+            Some(parent) => {
+                let parent_index = at.get(&parent.value()).copied().ok_or_else(|| {
+                    VrmError::new(VrmErrorKind::InvalidStructure, "親モデルが一覧にない")
+                        .with_object(model.id)
+                })?;
+                let parent_world = visit(file, at, worlds, visiting, parent_index)?;
+                crate::fbx::inherit_world_matrix(&parent_world, &local, model.inherit_type)
+                    .map_err(|error| {
+                        let mut out = wrap_fbx_error(error);
+                        if out.object_id().is_none() {
+                            out = out.with_object(model.id);
+                        }
+                        out
+                    })?
+            }
+        };
+        if !world.iter().all(|v| v.is_finite()) {
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidStructure,
+                "restの世界行列が有限でない",
+            )
+            .with_object(model.id));
+        }
+        worlds[index] = Some(world);
+        visiting[index] = false;
+        Ok(world)
+    }
+    let mut out = Vec::with_capacity(models.len());
+    for index in 0..models.len() {
+        out.push(visit(file, &at, &mut worlds, &mut visiting, index)?);
+    }
+    Ok(out)
 }
 
 /// 全スキンのクラスタが指す関節モデルのID集合を返す。
@@ -1023,7 +1202,11 @@ fn build_nodes(
                     )
                     .with_object(file.models()[parent].id)
                 })?;
-                locals[node] = matrix::mul(&inverse, &bind[node]);
+                let mut local = matrix::mul(&inverse, &bind[node]);
+                // 逆行列の丸め残差をアフィン不変条件に寄せる。
+                // 残差が既に0の場合は値を変えない。
+                matrix::snap_affine_row(&mut local);
+                locals[node] = local;
                 worlds[node] = matrix::mul(&worlds[parent], &locals[node]);
             } else if is_joint[node] {
                 locals[node] = bind[node];
@@ -1099,6 +1282,10 @@ fn build_skins(file: &FbxFile<'_>, bind: &[[f64; 16]]) -> Result<Vec<VrmSkin>, V
                 )
                 .with_object(cluster.joint));
             };
+            // 逆行列の丸め残差をアフィン不変条件に寄せる。
+            // 残差が既に0の場合は値を変えない。
+            let mut inverse = inverse;
+            matrix::snap_affine_row(&mut inverse);
             joints.push(joint);
             inverse_bind_matrices.push(inverse);
             joint_models.push(cluster.joint);
@@ -1136,6 +1323,7 @@ fn build_meshes(
     let mut truncated_influence_vertices = 0usize;
     let mut unweighted_vertices = 0usize;
     let mut non_triangle_polygons = 0usize;
+    let mut degenerate_normals = 0usize;
     let mut mirrored_meshes = 0usize;
     let mut morph_target_count = 0usize;
     // 選択順のチャンネル借用は対象メッシュの変換時だけ使う。
@@ -1223,6 +1411,16 @@ fn build_meshes(
             None => None,
         };
         let skin_ref = skin.as_ref().map(|(index, data)| (*index, data));
+        // 幾何変換はメッシュ側で掛ける（`World × G`）。
+        // 成分が既定値の場合は単位行列であり、従来の行列と1ビットも変わらない。
+        let geometric = owner.transform.geometric_matrix().map_err(|error| {
+            let mut out = wrap_fbx_error(error);
+            if out.object_id().is_none() {
+                out = out.with_object(owner.id);
+            }
+            out
+        })?;
+        let combined = matrix::mul(&bind[owner_index], &geometric);
         let selected = match plan {
             Some(plan) if mesh.id == plan.geometry => Some(mesh::SelectedMorph {
                 channels: &plan_channels,
@@ -1237,7 +1435,7 @@ fn build_meshes(
             &data,
             owner,
             owner_index,
-            &bind[owner_index],
+            &combined,
             skin_ref,
             selected,
         )?;
@@ -1259,6 +1457,7 @@ fn build_meshes(
         truncated_influence_vertices += outcome.truncated;
         unweighted_vertices += outcome.unweighted;
         non_triangle_polygons += outcome.non_triangles;
+        degenerate_normals += outcome.degenerate_normals;
         morph_target_count += outcome.mesh.targets.len();
         if outcome.mirrored {
             mirrored_meshes += 1;
@@ -1284,7 +1483,11 @@ fn build_meshes(
         non_triangle_polygons,
         mirrored_meshes,
         morph_target_count,
+        degenerate_normals,
         expression_count: plan.map(|plan| plan.bindings.len()).unwrap_or(0),
+        bind_pose_models: 0,
+        bind_cluster_models: 0,
+        bind_rest_models: 0,
     };
     Ok((meshes, report, expression_mesh))
 }

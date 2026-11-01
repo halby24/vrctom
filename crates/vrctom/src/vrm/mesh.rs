@@ -25,6 +25,8 @@ pub(crate) struct MeshOutcome {
     pub unweighted: usize,
     /// 三角形でない多角形の数。
     pub non_triangles: usize,
+    /// 長さ0の法線を面法線で補った頂点数。
+    pub degenerate_normals: usize,
     /// 鏡像で巻き方向を反転したかどうか。
     pub mirrored: bool,
 }
@@ -60,7 +62,7 @@ pub(crate) struct SelectedMorphChannel<'a> {
 
 /// メッシュ1件を変換する。
 ///
-/// `bind` は所有モデルのバインド世界行列であり、頂点のベイクに使う。
+/// `bind` は所有モデルのバインド世界行列に幾何変換を掛けた行列であり、頂点のベイクに使う。
 /// `skin` は対応するスキンの索引とその展開結果であり、無い場合は重みを載せない。
 /// `node` は所有モデルのノード索引である。
 /// `morph` は対象メッシュの選択済みチャンネルであり、ある場合は位置の差分を
@@ -103,6 +105,7 @@ pub(crate) fn convert_mesh(
     let mut truncated = 0usize;
     let mut unweighted = 0usize;
     let mut non_triangles = 0usize;
+    let mut degenerate_normals = 0usize;
     // 材質番号ごとの索引列。番号の昇順でプリミティブにする。
     let mut by_material: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
 
@@ -134,6 +137,9 @@ pub(crate) fn convert_mesh(
         if count != 3 {
             non_triangles += 1;
         }
+        // 面法線は長さ0の法線の代替に使う。面が退化している場合は `None` になる。
+        let face_normal = face_normal_of(data, corner_base, count)
+            .and_then(|n| matrix::transform_normal(bind, n));
         let mut face_vertices = Vec::with_capacity(count);
         for offset in 0..count {
             let corner = corner_base + offset;
@@ -153,6 +159,8 @@ pub(crate) fn convert_mesh(
                         &mut weights_out,
                         &mut truncated,
                         &mut unweighted,
+                        &mut degenerate_normals,
+                        face_normal,
                         influences.as_ref(),
                         control_points.as_mut(),
                     )?;
@@ -231,6 +239,7 @@ pub(crate) fn convert_mesh(
         truncated,
         unweighted,
         non_triangles,
+        degenerate_normals,
         mirrored,
     })
 }
@@ -337,6 +346,35 @@ fn corner_key(data: &MeshData, corner: usize) -> Result<VertexKey, VrmError> {
     Ok(VertexKey { pos, normal, uvs })
 }
 
+/// 面の法線をNewell法で求める。ファイル空間の位置から計算する。
+///
+/// 呼び出し側が所有モデルの行列で変換するため、ここでは正規化しない。
+/// 面が退化している（面積が0）場合や非有限の場合は `None` を返す。
+fn face_normal_of(data: &MeshData, corner_base: usize, count: usize) -> Option<[f64; 3]> {
+    let mut normal = [0.0; 3];
+    for offset in 0..count {
+        let current = data
+            .positions
+            .get(*data.corner_positions.get(corner_base + offset)? as usize)?;
+        let next = data.positions.get(
+            *data
+                .corner_positions
+                .get(corner_base + (offset + 1) % count)? as usize,
+        )?;
+        if !current.iter().chain(next.iter()).all(|v| v.is_finite()) {
+            return None;
+        }
+        normal[0] += (current[1] - next[1]) * (current[2] + next[2]);
+        normal[1] += (current[2] - next[2]) * (current[0] + next[0]);
+        normal[2] += (current[0] - next[0]) * (current[1] + next[1]);
+    }
+    let length = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
+    if length == 0.0 || !length.is_finite() {
+        return None;
+    }
+    Some(normal)
+}
+
 /// 新しい頂点を追加し、属性をベイクして索引を返す。
 #[allow(clippy::too_many_arguments)]
 fn push_vertex(
@@ -351,6 +389,8 @@ fn push_vertex(
     weights_out: &mut Option<Vec<[f32; 4]>>,
     truncated: &mut usize,
     unweighted: &mut usize,
+    degenerate_normals: &mut usize,
+    face_normal: Option<[f64; 3]>,
     influences: Option<&PerPoint>,
     control_points: Option<&mut Vec<u32>>,
 ) -> Result<u32, VrmError> {
@@ -392,11 +432,27 @@ fn push_vertex(
             VrmError::new(VrmErrorKind::InvalidStructure, "法線索引が範囲外である")
                 .with_object(mesh_id)
         })?;
-        let baked = matrix::transform_normal(bind, *raw).ok_or_else(|| {
-            VrmError::new(VrmErrorKind::InvalidStructure, "法線のベイクに失敗した")
-                .with_object(mesh_id)
-        })?;
-        out.push([baked[0] as f32, baked[1] as f32, baked[2] as f32]);
+        // 長さ0の法線は方向を持たないため、属する面の法線で補う。
+        // 実データ（購入アバター）に含まれる退化であり、捏造を避ける最終手段である。
+        // 件数はレポートに残す。面自体が退化している場合と非ゼロの変換失敗は
+        // 方向を決められないため従来どおり失敗とする。
+        if raw == &[0.0, 0.0, 0.0] {
+            let Some(fallback) = face_normal else {
+                return Err(VrmError::new(
+                    VrmErrorKind::InvalidStructure,
+                    "面法線の算出に失敗した",
+                )
+                .with_object(mesh_id));
+            };
+            *degenerate_normals += 1;
+            out.push([fallback[0] as f32, fallback[1] as f32, fallback[2] as f32]);
+        } else {
+            let baked = matrix::transform_normal(bind, *raw).ok_or_else(|| {
+                VrmError::new(VrmErrorKind::InvalidStructure, "法線のベイクに失敗した")
+                    .with_object(mesh_id)
+            })?;
+            out.push([baked[0] as f32, baked[1] as f32, baked[2] as f32]);
+        }
     }
     for (set, out) in data.uv_sets.iter().zip(uv_sets.iter_mut()) {
         let uv_index = set.corner_indices[corner] as usize;

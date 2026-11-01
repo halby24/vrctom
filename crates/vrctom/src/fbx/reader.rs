@@ -2,9 +2,14 @@
 //!
 //! 公開契約の入口は [`crate::fbx`] を参照。
 //!
-//! ここでは7.xの32bitレコードだけを読み、ノード名・プロパティ・親子の境界を
-//! 検証する。配列の中身は展開せず、 [`ArrayDesc`] として絶対位置だけを残す。
-//! 値の意味付け（ModelやGeometryの解釈）は上位で行う。
+//! 版によりノードレコードの幅を読み分ける。7000〜7400は32bit幅
+//! （EndOffset u32・NumProperties u32・PropertyListLen u32・NameLen u8の13バイト）、
+//! 7500〜7700は64bit幅（EndOffset u64・NumProperties u64・PropertyListLen u64・
+//! NameLen u8の25バイト）である。プロパティ本体の形式（文字列・生バイトの長さ前置き、
+//! 配列の要素数・encoding・圧縮長前置き）はいずれも32bit幅のままであり、
+//! FBX SDK 2020.3.x再書き出しの7700版3件（ミルクRe・シフォン・カリン）で確認した。
+//! ノード名・プロパティ・親子の境界を検証し、配列の中身は展開せず、
+//! [`ArrayDesc`] として絶対位置だけを残す。値の意味付け（ModelやGeometryの解釈）は上位で行う。
 
 use super::{FbxError, FbxErrorKind, FbxOptions};
 
@@ -171,6 +176,8 @@ impl RawNode {
 struct Scanner<'a> {
     bytes: &'a [u8],
     options: &'a FbxOptions,
+    /// 真のとき7500以上の64bit幅レコードで読む。偽のとき32bit幅で読む。
+    wide: bool,
     /// 読み終えたノード数。
     nodes: usize,
     /// 読み終えた配列の要素数の合計。
@@ -178,6 +185,11 @@ struct Scanner<'a> {
 }
 
 impl Scanner<'_> {
+    /// ノード先頭のバイト長を返す。32bit幅で13、64bit幅で25である。
+    fn record_header_len(&self) -> usize {
+        if self.wide { 25 } else { 13 }
+    }
+
     /// 指定範囲の u32 LE を読む。範囲外の場合は切り詰めとして失敗する。
     fn u32_at(&self, offset: usize) -> Result<u32, FbxError> {
         let bytes = self
@@ -198,6 +210,39 @@ impl Scanner<'_> {
         Ok(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
     }
 
+    /// 指定範囲の u64 LE を読む。範囲外の場合は切り詰めとして失敗する。
+    fn u64_at(&self, offset: usize) -> Result<u64, FbxError> {
+        let bytes = self
+            .bytes
+            .get(offset..offset.saturating_add(8))
+            .ok_or_else(|| {
+                FbxError::new(
+                    FbxErrorKind::InvalidStructure,
+                    "ノード境界の読み取りで切り詰めた",
+                )
+            })?;
+        let Some(chunk) = bytes.get(..8) else {
+            return Err(FbxError::new(
+                FbxErrorKind::InvalidStructure,
+                "ノード境界の読み取りで切り詰めた",
+            ));
+        };
+        Ok(u64::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]))
+    }
+
+    /// u64値を添え字に使う。収まらない場合は上限超過として失敗する。
+    ///
+    /// 32bit標的（wasm32を含む）ではu64が `usize` に収まらないため、
+    /// 黙って丸めず `LimitExceeded` で止める。64bit標的では通るが、
+    /// その後の範囲検査（親範囲・入力長との比較）が破損を弾く。
+    fn offset_in_range(value: u64, what: &'static str) -> Result<usize, FbxError> {
+        usize::try_from(value).map_err(|_| {
+            FbxError::new(FbxErrorKind::LimitExceeded, format!("{what}が上限を超えた"))
+        })
+    }
+
     /// ノード1件を `[pos, parent_end)` の範囲で読む。
     ///
     /// null終端の場合は `Ok(None)` を返し、呼び出し側が子列の終わりとして扱う。
@@ -208,17 +253,32 @@ impl Scanner<'_> {
         parent_end: usize,
         depth: usize,
     ) -> Result<Option<(RawNode, usize)>, FbxError> {
-        if pos.saturating_add(13) > parent_end || pos.saturating_add(13) > self.bytes.len() {
+        let header = self.record_header_len();
+        if pos.saturating_add(header) > parent_end || pos.saturating_add(header) > self.bytes.len()
+        {
             return Err(FbxError::new(
                 FbxErrorKind::InvalidStructure,
                 "ノード先頭の読み取りで切り詰めた",
             ));
         }
-        let end_offset = self.u32_at(pos)? as usize;
-        let num_props = self.u32_at(pos + 4)? as usize;
-        let prop_list_len = self.u32_at(pos + 8)? as usize;
-        let name_len = self.bytes[pos + 12] as usize;
-        if end_offset == 0 && num_props == 0 && prop_list_len == 0 && name_len == 0 {
+        // 先頭3項目の幅だけが版で変わる。u64に寄せて読み、32bit版は上位が0になる。
+        // 名前長は両版ともu8のままである。
+        let (end_raw, props_raw, list_raw, name_len) = if self.wide {
+            (
+                self.u64_at(pos)?,
+                self.u64_at(pos + 8)?,
+                self.u64_at(pos + 16)?,
+                self.bytes[pos + 24] as usize,
+            )
+        } else {
+            (
+                self.u32_at(pos)? as u64,
+                self.u32_at(pos + 4)? as u64,
+                self.u32_at(pos + 8)? as u64,
+                self.bytes[pos + 12] as usize,
+            )
+        };
+        if end_raw == 0 && props_raw == 0 && list_raw == 0 && name_len == 0 {
             return Ok(None);
         }
         if depth > self.options.max_depth {
@@ -234,25 +294,29 @@ impl Scanner<'_> {
                 "ノード数が上限を超えた",
             ));
         }
-        if end_offset <= pos {
+        if end_raw <= pos as u64 {
             return Err(FbxError::new(
                 FbxErrorKind::InvalidStructure,
                 "ノードの終了位置が現在位置以前である",
             ));
         }
-        if end_offset > parent_end {
+        if end_raw > parent_end as u64 {
             return Err(FbxError::new(
                 FbxErrorKind::InvalidStructure,
                 "ノードの終了位置が親の範囲外である",
             ));
         }
-        if end_offset > self.bytes.len() {
+        if end_raw > self.bytes.len() as u64 {
             return Err(FbxError::new(
                 FbxErrorKind::InvalidStructure,
                 "ノードの終了位置が入力を超える",
             ));
         }
-        pos += 13;
+        // 添え字化の前にu64の値を上限検査する。溢れは破損ではなく上限超過とする。
+        let end_offset = Self::offset_in_range(end_raw, "ノードの終了位置")?;
+        let num_props = Self::offset_in_range(props_raw, "プロパティ数")?;
+        let prop_list_len = Self::offset_in_range(list_raw, "プロパティ列長")?;
+        pos += header;
         let name_end = pos.saturating_add(name_len);
         if name_end > end_offset {
             return Err(FbxError::new(
@@ -265,7 +329,10 @@ impl Scanner<'_> {
             .to_owned()
             .into_boxed_str();
         pos = name_end;
-        let prop_end = pos.saturating_add(prop_list_len);
+        // プロパティ列長は名前を含まない。加算の溢れも上限超過として扱う。
+        let prop_end = pos.checked_add(prop_list_len).ok_or_else(|| {
+            FbxError::new(FbxErrorKind::LimitExceeded, "プロパティ列長が上限を超えた")
+        })?;
         if prop_end > end_offset {
             return Err(FbxError::new(
                 FbxErrorKind::InvalidStructure,
@@ -294,7 +361,7 @@ impl Scanner<'_> {
                     }
                     None => {
                         // null終端は子列の一部であり、親範囲の末端でなければならない。
-                        pos += 13;
+                        pos += header;
                         break;
                     }
                 }
@@ -514,15 +581,17 @@ pub(crate) fn parse_top(
         ));
     }
     let version = u32::from_le_bytes([bytes[23], bytes[24], bytes[25], bytes[26]]);
-    if !(7000..7500).contains(&version) {
+    if !(7000..=7700).contains(&version) {
         return Err(FbxError::new(
             FbxErrorKind::UnsupportedVersion,
-            "対応版（7000以上7500未満）でない",
+            "対応版（7000以上7700以下）でない",
         ));
     }
     let mut scanner = Scanner {
         bytes,
         options,
+        // 7500（FBX 2016）以降はノード先頭が64bit幅になる。
+        wide: version >= 7500,
         nodes: 0,
         total_array_elements: 0,
     };
@@ -533,4 +602,46 @@ pub(crate) fn parse_top(
         top.push(node);
     }
     Ok((version, top))
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod tests {
+    use super::*;
+
+    /// 実fixtureの直下走査で版と主要区画を読む。
+    ///
+    /// 意味層（`FbxFile::parse`）の可否ではなく、走査層が版の幅で
+    /// 直下ノード列を壊さず読めることを確かめる。対象は環境変数
+    /// `VRCTOM_FBX_FIXTURE` が指す1件であり、未設定なら跳ばす。
+    #[test]
+    fn 実fixtureの直下走査で版と区画を読む() {
+        let Ok(path) = std::env::var("VRCTOM_FBX_FIXTURE") else {
+            eprintln!("VRCTOM_FBX_FIXTUREが未設定のため跳ばす");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("実fixtureは読める");
+        let (version, top) =
+            parse_top(&bytes, &FbxOptions::new()).expect("実fixtureの直下は読める");
+        assert!(
+            (7000..=7700).contains(&version),
+            "実fixtureの版は対応範囲である: {version}"
+        );
+        let names: Vec<&str> = top.iter().map(|node| &*node.name).collect();
+        for expected in [
+            "FBXHeaderExtension",
+            "GlobalSettings",
+            "Objects",
+            "Connections",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "直下に{expected}がある: {names:?}"
+            );
+        }
+        eprintln!(
+            "fixture_version={version} top_nodes={} top={names:?}",
+            top.len()
+        );
+    }
 }

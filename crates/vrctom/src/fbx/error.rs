@@ -78,7 +78,7 @@ impl std::error::Error for FbxError {
 pub enum FbxErrorKind {
     /// 先頭のマジックや版の手前で形式が合わない場合。
     InvalidHeader,
-    /// 7.xの32bitレコードで扱える版（7000以上7500未満）でない場合。
+    /// 7.xの版（7000以上7700以下）でない場合。7500以上はノード先頭が64bit幅になる。
     UnsupportedVersion,
     /// 暗号化・未知の型やencoding・非対応の対応方式・変換成分など、
     /// 黙って補正できない非対応要素がある場合。

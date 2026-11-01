@@ -209,6 +209,9 @@ pub enum ModelKind {
 /// モデルのローカル変換。
 ///
 /// 回転はXYZ順の度数法のまま保持し、合成や変換はしない。
+/// ピボット・オフセット・事前事後回転・幾何変換は、FBXの標準的な合成規則で
+/// [`LocalTransform::local_matrix`]（階層側）と
+/// [`LocalTransform::geometric_matrix`]（メッシュ側）が1つの行列にまとめる。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LocalTransform {
     /// 平行移動。
@@ -217,6 +220,236 @@ pub struct LocalTransform {
     pub rotation: [f64; 3],
     /// 拡大縮小。
     pub scale: [f64; 3],
+    /// 回転オフセット。
+    pub rotation_offset: [f64; 3],
+    /// 回転ピボット。
+    pub rotation_pivot: [f64; 3],
+    /// 事前回転（XYZ順の度）。
+    pub pre_rotation: [f64; 3],
+    /// 事後回転（XYZ順の度）。
+    pub post_rotation: [f64; 3],
+    /// 拡大縮小オフセット。
+    pub scaling_offset: [f64; 3],
+    /// 拡大縮小ピボット。
+    pub scaling_pivot: [f64; 3],
+    /// 幾何平行移動（メッシュ側）。
+    pub geometric_translation: [f64; 3],
+    /// 幾何回転（XYZ順の度、メッシュ側）。
+    pub geometric_rotation: [f64; 3],
+    /// 幾何拡大縮小（メッシュ側）。
+    pub geometric_scaling: [f64; 3],
+    /// 回転が有効かどうか。偽の場合は回転系（回転・事前事後回転）を無視する。
+    pub rotation_active: bool,
+}
+
+impl LocalTransform {
+    /// 既定のローカル変換（移動0・回転0・倍率1・補正なし・回転有効）を作る。
+    fn identity() -> Self {
+        Self {
+            translation: [0.0, 0.0, 0.0],
+            rotation: [0.0, 0.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+            rotation_offset: [0.0, 0.0, 0.0],
+            rotation_pivot: [0.0, 0.0, 0.0],
+            pre_rotation: [0.0, 0.0, 0.0],
+            post_rotation: [0.0, 0.0, 0.0],
+            scaling_offset: [0.0, 0.0, 0.0],
+            scaling_pivot: [0.0, 0.0, 0.0],
+            geometric_translation: [0.0, 0.0, 0.0],
+            geometric_rotation: [0.0, 0.0, 0.0],
+            geometric_scaling: [1.0, 1.0, 1.0],
+            rotation_active: true,
+        }
+    }
+
+    /// 全成分が有限かどうかを確かめる。非有限の場合は構造破損として失敗する。
+    fn ensure_finite(&self) -> Result<(), FbxError> {
+        let all = [
+            &self.translation,
+            &self.rotation,
+            &self.scale,
+            &self.rotation_offset,
+            &self.rotation_pivot,
+            &self.pre_rotation,
+            &self.post_rotation,
+            &self.scaling_offset,
+            &self.scaling_pivot,
+            &self.geometric_translation,
+            &self.geometric_rotation,
+            &self.geometric_scaling,
+        ];
+        if all.iter().all(|v| v.iter().all(|v| v.is_finite())) {
+            Ok(())
+        } else {
+            Err(FbxError::new(
+                FbxErrorKind::InvalidStructure,
+                "有限でない変換値がある",
+            ))
+        }
+    }
+
+    /// 標準的なFBXのローカル変換合成で4x4行列を作る。
+    ///
+    /// 合成は `T × Roff × Rp × Rpre × R × Rpost × Rp⁻¹ × Soff × Sp × S × Sp⁻¹`
+    /// （列ベクトル規約。左が後から適用される）であり、幾何変換は含まない。
+    /// 回転の三つ組（事前・通常・事後）はいずれもFBXのXYZ順に従い、
+    /// 行ベクトル由来の転置として角度を反転させて合成する。詳細は
+    /// 行列欄の `fbx_euler_xyz_matrix` を参照。幾何変換はメッシュ側で
+    /// [`LocalTransform::geometric_matrix`] を掛ける。
+    /// `rotation_active` が偽の場合は、回転・事前事後回転を無視する。
+    /// 補正成分が既定値の場合は `T × R × S` と1ビットも変わらない。
+    ///
+    /// # Errors
+    ///
+    /// いずれかの成分が非有限、または合成結果が非有限の場合に返す。
+    pub fn local_matrix(&self) -> Result<[f64; 16], FbxError> {
+        use crate::vrm::matrix;
+        self.ensure_finite()?;
+        let zero = [0.0, 0.0, 0.0];
+        let (rotation, pre_rotation, post_rotation) = if self.rotation_active {
+            (self.rotation, self.pre_rotation, self.post_rotation)
+        } else {
+            (zero, zero, zero)
+        };
+        let mut out = matrix::translation_matrix(self.translation);
+        out = matrix::mul(&out, &matrix::translation_matrix(self.rotation_offset));
+        out = matrix::mul(&out, &matrix::translation_matrix(self.rotation_pivot));
+        out = matrix::mul(&out, &matrix::fbx_euler_xyz_matrix(pre_rotation));
+        out = matrix::mul(&out, &matrix::fbx_euler_xyz_matrix(rotation));
+        out = matrix::mul(&out, &matrix::fbx_euler_xyz_matrix(post_rotation));
+        out = matrix::mul(
+            &out,
+            &matrix::translation_matrix([
+                -self.rotation_pivot[0],
+                -self.rotation_pivot[1],
+                -self.rotation_pivot[2],
+            ]),
+        );
+        out = matrix::mul(&out, &matrix::translation_matrix(self.scaling_offset));
+        out = matrix::mul(&out, &matrix::translation_matrix(self.scaling_pivot));
+        out = matrix::mul(&out, &matrix::non_uniform_scale_matrix(self.scale));
+        out = matrix::mul(
+            &out,
+            &matrix::translation_matrix([
+                -self.scaling_pivot[0],
+                -self.scaling_pivot[1],
+                -self.scaling_pivot[2],
+            ]),
+        );
+        if matrix::is_finite_matrix(&out) {
+            Ok(out)
+        } else {
+            Err(FbxError::new(
+                FbxErrorKind::InvalidStructure,
+                "合成したローカル行列が有限でない",
+            ))
+        }
+    }
+
+    /// 幾何変換を4x4行列にまとめる。`G = Tgeo × Rgeo × Sgeo` である。
+    ///
+    /// 階層の合成には含めず、メッシュ側で所有モデルの世界行列に掛ける
+    /// （`World × G`）。成分が既定値の場合は単位行列になる。
+    ///
+    /// # Errors
+    ///
+    /// いずれかの成分が非有限、または合成結果が非有限の場合に返す。
+    pub fn geometric_matrix(&self) -> Result<[f64; 16], FbxError> {
+        use crate::vrm::matrix;
+        self.ensure_finite()?;
+        let mut out = matrix::translation_matrix(self.geometric_translation);
+        out = matrix::mul(&out, &matrix::fbx_euler_xyz_matrix(self.geometric_rotation));
+        out = matrix::mul(
+            &out,
+            &matrix::non_uniform_scale_matrix(self.geometric_scaling),
+        );
+        if matrix::is_finite_matrix(&out) {
+            Ok(out)
+        } else {
+            Err(FbxError::new(
+                FbxErrorKind::InvalidStructure,
+                "合成した幾何行列が有限でない",
+            ))
+        }
+    }
+}
+
+/// 親の世界行列とローカル行列から子の世界行列を作る。
+///
+/// `inherit_type` は `InheritType` の値であり、0（RrSs）は親の行列をそのまま継承し、
+/// 1（RSrs）は親の拡大縮小が子の回転方向を歪めないよう子の回転を親の拡大縮小の
+/// 左に置き、2（Rrs）は親の拡大縮小を無視する。子の平行移動と拡大縮小は
+/// 1でも親の拡大縮小を受け、2では受けない。親の拡大縮小が単位の場合は
+/// いずれも `親 × ローカル` と一致する。
+/// せん断を含む親行列の分解は行わないため、分解に失敗した場合は不正として失敗する。
+///
+/// # Errors
+///
+/// 入力または結果が非有限、継承方式が0〜2以外、RSrs・Rrsで親の分解に
+/// 失敗した場合に返す。
+pub fn inherit_world_matrix(
+    parent_world: &[f64; 16],
+    local: &[f64; 16],
+    inherit_type: i32,
+) -> Result<[f64; 16], FbxError> {
+    use crate::vrm::matrix;
+    if !matrix::is_finite_matrix(parent_world) || !matrix::is_finite_matrix(local) {
+        return Err(FbxError::new(
+            FbxErrorKind::InvalidStructure,
+            "有限でない行列がある",
+        ));
+    }
+    let out = match inherit_type {
+        // RrSs: 親の行列をそのまま継承する。
+        0 => matrix::mul(parent_world, local),
+        // RSrs: 親の拡大縮小が子の回転方向を歪めないよう、子の回転を左に置く。
+        // `Tp × Rp × Rl × Sp × Tl × Sl` であり、子の平行移動と拡大縮小は
+        // 親の拡大縮小を受ける。FBX SDKの説明の解釈であり、詳細は設計文書を参照。
+        1 => {
+            let (parent_t, parent_r, parent_s) =
+                matrix::decompose_trs(parent_world).ok_or_else(|| {
+                    FbxError::new(FbxErrorKind::InvalidStructure, "親の世界行列を分解できない")
+                })?;
+            let (local_t, local_r, local_s) = matrix::decompose_trs(local).ok_or_else(|| {
+                FbxError::new(FbxErrorKind::InvalidStructure, "ローカル行列を分解できない")
+            })?;
+            // `Rl` を `Sp` の左に置き直すため、分解した回転とそれ以外を組み替える。
+            let left = matrix::mul(
+                &matrix::translation_matrix(parent_t),
+                &matrix::mul(&parent_r, &local_r),
+            );
+            let right = matrix::mul(
+                &matrix::non_uniform_scale_matrix(parent_s),
+                &matrix::mul(
+                    &matrix::translation_matrix(local_t),
+                    &matrix::non_uniform_scale_matrix(local_s),
+                ),
+            );
+            matrix::mul(&left, &right)
+        }
+        // Rrs: 親の拡大縮小を無視する。
+        2 => {
+            let (parent_t, parent_r, _) = matrix::decompose_trs(parent_world).ok_or_else(|| {
+                FbxError::new(FbxErrorKind::InvalidStructure, "親の世界行列を分解できない")
+            })?;
+            let left = matrix::mul(&matrix::translation_matrix(parent_t), &parent_r);
+            matrix::mul(&left, local)
+        }
+        _ => {
+            return Err(FbxError::new(
+                FbxErrorKind::UnsupportedFeature,
+                "非対応の継承方式である",
+            ));
+        }
+    };
+    if matrix::is_finite_matrix(&out) {
+        Ok(out)
+    } else {
+        Err(FbxError::new(
+            FbxErrorKind::InvalidStructure,
+            "合成した世界行列が有限でない",
+        ))
+    }
 }
 
 /// モデル1件。
@@ -362,6 +595,10 @@ pub struct Cluster {
     pub(crate) indexes: Option<ArrayDesc>,
     /// 重みの配列位置。無い場合は `None` である。
     pub(crate) weights: Option<ArrayDesc>,
+    /// `Transform`（変形対象のバインド時世界行列）の位置。無い場合は `None` である。
+    pub(crate) transform: Option<ArrayDesc>,
+    /// `TransformLink`（結合モデルのバインド時世界行列）の位置。無い場合は `None` である。
+    pub(crate) transform_link: Option<ArrayDesc>,
 }
 
 /// スキン1件の重みの展開結果。
@@ -450,6 +687,23 @@ pub struct BindPoseNode {
     pub matrix: [f64; 16],
 }
 
+/// クラスタ1件のバインド時行列の展開結果。
+///
+/// `Transform` は変形対象（メッシュ側）のバインド時世界行列、
+/// `TransformLink` は結合モデル（関節側）のバインド時世界行列である。
+/// いずれも16値の行優先（平行移動は12〜14番）で返す。
+/// 配列を持たないクラスタは `None` になる。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClusterBindMatrix {
+    /// クラスタのオブジェクトID。
+    pub cluster: ObjectId,
+    /// 結合モデル。
+    pub joint: ObjectId,
+    /// `Transform` の行列。無い場合は `None` である。
+    pub transform: Option<[f64; 16]>,
+    /// `TransformLink` の行列。無い場合は `None` である。
+    pub transform_link: Option<[f64; 16]>,
+}
 /// 読み取り済みのFBX。
 ///
 /// 入力バイト列を借用し、階層・要約・配列位置だけを保持する。
@@ -538,6 +792,10 @@ struct DeformerRec {
     indexes: Option<ArrayDesc>,
     /// `Cluster/Weights` の位置。無い場合は `None` である。
     weights: Option<ArrayDesc>,
+    /// `Cluster/Transform` の位置。無い場合は `None` である。
+    transform: Option<ArrayDesc>,
+    /// `Cluster/TransformLink` の位置。無い場合は `None` である。
+    transform_link: Option<ArrayDesc>,
     /// `BlendShapeChannel/DeformPercent`。チャンネル以外では `None` である。
     deform_percent: Option<f64>,
     /// `BlendShapeChannel/FullWeights` の位置。無い場合は `None` である。
@@ -1099,6 +1357,72 @@ impl<'a> FbxFile<'a> {
         nodes.sort_by_key(|node| node.model.value());
         Ok(nodes)
     }
+
+    /// 指定IDのスキンのクラスタごとにバインド時行列を展開する。
+    ///
+    /// 順序は [`Skin::clusters`] と同じである。`Transform`・`TransformLink` を
+    /// 持たないクラスタは `None` として返す。行列の中身は対象分だけ展開する。
+    ///
+    /// # Errors
+    ///
+    /// 未知ID・行列の要素数が16でない・有限でない場合に返す。
+    pub fn cluster_bind_matrices(&self, id: ObjectId) -> Result<Vec<ClusterBindMatrix>, FbxError> {
+        let skin = self
+            .skin(id)
+            .ok_or_else(|| FbxError::new(FbxErrorKind::NotFound, "スキンがない").with_object(id))?;
+        skin.clusters
+            .iter()
+            .map(|cluster| {
+                Ok(ClusterBindMatrix {
+                    cluster: cluster.id,
+                    joint: cluster.joint,
+                    transform: expand_bind_matrix(self.bytes, cluster.transform, cluster.id)?,
+                    transform_link: expand_bind_matrix(
+                        self.bytes,
+                        cluster.transform_link,
+                        cluster.id,
+                    )?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// バインド時行列の配列位置を展開する。位置が無い場合は `None` を返す。
+///
+/// 要素数が16でない場合や非有限値の場合は構造破損として失敗する。
+fn expand_bind_matrix(
+    bytes: &[u8],
+    desc: Option<ArrayDesc>,
+    object: ObjectId,
+) -> Result<Option<[f64; 16]>, FbxError> {
+    let Some(desc) = desc else {
+        return Ok(None);
+    };
+    let plain = expand(bytes, desc, object)?;
+    let values = mesh::as_f64s(plain.as_slice(), desc.kind, object)?;
+    if values.len() != 16 {
+        return Err(FbxError::new(
+            FbxErrorKind::InvalidStructure,
+            "バインド時行列が16要素でない",
+        )
+        .with_object(object));
+    }
+    if !values.iter().all(|v| v.is_finite()) {
+        return Err(FbxError::new(
+            FbxErrorKind::InvalidStructure,
+            "有限でないバインド時行列がある",
+        )
+        .with_object(object));
+    }
+    let matrix: [f64; 16] = values.try_into().map_err(|_| {
+        FbxError::new(
+            FbxErrorKind::InvalidStructure,
+            "バインド時行列が16要素でない",
+        )
+        .with_object(object)
+    })?;
+    Ok(Some(matrix))
 }
 
 /// `FBXHeaderExtension/EncryptionType` が0以外の場合に拒否する。
@@ -1287,47 +1611,45 @@ fn read_models(top: &[RawNode]) -> Result<Vec<Model>, FbxError> {
 
 /// `Model` の子 `Properties70` からローカル変換を読む。
 ///
-/// `Lcl Translation`・`Lcl Rotation`・`Lcl Scaling` と `InheritType` だけを
-/// 受け付ける。TRS以外の変換成分は黙って落とすと誤った姿勢を返すため、
-/// 明示的な非対応として失敗する。
+/// `Lcl Translation`・`Lcl Rotation`・`Lcl Scaling`・回転と拡大縮小の
+/// オフセットとピボット・事前事後回転・幾何変換・`InheritType`・`RotationActive`
+/// を受け付け、1つの行列への合成は [`LocalTransform::local_matrix`] が行う。
+/// `RotationOrder` だけは0（XYZ順）の場合に限り、既定の解釈と一致するため通す。
+/// それ以外の値は、黙って落とすと誤った姿勢を返すため明示的に失敗する。
 fn read_local(node: &RawNode) -> Result<(LocalTransform, i32), FbxError> {
     let id = node.props.first().and_then(RawProp::as_int).unwrap_or(0);
     let object = ObjectId(id);
-    let mut transform = LocalTransform {
-        translation: [0.0, 0.0, 0.0],
-        rotation: [0.0, 0.0, 0.0],
-        scale: [1.0, 1.0, 1.0],
-    };
+    let mut transform = LocalTransform::identity();
     let mut inherit_type = 1;
     let Some(props) = node.child("Properties70") else {
         return Ok((transform, inherit_type));
     };
-    // 値の黙殺を避けるため、非対応成分は列挙で拒否する。
-    // `RotationOrder` だけは0（XYZ順）の場合に限り、既定の解釈と一致するため通す。
-    const UNSUPPORTED: &[&[u8]] = &[
-        b"PreRotation",
-        b"RotationPivot",
-        b"PostRotation",
-        b"ScalingPivot",
-        b"ScalingOffset",
-        b"GeometricTranslation",
-        b"GeometricRotation",
-        b"GeometricScaling",
-    ];
     for node in props.children_by("P") {
         let Some(name) = node.props.first().and_then(RawProp::as_bytes) else {
             continue;
         };
-        if UNSUPPORTED.contains(&name) {
-            return Err(
-                FbxError::new(FbxErrorKind::UnsupportedFeature, "非対応の変換成分がある")
-                    .with_object(object),
-            );
-        }
         match name {
             b"Lcl Translation" => transform.translation = read_triplet(node, object)?,
             b"Lcl Rotation" => transform.rotation = read_triplet(node, object)?,
             b"Lcl Scaling" => transform.scale = read_triplet(node, object)?,
+            b"RotationOffset" => transform.rotation_offset = read_triplet(node, object)?,
+            b"RotationPivot" => transform.rotation_pivot = read_triplet(node, object)?,
+            b"PreRotation" => transform.pre_rotation = read_triplet(node, object)?,
+            b"PostRotation" => transform.post_rotation = read_triplet(node, object)?,
+            b"ScalingOffset" => transform.scaling_offset = read_triplet(node, object)?,
+            b"ScalingPivot" => transform.scaling_pivot = read_triplet(node, object)?,
+            b"GeometricTranslation" => {
+                transform.geometric_translation = read_triplet(node, object)?;
+            }
+            b"GeometricRotation" => {
+                transform.geometric_rotation = read_triplet(node, object)?;
+            }
+            b"GeometricScaling" => {
+                transform.geometric_scaling = read_triplet(node, object)?;
+            }
+            b"RotationActive" => {
+                transform.rotation_active = read_active_flag(node, object)?;
+            }
             b"InheritType" => {
                 inherit_type = node
                     .props
@@ -1341,6 +1663,13 @@ fn read_local(node: &RawNode) -> Result<(LocalTransform, i32), FbxError> {
                         )
                         .with_object(object)
                     })?;
+                if !(0..=2).contains(&inherit_type) {
+                    return Err(FbxError::new(
+                        FbxErrorKind::UnsupportedFeature,
+                        "非対応の継承方式である",
+                    )
+                    .with_object(object));
+                }
             }
             b"RotationOrder" => {
                 let order = node.props.get(4).and_then(RawProp::as_int).ok_or_else(|| {
@@ -1361,19 +1690,30 @@ fn read_local(node: &RawNode) -> Result<(LocalTransform, i32), FbxError> {
             _ => {}
         }
     }
-    if !transform
-        .translation
-        .iter()
-        .chain(&transform.rotation)
-        .chain(&transform.scale)
-        .all(|v| v.is_finite())
-    {
-        return Err(
-            FbxError::new(FbxErrorKind::InvalidStructure, "有限でない変換値がある")
-                .with_object(object),
-        );
-    }
+    transform.ensure_finite().map_err(|_| {
+        // 対象モデルを添えるため、ここで作り直す。
+        FbxError::new(FbxErrorKind::InvalidStructure, "有限でない変換値がある").with_object(object)
+    })?;
     Ok((transform, inherit_type))
+}
+
+/// `P` の `[4]` から真偽値を読む。真偽値・整数のどちらでも受け付ける。
+fn read_active_flag(node: &RawNode, object: ObjectId) -> Result<bool, FbxError> {
+    let values = node.props.get(4..).unwrap_or_default();
+    match values {
+        [prop] => match prop.as_int() {
+            Some(0) => Ok(false),
+            Some(_) => Ok(true),
+            None => Err(
+                FbxError::new(FbxErrorKind::InvalidStructure, "真偽値の形状が壊れている")
+                    .with_object(object),
+            ),
+        },
+        _ => Err(
+            FbxError::new(FbxErrorKind::InvalidStructure, "真偽値の形状が壊れている")
+                .with_object(object),
+        ),
+    }
 }
 
 /// `P` の `[4..]` から3数値を読む。個数違いは破損として失敗する。
@@ -1608,6 +1948,21 @@ fn read_deformers(top: &[RawNode]) -> Result<Vec<DeformerRec>, FbxError> {
             .child("Weights")
             .and_then(|child| child.props.first())
             .and_then(RawProp::as_array);
+        // クラスタのバインド時行列（変形対象の世界行列と結合モデルの世界行列）は、
+        // `BindPose` に無い結合モデルを補うために位置だけ残す。
+        // 値の解釈（どちらを正とするか）は呼び出し側に残す。
+        let (transform, transform_link) = if kind == DeformerKind::Cluster {
+            (
+                node.child("Transform")
+                    .and_then(|child| child.props.first())
+                    .and_then(RawProp::as_array),
+                node.child("TransformLink")
+                    .and_then(|child| child.props.first())
+                    .and_then(RawProp::as_array),
+            )
+        } else {
+            (None, None)
+        };
         // ブレンドシェイプ系は `Skin`/`Cluster` の配列を持たず、
         // チャンネルの `DeformPercent` と `FullWeights` だけを保持する。
         // 値の解釈（単一フレーム条件）は呼び出し側に残す。
@@ -1634,6 +1989,8 @@ fn read_deformers(top: &[RawNode]) -> Result<Vec<DeformerRec>, FbxError> {
             kind,
             indexes,
             weights,
+            transform,
+            transform_link,
             deform_percent,
             full_weights,
         });
@@ -2364,6 +2721,8 @@ fn wire_skins(
                     influence_count,
                     indexes: cluster.indexes,
                     weights: cluster.weights,
+                    transform: cluster.transform,
+                    transform_link: cluster.transform_link,
                 });
             }
         }

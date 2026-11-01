@@ -449,6 +449,28 @@ fn read_rgba(document: &Document, value: &Value, key: &str) -> Result<[f64; 4], 
     Ok(out)
 }
 
+/// 欠落やnullを空として読む `- 名前: 値` 形の1件列。
+///
+/// 材質の一覧は項目が無い場合に欄ごと書かないことがあり、欠落と空は同じ意味である。
+/// 存在する欄の形状違い（シーケンスでない・項目の形状違い）は失敗にする。
+fn read_optional_named_list<T>(
+    document: &Document,
+    saved: &Mapping,
+    key: &str,
+    read_value: impl Fn(&Document, &Value, &str) -> Result<T, UnityError>,
+) -> Result<Vec<NamedProperty<T>>, UnityError> {
+    let Some(value) = saved.get(key) else {
+        return Ok(Vec::new());
+    };
+    if matches!(value, Value::Null) {
+        return Ok(Vec::new());
+    }
+    let items = value
+        .as_sequence()
+        .ok_or_else(|| shape_error(document, key, "シーケンスでない"))?;
+    read_named_list(document, items, key, read_value)
+}
+
 /// `- 名前: 値` 形の1件列を順序通りに読む。重複名は別物として保つ。
 fn read_named_list<T>(
     document: &Document,
@@ -592,32 +614,18 @@ fn read_texture_environment(
 }
 
 /// Materialの共通欄を読む。
+///
+/// `m_SavedProperties` の4一覧（テクスチャ・浮動小数点・整数・色）は、
+/// 欠落している場合やnullの場合は空として読む。実データ（lilToonなど）では
+/// 項目を持たない一覧を書かない材質があり、欠落と空は同じ意味である。
+/// 存在する一覧の形状違いは従来どおり失敗にする。
 fn decode_material(document: &Document, mapping: &Mapping) -> Result<Material, UnityError> {
     let saved = read_mapping(document, mapping, "m_SavedProperties")?;
-    let tex_envs = read_named_list(
-        document,
-        read_sequence(document, saved, "m_TexEnvs")?,
-        "m_TexEnvs",
-        read_texture_environment,
-    )?;
-    let floats = read_named_list(
-        document,
-        read_sequence(document, saved, "m_Floats")?,
-        "m_Floats",
-        read_f64,
-    )?;
-    let ints = read_named_list(
-        document,
-        read_sequence(document, saved, "m_Ints")?,
-        "m_Ints",
-        read_i64,
-    )?;
-    let colors = read_named_list(
-        document,
-        read_sequence(document, saved, "m_Colors")?,
-        "m_Colors",
-        read_rgba,
-    )?;
+    let tex_envs =
+        read_optional_named_list(document, saved, "m_TexEnvs", read_texture_environment)?;
+    let floats = read_optional_named_list(document, saved, "m_Floats", read_f64)?;
+    let ints = read_optional_named_list(document, saved, "m_Ints", read_i64)?;
+    let colors = read_optional_named_list(document, saved, "m_Colors", read_rgba)?;
     Ok(Material {
         name: read_name(document, required(document, mapping, "m_Name")?, "m_Name")?,
         shader: read_ref(document, mapping, "m_Shader")?,

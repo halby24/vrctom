@@ -440,6 +440,13 @@ fn export(
             return 1;
         }
     };
+    // バインド行列の代替を使った場合は、どの経路で何件補ったか残す。
+    if report.bind_cluster_models > 0 || report.bind_rest_models > 0 {
+        eprintln!(
+            "バインド行列の代替: Poseに無いモデルを補った（関節{}件・その他{}件）",
+            report.bind_cluster_models, report.bind_rest_models
+        );
+    }
     // 物理sidecarの指定時は、解決とコンパイルが通ってから代入する。
     // 失敗時はモデルを部分更新しない。
     let mut spring_summary: Option<String> = None;

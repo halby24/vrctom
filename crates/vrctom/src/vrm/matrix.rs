@@ -163,6 +163,28 @@ fn inverse3(m: &[f64; 16]) -> Option<[f64; 9]> {
     ])
 }
 
+/// アフィン行列のw行を `[0, 0, 0, 1]` に寄せる。
+///
+/// 逆行列の丸めで生じる微小残差を消す。読み取り層の行列はアフィンであることが
+/// 前提であり、glTFのノード行列と逆バインド行列は正確な `[0, 0, 0, 1]` を要求する
+/// （Khronos Validatorの `NODE_MATRIX_NON_TRS` と `ACCESSOR_INVALID_IBM`）。
+/// いずれかの残差が許容値（1e-9）を超える場合は何もせず、
+/// 非アフィンな入力は呼び出し側の検査（Validatorを含む）に譲る。
+/// 残差が既に0の場合は値を変えない。
+pub(crate) fn snap_affine_row(m: &mut [f64; 16]) {
+    const TOLERANCE: f64 = 1e-9;
+    if m[3].abs() <= TOLERANCE
+        && m[7].abs() <= TOLERANCE
+        && m[11].abs() <= TOLERANCE
+        && (m[15] - 1.0).abs() <= TOLERANCE
+    {
+        m[3] = 0.0;
+        m[7] = 0.0;
+        m[11] = 0.0;
+        m[15] = 1.0;
+    }
+}
+
 /// 3x3部分の行列式を返す。巻き方向（鏡像）の判定に使う。
 pub(crate) fn det3(m: &[f64; 16]) -> f64 {
     let (a, b, c) = (m[0], m[1], m[2]);
@@ -179,6 +201,95 @@ pub(crate) fn scale_matrix(s: f64) -> [f64; 16] {
         0.0, 0.0, s, 0.0, //
         0.0, 0.0, 0.0, 1.0, //
     ]
+}
+
+/// 平行移動の行列を返す。FBXのオフセットとピボットに使う。
+pub(crate) fn translation_matrix(t: [f64; 3]) -> [f64; 16] {
+    [
+        1.0, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 1.0, 0.0, //
+        t[0], t[1], t[2], 1.0, //
+    ]
+}
+
+/// 非一様拡大縮小の行列を返す。FBXの `Scaling` 系に使う。
+pub(crate) fn non_uniform_scale_matrix(s: [f64; 3]) -> [f64; 16] {
+    [
+        s[0], 0.0, 0.0, 0.0, //
+        0.0, s[1], 0.0, 0.0, //
+        0.0, 0.0, s[2], 0.0, //
+        0.0, 0.0, 0.0, 1.0, //
+    ]
+}
+
+/// 単軸の回転行列を作る。列ベクトル規約の右手系回転である。
+fn axis_rotation_matrix(axis: usize, radians: f64) -> [f64; 16] {
+    let (sin, cos) = radians.sin_cos();
+    let mut out = IDENTITY;
+    let (a, b) = match axis {
+        0 => (1, 2),
+        1 => (0, 2),
+        _ => (0, 1),
+    };
+    // 符号は `transform_normal` の回転試験（X+90度で `y` が `z` に向く）と一致させる。
+    let sign = if axis == 1 { -1.0 } else { 1.0 };
+    out[a * 4 + a] = cos;
+    out[b * 4 + b] = cos;
+    out[a * 4 + b] = sign * sin;
+    out[b * 4 + a] = -sign * sin;
+    out
+}
+
+/// FBXのXYZ順のオイラー角（度）から回転行列を作る。`R = Rz * Ry * Rx` である。
+///
+/// FBX SDKは行ベクトル規約であり、`RotationOrder` の0（XYZ順）は
+/// X・Y・Zの順に掛ける（`v * Rx * Ry * Rz`）。列ベクトル規約の本層では
+/// 掛ける順序が逆になり、`Rz * Ry * Rx` と等しくなる。
+/// 購入アバターの実ファイル（PreRotationを持つモデル）のバインド行列との
+/// 突き合わせで確認した。回転が無い場合は単位行列になる。
+pub(crate) fn fbx_euler_xyz_matrix(degrees: [f64; 3]) -> [f64; 16] {
+    let factor = std::f64::consts::PI / 180.0;
+    let rx = axis_rotation_matrix(0, degrees[0] * factor);
+    let ry = axis_rotation_matrix(1, degrees[1] * factor);
+    let rz = axis_rotation_matrix(2, degrees[2] * factor);
+    mul(&mul(&rz, &ry), &rx)
+}
+
+/// 行列の全成分が有限かどうかを返す。
+pub(crate) fn is_finite_matrix(m: &[f64; 16]) -> bool {
+    m.iter().all(|v| v.is_finite())
+}
+
+/// アフィン行列を平行移動・回転・拡大縮小に分ける。
+///
+/// 回転は3列の正規化で求めるため、せん断を含む行列には使えない。
+/// `InheritType` のRSrs・Rrs（親の拡大縮小を外す合成）だけに使い、
+/// 一般の行列分解には使わない。いずれかの軸の長さが0または非有限の場合、
+/// および平行移動が非有限の場合は `None` を返す。
+pub(crate) fn decompose_trs(m: &[f64; 16]) -> Option<([f64; 3], [f64; 16], [f64; 3])> {
+    let translation = [m[12], m[13], m[14]];
+    if !translation.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let mut scales = [0.0; 3];
+    for col in 0..3 {
+        let length = (m[col * 4] * m[col * 4]
+            + m[col * 4 + 1] * m[col * 4 + 1]
+            + m[col * 4 + 2] * m[col * 4 + 2])
+            .sqrt();
+        if length == 0.0 || !length.is_finite() {
+            return None;
+        }
+        scales[col] = length;
+    }
+    let mut rotation = IDENTITY;
+    for col in 0..3 {
+        for row in 0..3 {
+            rotation[col * 4 + row] = m[col * 4 + row] / scales[col];
+        }
+    }
+    Some((translation, rotation, scales))
 }
 
 #[cfg(test)]

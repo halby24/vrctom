@@ -137,35 +137,49 @@ impl TNode {
     }
 }
 
-/// 論理ノードを絶対オフセット付きで書き出す。
-fn ser(node: &TNode, buf: &mut Vec<u8>) {
+/// 論理ノードを絶対オフセット付きで書き出す。7500以上は64bit幅の先頭で書く。
+fn ser(node: &TNode, buf: &mut Vec<u8>, wide: bool) {
     let start = buf.len();
-    buf.extend_from_slice(&[0u8; 13]);
+    let header = if wide { 25 } else { 13 };
+    buf.extend_from_slice(&vec![0u8; header]);
     buf.extend_from_slice(&node.name);
     buf.extend_from_slice(&node.props.buf);
     for child in &node.children {
-        ser(child, buf);
+        ser(child, buf, wide);
     }
     if !node.children.is_empty() {
         // 子列の終端であり、親範囲の一部である。
-        buf.extend_from_slice(&[0u8; 13]);
+        buf.extend_from_slice(&vec![0u8; header]);
     }
-    let end = buf.len() as u32;
-    buf[start..start + 4].copy_from_slice(&end.to_le_bytes());
-    buf[start + 4..start + 8].copy_from_slice(&node.props.count.to_le_bytes());
-    buf[start + 8..start + 12].copy_from_slice(&(node.props.buf.len() as u32).to_le_bytes());
-    buf[start + 12] = node.name.len() as u8;
+    if wide {
+        let end = buf.len() as u64;
+        buf[start..start + 8].copy_from_slice(&end.to_le_bytes());
+        buf[start + 8..start + 16].copy_from_slice(&(node.props.count as u64).to_le_bytes());
+        buf[start + 16..start + 24].copy_from_slice(&(node.props.buf.len() as u64).to_le_bytes());
+        buf[start + 24] = node.name.len() as u8;
+    } else {
+        let end = buf.len() as u32;
+        buf[start..start + 4].copy_from_slice(&end.to_le_bytes());
+        buf[start + 4..start + 8].copy_from_slice(&node.props.count.to_le_bytes());
+        buf[start + 8..start + 12].copy_from_slice(&(node.props.buf.len() as u32).to_le_bytes());
+        buf[start + 12] = node.name.len() as u8;
+    }
 }
 
-/// 直下ノード列からバイナリFBXを組み立てる。
+/// 直下ノード列からバイナリFBXを組み立てる。版で先頭幅を切り替える。
+///
+/// プロパティ本体（文字列・配列の長さ前置きを含む）の形式は両幅で同じであり、
+/// 実ファイル（7700版）で確認した。版の違いはノード先頭の幅だけである。
 fn file(version: u32, top: Vec<TNode>) -> Vec<u8> {
+    let wide = version >= 7500;
+    let header = if wide { 25 } else { 13 };
     let mut buf = b"Kaydara FBX Binary  \x00\x1a\x00".to_vec();
     buf.extend_from_slice(&version.to_le_bytes());
     for node in &top {
-        ser(node, &mut buf);
+        ser(node, &mut buf, wide);
     }
     // トップレベルの終端以降はフッタであり、読まない。
-    buf.extend_from_slice(&[0u8; 13]);
+    buf.extend_from_slice(&vec![0u8; header]);
     buf
 }
 
@@ -1373,8 +1387,9 @@ fn 範囲外索引と不正な多角形と非有限値と長さ不一致は失�
 }
 
 #[test]
-fn 非対応の変換成分で失敗し回転順序の0は通る() {
-    // `PreRotation` は黙って落とすと姿勢が変わるため、非対応として失敗する。
+fn 変換成分を受け回転順序の0以外は非対応とする() {
+    // `PreRotation` は合成に反映する（黙って落とさない）。
+    // 合成結果の正しさは `fbx_transform` 側の手計算テストで担保する。
     let bytes = file(
         7400,
         vec![
@@ -1382,17 +1397,12 @@ fn 非対応の変換成分で失敗し回転順序の0は通る() {
                 1,
                 b"M\x00\x01Model",
                 "LimbNode",
-                Some(vec![p_triplet("PreRotation", [0.0, 0.0, 0.0])]),
+                Some(vec![p_triplet("PreRotation", [0.0, 0.0, 30.0])]),
             )]),
             connections(vec![conn(1, 0)]),
         ],
     );
-    assert_eq!(
-        FbxFile::parse(&bytes, &FbxOptions::new())
-            .unwrap_err()
-            .kind(),
-        FbxErrorKind::UnsupportedFeature
-    );
+    FbxFile::parse(&bytes, &FbxOptions::new()).expect("PreRotationは受ける");
 
     // `RotationOrder` の0は既定のXYZ順と一致するため、通す。
     let bytes = file(
@@ -1443,7 +1453,7 @@ fn ヘッダと版と暗号化と未知型と破損は失敗する() {
     );
 
     // 版が範囲外の場合は非対応である。
-    for version in [6900, 7500] {
+    for version in [6900, 6999, 7701, 7800] {
         let bytes = 最小構成ファイル(version);
         assert_eq!(
             FbxFile::parse(&bytes, &FbxOptions::new())
@@ -1742,7 +1752,11 @@ fn 実fixtureの全メッシュで不変条件を満たす() {
     let started = std::time::Instant::now();
     let bytes = std::fs::read(&path).expect("実fixtureは読める");
     let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("実fixtureは読める");
-    assert_eq!(parsed.version(), 7400);
+    assert!(
+        (7000..=7700).contains(&parsed.version()),
+        "実fixtureの版は対応範囲である: {}",
+        parsed.version()
+    );
     let mut meshes = 0;
     let mut polygons = 0;
     let mut corners = 0;
@@ -3420,4 +3434,124 @@ fn 形状の配列欠損と対象不整合は解析時に失敗する() {
             .kind(),
         FbxErrorKind::InvalidStructure
     );
+}
+
+#[test]
+fn 広幅レコードの最小構成は狭幅と同値に読める() {
+    // 7500以上はノード先頭が64bit幅になる。名前・入れ子・配列の値が
+    // 7400版と一致し、版番号だけが違うことを確かめる。
+    let narrow = 最小構成ファイル(7400);
+    let narrow_parsed = FbxFile::parse(&narrow, &FbxOptions::new()).expect("狭幅は読める");
+    let narrow_data = narrow_parsed
+        .mesh_data(ObjectId::new(3))
+        .expect("狭幅は展開できる");
+    for version in [7500, 7700] {
+        let bytes = 最小構成ファイル(version);
+        let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("広幅は読める");
+        assert_eq!(parsed.version(), version);
+        assert_eq!(parsed.models().len(), narrow_parsed.models().len());
+        assert_eq!(parsed.meshes().len(), narrow_parsed.meshes().len());
+        let child = parsed.model(ObjectId::new(2)).expect("子がある");
+        assert_eq!(child.name, "Child");
+        assert_eq!(child.transform.translation, [1.0, 2.0, 3.0]);
+        let data = parsed
+            .mesh_data(ObjectId::new(3))
+            .expect("広幅は展開できる");
+        assert_eq!(data.positions, narrow_data.positions);
+        assert_eq!(
+            data.polygon_corner_counts,
+            narrow_data.polygon_corner_counts
+        );
+        assert_eq!(data.corner_positions, narrow_data.corner_positions);
+    }
+}
+
+#[test]
+fn 広幅レコードで圧縮配列と入れ子を読める() {
+    // 頂点は圧縮・索引は非圧縮の組み合わせで、広幅でも狭幅と同値になる。
+    let bytes = file(
+        7700,
+        vec![
+            objects(vec![
+                model(1, b"M\x00\x01Model", "Mesh", None),
+                quad_geometry(2, true),
+            ]),
+            connections(vec![conn(1, 0), conn(2, 1)]),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("広幅の圧縮は読める");
+    assert_eq!(parsed.version(), 7700);
+    let data = parsed
+        .mesh_data(ObjectId::new(2))
+        .expect("広幅の圧縮は展開できる");
+    let plain = 最小構成ファイル(7400);
+    let plain_parsed = FbxFile::parse(&plain, &FbxOptions::new()).expect("狭幅は読める");
+    let plain_data = plain_parsed
+        .mesh_data(ObjectId::new(3))
+        .expect("狭幅は展開できる");
+    assert_eq!(data.positions, plain_data.positions);
+    assert_eq!(data.polygon_corner_counts, plain_data.polygon_corner_counts);
+    assert_eq!(data.corner_positions, plain_data.corner_positions);
+}
+
+#[test]
+fn 広幅レコードの壊れた値を拒否する() {
+    // 終了位置が入力を超える場合は破損として失敗する。
+    let mut bytes = 最小構成ファイル(7700);
+    let beyond = bytes.len() as u64 + 64;
+    bytes[27..35].copy_from_slice(&beyond.to_le_bytes());
+    assert_eq!(
+        FbxFile::parse(&bytes, &FbxOptions::new())
+            .unwrap_err()
+            .kind(),
+        FbxErrorKind::InvalidStructure
+    );
+
+    // プロパティ列長がu64の範囲で収まらない場合は上限超過として失敗する。
+    // 64bit標的では加算の溢れで、32bit標的では添え字化で止める。
+    let mut bytes = 最小構成ファイル(7700);
+    bytes[27 + 16..27 + 24].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert_eq!(
+        FbxFile::parse(&bytes, &FbxOptions::new())
+            .unwrap_err()
+            .kind(),
+        FbxErrorKind::LimitExceeded
+    );
+
+    // 配列の要素数宣言が上限を超える場合は上限超過として失敗する。
+    let mut vert_props = Props::default();
+    vert_props.array(b'd', u32::MAX, 0, &[]);
+    let bytes = file(
+        7700,
+        vec![
+            objects(vec![
+                model(1, b"M\x00\x01Model", "Mesh", None),
+                geometry(
+                    2,
+                    b"G\x00\x01Geometry",
+                    vec![
+                        TNode::leaf(b"Vertices", vert_props),
+                        pvi_node(&[0, 1, 2, -4], false),
+                    ],
+                ),
+            ]),
+            connections(vec![conn(1, 0), conn(2, 1)]),
+        ],
+    );
+    assert_eq!(
+        FbxFile::parse(&bytes, &FbxOptions::new())
+            .unwrap_err()
+            .kind(),
+        FbxErrorKind::LimitExceeded
+    );
+}
+
+#[test]
+fn 狭幅レコードは従来どおり読める() {
+    // 7400形式の受理を明示し、広幅化の回帰がないことを確かめる。
+    let bytes = 最小構成ファイル(7400);
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("7400は読める");
+    assert_eq!(parsed.version(), 7400);
+    assert_eq!(parsed.models().len(), 2);
+    assert_eq!(parsed.meshes().len(), 1);
 }

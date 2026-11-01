@@ -906,14 +906,28 @@ impl<'a> LoadContext<'a> {
             }
         };
         let mut found = None;
+        let mut decode_error = None;
         for document in file.documents() {
-            if let Ok(TypedObject::Material(material)) = document.decode() {
-                found = Some(material);
-                break;
+            match document.decode() {
+                Ok(TypedObject::Material(material)) => {
+                    found = Some(material);
+                    break;
+                }
+                // 材質以外の文書は読み飛ばす。材質の読み取り失敗は覚えて警告に載せる。
+                Ok(_) => {}
+                Err(error) => {
+                    decode_error = Some(error);
+                }
             }
         }
         let Some(material) = found else {
-            self.warn(format!("材質文書がないため灰色材質にする: {slot}: {path}"));
+            if let Some(error) = decode_error {
+                self.warn(format!(
+                    "材質の読み取りに失敗したため灰色材質にする: {slot}: {error}"
+                ));
+            } else {
+                self.warn(format!("材質文書がないため灰色材質にする: {slot}: {path}"));
+            }
             return Ok((placeholder(slot), -1));
         };
         // 写像時の `clamp01` や `.max(0.0)` が非有限を正常値に潰す前に検出する。
