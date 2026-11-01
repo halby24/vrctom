@@ -35,6 +35,12 @@ FBXの材質スロット名は `.fbx.meta` の `externalObjects` が持つ
 名前だけの一致では解決しない。置換表に無いスロットは、書き出し時に
 既定の灰色材質へ落ちる。
 
+購入アバターの割当はPrefabにあるため、置換表だけでは足りない。
+`--renderers` を指定した場合は、レンダラsidecar
+（`tools/unity/README.md` の「RendererSidecarExporter」の節）の
+「レンダラ→材質」の割当を使い、FBXの置換表は使わない。
+詳しくは [`レンダラsidecarによる割当`](#レンダラsidecarによる割当--renderers) を参照。
+
 `.mat` はUnity YAMLとして読み、`Material` の代表型を使う。
 `m_Shader` のGUIDは、索引に `.shader` があればその先頭行のシェーダ名で、
 無ければ既知のlilToonのGUID表で系列と能力を判定する。
@@ -61,6 +67,46 @@ Multi系（`Multi` を含む）は `_TransparentMode`
 それ以外（屈折・宝石・ファー）は未対応として灰色材質へ落とす。
 `m_CustomRenderQueue` が-1（未設定）の場合は系列の既定
 （不透明2000・カットアウト2450・半透明3000）を実効描画順とする。
+
+## レンダラsidecarによる割当（`--renderers`）
+
+Prefabの材質割当と有効状態を再現する入力であり、無指定時は従来の
+FBX置換表経路のままにする（Prefabの割当・有効状態は未反映である旨を
+レポートに1行残す）。`.mat` の読み取りはNative限定であり、
+wasmでは未対応として明示エラーにする（材質経路と同じ扱い）。
+
+```mermaid
+flowchart TB
+    sidecar[レンダラsidecar<br/>format・版の検査] --> sha[FBXのSHA-256照合<br/>models[] のいずれか]
+    sha --> match[Model名で対応付け<br/>mesh.name → 所有モデル名]
+    match --> pool[材質プール<br/>guidとfileIDで同一性判定]
+    pool --> mat2[".mat の読み取り<br/>既存の写像・ベイク・解像度合わせ"]
+    match --> cut[除外<br/>有効レンダラに無いメッシュは出さない]
+```
+
+- 照合キーはModel名である。sidecarの `mesh.name` はUnityのメッシュ
+  サブアセット名＝FBXのModel名であり、当方の出力メッシュ名
+  （ジオメトリ名）とは一致しない。`model.nodePath` はPrefab直置きの
+  レンダラでは `null` のため使わない。
+- 有効なレンダラは `supported && enabled && activeInHierarchy` だけである。
+- 入力FBXのSHA-256は `models[].sha256` のいずれかと一致すること。
+  一致しなければ別アバター用のsidecarを取り違えた事故として失敗し、
+  どのモデルに一致したかはレポートに出す。
+- 有効レンダラの `mesh.name` は中間モデルのModel名で一意に解決できること。
+  見つからない・重複する場合は先勝ちにせず失敗し、対象名と候補数を出す。
+- レンダラの材質配列長とメッシュの材質スロット数は一致すること。
+  `materials[i]` が `null` の場合は失敗し、灰色材質で続行しない。
+- sidecarにあるが当方のFBXに無い有効レンダラは失敗とし、
+  当方のFBXにあるが有効レンダラに無いメッシュは出力しない。
+  除外は件数と名前をレポートに出す。ノードやスキンの関節は消さず、
+  表情の参照先が除外された場合は黙って消さず失敗する。
+- 材質プールは `(guid, fileID)` で同一性を判定し、重複を1つにまとめる。
+  材質スロットの並びはレンダラ順→サブメッシュ順の初出順で決定的にし、
+  列挙順に依存しない。材質名は `.mat` の `m_Name` を使い、
+  焼くか載せるかの判断も既存の処理を通す。新しいシェーダ変換器は作らない。
+- 内部では「材質プール＋（メッシュ、ローカルスロット）→材質」の割当表に
+  正規化し、メッシュ側は既存の `primitive.material` の引き方を保つ
+  （`VrmMaterialEntry.slot` の意味は変えない）。
 
 ## 色空間
 

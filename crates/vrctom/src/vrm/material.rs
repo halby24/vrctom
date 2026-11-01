@@ -720,7 +720,7 @@ struct ShaderCapability {
 
 /// 読み取り作業域。警告・材質・画像と重複排除表を持つ。
 #[cfg(not(target_arch = "wasm32"))]
-struct LoadContext<'a> {
+pub(crate) struct LoadContext<'a> {
     root: &'a Path,
     index: &'a AssetIndex,
     options: &'a MaterialOptions,
@@ -742,7 +742,7 @@ struct LoadContext<'a> {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl<'a> LoadContext<'a> {
-    fn new(root: &'a Path, index: &'a AssetIndex, options: &'a MaterialOptions) -> Self {
+    pub(crate) fn new(root: &'a Path, index: &'a AssetIndex, options: &'a MaterialOptions) -> Self {
         Self {
             root,
             index,
@@ -796,6 +796,62 @@ impl<'a> LoadContext<'a> {
         Ok(())
     }
 
+    /// sidecar指定の材質1件をGUIDで読み取り、材質列に積む（レンダラ割当用）。
+    ///
+    /// 解決できない材質は灰色材質へ落として警告し、書き出しは続ける。
+    /// 材質数の上限超過と画像の読み込み失敗だけは失敗として返す。
+    /// `slot` は材質プールの共有名であり、重複時は最初の読み取りを残す。
+    /// `mat_path` はsidecarの `.mat` 資産パスであり、索引と食い違う場合は
+    /// 警告して索引側を使う。
+    pub(crate) fn load_renderer_material(
+        &mut self,
+        guid_text: &str,
+        mat_path: &str,
+        slot: &str,
+    ) -> Result<(), MaterialError> {
+        if !self.seen_slots.insert(slot.to_owned()) {
+            return Ok(());
+        }
+        if self.entries.len() >= self.options.max_materials {
+            return Err(MaterialError::new(
+                MaterialErrorKind::LimitExceeded,
+                format!("材質数が上限を超えた: {}", self.entries.len() + 1),
+            ));
+        }
+        let guid = match Guid::parse(guid_text) {
+            Ok(guid) => guid,
+            Err(_) => {
+                self.warn(format!(
+                    "レンダラ材質のGUIDが不正のため灰色材質にする: {slot}: {mat_path}"
+                ));
+                self.entries.push(VrmMaterialEntry {
+                    slot: slot.to_owned(),
+                    material: placeholder(slot),
+                });
+                self.queues.push(-1);
+                return Ok(());
+            }
+        };
+        let (material, queue) =
+            self.load_material_by_guid(&guid, Some(mat_path), "レンダラ材質", slot)?;
+        self.entries.push(VrmMaterialEntry {
+            slot: slot.to_owned(),
+            material,
+        });
+        self.queues.push(queue);
+        Ok(())
+    }
+
+    /// 読み取り作業域から材質集合と報告を取り出す。
+    pub(crate) fn finish(mut self) -> (VrmMaterials, MaterialReport) {
+        let materials = VrmMaterials::new(
+            std::mem::take(&mut self.entries),
+            std::mem::take(&mut self.images),
+        );
+        let report = self.report();
+        (materials, report)
+    }
+
     /// 全材質の描画順差分を割り当てる。
     ///
     /// 参照実装の `RenderQueueOffsets::Assign` と対応する。絶対値ではなく
@@ -803,7 +859,7 @@ impl<'a> LoadContext<'a> {
     /// 半透明かつZ書き込みありは描画順の昇順に0から、
     /// 半透明かつZ書き込みなしは描画順の降順に0から下げる。
     /// 範囲はMToon仕様（Z書き込みありは0〜9、なしは-9〜0）に収める。
-    fn assign_render_queue_offsets(&mut self) {
+    pub(crate) fn assign_render_queue_offsets(&mut self) {
         let mut zwrite: Vec<i32> = Vec::new();
         let mut nozwrite: Vec<i32> = Vec::new();
         for (entry, queue) in self.entries.iter().zip(self.queues.iter()) {
@@ -861,19 +917,42 @@ impl<'a> LoadContext<'a> {
             self.warn(format!("材質の置換先GUIDがないため灰色材質にする: {slot}"));
             return Ok((placeholder(slot), -1));
         };
-        let Some(record) = self.index.get(&guid) else {
-            self.warn(format!(
-                "材質の置換先が索引にないため灰色材質にする: {slot}"
-            ));
+        self.load_material_by_guid(&guid, None, "材質の置換先", slot)
+    }
+
+    /// GUID指定で `.mat` から材質を作る。未対応は灰色材質へ落として警告する。
+    ///
+    /// 描画順の算出に使う実効描画順も返す。灰色材質へ落ちた場合は-1であり、
+    /// 描画順の割り当てでは使わない。`expected_path` がある場合は索引の
+    /// パスと突き合わせ、食い違う場合は警告して索引側を使う。
+    /// `subject` は警告文の主語（置換表経路かレンダラ経路か）である。
+    fn load_material_by_guid(
+        &mut self,
+        guid: &Guid,
+        expected_path: Option<&str>,
+        subject: &str,
+        slot: &str,
+    ) -> Result<(VrmMaterial, i32), MaterialError> {
+        let Some(record) = self.index.get(guid) else {
+            self.warn(format!("{subject}が索引にないため灰色材質にする: {slot}"));
             return Ok((placeholder(slot), -1));
         };
         if record.kind != AssetKind::Material {
-            self.warn(format!(
-                "材質の置換先が材質でないため灰色材質にする: {slot}"
-            ));
+            self.warn(format!("{subject}が材質でないため灰色材質にする: {slot}"));
             return Ok((placeholder(slot), -1));
         };
         let path = record.path.clone();
+        // sidecarの資産パスは `Assets/` 始まり、索引は `Assets` 配下の相対のため、
+        // 接頭辞を除いて突き合わせる。食い違う場合は警告して索引側を使う。
+        let expected =
+            expected_path.map(|expected| expected.strip_prefix("Assets/").unwrap_or(expected));
+        if let Some(expected) = expected
+            && expected != path
+        {
+            self.warn(format!(
+                "{subject}のパスが索引と一致しないため索引を使う: {slot}: {expected}に対して{path}"
+            ));
+        }
         let bytes = match read_limited(&self.root.join(&path), MAX_MATERIAL_BYTES) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {

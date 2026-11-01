@@ -11,11 +11,14 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 use vrctom::fbx::{FbxFile, FbxOptions};
 use vrctom::unitypackage::{UnpackOptions, unpack_to};
+#[cfg(not(target_arch = "wasm32"))]
+use vrctom::vrm::load_renderer_materials;
 use vrctom::vrm::{
-    HumanoidBones, MaterialOptions, PhysicsLimits, PhysicsSidecar, SpringCompileOptions,
-    VrmAvatarPermission, VrmCommercialUsage, VrmCreditNotation, VrmExportOptions,
-    VrmExpressionProfile, VrmMaterials, VrmMeta, VrmModel, VrmModification, VrmOptions,
-    apply_humanoid_t_pose, compile_springs, resolve_look_at,
+    HumanoidBones, MaterialOptions, PhysicsLimits, PhysicsSidecar, RendererApplyReport,
+    RendererLimits, RendererMeshView, RendererSidecar, SpringCompileOptions, VrmAvatarPermission,
+    VrmCommercialUsage, VrmCreditNotation, VrmExportOptions, VrmExpressionProfile, VrmMaterials,
+    VrmMeta, VrmModel, VrmModification, VrmOptions, apply_humanoid_t_pose, apply_renderer_plan,
+    compile_springs, plan_renderer_assignment, resolve_look_at,
 };
 
 #[derive(Debug, Parser)]
@@ -61,6 +64,9 @@ enum Command {
         /// 物理sidecar（JSON）のパス。指定時はスプリングをコンパイルして載せる。
         #[arg(long, value_name = "FILE")]
         physics: Option<PathBuf>,
+        /// レンダラsidecar（JSON）のパス。指定時はPrefabの割当と有効状態を使う。
+        #[arg(long, value_name = "FILE")]
+        renderers: Option<PathBuf>,
         /// アバターの人格権の扱い。既定は `only-author`。
         #[arg(long, value_enum, value_name = "PERMISSION")]
         avatar_permission: Option<AvatarPermissionArg>,
@@ -214,6 +220,7 @@ fn main() {
             assets,
             expressions,
             physics,
+            renderers,
             avatar_permission,
             commercial_usage,
             credit_notation,
@@ -231,6 +238,7 @@ fn main() {
             assets,
             expressions,
             physics,
+            renderers,
             ExportMetaArgs {
                 avatar_permission,
                 commercial_usage,
@@ -384,6 +392,7 @@ fn export(
     assets: Option<PathBuf>,
     expressions: Option<ExpressionProfile>,
     physics: Option<PathBuf>,
+    renderers: Option<PathBuf>,
     meta_args: ExportMetaArgs,
 ) -> i32 {
     // 既定出力先は入力の拡張子を `vrm` に変えたパスとする。
@@ -626,9 +635,39 @@ fn export(
         Some(dir) => Some(assets_root_of(&dir)),
         None => assets_root_from_ancestors(&input),
     };
+    let use_renderers = renderers.is_some();
+    // レンダラsidecarの指定時は、対応付けと除外が通ってから材質プールを読む。
+    // 失敗時はモデルを部分更新しない。wasmでは未対応として終了する。
+    #[cfg(target_arch = "wasm32")]
+    let renderer_out: Option<(VrmMaterials, RendererApplyReport)> = {
+        if use_renderers {
+            eprintln!("レンダラ割当は wasm では未対応である");
+            return 1;
+        }
+        None
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let renderer_out: Option<(VrmMaterials, RendererApplyReport)> = match renderers {
+        Some(sidecar_path) => {
+            match apply_renderer_sidecar(
+                &mut model,
+                &file,
+                &bytes,
+                &sidecar_path,
+                assets_root.as_deref(),
+            ) {
+                Ok(out) => Some(out),
+                Err(code) => return code,
+            }
+        }
+        None => None,
+    };
     let mut export_options = VrmExportOptions::new(meta);
     let mut material_count = 0usize;
-    if let Some(root) = assets_root {
+    if let Some((renderer_materials, _)) = renderer_out {
+        material_count = renderer_materials.entries().len();
+        export_options = export_options.with_materials(renderer_materials);
+    } else if let Some(root) = assets_root {
         match VrmMaterials::load(&root, &input, &MaterialOptions::new()) {
             Ok((Some(materials), report)) => {
                 for warning in report.warnings() {
@@ -688,16 +727,112 @@ fn export(
     eprintln!(
         "書き出しが完了した: ノード{}件 メッシュ{}件 スキン{}件 材質{}件 {}バイト: {}",
         report.node_count,
-        report.mesh_count,
+        model.meshes.len(),
         report.skin_count,
         material_count,
         vrm_bytes.len(),
         escape_diag(&format!("{destination:?}"))
     );
+    if !use_renderers {
+        eprintln!("材質の解決: FBXの置換表経路であり、Prefab の割当・有効状態は未反映である");
+    }
     if let Some(summary) = spring_summary {
         eprintln!("物理: {summary}");
     }
     0
+}
+
+/// レンダラsidecarを中間モデルへ適用し、材質プールと適用報告を返す。
+///
+/// sidecarの読み取り・FBXのSHA-256照合・Model名での対応付け・材質プールの
+/// 読み取り・除外と割当の適用を順に行う。いずれかの段階で失敗した場合は
+/// 診断を標準エラーに出し、終了コード1を返す。成功時はモデルを更新する。
+/// 材質配置が無い場合は `.mat` を読めないため失敗する。
+#[cfg(not(target_arch = "wasm32"))]
+fn apply_renderer_sidecar(
+    model: &mut VrmModel,
+    file: &FbxFile<'_>,
+    fbx_bytes: &[u8],
+    sidecar_path: &std::path::Path,
+    assets_root: Option<&std::path::Path>,
+) -> Result<(VrmMaterials, RendererApplyReport), i32> {
+    let sidecar_bytes = match std::fs::read(sidecar_path) {
+        Ok(sidecar_bytes) => sidecar_bytes,
+        Err(error) => {
+            eprintln!(
+                "レンダラsidecarを読み込めない: {}: {}",
+                escape_diag(&format!("{sidecar_path:?}")),
+                escape_diag(&error.to_string())
+            );
+            return Err(1);
+        }
+    };
+    let sidecar = match RendererSidecar::parse(&sidecar_bytes, &RendererLimits::new()) {
+        Ok(sidecar) => sidecar,
+        Err(error) => {
+            diagnose_stage("レンダラsidecarの解析に失敗した", &error);
+            return Err(1);
+        }
+    };
+    let mut views = Vec::with_capacity(model.meshes.len());
+    for mesh in &model.meshes {
+        let Some(owner) = file.model(mesh.model) else {
+            eprintln!(
+                "所有モデルがFBXに無い: {}",
+                escape_diag(&format!("{:?}", mesh.model.value()))
+            );
+            return Err(1);
+        };
+        views.push(RendererMeshView {
+            model_name: owner.name.as_str(),
+            slot_count: mesh.material_slots.len(),
+        });
+    }
+    let plan = match plan_renderer_assignment(&sidecar, fbx_bytes, &views) {
+        Ok(plan) => plan,
+        Err(error) => {
+            diagnose_stage("レンダラ割当の解決に失敗した", &error);
+            return Err(1);
+        }
+    };
+    eprintln!(
+        "レンダラ割当: FBX一致 {} sha256:{}",
+        escape_diag(&plan.matched_model_path),
+        plan.matched_model_sha256
+    );
+    let Some(root) = assets_root else {
+        eprintln!(
+            "レンダラ割当には材質配置が必要である: {}",
+            escape_diag(&format!("{sidecar_path:?}"))
+        );
+        return Err(1);
+    };
+    let (materials, material_report) =
+        match load_renderer_materials(root, &plan.pool, &MaterialOptions::new()) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                diagnose_stage("レンダラ材質の読み取りに失敗した", &error);
+                return Err(1);
+            }
+        };
+    for warning in material_report.warnings() {
+        eprintln!("材質の警告: {}", escape_diag(warning));
+    }
+    let report = match apply_renderer_plan(model, &plan, &materials) {
+        Ok(report) => report,
+        Err(error) => {
+            diagnose_stage("レンダラ割当の適用に失敗した", &error);
+            return Err(1);
+        }
+    };
+    eprintln!(
+        "レンダラ割当: 有効{}件 除外{}件（{}） 材質プール{}件",
+        plan.active_count(),
+        report.excluded_count,
+        escape_diag(&report.excluded_names.join(", ")),
+        report.pool_count
+    );
+    Ok((materials, report))
 }
 
 /// meta権限9項目のCLI上書き指定。指定が無い列挙は既定値のままにする。

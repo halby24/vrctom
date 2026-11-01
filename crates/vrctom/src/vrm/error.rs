@@ -85,6 +85,8 @@ pub enum VrmErrorKind {
     InvalidPhysicsSidecar,
     /// sidecarのノードを `VrmModel` に対応付けできない場合。
     UnresolvedPhysicsNode,
+    /// レンダラsidecarの書式・参照・割当の検証に失敗した場合。
+    InvalidRendererSidecar,
     /// sidecarとモデルの座標変換が単一の行列に一致しない場合。
     PhysicsCoordinateMismatch,
     /// 平面colliderや参照姿勢など、今回未対応の機能がある場合。

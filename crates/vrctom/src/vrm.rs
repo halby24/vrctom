@@ -26,6 +26,7 @@ mod material;
 pub(crate) mod matrix;
 mod mesh;
 pub mod physics;
+pub mod renderers;
 
 pub use error::{VrmError, VrmErrorKind};
 pub use export::{
@@ -52,6 +53,13 @@ pub use physics::{
     VrmNodeConstraintKind, VrmRollAxis, VrmSpring, VrmSpringBones, VrmSpringCollider,
     VrmSpringColliderExtension, VrmSpringColliderGroup, VrmSpringColliderShape, VrmSpringJoint,
     VrmSpringJointLimit, ZeroLengthJoint, apply_humanoid_t_pose, compile_springs,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use renderers::load_renderer_materials;
+pub use renderers::{
+    RendererApplyReport, RendererEntry, RendererLimits, RendererMesh, RendererMeshAssignment,
+    RendererMeshView, RendererPlan, RendererPoolEntry, RendererSidecar, apply_renderer_plan,
+    plan_renderer_assignment,
 };
 use std::collections::{HashMap, HashSet};
 
