@@ -65,8 +65,11 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         physics: Option<PathBuf>,
         /// レンダラsidecar（JSON）のパス。指定時はPrefabの割当と有効状態を使う。
-        #[arg(long, value_name = "FILE")]
+        #[arg(long, value_name = "FILE", conflicts_with = "prefab")]
         renderers: Option<PathBuf>,
+        /// Prefabのパス。指定時はPrefabの改変内容または直接記述から割当と有効状態を使う。
+        #[arg(long, value_name = "FILE")]
+        prefab: Option<PathBuf>,
         /// アバターの人格権の扱い。既定は `only-author`。
         #[arg(long, value_enum, value_name = "PERMISSION")]
         avatar_permission: Option<AvatarPermissionArg>,
@@ -221,6 +224,7 @@ fn main() {
             expressions,
             physics,
             renderers,
+            prefab,
             avatar_permission,
             commercial_usage,
             credit_notation,
@@ -239,6 +243,7 @@ fn main() {
             expressions,
             physics,
             renderers,
+            prefab,
             ExportMetaArgs {
                 avatar_permission,
                 commercial_usage,
@@ -393,6 +398,7 @@ fn export(
     expressions: Option<ExpressionProfile>,
     physics: Option<PathBuf>,
     renderers: Option<PathBuf>,
+    prefab: Option<PathBuf>,
     meta_args: ExportMetaArgs,
 ) -> i32 {
     // 既定出力先は入力の拡張子を `vrm` に変えたパスとする。
@@ -635,20 +641,20 @@ fn export(
         Some(dir) => Some(assets_root_of(&dir)),
         None => assets_root_from_ancestors(&input),
     };
-    let use_renderers = renderers.is_some();
-    // レンダラsidecarの指定時は、対応付けと除外が通ってから材質プールを読む。
+    let use_assignment = renderers.is_some() || prefab.is_some();
+    // レンダラsidecar・Prefabの指定時は、対応付けと除外が通ってから材質プールを読む。
     // 失敗時はモデルを部分更新しない。wasmでは未対応として終了する。
     #[cfg(target_arch = "wasm32")]
-    let renderer_out: Option<(VrmMaterials, RendererApplyReport)> = {
-        if use_renderers {
-            eprintln!("レンダラ割当は wasm では未対応である");
+    let assignment_out: Option<(VrmMaterials, RendererApplyReport)> = {
+        if use_assignment {
+            eprintln!("レンダラ・Prefab割当は wasm では未対応である");
             return 1;
         }
         None
     };
     #[cfg(not(target_arch = "wasm32"))]
-    let renderer_out: Option<(VrmMaterials, RendererApplyReport)> = match renderers {
-        Some(sidecar_path) => {
+    let assignment_out: Option<(VrmMaterials, RendererApplyReport)> = match (renderers, prefab) {
+        (Some(sidecar_path), None) => {
             match apply_renderer_sidecar(
                 &mut model,
                 &file,
@@ -660,13 +666,29 @@ fn export(
                 Err(code) => return code,
             }
         }
-        None => None,
+        (None, Some(prefab_path)) => {
+            match apply_prefab_assignment(
+                &mut model,
+                &file,
+                &prefab_path,
+                &input,
+                assets_root.as_deref(),
+            ) {
+                Ok(out) => Some(out),
+                Err(code) => return code,
+            }
+        }
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            eprintln!("--renderers と --prefab は同時に指定できない");
+            return 2;
+        }
     };
     let mut export_options = VrmExportOptions::new(meta);
     let mut material_count = 0usize;
-    if let Some((renderer_materials, _)) = renderer_out {
-        material_count = renderer_materials.entries().len();
-        export_options = export_options.with_materials(renderer_materials);
+    if let Some((assigned_materials, _)) = assignment_out {
+        material_count = assigned_materials.entries().len();
+        export_options = export_options.with_materials(assigned_materials);
     } else if let Some(root) = assets_root {
         match VrmMaterials::load(&root, &input, &MaterialOptions::new()) {
             Ok((Some(materials), report)) => {
@@ -733,7 +755,7 @@ fn export(
         vrm_bytes.len(),
         escape_diag(&format!("{destination:?}"))
     );
-    if !use_renderers {
+    if !use_assignment {
         eprintln!("材質の解決: FBXの置換表経路であり、Prefab の割当・有効状態は未反映である");
     }
     if let Some(summary) = spring_summary {
@@ -827,6 +849,211 @@ fn apply_renderer_sidecar(
     };
     eprintln!(
         "レンダラ割当: 有効{}件 除外{}件（{}） 材質プール{}件",
+        plan.active_count(),
+        report.excluded_count,
+        escape_diag(&report.excluded_names.join(", ")),
+        report.pool_count
+    );
+    Ok((materials, report))
+}
+
+/// Prefabを中間モデルへ適用し、材質プールと適用報告を返す。
+///
+/// Prefabの読み取り・入力FBXのGUID照合・取り込みIDでの対応付け・材質プールの
+/// 読み取り・除外と割当の適用を順に行う。いずれかの段階で失敗した場合は
+/// 診断を標準エラーに出し、終了コード1を返す。成功時はモデルを更新する。
+/// 材質配置が無い場合は `.fbx.meta` と `.mat` を読めないため失敗する。
+/// 索引は一度だけ走査し、計画と読み取りで共有する。
+#[cfg(not(target_arch = "wasm32"))]
+fn apply_prefab_assignment(
+    model: &mut VrmModel,
+    file: &FbxFile<'_>,
+    prefab_path: &std::path::Path,
+    input: &std::path::Path,
+    assets_root: Option<&std::path::Path>,
+) -> Result<(VrmMaterials, RendererApplyReport), i32> {
+    use vrctom::unity::{IndexOptions, ParseOptions, SerializedFile, scan_directory};
+    use vrctom::vrm::{
+        PrefabMeshView, apply_prefab_plan, load_renderer_materials_with_index,
+        plan_prefab_assignment, prefab_base_materials, prefab_hierarchy_paths,
+        resolve_prefab_pool_paths,
+    };
+
+    let prefab_label = format!("{prefab_path:?}");
+    let prefab_bytes = match std::fs::read(prefab_path) {
+        Ok(prefab_bytes) => prefab_bytes,
+        Err(error) => {
+            eprintln!(
+                "Prefabを読み込めない: {}: {}",
+                escape_diag(&prefab_label),
+                escape_diag(&error.to_string())
+            );
+            return Err(1);
+        }
+    };
+    let prefab = match SerializedFile::parse(&prefab_bytes, &ParseOptions::new()) {
+        Ok(prefab) => prefab,
+        Err(error) => {
+            diagnose_stage("Prefabの解析に失敗した", &error);
+            return Err(1);
+        }
+    };
+    let Some(root) = assets_root else {
+        eprintln!(
+            "Prefab割当には材質配置が必要である: {}",
+            escape_diag(&prefab_label)
+        );
+        return Err(1);
+    };
+    // 以降の索引・正規化は `.fbx.meta` の読み取りと同じ手順であり、
+    // 材質経路の `VrmMaterials::load` と対応する。
+    let canonical_root = match std::fs::canonicalize(root) {
+        Ok(canonical_root) => canonical_root,
+        Err(error) => {
+            eprintln!(
+                "材質の走査元を解決できない: {}: {}",
+                escape_diag(&format!("{root:?}")),
+                escape_diag(&error.to_string())
+            );
+            return Err(1);
+        }
+    };
+    let canonical_assets = match std::fs::canonicalize(canonical_root.join("Assets")) {
+        Ok(canonical_assets) => canonical_assets,
+        Err(error) => {
+            eprintln!(
+                "材質のAssetsを解決できない: {}: {}",
+                escape_diag(&format!("{:?}", canonical_root.join("Assets"))),
+                escape_diag(&error.to_string())
+            );
+            return Err(1);
+        }
+    };
+    let canonical_fbx = match std::fs::canonicalize(input) {
+        Ok(canonical_fbx) => canonical_fbx,
+        Err(error) => {
+            eprintln!(
+                "FBXを解決できない: {}: {}",
+                escape_diag(&format!("{input:?}")),
+                escape_diag(&error.to_string())
+            );
+            return Err(1);
+        }
+    };
+    let relative = canonical_fbx
+        .strip_prefix(&canonical_assets)
+        .ok()
+        .and_then(|path| {
+            path.components()
+                .map(|component| component.as_os_str().to_str().map(str::to_owned).ok_or(()))
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+        })
+        .map(|parts| parts.join("/").replace('\\', "/"));
+    let Some(relative) = relative else {
+        eprintln!(
+            "Prefab割当のFBXがAssets配下にない: {}",
+            escape_diag(&format!("{input:?}"))
+        );
+        return Err(1);
+    };
+    let index = match scan_directory(&canonical_assets, &IndexOptions::default()) {
+        Ok(index) => index,
+        Err(error) => {
+            diagnose_stage("材質の索引化に失敗した", &error);
+            return Err(1);
+        }
+    };
+    let Some(record) = index.get_by_path(&relative) else {
+        eprintln!("Prefab割当のFBXが索引にない: {}", escape_diag(&relative));
+        return Err(1);
+    };
+    let fbx_guid = record.meta.guid().as_str().to_owned();
+    let remaps = match record.meta.external_object_remaps() {
+        Ok(remaps) => remaps,
+        Err(error) => {
+            diagnose_stage("FBXの置換表を読めない", &error);
+            return Err(1);
+        }
+    };
+    let base = prefab_base_materials(&remaps);
+    let nodes = match prefab_hierarchy_paths(file) {
+        Ok(nodes) => nodes,
+        Err(error) => {
+            diagnose_stage("Prefab割当の階層パスを作れない", &error);
+            return Err(1);
+        }
+    };
+    let at: std::collections::HashMap<i64, usize> = file
+        .models()
+        .iter()
+        .enumerate()
+        .map(|(index, model)| (model.id.value(), index))
+        .collect();
+    let mut views = Vec::with_capacity(model.meshes.len());
+    for mesh in &model.meshes {
+        let Some(owner) = file.model(mesh.model) else {
+            eprintln!(
+                "所有モデルがFBXに無い: {}",
+                escape_diag(&format!("{:?}", mesh.model.value()))
+            );
+            return Err(1);
+        };
+        let Some(&node_index) = at.get(&owner.id.value()) else {
+            eprintln!(
+                "所有モデルが階層に無い: {}",
+                escape_diag(&format!("{:?}", owner.id.value()))
+            );
+            return Err(1);
+        };
+        views.push(PrefabMeshView {
+            model_name: owner.name.as_str(),
+            hierarchy_path: nodes[node_index].path.as_str(),
+            slot_names: mesh.material_slots.as_slice(),
+        });
+    }
+    let mut plan = match plan_prefab_assignment(&prefab, &prefab_label, &fbx_guid, &base, &views) {
+        Ok(plan) => plan,
+        Err(error) => {
+            diagnose_stage("Prefab割当の解決に失敗した", &error);
+            return Err(1);
+        }
+    };
+    let mode = match plan.mode {
+        vrctom::vrm::PrefabMode::Instance => "改変内容",
+        vrctom::vrm::PrefabMode::Direct => "直接記述",
+    };
+    eprintln!(
+        "Prefab割当: FBX一致 {} guid:{}",
+        escape_diag(&relative),
+        plan.fbx_guid
+    );
+    resolve_prefab_pool_paths(&mut plan.pool, &index);
+    let (materials, material_report) = match load_renderer_materials_with_index(
+        &canonical_assets,
+        &index,
+        &plan.pool,
+        &MaterialOptions::new(),
+    ) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            diagnose_stage("Prefab材質の読み取りに失敗した", &error);
+            return Err(1);
+        }
+    };
+    for warning in material_report.warnings() {
+        eprintln!("材質の警告: {}", escape_diag(warning));
+    }
+    let report = match apply_prefab_plan(model, &plan, &materials) {
+        Ok(report) => report,
+        Err(error) => {
+            diagnose_stage("Prefab割当の適用に失敗した", &error);
+            return Err(1);
+        }
+    };
+    eprintln!(
+        "Prefab割当: {}方式 有効{}件 除外{}件（{}） 材質プール{}件",
+        mode,
         plan.active_count(),
         report.excluded_count,
         escape_diag(&report.excluded_names.join(", ")),

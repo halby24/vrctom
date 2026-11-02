@@ -149,12 +149,80 @@ pub struct MonoBehaviour {
 ///
 /// 参照元のprefabへの参照を型付きで持ち、改変内容などの残りは
 /// 汎用データのまま [`PrefabInstance::extra`] に残す。
+/// 改変内容の型付き読み取りは [`PrefabInstance::modifications`] を使う。
 #[derive(Debug, Clone)]
 pub struct PrefabInstance {
     /// 参照元のprefabへの参照。
     pub source: ObjectRef,
     /// 参照以外の改変内容など。順序を保ったまま残す。
     pub extra: Mapping,
+}
+
+/// `m_Modification.m_Modifications` の1件。
+///
+/// 取り込み由来の対象（FBXのサブアセットなど）への上書き1件である。
+/// `target` と `propertyPath` は必須であり、`value` と `objectReference` は
+/// 欄自体が無い場合とnullの場合に `None` になる。
+#[derive(Debug, Clone)]
+pub struct PrefabModification {
+    /// 上書き対象への参照。取り込み由来の場合はGUID付きである。
+    pub target: ObjectRef,
+    /// 上書きする欄のパス（`m_Materials.Array.data[0]`・`m_IsActive` など）。
+    pub property_path: String,
+    /// 上書きする値。欄が無い場合とnullの場合は `None` である。
+    /// 数値・真偽値・シーケンスなどYAMLの値のまま持つ。
+    pub value: Option<Value>,
+    /// 上書きする参照。欄が無い場合とnullの場合は `None` である。
+    /// `{fileID: 0}` はnull参照として `Some` のまま残し、
+    /// 呼び出し側が [`ObjectRef::is_null`] で判定する。
+    pub object_reference: Option<ObjectRef>,
+}
+
+impl PrefabInstance {
+    /// 改変内容の一覧を型付きで読む。
+    ///
+    /// `m_Modification` 自体や `m_Modifications` が無い場合とnullの場合は
+    /// 空を返す。ある場合の形状違い（写像・列でないなど）は失敗にする。
+    /// 必須欄（`target`・`propertyPath`）の欠落や形状違いも失敗にする。
+    /// 対象GUIDの一致判定や欄の解釈はしない。
+    ///
+    /// # Errors
+    ///
+    /// 改変内容の形状が壊れている場合に返す。
+    pub fn modifications(&self) -> Result<Vec<PrefabModification>, UnityError> {
+        const FIELD: &str = "m_Modification.m_Modifications";
+        let Some(modification) = self.extra.get("m_Modification") else {
+            return Ok(Vec::new());
+        };
+        if matches!(modification, Value::Null) {
+            return Ok(Vec::new());
+        }
+        let modification = modification.as_mapping().ok_or_else(|| {
+            UnityError::new(
+                UnityErrorKind::TypeMismatch,
+                "改変内容がマッピングでない: m_Modification",
+            )
+            .with_field("m_Modification".to_owned())
+        })?;
+        let Some(list) = modification.get("m_Modifications") else {
+            return Ok(Vec::new());
+        };
+        if matches!(list, Value::Null) {
+            return Ok(Vec::new());
+        }
+        let items = list.as_sequence().ok_or_else(|| {
+            UnityError::new(
+                UnityErrorKind::TypeMismatch,
+                "改変内容がシーケンスでない: m_Modifications",
+            )
+            .with_field(FIELD.to_owned())
+        })?;
+        items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| decode_modification(item, index))
+            .collect()
+    }
 }
 
 /// `stripped` 文書の参照先。
@@ -702,5 +770,67 @@ fn decode_prefab_link(document: &Document, mapping: &Mapping) -> Result<PrefabLi
     Ok(PrefabLink {
         corresponding_source: read_ref(document, mapping, "m_CorrespondingSourceObject")?,
         extra: extra_of(mapping, CONSUMED),
+    })
+}
+
+/// 改変1件を読む。
+///
+/// 対象・欄パスは必須であり、値・参照は欠落とnullを空として読む。
+/// 欄パスの解釈（`m_Materials.Array.data[i]` など）は呼び出し側が行う。
+fn decode_modification(item: &Value, index: usize) -> Result<PrefabModification, UnityError> {
+    let field = format!("m_Modifications[{index}]");
+    let mapping = item.as_mapping().ok_or_else(|| {
+        UnityError::new(UnityErrorKind::TypeMismatch, "改変内容がマッピングでない")
+            .with_field(field.clone())
+    })?;
+    let target = mapping
+        .get("target")
+        .ok_or_else(|| {
+            UnityError::new(UnityErrorKind::TypeMismatch, "改変内容に対象がない")
+                .with_field(field.clone())
+        })
+        .and_then(|value| {
+            ObjectRef::decode_body(value).map_err(|error| {
+                if error.field().is_none() {
+                    error.with_field(format!("{field}.target"))
+                } else {
+                    error
+                }
+            })
+        })?;
+    let property_path = mapping
+        .get("propertyPath")
+        .ok_or_else(|| {
+            UnityError::new(UnityErrorKind::TypeMismatch, "改変内容に欄パスがない")
+                .with_field(field.clone())
+        })
+        .and_then(|value| {
+            value.as_str().ok_or_else(|| {
+                UnityError::new(
+                    UnityErrorKind::TypeMismatch,
+                    "改変内容の欄パスが文字列でない",
+                )
+                .with_field(format!("{field}.propertyPath"))
+            })
+        })?;
+    let value = match mapping.get("value") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.clone()),
+    };
+    let object_reference = match mapping.get("objectReference") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(ObjectRef::decode_body(value).map_err(|error| {
+            if error.field().is_none() {
+                error.with_field(format!("{field}.objectReference"))
+            } else {
+                error
+            }
+        })?),
+    };
+    Ok(PrefabModification {
+        target,
+        property_path: property_path.to_owned(),
+        value,
+        object_reference,
     })
 }

@@ -26,6 +26,7 @@ mod material;
 pub(crate) mod matrix;
 mod mesh;
 pub mod physics;
+pub mod prefab;
 pub mod renderers;
 
 pub use error::{VrmError, VrmErrorKind};
@@ -54,8 +55,15 @@ pub use physics::{
     VrmSpringColliderExtension, VrmSpringColliderGroup, VrmSpringColliderShape, VrmSpringJoint,
     VrmSpringJointLimit, ZeroLengthJoint, apply_humanoid_t_pose, compile_springs,
 };
+pub use prefab::{
+    PrefabBaseMaterial, PrefabHierarchyNode, PrefabMeshView, PrefabMode, PrefabPlan,
+    apply_prefab_plan, plan_prefab_assignment, prefab_base_materials, prefab_hierarchy_paths,
+    resolve_prefab_pool_paths,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use renderers::load_renderer_materials;
+#[cfg(not(target_arch = "wasm32"))]
+pub use renderers::load_renderer_materials_with_index;
 pub use renderers::{
     RendererApplyReport, RendererEntry, RendererLimits, RendererMesh, RendererMeshAssignment,
     RendererMeshView, RendererPlan, RendererPoolEntry, RendererSidecar, apply_renderer_plan,

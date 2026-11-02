@@ -604,12 +604,37 @@ pub fn apply_renderer_plan(
     plan: &RendererPlan,
     materials: &VrmMaterials,
 ) -> Result<RendererApplyReport, VrmError> {
-    let excluded: HashSet<usize> = plan.excluded_meshes.iter().copied().collect();
+    apply_assignment_core(
+        model,
+        &plan.assignments,
+        &plan.excluded_meshes,
+        &plan.excluded_names,
+        &plan.pool,
+        materials,
+        VrmErrorKind::InvalidRendererSidecar,
+    )
+}
+
+/// 対応付けの適用本体。sidecar由来とPrefab由来で共有する。
+///
+/// 計画の由来（sidecarかPrefabか）で失敗の種別だけを変え、
+/// 適用の手順は同じにする。呼び出し側は由来に応じた適用口
+/// （[`apply_renderer_plan`] など）を使う。
+pub(crate) fn apply_assignment_core(
+    model: &mut super::VrmModel,
+    assignments: &[RendererMeshAssignment],
+    excluded_meshes: &[usize],
+    excluded_names: &[String],
+    pool: &[RendererPoolEntry],
+    materials: &VrmMaterials,
+    kind: VrmErrorKind,
+) -> Result<RendererApplyReport, VrmError> {
+    let excluded: HashSet<usize> = excluded_meshes.iter().copied().collect();
     for preset in &model.expressions.preset {
         for bind in &preset.morph_target_binds {
             if excluded.contains(&bind.mesh) {
                 return Err(VrmError::new(
-                    VrmErrorKind::InvalidRendererSidecar,
+                    kind,
                     format!(
                         "表情の参照先が除外された: {}（メッシュ{}）",
                         preset.name, bind.mesh
@@ -618,26 +643,25 @@ pub fn apply_renderer_plan(
             }
         }
     }
-    if materials.entries().len() != plan.pool.len() {
+    if materials.entries().len() != pool.len() {
         return Err(VrmError::new(
-            VrmErrorKind::InvalidRendererSidecar,
+            kind,
             format!(
                 "材質プールの件数が計画と一致しない: {}件に対して{}件",
                 materials.entries().len(),
-                plan.pool.len()
+                pool.len()
             ),
         ));
     }
     let slot_of = |pool_index: usize| {
-        let entry = &plan.pool[pool_index];
+        let entry = &pool[pool_index];
         renderer_slot_key(&entry.guid, entry.file_id)
     };
-    let assignment_at: HashMap<usize, &RendererMeshAssignment> = plan
-        .assignments
+    let assignment_at: HashMap<usize, &RendererMeshAssignment> = assignments
         .iter()
         .map(|assignment| (assignment.mesh_index, assignment))
         .collect();
-    let mut meshes = Vec::with_capacity(plan.assignments.len());
+    let mut meshes = Vec::with_capacity(assignments.len());
     let mut remap = HashMap::new();
     for (old_index, mesh) in model.meshes.iter().enumerate() {
         let Some(assignment) = assignment_at.get(&old_index) else {
@@ -645,7 +669,7 @@ pub fn apply_renderer_plan(
         };
         if mesh.material_slots.len() != assignment.pool_indices.len() {
             return Err(VrmError::new(
-                VrmErrorKind::InvalidRendererSidecar,
+                kind,
                 format!(
                     "メッシュの材質スロット数が計画と一致しない: {}（{}に対して{}）",
                     assignment.model_name,
@@ -663,9 +687,9 @@ pub fn apply_renderer_plan(
         remap.insert(old_index, meshes.len());
         meshes.push(mesh);
     }
-    if meshes.len() != plan.assignments.len() {
+    if meshes.len() != assignments.len() {
         return Err(VrmError::new(
-            VrmErrorKind::InvalidRendererSidecar,
+            kind,
             "対応付けたメッシュ数が出力に一致しない",
         ));
     }
@@ -673,7 +697,7 @@ pub fn apply_renderer_plan(
         for bind in &mut preset.morph_target_binds {
             let Some(&next) = remap.get(&bind.mesh) else {
                 return Err(VrmError::new(
-                    VrmErrorKind::InvalidRendererSidecar,
+                    kind,
                     format!(
                         "表情の参照先が除外された: {}（メッシュ{}）",
                         preset.name, bind.mesh
@@ -685,10 +709,10 @@ pub fn apply_renderer_plan(
     }
     model.meshes = meshes;
     Ok(RendererApplyReport {
-        included_count: plan.assignments.len(),
-        excluded_count: plan.excluded_meshes.len(),
-        excluded_names: plan.excluded_names.clone(),
-        pool_count: plan.pool.len(),
+        included_count: assignments.len(),
+        excluded_count: excluded_meshes.len(),
+        excluded_names: excluded_names.to_owned(),
+        pool_count: pool.len(),
     })
 }
 
@@ -710,8 +734,6 @@ pub fn load_renderer_materials(
     options: &super::material::MaterialOptions,
 ) -> Result<(VrmMaterials, MaterialReport), super::material::MaterialError> {
     use crate::unity::{IndexOptions, scan_directory};
-
-    use super::material::LoadContext;
 
     let canonical_root = std::fs::canonicalize(root).map_err(|error| {
         super::material::MaterialError::new(
@@ -748,13 +770,43 @@ pub fn load_renderer_materials(
         }
         failure
     })?;
-    let mut context = LoadContext::new(&canonical_assets, &index, options);
+    load_renderer_materials_with_index(&canonical_assets, &index, pool, options)
+}
+
+/// 索引済みの配置から材質プールを `.mat` から読み取る（Native限定）。
+///
+/// [`load_renderer_materials`] の走査済み版であり、Prefab由来の計画など
+/// 索引を先に使う場合に二重走査を避ける。`assets` は `Assets`
+/// そのものを指し、`index` はその走査結果である。
+/// 材質プールの扱いは [`load_renderer_materials`] と同じである。
+///
+/// # Errors
+///
+/// [`VrmMaterials::load`](super::material::VrmMaterials::load) と同じ条件で返す。
+/// ただし走査は行わないため、索引化の失敗は呼び出し側の責任である。
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_renderer_materials_with_index(
+    assets: &std::path::Path,
+    index: &crate::unity::AssetIndex,
+    pool: &[RendererPoolEntry],
+    options: &super::material::MaterialOptions,
+) -> Result<(VrmMaterials, MaterialReport), super::material::MaterialError> {
+    use super::material::LoadContext;
+
+    let mut context = LoadContext::new(assets, index, options);
     for entry in pool {
-        let slot = renderer_slot_key(&entry.guid, entry.file_id);
-        context.load_renderer_material(&entry.guid, &entry.path, &slot)?;
+        context.load_renderer_material(&entry.guid, &entry.path, &slot_key_of(entry))?;
     }
     context.assign_render_queue_offsets();
     Ok(context.finish())
+}
+
+/// 材質プール1件に対応する材質スロット名を作る.
+///
+/// sidecar由来とPrefab由来で同じ写像を使い、書き出し側の共有に合流させる。
+#[cfg(not(target_arch = "wasm32"))]
+fn slot_key_of(entry: &RendererPoolEntry) -> String {
+    renderer_slot_key(&entry.guid, entry.file_id)
 }
 
 /// FBXバイト列のSHA-256を小文字hexで返す。

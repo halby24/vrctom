@@ -39,6 +39,8 @@ FBXの材質スロット名は `.fbx.meta` の `externalObjects` が持つ
 `--renderers` を指定した場合は、レンダラsidecar
 （`tools/unity/README.md` の「RendererSidecarExporter」の節）の
 「レンダラ→材質」の割当を使い、FBXの置換表は使わない。
+`--prefab` を指定した場合はPrefab自体から同じ割当を解決する
+（[`Prefabによる割当`](#prefabによる割当--prefab)を参照）。
 詳しくは [`レンダラsidecarによる割当`](#レンダラsidecarによる割当--renderers) を参照。
 
 `.mat` はUnity YAMLとして読み、`Material` の代表型を使う。
@@ -107,6 +109,65 @@ flowchart TB
 - 内部では「材質プール＋（メッシュ、ローカルスロット）→材質」の割当表に
   正規化し、メッシュ側は既存の `primitive.material` の引き方を保つ
   （`VrmMaterialEntry.slot` の意味は変えない）。
+
+## Prefabによる割当（`--prefab`）
+
+Unityを回さずにPrefabから材質割当と出力対象レンダラを解決する入力であり、
+`--renderers` と同じ正規化（材質プール＋割当表＋除外）に合流する。
+材質の写像・ベイク・解像度合わせは共通コードを通し、新しいシェーダ変換器は作らない。
+`--renderers` との同時指定は引数エラー、`--assets` は必須、wasmでは未対応である。
+
+```mermaid
+flowchart TB
+    prefab[Prefab YAML<br/>改変内容か直接記述] --> id[取り込みID算出<br/>XXH64・seed 0]
+    fbx[FBXモデル階層<br/>階層パス] --> id
+    id --> assign[対応付け<br/>Model名で解決]
+    assign --> pool[材質プール<br/>guidとfileIDで同一性判定]
+    pool --> apply[除外と割当の適用<br/>sidecar経路と同一本体]
+```
+
+- 対象範囲は2方式である。入力FBXへの `PrefabInstance` がちょうど1件ある
+  場合は改変内容（`m_Modification.m_Modifications`）を読み、無い場合は
+  直接書かれた `SkinnedMeshRenderer` 文書を読む。混在・複数は先勝ちにせず失敗する。
+- 取り込みIDは2019.3以降の新方式（XXH64・seed 0・符号付きi64へ写像）で算出する。
+  対象文字列は種類で決まる。メッシュは所有モデルの名前だけから作り、
+  階層は含まない。ゲームオブジェクトと描画設定はFBXのModel階層のパスから作る。
+
+  | 対象 | 対象文字列 |
+  |---|---|
+  | メッシュ | `Type:Mesh->{モデル名}0` |
+  | ゲームオブジェクト | `Type:GameObject->//RootNode/root/{階層パス}0` |
+  | 描画設定 | `Type:SkinnedMeshRenderer->//RootNode/root/{階層パス}/SkinnedMeshRenderer0` |
+
+  取り込みルート自身は階層パスが空であり、`Type:GameObject->//RootNode/root0`
+  になる。資産に依らず同値であり、s&box側の実装でも取り込みルートの固定値として
+  同じ文字列を扱う。末尾の `0` は衝突番号であり、実データでは常に0である。
+- 根拠は実データの突き合わせである。マヌカの22レンダラの改変対象と
+  `m_Modifications` の `target` が全件一致し、シフォンの14件と
+  `m_IsActive: 0` の対象（`Bra` のゲームオブジェクト）も一致する。
+  ミルク・カリンはsidecarが無いため `.fbx.meta` 経路との整合確認に留める。
+- 2019.3より前の取り込み方式（`.meta` の `fileIDToRecycleName`）は未対応である。
+  新方式で解決できない対象は失敗させ、理由（旧方式は未対応）を文面に残す。
+  過去方式のフォールバックは作らない。
+- 有効とは描画設定が有効かつ自階層がすべて有効な場合だけであり、
+  祖先の `m_IsActive: 0` は子にも効く。取り込みルートの無効も子に効く。
+  無効なメッシュは出力しない。既定は有効である。
+- 改変で上書きされないスロットは `.fbx.meta` の `UnityEngine:Material` 置換表から
+  引く。置換表にも無い場合は材質GUID不在として失敗する。
+  部分上書きの残りは元配列（FBX取り込みの材質）であり、実データ（Milfy・シフォンで
+  上書きが無い・全スロットが置換表にある・マヌカで全スロットが上書きされる）で
+  確かめた。上書きの添字が材質数を超える場合も失敗する。
+- 材質参照がnullまたはGUIDなしの場合、材質数とスロット数が合わない場合、
+  メッシュIDが重複する場合、1つのメッシュに複数の有効レンダラが対応する場合は
+  先勝ちにせず失敗し、対象の名前や件数を文面に含める。
+  直接記述方式で入力FBXを指す描画設定が無い場合（Prefabが入力FBXを含まない）は
+  失敗する。改変の対象GUIDが入力FBXでない項目は別資産のものとして無視する。
+- 出典はUnityディスカッションの回答（2019.3以降の新方式が対象文字列のXXH64で
+  あること・旧方式が `fileIDToRecycleName` であること・末尾が衝突番号であること:
+  [FBX Submesh FileIDs](https://discussions.unity.com/t/fbx-submesh-fileids/803882)、
+  [How to control fileID using custom ScriptedImporter](https://discussions.unity.com/t/how-to-control-fileid-using-custom-scriptedimporter/905628)）と
+  s&boxの実装（`Editor/Core/UnityFileId.cs` のXXH64互換実装と取り込みルート固定値、
+  [sbox.gameのgrubs](https://sbox.game/grubs/importunitypackage/source?file=Editor%2FCore%2FUnityFileId.cs)）である。
 
 ## 色空間
 

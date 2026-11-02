@@ -87,6 +87,8 @@ pub enum VrmErrorKind {
     UnresolvedPhysicsNode,
     /// レンダラsidecarの書式・参照・割当の検証に失敗した場合。
     InvalidRendererSidecar,
+    /// Prefabの参照・改変内容・割当の検証に失敗した場合。
+    InvalidPrefab,
     /// sidecarとモデルの座標変換が単一の行列に一致しない場合。
     PhysicsCoordinateMismatch,
     /// 平面colliderや参照姿勢など、今回未対応の機能がある場合。

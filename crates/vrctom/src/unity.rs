@@ -21,6 +21,7 @@
 //! ディレクトリ走査だけがNative限定である。
 
 mod error;
+mod file_id;
 mod hierarchy;
 mod index;
 mod meta;
@@ -32,6 +33,7 @@ mod yaml;
 mod native;
 
 pub use error::{UnityError, UnityErrorKind};
+pub use file_id::{game_object_file_id, mesh_file_id, skinned_mesh_renderer_file_id};
 pub use hierarchy::{HierarchyOptions, LocalHierarchy, LocalNode};
 pub use index::{AssetIndex, AssetRecord, IndexOptions, ReferenceLocation};
 pub use meta::{AssetKind, AssetMeta, ExternalObjectEntry, Importer};
@@ -39,7 +41,7 @@ pub use meta::{AssetKind, AssetMeta, ExternalObjectEntry, Importer};
 pub(crate) use meta::classify;
 pub use objects::{
     GameObject, Material, MonoBehaviour, NamedProperty, PrefabInstance, PrefabLink,
-    SkinnedMeshRenderer, TextureEnvironment, Transform, TypedObject,
+    PrefabModification, SkinnedMeshRenderer, TextureEnvironment, Transform, TypedObject,
 };
 pub(crate) use reference::read_guid;
 pub use reference::{FileId, Guid, ObjectRef};

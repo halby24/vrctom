@@ -15,6 +15,9 @@ yaml_serde = "0.10"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # MMD標準フェイシャルモーフ名の突き合わせに使うNFKC正規化。純Rustでwasmでも動く。
 unicode-normalization = "0.1"
+# Unity 2019.3 以降のFBX取り込みが生成する fileID（XXH64・seed 0）。
+# 純Rustでありwasmでも使う。
+xxhash-rust = { version = "0.8", default-features = false, features = ["xxh64"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tempfile = "3"
