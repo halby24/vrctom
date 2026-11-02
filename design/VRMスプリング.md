@@ -301,3 +301,74 @@ flowchart LR
   明示的な失敗にする。
 - 対応表の鍵に `scenePath` は使わない。シーンルート名はUnity側の都合で変わるため、
   FBX由来の `source.path` を正とする。
+
+## Prefabからの導出（Unity不要）
+
+Unityを回さずに `--prefab` から同じsidecarをRustだけで導出する。
+入口は `vrm::physics_prefab::derive_physics_sidecar` であり、
+FBXバイト列・Assets配置（`.meta` 読み取り用）・Prefab文書から組み立てる。
+出力は既存sidecarと同一スキーマ（`format: vrctom.physics`, `schemaVersion: 1`）であり、
+`generator` と `capture` の採取メタ以外はフィールド単位で一致させる。
+
+情報源と対応付けは次のとおりである。
+
+- ノード：アバタールート配下のTransformをDFSで `n:N` 化する。
+  親子・名前・兄弟順（`siblingIndex`）・シーンパス（`scenePath`）・出所（`source`）・
+  参照出所（`referenceSource`）・参照ローカル（`referenceLocal`）を持つ。
+  FBX由来ノードはPrefab→FBXと遡った最外の対応から `modelId`・`path`・`assetGuid`・
+  `localId` を求める。Prefab直付けやシーン追加は `source: null` である。
+  取り込みfileIDは `unity::file_id` の規則
+  （`Type:Transform->//RootNode/root/{path}/Transform0` のXXH64）で求め、
+  PrefabのGameObject/Transform文書とFBXモデル内ノードを対応付ける。
+- humanoid：`.fbx.meta` の `humanDescription.human`（`boneName`→`humanName`）と
+  `humanDescription.skeleton`（`{name, position, rotation, scale}`）から作る。
+  sidecarの `humanoid.bones[].tPose` はskeletonをTransform名で引いたものである。
+  `.meta` の `humanName` は空白を含む（`Left Thumb Proximal`）ため、
+  空白除去で正規化して `HumanBodyBones` 名（`LeftThumbProximal`）と突き合わせる。
+- 型判定：MonoBehaviourのscript参照（`guid`＋`fileID`）をMD4で計算して突き合わせる。
+  `MD4("s\0\0\0" + namespace + className)` の先頭4バイトをLE int32として読み、
+  guidがVRChatのDLLかも確かめる。MD4は自前実装であり、既知ベクタ
+  `MD4("") = 31d6cfe0d16ae931b73c59d7e0c089c0` で裏付ける。
+  実測6組（PhysBone・Collider・RotationConstraint・AvatarDescriptor・HeadChop・
+  ContactReceiver）で検証する。未知のDLL型は黙って落とさず失敗する。
+- 参照姿勢：`statePolicy` は `bind-pose` 相当であり、ノードのローカル変換は
+  Bodyのbind行列（ボーン数最大→`Body` 優先→頂点数→階層順）から復元する。
+  `bindWorld = meshWorld * bindpose.inverse` と同じ選び方であり、
+  当方はFBXのbind行列（BindPose）から同じ計算をする。
+  FBXの右手系からUnityの左手系への写像として、位置Xと回転Y/Zの符号を反転させる。
+  Prefab数値はUnityのfloat32へ量子化する（`0.7` は `0.699999988...` になる）。
+  親が同じSMRのボーンなら親のbind世界、そうでなければ親のscene現在行列を使い、
+  `local = parentWorld.inverse * boneWorld` を分解する。鏡像はX軸に寄せ、
+  TRSに戻らない場合は `bind-decomposed-approx` として申告する。
+- PhysBone：有効なものだけ（`enabled && activeInHierarchy`）を収録する。
+  全フィールド（pull/spring/stiffness/gravity/gravityFalloff/immobile/radius/
+  allowCollision/limits/ignoreNodeIds/endpointPosition/multiChildType等）を
+  Prefabから読み、`AnimationCurve` 形式（値＋キー＋wrap）も再現する。
+  Prefabの `2`（Loop）は `8`（ClampForever）に読み替える。重み付きは拒否する。
+  制約の `Sources.source{i}` は番号順に読み、末尾のnullを落とす。
+  中間のnullは空IDで残す。`GlobalWeight` 等もfloat32へ量子化する。
+- Collider・Constraint・lookAt・unsupportedFeaturesも同様にPrefabから読む。
+  lookAtはdescriptorの生値を写し、目はノードID体系で空文字許容とする。
+  決定性はノードDFS順→取得順（文書順）である。
+
+失敗条件は次のとおりであり、いずれも黙って落とさず明示的に失敗する。
+
+- 型判定不能（未知のDLL型）。
+- 参照解決不能（対象・参照先・ignore・collider・制約の解決不能）。
+- 2019.3より前のFBX取り込み方式（`.meta` の `fileIdsGeneration != 2`）。
+- 無関係な成分（Contact等）は無視してよいが、無視した型名をレポートに残す。
+
+現状の制約として、スマホ副階層（KumaPhone配下の32ノード）のgraftは未実装であり、
+導出は255ノードに留まる（正解287ノード）。Ahogeの2ノードに微差
+（回転0.0008度・位置1e-7・拡大率5e-6、quaternionの符号反転を含む）が残る。
+
+さらに、**導出した物理を適用した出力は、Unityのsidecarを使った出力と骨の姿勢が一致しない**。
+実測（Milfy）では `Shoulder.L` / `Shoulder.R` が約179度、`Thumb Proximal.L` が約95度、
+`Upper_arm.L` が約3度ずれる。spring 45・joint 148・collider 12・center 43・
+constraint 8・humanoid 53・limit 71 という件数は一致するが、姿勢が違うため
+**実運用には使えない**。原因はノード対応（副階層を含めたID・経路の対応付け）と
+rest姿勢の復元のいずれかであり、まだ切り分けていない。
+
+そのためCLIでは `--physics-from-prefab` を明示したときだけ導出経路を使い、
+既定ではsidecar（`--physics`）を要求する。導出経路を既定にするのは、
+上記の姿勢差を解消し、sidecar経路とVRMバイト一致を確認した後にする。

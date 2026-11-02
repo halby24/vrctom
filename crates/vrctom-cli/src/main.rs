@@ -70,6 +70,9 @@ enum Command {
         /// Prefabのパス。指定時はPrefabの改変内容または直接記述から割当と有効状態を使う。
         #[arg(long, value_name = "FILE")]
         prefab: Option<PathBuf>,
+        /// 物理sidecarを `--prefab` から導出する（実験的）。`--physics` 指定時は使わない。
+        #[arg(long, requires = "prefab")]
+        physics_from_prefab: bool,
         /// アバターの人格権の扱い。既定は `only-author`。
         #[arg(long, value_enum, value_name = "PERMISSION")]
         avatar_permission: Option<AvatarPermissionArg>,
@@ -225,6 +228,7 @@ fn main() {
             physics,
             renderers,
             prefab,
+            physics_from_prefab,
             avatar_permission,
             commercial_usage,
             credit_notation,
@@ -244,6 +248,7 @@ fn main() {
             physics,
             renderers,
             prefab,
+            physics_from_prefab,
             ExportMetaArgs {
                 avatar_permission,
                 commercial_usage,
@@ -399,6 +404,7 @@ fn export(
     physics: Option<PathBuf>,
     renderers: Option<PathBuf>,
     prefab: Option<PathBuf>,
+    physics_from_prefab: bool,
     meta_args: ExportMetaArgs,
 ) -> i32 {
     // 既定出力先は入力の拡張子を `vrm` に変えたパスとする。
@@ -462,6 +468,13 @@ fn export(
             report.bind_cluster_models, report.bind_rest_models
         );
     }
+    // 材質配置の解決は物理導出（Prefabからのsidecar生成）でも使うため、物理より先に確定させる。
+    // 指定時はその配置、省略時はFBXの祖先の `Assets` から求める。
+    let explicit_assets = assets.is_some();
+    let assets_root = match assets {
+        Some(dir) => Some(assets_root_of(&dir)),
+        None => assets_root_from_ancestors(&input),
+    };
     // 物理sidecarの指定時は、解決とコンパイルが通ってから代入する。
     // 失敗時はモデルを部分更新しない。
     let mut spring_summary: Option<String> = None;
@@ -484,163 +497,35 @@ fn export(
                 return 1;
             }
         };
-        let resolution = match model.resolve_physics_sidecar(&sidecar, &bytes) {
-            Ok(resolution) => resolution,
-            Err(error) => {
-                diagnose_stage("物理sidecarの解決に失敗した", &error);
-                return 1;
-            }
-        };
-        // humanoidのrest姿勢はsidecarのT-poseを優先する。無い骨は
-        // ノードの姿勢のまま残す。参照実装もリグ構築直後にT-poseを当ててから
-        // 物理を解決するため、視線の測定とスプリングの生成より前に適用する。
-        // 失敗時はモデルを部分更新せず打ち切る。
-        let (tpose_applied, tpose_skipped) = match apply_humanoid_t_pose(
-            &sidecar,
-            &mut model,
-            &resolution,
-            sidecar.humanoid.as_ref(),
-        ) {
-            Ok(report) => {
-                for skipped in &report.skipped {
-                    eprintln!(
-                        "T-ポーズのスキップ: {} {}: {}",
-                        escape_diag(&skipped.bone),
-                        escape_diag(&skipped.node_id),
-                        skipped.reason,
-                    );
-                }
-                (report.applied.len(), report.skipped.len())
-            }
-            Err(error) => {
-                diagnose_stage("T-ポーズの適用に失敗した", &error);
-                return 1;
-            }
-        };
-        // 視線の解決。sidecarに視線記録が無い旧形式では何もしない。
-        // 測定も既定もここで確定する。モデルは変更しないため、
-        // 失敗時は部分更新なく打ち切る。humanoidの検出は鎖の生成より前に行い、
-        // 平面用の補助ノードの影響を受けない。
-        let look_at = match sidecar.look_at.as_ref() {
-            Some(_) => {
-                let humanoid = match HumanoidBones::detect(&model) {
-                    Ok(humanoid) => humanoid,
-                    Err(error) => {
-                        diagnose_stage("視線の解決に失敗した", &error);
-                        return 1;
-                    }
-                };
-                match resolve_look_at(&sidecar, &model, &resolution, &humanoid) {
-                    Ok(look_at) => look_at,
-                    Err(error) => {
-                        diagnose_stage("視線の解決に失敗した", &error);
-                        return 1;
-                    }
-                }
-            }
-            None => None,
-        };
-        match compile_springs(
-            &sidecar,
-            &mut model,
-            &resolution,
-            &SpringCompileOptions::new(),
-        ) {
-            Ok(compiled) => {
-                // 主要な近似件数と関節値の目安も出し、文書の制限と突き合わせられるようにする。
-                let world = compiled
-                    .report
-                    .center_applied
-                    .iter()
-                    .filter(|entry| entry.kind == vrctom::vrm::CenterKind::World)
-                    .count();
-                let all_motion = compiled
-                    .report
-                    .center_applied
-                    .iter()
-                    .filter(|entry| entry.kind == vrctom::vrm::CenterKind::AllMotion)
-                    .count();
-                let mut stiff_sum = 0.0f64;
-                let mut grav_count = 0usize;
-                let mut joint_total = 0usize;
-                for spring in &compiled.bones.springs {
-                    for joint in &spring.joints {
-                        stiff_sum += f64::from(joint.stiffness);
-                        if joint.gravity_power > 0.0 {
-                            grav_count += 1;
-                        }
-                        joint_total += 1;
-                    }
-                }
-                let stiff_mean = if joint_total > 0 {
-                    stiff_sum / joint_total as f64
-                } else {
-                    0.0
-                };
-                let summary = format!(
-                    "スプリング{}件 関節{}件 collider{}件 グループ{}件 分岐{}件 center{}件（world{} / all-motion{} / なし{}） 近似(endpoint未生成{} gravity0関節{} first-child{} 平均近似{} 平面落下{}) 関節値(硬さ平均{:.3} 重力あり{}件) 共有{}件 スキップ{}件 制約{}件 制約スキップ{}件 T-ポーズ{}件",
-                    compiled.report.spring_count,
-                    compiled.report.joint_count,
-                    compiled.report.collider_count,
-                    compiled.report.group_count,
-                    compiled.report.branch_splits.len(),
-                    compiled.report.center_applied.len(),
-                    world,
-                    all_motion,
-                    compiled.report.center_missing.len(),
-                    compiled.report.no_endpoint.len(),
-                    compiled.report.gravity_zero_joints,
-                    compiled.report.first_child_multichild.len(),
-                    compiled.report.average_approximated.len(),
-                    compiled.report.plane_colliders_dropped.len(),
-                    stiff_mean,
-                    grav_count,
-                    compiled.report.lost_nodes.len(),
-                    compiled.report.skipped_bones.len(),
-                    model.node_constraints.len(),
-                    compiled.report.skipped_constraints.len(),
-                    tpose_applied,
-                );
-                if tpose_skipped > 0 {
-                    eprintln!("T-ポーズのスキップ: {tpose_skipped}件");
-                }
-                model.spring_bones = compiled.bones;
+        match apply_physics_sidecar(&mut model, &sidecar, &bytes) {
+            Ok(summary) => {
                 spring_summary = Some(summary);
-                // 視線は鎖の生成が通ってから代入する。失敗時はモデルを更新しない。
-                if let Some((look, report)) = look_at {
-                    model.look_at = Some(look);
-                    eprintln!(
-                        "視線: lookAt={} {} 内{:.3}度 外{:.3}度 下{:.3}度 上{:.3}度 頭基準ずれ[{:.6}, {:.6}, {:.6}]",
-                        report.look_type,
-                        if report.measured {
-                            "測定値"
-                        } else {
-                            "既定値"
-                        },
-                        report.range.horizontal_inner,
-                        report.range.horizontal_outer,
-                        report.range.vertical_down,
-                        report.range.vertical_up,
-                        report.offset_from_head[0],
-                        report.offset_from_head[1],
-                        report.offset_from_head[2],
-                    );
-                }
             }
-            Err(error) => {
-                diagnose_stage("スプリングの生成に失敗した", &error);
-                return 1;
+            Err(code) => return code,
+        }
+    }
+    // `--physics-from-prefab` 指定時は、Prefabから物理sidecarを導出して同じく適用する。
+    // 採取メタ以外のフィールド単位の一致を目標にし、レポートに導出元を出す。
+    // 失敗時は型判定不能・参照解決不能・旧FBX方式として明示的に失敗する。
+    else if physics_from_prefab && let Some(prefab_path) = prefab.as_ref() {
+        match derive_physics_from_prefab(
+            &mut model,
+            &file,
+            &bytes,
+            prefab_path,
+            &input,
+            assets_root.as_deref(),
+        ) {
+            Ok(summary) => {
+                spring_summary = Some(summary);
+                eprintln!("物理: Prefab から導出");
             }
+            Err(code) => return code,
         }
     }
     let mut meta = VrmMeta::new(meta_name, meta_authors);
     apply_meta_args(&mut meta, meta_args);
-    // 材質の読み取り。指定時はその配置、省略時はFBXの祖先の `Assets` から求める。
-    let explicit_assets = assets.is_some();
-    let assets_root = match assets {
-        Some(dir) => Some(assets_root_of(&dir)),
-        None => assets_root_from_ancestors(&input),
-    };
+    // 材質の読み取りは上で確定した `assets_root` を使う。明示指定の有無は警告の扱いに使う。
     let use_assignment = renderers.is_some() || prefab.is_some();
     // レンダラsidecar・Prefabの指定時は、対応付けと除外が通ってから材質プールを読む。
     // 失敗時はモデルを部分更新しない。wasmでは未対応として終了する。
@@ -770,6 +655,281 @@ fn export(
 /// 読み取り・除外と割当の適用を順に行う。いずれかの段階で失敗した場合は
 /// 診断を標準エラーに出し、終了コード1を返す。成功時はモデルを更新する。
 /// 材質配置が無い場合は `.mat` を読めないため失敗する。
+/// レンダラsidecarを中間モデルへ適用し、材質プールと適用報告を返す。
+///
+/// sidecarの読み取り・FBXのSHA-256照合・Model名での対応付け・材質プールの
+/// 読み取り・除外と割当の適用を順に行う。いずれかの段階で失敗した場合は
+/// 診断を標準エラーに出し、終了コード1を返す。成功時はモデルを更新する。
+/// 材質配置が無い場合は `.mat` を読めないため失敗する。
+#[cfg(not(target_arch = "wasm32"))]
+fn derive_physics_from_prefab(
+    model: &mut VrmModel,
+    file: &FbxFile<'_>,
+    fbx_bytes: &[u8],
+    prefab_path: &std::path::Path,
+    input: &std::path::Path,
+    assets_root: Option<&std::path::Path>,
+) -> Result<String, i32> {
+    use vrctom::unity::{ParseOptions, SerializedFile};
+    use vrctom::vrm::derive_physics_sidecar;
+    let prefab_label = format!("{prefab_path:?}");
+    let prefab_bytes = match std::fs::read(prefab_path) {
+        Ok(prefab_bytes) => prefab_bytes,
+        Err(error) => {
+            eprintln!(
+                "Prefabを読み込めない: {}: {}",
+                escape_diag(&prefab_label),
+                escape_diag(&error.to_string())
+            );
+            return Err(1);
+        }
+    };
+    let prefab = match SerializedFile::parse(&prefab_bytes, &ParseOptions::new()) {
+        Ok(prefab) => prefab,
+        Err(error) => {
+            diagnose_stage("Prefabの解析に失敗した", &error);
+            return Err(1);
+        }
+    };
+    let Some(root) = assets_root else {
+        eprintln!(
+            "Prefabからの物理導出には材質配置が必要である: {}",
+            escape_diag(&prefab_label)
+        );
+        return Err(1);
+    };
+    // 索引・正規化は材質経路と同じ手順を使う。FBXの資産相対パスを求める。
+    let canonical_root = match std::fs::canonicalize(root) {
+        Ok(canonical_root) => canonical_root,
+        Err(error) => {
+            eprintln!(
+                "材質の走査元を解決できない: {}: {}",
+                escape_diag(&format!("{root:?}")),
+                escape_diag(&error.to_string())
+            );
+            return Err(1);
+        }
+    };
+    let canonical_assets = match std::fs::canonicalize(canonical_root.join("Assets")) {
+        Ok(canonical_assets) => canonical_assets,
+        Err(error) => {
+            eprintln!(
+                "材質のAssetsを解決できない: {}: {}",
+                escape_diag(&format!("{:?}", canonical_root.join("Assets"))),
+                escape_diag(&error.to_string())
+            );
+            return Err(1);
+        }
+    };
+    let canonical_fbx = match std::fs::canonicalize(input) {
+        Ok(canonical_fbx) => canonical_fbx,
+        Err(error) => {
+            eprintln!(
+                "FBXを解決できない: {}: {}",
+                escape_diag(&format!("{input:?}")),
+                escape_diag(&error.to_string())
+            );
+            return Err(1);
+        }
+    };
+    let relative = canonical_fbx
+        .strip_prefix(&canonical_assets)
+        .ok()
+        .and_then(|path| {
+            path.components()
+                .map(|component| component.as_os_str().to_str().map(str::to_owned).ok_or(()))
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+        })
+        .map(|parts| parts.join("/").replace('\\', "/"));
+    let Some(relative) = relative else {
+        eprintln!(
+            "Prefab割当のFBXがAssets配下にない: {}",
+            escape_diag(&format!("{input:?}"))
+        );
+        return Err(1);
+    };
+    let fbx_asset_path = format!("Assets/{relative}");
+    let fbx_asset_owned = fbx_asset_path.clone();
+    let input_ref = vrctom::vrm::PrefabDeriveInput {
+        fbx_bytes,
+        fbx: file,
+        assets_root: root,
+        prefab: &prefab,
+        prefab_label: &prefab_label,
+        fbx_asset_path: &fbx_asset_owned,
+    };
+    let derived = match derive_physics_sidecar(&input_ref) {
+        Ok(derived) => derived,
+        Err(error) => {
+            diagnose_stage("Prefabからの物理導出に失敗した", &error);
+            return Err(1);
+        }
+    };
+    for ignored in &derived.ignored_types {
+        eprintln!("物理導出の無視: {}", escape_diag(ignored));
+    }
+    let sidecar = match PhysicsSidecar::parse(&derived.json, &PhysicsLimits::new()) {
+        Ok(sidecar) => sidecar,
+        Err(error) => {
+            diagnose_stage("導出した物理sidecarの解析に失敗した", &error);
+            return Err(1);
+        }
+    };
+    apply_physics_sidecar(model, &sidecar, fbx_bytes)
+}
+
+/// 解決済みの物理sidecarを中間モデルへ適用し、要約文を返す。
+///
+/// 解決・T-pose・視線・スプリング生成が通ってからモデルを更新する。
+/// 失敗時はモデルを部分更新せず、診断を標準エラーに出して終了コードを返す。
+#[allow(clippy::too_many_lines)]
+fn apply_physics_sidecar(
+    model: &mut VrmModel,
+    sidecar: &PhysicsSidecar,
+    fbx_bytes: &[u8],
+) -> Result<String, i32> {
+    let resolution = match model.resolve_physics_sidecar(sidecar, fbx_bytes) {
+        Ok(resolution) => resolution,
+        Err(error) => {
+            diagnose_stage("物理sidecarの解決に失敗した", &error);
+            return Err(1);
+        }
+    };
+    // humanoidのrest姿勢はsidecarのT-poseを優先する。無い骨は
+    // ノードの姿勢のまま残す。参照実装もリグ構築直後にT-poseを当ててから
+    // 物理を解決するため、視線の測定とスプリングの生成より前に適用する。
+    // 失敗時はモデルを部分更新せず打ち切る。
+    let (tpose_applied, tpose_skipped) =
+        match apply_humanoid_t_pose(sidecar, model, &resolution, sidecar.humanoid.as_ref()) {
+            Ok(report) => {
+                for skipped in &report.skipped {
+                    eprintln!(
+                        "T-ポーズのスキップ: {} {}: {}",
+                        escape_diag(&skipped.bone),
+                        escape_diag(&skipped.node_id),
+                        skipped.reason,
+                    );
+                }
+                (report.applied.len(), report.skipped.len())
+            }
+            Err(error) => {
+                diagnose_stage("T-ポーズの適用に失敗した", &error);
+                return Err(1);
+            }
+        };
+    // 視線の解決。sidecarに視線記録が無い旧形式では何もしない。
+    // 測定も既定もここで確定する。モデルは変更しないため、
+    // 失敗時は部分更新なく打ち切る。humanoidの検出は鎖の生成より前に行い、
+    // 平面用の補助ノードの影響を受けない。
+    let look_at = match sidecar.look_at.as_ref() {
+        Some(_) => {
+            let humanoid = match HumanoidBones::detect(model) {
+                Ok(humanoid) => humanoid,
+                Err(error) => {
+                    diagnose_stage("視線の解決に失敗した", &error);
+                    return Err(1);
+                }
+            };
+            match resolve_look_at(sidecar, model, &resolution, &humanoid) {
+                Ok(look_at) => look_at,
+                Err(error) => {
+                    diagnose_stage("視線の解決に失敗した", &error);
+                    return Err(1);
+                }
+            }
+        }
+        None => None,
+    };
+    match compile_springs(sidecar, model, &resolution, &SpringCompileOptions::new()) {
+        Ok(compiled) => {
+            // 主要な近似件数と関節値の目安も出し、文書の制限と突き合わせられるようにする。
+            let world = compiled
+                .report
+                .center_applied
+                .iter()
+                .filter(|entry| entry.kind == vrctom::vrm::CenterKind::World)
+                .count();
+            let all_motion = compiled
+                .report
+                .center_applied
+                .iter()
+                .filter(|entry| entry.kind == vrctom::vrm::CenterKind::AllMotion)
+                .count();
+            let mut stiff_sum = 0.0f64;
+            let mut grav_count = 0usize;
+            let mut joint_total = 0usize;
+            for spring in &compiled.bones.springs {
+                for joint in &spring.joints {
+                    stiff_sum += f64::from(joint.stiffness);
+                    if joint.gravity_power > 0.0 {
+                        grav_count += 1;
+                    }
+                    joint_total += 1;
+                }
+            }
+            let stiff_mean = if joint_total > 0 {
+                stiff_sum / joint_total as f64
+            } else {
+                0.0
+            };
+            let summary = format!(
+                "スプリング{}件 関節{}件 collider{}件 グループ{}件 分岐{}件 center{}件（world{} / all-motion{} / なし{}） 近似(endpoint未生成{} gravity0関節{} first-child{} 平均近似{} 平面落下{}) 関節値(硬さ平均{:.3} 重力あり{}件) 共有{}件 スキップ{}件 制約{}件 制約スキップ{}件 T-ポーズ{}件",
+                compiled.report.spring_count,
+                compiled.report.joint_count,
+                compiled.report.collider_count,
+                compiled.report.group_count,
+                compiled.report.branch_splits.len(),
+                compiled.report.center_applied.len(),
+                world,
+                all_motion,
+                compiled.report.center_missing.len(),
+                compiled.report.no_endpoint.len(),
+                compiled.report.gravity_zero_joints,
+                compiled.report.first_child_multichild.len(),
+                compiled.report.average_approximated.len(),
+                compiled.report.plane_colliders_dropped.len(),
+                stiff_mean,
+                grav_count,
+                compiled.report.lost_nodes.len(),
+                compiled.report.skipped_bones.len(),
+                model.node_constraints.len(),
+                compiled.report.skipped_constraints.len(),
+                tpose_applied,
+            );
+            if tpose_skipped > 0 {
+                eprintln!("T-ポーズのスキップ: {tpose_skipped}件");
+            }
+            model.spring_bones = compiled.bones;
+            // 視線は鎖の生成が通ってから代入する。失敗時はモデルを更新しない。
+            if let Some((look, report)) = look_at {
+                model.look_at = Some(look);
+                eprintln!(
+                    "視線: lookAt={} {} 内{:.3}度 外{:.3}度 下{:.3}度 上{:.3}度 頭基準ずれ[{:.6}, {:.6}, {:.6}]",
+                    report.look_type,
+                    if report.measured {
+                        "測定値"
+                    } else {
+                        "既定値"
+                    },
+                    report.range.horizontal_inner,
+                    report.range.horizontal_outer,
+                    report.range.vertical_down,
+                    report.range.vertical_up,
+                    report.offset_from_head[0],
+                    report.offset_from_head[1],
+                    report.offset_from_head[2],
+                );
+            }
+            Ok(summary)
+        }
+        Err(error) => {
+            diagnose_stage("スプリングの生成に失敗した", &error);
+            Err(1)
+        }
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn apply_renderer_sidecar(
     model: &mut VrmModel,

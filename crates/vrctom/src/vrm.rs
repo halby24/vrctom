@@ -26,6 +26,7 @@ mod material;
 pub(crate) mod matrix;
 mod mesh;
 pub mod physics;
+pub mod physics_prefab;
 pub mod prefab;
 pub mod renderers;
 
@@ -55,6 +56,7 @@ pub use physics::{
     VrmSpringColliderExtension, VrmSpringColliderGroup, VrmSpringColliderShape, VrmSpringJoint,
     VrmSpringJointLimit, ZeroLengthJoint, apply_humanoid_t_pose, compile_springs,
 };
+pub use physics_prefab::{DerivedSidecar, PrefabDeriveInput, derive_physics_sidecar};
 pub use prefab::{
     PrefabBaseMaterial, PrefabHierarchyNode, PrefabMeshView, PrefabMode, PrefabPlan,
     apply_prefab_plan, plan_prefab_assignment, prefab_base_materials, prefab_hierarchy_paths,

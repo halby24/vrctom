@@ -32,6 +32,10 @@ public static class PhysicsSidecarExporter
     // 開いているシーンにアバターが見当たらない場合に開く検証用シーン。
     private const string FallbackScenePath = "Assets/Scenes/MilfyCheck.unity";
 
+    // 環境変数 VRCTOM_PHYSICS_PREFAB があれば、その Prefab を空シーンへ実体化して採取する。
+    // シーンを用意せずに任意のアバターを対象にできる。
+    private const string PrefabEnv = "VRCTOM_PHYSICS_PREFAB";
+
     private const string FormatName = "vrctom.physics";
     private const int SchemaVersion = 1;
 
@@ -148,9 +152,25 @@ public static class PhysicsSidecarExporter
     }
 
     // アバタールート (VRCAvatarDescriptor の GameObject) を探す。
+    // `VRCTOM_PHYSICS_PREFAB` があればその Prefab を空シーンに実体化して使う。
     // 選択中がアバターならそれを優先し、なければシーン内を1件だけ探す。複数はエラー。
     private static GameObject ResolveAvatarRoot(bool allowSceneFallback)
     {
+        string prefabPath = Environment.GetEnvironmentVariable(PrefabEnv);
+        if (!string.IsNullOrEmpty(prefabPath))
+        {
+            GameObject prefab = AssetDatabase.LoadAssetAtPath<GameObject>(prefabPath);
+            if (prefab == null)
+                throw new InvalidOperationException("Prefab を読めない: " + prefabPath);
+            Scene temporary = EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Single);
+            var instance = (GameObject)PrefabUtility.InstantiatePrefab(prefab, temporary);
+            var descriptors = instance.GetComponentsInChildren<VRCAvatarDescriptor>(true);
+            if (descriptors.Length != 1)
+                throw new InvalidOperationException(
+                    "Prefab 内の VRCAvatarDescriptor が1件でない: " + prefabPath + " (" + descriptors.Length + ")");
+            return descriptors[0].gameObject;
+        }
+
         GameObject selected = Selection.activeGameObject;
         if (selected != null && selected.GetComponent<VRCAvatarDescriptor>() != null) return selected;
 
