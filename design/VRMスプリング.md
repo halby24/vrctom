@@ -325,6 +325,9 @@ flowchart LR
 
 ## Prefabからの導出（Unity不要）
 
+以降に述べる sidecar（Unity採取）は**検証専用**の入力であり、外部利用は想定しない。
+実変換は `--prefab` からの導出だけを使う。
+
 Unityを回さずに `--prefab` から同じsidecarをRustだけで導出する。
 入口は `vrm::physics_prefab::derive_physics_sidecar` であり、
 FBXバイト列・Assets配置（`.meta` 読み取り用）・Prefab文書から組み立てる。

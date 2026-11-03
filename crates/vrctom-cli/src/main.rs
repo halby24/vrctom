@@ -61,7 +61,8 @@ enum Command {
         /// 表情の選択指定。`vrc` はVRChat向けの8件（あいうえお・瞬き・視線上下）を使う。
         #[arg(long, value_name = "PROFILE")]
         expressions: Option<ExpressionProfile>,
-        /// 物理sidecar（JSON）のパス。指定時はスプリングをコンパイルして載せる。
+        /// 検証用: Unity採取の物理sidecar（JSON）。比較のための入力であり、通常は使わない。
+        /// 既定では `--prefab` から物理を導出する。
         #[arg(long, value_name = "FILE")]
         physics: Option<PathBuf>,
         /// レンダラsidecar（JSON）のパス。指定時はPrefabの割当と有効状態を使う。

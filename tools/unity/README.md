@@ -1,5 +1,9 @@
 # PhysicsSidecarExporter
 
+> この sidecar は **検証専用**である。実変換は `vrctom export --prefab <prefab>` が
+> Prefab から物理を導出するため、Unity を回す必要はない。ここで作る JSON は、
+> 導出経路の答えを突き合わせるための参照データとして使う。
+
 Unity 2022.3 + VRChat SDK 3.10.5 のプロジェクトで、スプリングボーン変換用の物理 sidecar JSON
 (`format: vrctom.physics`, `schemaVersion: 1`) を書き出すエディタヘルパ。
 Rust 側の変換が読む中間ファイルを作る。シーンや Prefab の保存・変更はしない。
