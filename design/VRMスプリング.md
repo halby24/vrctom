@@ -358,17 +358,22 @@ FBXバイト列・Assets配置（`.meta` 読み取り用）・Prefab文書から
 - 2019.3より前のFBX取り込み方式（`.meta` の `fileIdsGeneration != 2`）。
 - 無関係な成分（Contact等）は無視してよいが、無視した型名をレポートに残す。
 
-現状の制約として、スマホ副階層（KumaPhone配下の32ノード）のgraftは未実装であり、
-導出は255ノードに留まる（正解287ノード）。Ahogeの2ノードに微差
-（回転0.0008度・位置1e-7・拡大率5e-6、quaternionの符号反転を含む）が残る。
+実測（Milfy）での一致状況は次のとおりである。
 
-さらに、**導出した物理を適用した出力は、Unityのsidecarを使った出力と骨の姿勢が一致しない**。
-実測（Milfy）では `Shoulder.L` / `Shoulder.R` が約179度、`Thumb Proximal.L` が約95度、
-`Upper_arm.L` が約3度ずれる。spring 45・joint 148・collider 12・center 43・
-constraint 8・humanoid 53・limit 71 という件数は一致するが、姿勢が違うため
-**実運用には使えない**。原因はノード対応（副階層を含めたID・経路の対応付け）と
-rest姿勢の復元のいずれかであり、まだ切り分けていない。
+- ノードは **287/287** で一致（副階層のgraftを含む）。
+  `parentId`・`siblingIndex`・`scenePath`・`source` は全件一致し、
+  `referenceLocal` の差は回転 最大0.000385度（`Ahoge.001`）、
+  位置 最大5.2e-7 m（0.5µm）に収まる。0.001度を超えるノードは0件。
+- PhysBone 39・Collider 12・Constraint 11・humanoid 53・lookAt は
+  **JSONとして完全一致**する。
+- 出力VRMは件数（spring 45 / joint 148 / collider 12 / center 43 /
+  constraint 8 / humanoid 53 / limit 71）が一致し、差分は516件すべて
+  浮動小数の末尾（stiffness 最大2.2e-5、hitRadius 最大3.7e-8）である。
+  バイト列は一致しない（49,565,696 対 49,565,728 バイト）が、
+  構造・骨の姿勢・材質・表情に差はない。
 
-そのためCLIでは `--physics-from-prefab` を明示したときだけ導出経路を使い、
-既定ではsidecar（`--physics`）を要求する。導出経路を既定にするのは、
-上記の姿勢差を解消し、sidecar経路とVRMバイト一致を確認した後にする。
+以上から、導出経路はUnity採取のsidecarと**実用上等価**である。
+ただしバイト一致ではないため、CLIでは `--physics-from-prefab` を明示したときだけ
+導出経路を使い、既定ではsidecar（`--physics`）を要求する。既定に切り替えるのは、
+他アバターでの確認と、浮動小数差の由来（stiffnessの骨長依存の丸め）を
+詰めてからにする。
