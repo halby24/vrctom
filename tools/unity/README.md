@@ -198,10 +198,15 @@ humanoid の要約（`humanoid=骨数(tPose省略数)`）も出す。
 - FX レイヤーのデフォルト値は収集しない。
   Plane コライダーは記録し、`plane-colliders` として申告する（Rust 側は補助ノードと
   `VRMC_springBone_extended_collider` で出力する）。
-- Prefab にレンダラが直接書かれ、FBX のインスタンスを持たないアバター（シエル・ミルク・カリン）では、
-  ノードを FBX へ帰属できないため `sourceModels` が空になる。この形の sidecar は
-  参照モデルを照合できないので、Rust 側は受け付けない。材質・ノードは
-  `--prefab` の導出経路で解決できる。
+- Prefab にレンダラが直接書かれ、FBX のインスタンスを持たないアバター（シエル・ミルク・カリン）でも、
+  骨（`SkinnedMeshRenderer.bones`）とレンダラを持つノードは、配下または祖先のメッシュから
+  FBX を決めて `source` を付ける。`sourceModels` は空にならない。
+  - Prefab で追加した補助オブジェクト（`PBCollider_*` 等）は骨でもレンダラでもないため
+    `source: null` のまま出す（Rust 側が補助ノードとして作る）。
+  - Unity が同名の兄弟に付ける ` 1` のような接尾辞は、FBX 側の名前と一致しないため
+    対応付けず `source: null` にする（推測で名前を削らない）。
+  - Prefab がメッシュを作者の親ノード（`髪` など）の下へ移している場合（シエル）、
+    経路が FBX と一致せず一部のノードが対応付かない。この場合は導出経路を使う。
 - 決定性: ノード DFS 順、コンポーネントは Transform 順（同 Transform 内は取得順）。
   同じ状態からはバイト同一の JSON になる（同一コードの再実行で md5 一致を確認）。
 - bind-pose の復元は Unity 空間（インポート適用後）の行列で行う。FBX 生値との突合せは

@@ -220,9 +220,27 @@ public static class PhysicsSidecarExporter
 
         var nodes = new NodeDto[order.Count];
         var fbxSources = new SortedDictionary<string, SourceModelDto>(StringComparer.Ordinal);
+        // FBX 由来のノード（骨とレンダラ）を先に集める。Prefab で追加した補助オブジェクト
+        // （当たり判定用の空オブジェクト等）はここに入らない。
+        var fbxNodes = new HashSet<Transform>();
+        foreach (SkinnedMeshRenderer smr in avatarRoot.GetComponentsInChildren<SkinnedMeshRenderer>(true))
+        {
+            fbxNodes.Add(smr.transform);
+            if (smr.bones == null) continue;
+            foreach (Transform bone in smr.bones)
+            {
+                if (bone != null) fbxNodes.Add(bone);
+            }
+        }
+        foreach (Renderer r in avatarRoot.GetComponentsInChildren<Renderer>(true))
+        {
+            fbxNodes.Add(r.transform);
+        }
+        var allNames = new HashSet<string>(StringComparer.Ordinal);
+        foreach (Transform tr in avatarRoot.GetComponentsInChildren<Transform>(true)) allNames.Add(tr.name);
         var unsupported = new HashSet<string>(StringComparer.Ordinal);
         for (int i = 0; i < order.Count; i++)
-            nodes[i] = BuildNode(avatarRoot, order[i], nodeIndex, fbxSources, frame, stats, unsupported);
+            nodes[i] = BuildNode(avatarRoot, order[i], nodeIndex, fbxSources, frame, stats, unsupported, fbxNodes, allNames);
 
         // コライダーを先に ID 化する。PhysBone 側の参照解決に使う。
         // 収録対象は Edit Mode で有効なものだけ (component.enabled かつ activeInHierarchy)。
@@ -323,7 +341,7 @@ public static class PhysicsSidecarExporter
     private static NodeDto BuildNode(
         GameObject avatarRoot, Transform t, Dictionary<Transform, int> nodeIndex,
         SortedDictionary<string, SourceModelDto> fbxSources, ReferenceFrame frame, ReferenceStats stats,
-        HashSet<string> unsupported)
+        HashSet<string> unsupported, HashSet<Transform> fbxNodes, HashSet<string> allNames)
     {
         Vector3 position;
         Quaternion rotation;
@@ -380,7 +398,7 @@ public static class PhysicsSidecarExporter
             name = t.name,
             siblingIndex = t.GetSiblingIndex(),
             scenePath = BuildScenePath(avatarRoot.transform, t),
-            source = BuildSource(t, fbxSources),
+            source = BuildSource(t, avatarRoot, fbxSources, fbxNodes, allNames),
             referenceSource = referenceSource,
             referenceLocal = new TransformDto
             {
@@ -518,7 +536,9 @@ public static class PhysicsSidecarExporter
         return names.ToArray();
     }
 
-    private static SourceRefDto BuildSource(Transform t, SortedDictionary<string, SourceModelDto> fbxSources)
+    private static SourceRefDto BuildSource(
+        Transform t, GameObject avatarRoot, SortedDictionary<string, SourceModelDto> fbxSources,
+        HashSet<Transform> fbxNodes, HashSet<string> allNames)
     {
         // シーン→Prefab→FBX と対応元を遡り、最も外側の FBX 由来オブジェクトを使う。
         // Prefab 直付けやシーン追加のノードは対応元が FBX に届かないため source: null になる。
@@ -529,11 +549,32 @@ public static class PhysicsSidecarExporter
             if (outer == null) break;
             src = outer;
         }
-        if (src == t) return null;
+        if (src == t)
+        {
+            // Prefab にレンダラが直接書かれているアバター（シエル・ミルク・カリン）。
+            // 対応元が無いので、このノードの配下にあるレンダラのメッシュから FBX を決め、
+            // 階層パスはアバタールートからの名前列で代用する。
+            string directAsset = ResolveFbxFromRenderers(t);
+            if (directAsset == null) return null;
+            return DirectSource(t, avatarRoot, directAsset, fbxSources);
+        }
 
         string assetPath = AssetDatabase.GetAssetPath(src);
         if (string.IsNullOrEmpty(assetPath) || !assetPath.EndsWith(".fbx", StringComparison.OrdinalIgnoreCase))
-            return null;
+        {
+            // Prefab 直付けのアバターでは、対応元がプレハブ自身を指して FBX に届かない。
+            // その場合は配下のレンダラのメッシュから FBX を決める。
+            // 骨・レンダラとして FBX に由来するノードだけを対応付ける。
+            // Prefab で追加した補助オブジェクト（PBCollider_* 等）は source: null のままにする。
+            if (!fbxNodes.Contains(t)) return null;
+            // Unity は同名の兄弟に " 1" を付ける。FBX 側の名前と一致しないため、
+            // 対応付けずに補助ノードとして扱わせる（推測で名前を削らない）。
+            var dup = System.Text.RegularExpressions.Regex.Match(t.name, "^(.*) [0-9]+$");
+            if (dup.Success && allNames.Contains(dup.Groups[1].Value)) return null;
+            string fallbackAsset = ResolveFbxFromRenderers(t);
+            if (fallbackAsset == null) return null;
+            return DirectSource(t, avatarRoot, fallbackAsset, fbxSources);
+        }
 
         // FBX ルート名は含めず、その配下の名前列だけを path にする。
         // src から同じアセットの親を辿り、最も外側 (FBX ルート) の手前までを集める。
@@ -564,6 +605,71 @@ public static class PhysicsSidecarExporter
             };
         }
 
+        return new SourceRefDto
+        {
+            modelId = modelId,
+            path = names.ToArray(),
+            assetGuid = guid,
+            localId = localId,
+        };
+    }
+
+    // ノード自身または子孫のレンダラが使うメッシュから FBX のパスを求める。
+    // 骨ノードはレンダラを持たないため、子孫を見る必要がある。
+    private static string ResolveFbxFromRenderers(Transform t)
+    {
+        // 自身・子孫 → 祖先 → アバター全体の順に探す。
+        // 骨（レンダラを持たない末端）でも、同じアバターのメッシュから FBX を決められる。
+        Renderer renderer = t.GetComponentInChildren<Renderer>(true);
+        if (renderer == null)
+        {
+            for (Transform a = t.parent; a != null && renderer == null; a = a.parent)
+                renderer = a.GetComponent<Renderer>();
+        }
+        if (renderer == null)
+        {
+            Transform root = t.root;
+            renderer = root.GetComponentInChildren<Renderer>(true);
+        }
+        if (renderer == null) return null;
+        Mesh mesh = null;
+        var skinned = renderer as SkinnedMeshRenderer;
+        if (skinned != null) mesh = skinned.sharedMesh;
+        else
+        {
+            var filter = renderer.GetComponent<MeshFilter>();
+            if (filter != null) mesh = filter.sharedMesh;
+        }
+        if (mesh == null) return null;
+        string path = AssetDatabase.GetAssetPath(mesh);
+        if (string.IsNullOrEmpty(path) || !path.EndsWith(".fbx", StringComparison.OrdinalIgnoreCase)) return null;
+        return path;
+    }
+
+    // Prefab 直付けノードの source。パスはアバタールート直下からの名前列にする。
+    private static SourceRefDto DirectSource(
+        Transform t, GameObject avatarRoot, string assetPath, SortedDictionary<string, SourceModelDto> fbxSources)
+    {
+        var names = new List<string>();
+        for (Transform s = t; s != null && s != avatarRoot.transform; s = s.parent) names.Add(s.name);
+        names.Reverse();
+        if (names.Count == 0) names.Add(t.name);
+
+        string guid;
+        long localId;
+        if (!AssetDatabase.TryGetGUIDAndLocalFileIdentifier(t, out guid, out localId)) localId = 0;
+
+        string modelId = Path.GetFileNameWithoutExtension(assetPath).ToLowerInvariant();
+        if (!fbxSources.ContainsKey(assetPath))
+        {
+            fbxSources[assetPath] = new SourceModelDto
+            {
+                id = modelId,
+                sha256 = Sha256OfAsset(assetPath),
+                assetGuid = AssetDatabase.AssetPathToGUID(assetPath),
+                assetPath = assetPath,
+            };
+        }
         return new SourceRefDto
         {
             modelId = modelId,
