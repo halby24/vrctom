@@ -672,6 +672,8 @@ struct ExtraFbx {
 struct ExtraFbxModel {
     name: String,
     parent: Option<usize>,
+    /// ジオメトリを持つか（Unityのメッシュサブアセットになるか）。
+    has_mesh: bool,
 }
 
 /// 参照FBXを索引から探して読み取り、所有側へ写す。
@@ -742,6 +744,7 @@ fn load_extra_fbx(
         .collect();
     let mut models = Vec::with_capacity(file_models.len());
     for model in file_models {
+        let has_mesh = model.mesh.is_some();
         if model.name.contains('/') {
             return Err(VrmError::new(
                 VrmErrorKind::InvalidPrefab,
@@ -761,6 +764,7 @@ fn load_extra_fbx(
         models.push(ExtraFbxModel {
             name: model.name.clone(),
             parent,
+            has_mesh,
         });
     }
     let mut children_sorted: Vec<Vec<usize>> = vec![Vec::new(); models.len()];
@@ -789,6 +793,11 @@ fn load_extra_fbx(
     });
     let mut mesh_at = HashMap::new();
     for (i, model) in models.iter().enumerate() {
+        // Unityのメッシュサブアセットは、ジオメトリを持つノードにだけ作られる。
+        // 骨（ジオメトリ無し）が同名でも衝突しない。
+        if !model.has_mesh {
+            continue;
+        }
         let fid = crate::unity::mesh_file_id(&model.name);
         // 同名メッシュの重複は先勝ちにせず失敗する。
         if mesh_at.contains_key(&fid) {
@@ -909,6 +918,10 @@ fn build_direct_tree(
     // 入力FBXを優先し、参照FBXも使う。重複は先勝ちにせず失敗する。
     let mut input_mesh_at: HashMap<FileId, usize> = HashMap::new();
     for (i, model) in fbx.models().iter().enumerate() {
+        // ジオメトリを持つノードだけがUnityのメッシュサブアセットになる。
+        if model.mesh.is_none() {
+            continue;
+        }
         let fid = crate::unity::mesh_file_id(&model.name);
         if input_mesh_at.contains_key(&fid) {
             return Err(VrmError::new(

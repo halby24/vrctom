@@ -1245,16 +1245,12 @@ fn check_quat(value: &[f64; 4], what: &str) -> Result<(), VrmError> {
 }
 
 /// TRSの有限値・正規化・拡大率を確認する。
-fn check_trs(trs: &SidecarTrs, id: &str) -> Result<(), VrmError> {
+fn check_trs(trs: &SidecarTrs, _id: &str) -> Result<(), VrmError> {
     check_vec3_finite(&trs.position, "参照位置")?;
     check_quat(&trs.rotation, "参照回転")?;
     check_vec3_finite(&trs.scale, "参照拡大率")?;
-    if trs.scale.contains(&0.0) {
-        return Err(VrmError::new(
-            VrmErrorKind::InvalidPhysicsSidecar,
-            format!("参照拡大率に0がある: {id}"),
-        ));
-    }
+    // 拡大率0はデータとして成立する（非表示にするため0を入れるPrefabがある）。
+    // 物理が参照するノードだけ、解決時に別途拒否する。
     Ok(())
 }
 
