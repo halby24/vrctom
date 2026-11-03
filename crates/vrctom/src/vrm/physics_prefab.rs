@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use yaml_serde::Value;
 
 use super::error::{VrmError, VrmErrorKind};
-use crate::fbx::FbxFile;
+use crate::fbx::{FbxFile, FbxOptions, LocalTransform};
 use crate::unity::{AssetMeta, FileId, SerializedFile, TypedObject};
 
 /// 参照ローカル1件。位置・回転・拡大率と出所（`bind`・`scene` 等）の組である。
@@ -390,17 +390,28 @@ fn derive_native(input: &PrefabDeriveInput<'_>) -> Result<DerivedSidecar, VrmErr
             ),
         ));
     }
-    // ネストしたKumaPhoneの解決。2件目のインスタンス（KumaPhone prefab）の
-    // 実体をAssetsから読み、SmartPhone.fbxと合わせて副階層を作る。
-    let phone = resolve_phone_subtree(&index, &canonical_assets, &parsed, label)?;
+    // ネストした副階層の解決。主FBX以外のインスタンス（副Prefab）の
+    // 実体をAssetsから読み、副FBXと合わせて graft の材料を作る。
+    let phone = resolve_phone_subtree(&index, &canonical_assets, &parsed, &fbx_guid, label)?;
     // 1930年代方式ではなく、2019.3以降のXXH64方式であることを確かめる。
     // fileIDの一致で解決できない対象があれば旧方式として失敗する。
+    // 主インスタンスの姿勢上書きは取り込み根の初期化に限り、骨への上書きは未対応として失敗する。
+    check_main_instance_trs(&parsed, &fbx_guid, label)?;
     // ノード階層の組み立て。
-    let tree = assemble_tree(input.fbx, &milfy_hier, &parsed, &phone, label)?;
+    let model_id_main = model_id_from_asset_path(input.fbx_asset_path);
+    let tree = assemble_tree(
+        input.fbx,
+        &milfy_hier,
+        &parsed,
+        &phone,
+        &fbx_guid,
+        &model_id_main,
+        label,
+    )?;
     // bind選択（Body優先）。
     let bind = select_bind(input.fbx, &milfy_hier, label)?;
     // 参照ローカルの計算（f32でUnityと同順）。
-    let locals = compute_reference_locals(input.fbx, &tree, &bind)?;
+    let locals = compute_reference_locals(input.fbx, &tree, &bind, &phone, label)?;
     // 成分の判別と収集。
     let collector = collect_components(&parsed, &tree, &phone, &fbx_guid, label)?;
     // humanoid・lookAtのための.meta読み取り。
@@ -457,6 +468,47 @@ fn check_file_ids_generation(meta: &AssetMeta, label: &str) -> Result<(), VrmErr
     Ok(())
 }
 
+/// 主インスタンスの姿勢上書きを検査する。取り込み根の初期化は想定内であり、
+/// 骨への `m_Local*` 上書きは参照姿勢の復元が変わるため未対応として失敗する。
+#[cfg(not(target_arch = "wasm32"))]
+fn check_main_instance_trs(
+    parsed: &ParsedPrefab,
+    main_fbx_guid: &str,
+    label: &str,
+) -> Result<(), VrmError> {
+    let import_tr = transform_file_id("");
+    for instance in &parsed.instances {
+        if !instance.source_guid.eq_ignore_ascii_case(main_fbx_guid) {
+            continue;
+        }
+        for m in &instance.modifications {
+            let guid_match = m
+                .target_guid
+                .as_ref()
+                .map(|g| g.eq_ignore_ascii_case(main_fbx_guid))
+                .unwrap_or(false);
+            if !guid_match {
+                continue;
+            }
+            let is_trs = (m.path.starts_with("m_LocalPosition.")
+                || m.path.starts_with("m_LocalRotation.")
+                || m.path.starts_with("m_LocalScale."))
+                && !m.path.starts_with("m_LocalEulerAnglesHint");
+            if is_trs && m.target_fid != import_tr {
+                return Err(VrmError::new(
+                    VrmErrorKind::InvalidPrefab,
+                    format!(
+                        "主FBXの骨への姿勢上書きは未対応である: {}（{}）",
+                        crate::escape_diag(&m.path),
+                        crate::escape_diag(label),
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 // Prefab文書の型付き読み取り結果。
 #[cfg(not(target_arch = "wasm32"))]
 struct ParsedPrefab {
@@ -470,10 +522,10 @@ struct ParsedPrefab {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // スマホ graft 保留中の保持項目であり、次単位で配線する。
 struct StrippedRef {
     source_fid: FileId,
     source_guid: String,
+    /// 所属するPrefabInstance文書。graft元の対応付けに使う。
     instance: FileId,
 }
 
@@ -608,12 +660,18 @@ fn parse_prefab_docs_inner(prefab: &SerializedFile, label: &str) -> Result<Parse
                     VrmError::new(VrmErrorKind::InvalidPrefab, "strippedに対応元がない")
                 })?;
                 let r = parse_ref_value(corr)?;
+                let instance = raw
+                    .get("m_PrefabInstance")
+                    .and_then(|v| v.as_mapping())
+                    .and_then(|m| m.get("fileID"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
                 stripped_go.insert(
                     doc.file_id(),
                     StrippedRef {
                         source_fid: r.fid,
                         source_guid: r.guid.unwrap_or_default(),
-                        instance: 0,
+                        instance,
                     },
                 );
             } else if doc.class_name() == "Transform" {
@@ -621,16 +679,22 @@ fn parse_prefab_docs_inner(prefab: &SerializedFile, label: &str) -> Result<Parse
                     VrmError::new(VrmErrorKind::InvalidPrefab, "strippedに対応元がない")
                 })?;
                 let r = parse_ref_value(corr)?;
+                let instance = raw
+                    .get("m_PrefabInstance")
+                    .and_then(|v| v.as_mapping())
+                    .and_then(|m| m.get("fileID"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
                 stripped_tr.insert(
                     doc.file_id(),
                     StrippedRef {
                         source_fid: r.fid,
                         source_guid: r.guid.unwrap_or_default(),
-                        instance: 0,
+                        instance,
                     },
                 );
             }
-            // m_PrefabInstanceは使わない（対応付けはfileIDで行う）。
+            // m_PrefabInstanceは対応付けに使い、対応付けはfileIDで行う。
             continue;
         }
         match doc.decode() {
@@ -738,9 +802,12 @@ fn parse_prefab_docs_inner(prefab: &SerializedFile, label: &str) -> Result<Parse
                         .guid
                         .map(|g| g.as_str().to_owned())
                         .unwrap_or_default(),
+                    // 親は `m_Modification` の内側にある。直下には無い。
                     parent: instance
                         .extra
-                        .get("m_TransformParent")
+                        .get("m_Modification")
+                        .and_then(|v| v.as_mapping())
+                        .and_then(|m| m.get("m_TransformParent"))
                         .and_then(|v| v.as_mapping())
                         .and_then(|m| m.get("fileID"))
                         .and_then(|v| v.as_i64())
@@ -904,114 +971,272 @@ fn transform_file_id(hierarchy_path: &str) -> FileId {
     xxhash_rust::xxh64::xxh64(text.as_bytes(), 0) as FileId
 }
 
-// KumaPhone副階層。
+// KumaPhone相当の副階層。Milfy.prefab内の2件目のインスタンス（副Prefab）と、
+// その実体が指すSmartPhone.fbxを組み合わせた graft の材料である。
 #[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)] // スマホ graft 保留中の保持項目であり、次単位で配線する。
 struct PhoneSubtree {
+    /// 副PrefabのGUID（小文字）。Milfy側の解決と graft 対象の判定に使う。
     guid: String,
-    // KumaPhone.prefabの文書列。所有権のためバイト列も保持する。
-    prefab_bytes: Vec<u8>,
-    // SmartPhone.fbxのバイト列と階層。SHA-256とsourceModelsに使う。
-    fbx_bytes: Vec<u8>,
-    #[allow(dead_code)]
-    fbx_paths: Vec<String>,
+    /// 副Prefabの資産パス（`Assets/` 付き）。graft 根の既定名に使う。
+    asset_path: String,
+    /// 副Prefabの型付き読み取り。成分収集と追加物の配置に使う。
+    parsed: ParsedPrefab,
+    /// 副Prefab内のSmartPhone.fbxインスタンス文書。改変の適用元である。
+    phone_instance_doc: FileId,
+    /// SmartPhone.fbxのGUID（小文字）。
+    fbx_guid: String,
+    /// SmartPhone.fbxの資産パス（`Assets/` 付き）。sourceModelsに使う。
+    fbx_asset_path: String,
+    /// SmartPhone.fbxのSHA-256（小文字hex）。sourceModelsに使う。
+    fbx_sha256: String,
+    /// SmartPhone.fbxのモデル列。階層の組み立てに使う。
+    models: Vec<PhoneModel>,
+    /// モデル索引ごとの子索引列。名前順（小文字優先・同点はバイト順）である。
+    children_sorted: Vec<Vec<usize>>,
+    /// ルート索引列。同じ規則で名前順である。
+    roots_sorted: Vec<usize>,
 }
 
-// ネストしたKumaPhoneを解決する。Milfy.prefab内の2件目のインスタンスが対象である。
+/// SmartPhone.fbxのモデル1件の所有側の写し。階層の組み立てに使う。
+/// 継承方式は主階層と同じく素朴な親子積で扱い、区別しない。
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Clone)]
+struct PhoneModel {
+    name: String,
+    parent: Option<usize>,
+    transform: LocalTransform,
+}
+
+// ネストした副階層を解決する。Milfy.prefab内の主FBX以外のインスタンスが対象である。
+// 主FBXへの参照と副Prefabへの参照がちょうど1件ずつあることを確かめ、
+// それ以外（複数・FBX直置き等）は黙って選ばず明示的に失敗する。
 #[cfg(not(target_arch = "wasm32"))]
 fn resolve_phone_subtree(
     index: &crate::unity::AssetIndex,
     canonical_assets: &std::path::Path,
     parsed: &ParsedPrefab,
+    main_fbx_guid: &str,
     label: &str,
 ) -> Result<Option<PhoneSubtree>, VrmError> {
-    // Milfy.fbx以外のインスタンス（KumaPhone）を探す。
-    // guidがFBXでなくprefabであるものを副階層とみなす。
-    // KumaPhoneでないprefabインスタンスがあれば明示的に失敗する。
+    // 主FBX以外のインスタンス（副Prefab）を集める。
+    let mut nested: Vec<&ParsedInstance> = Vec::new();
     for instance in &parsed.instances {
-        let guid = instance.source_guid.clone();
-        if guid.is_empty() {
+        if instance.source_guid.is_empty()
+            || instance.source_guid.eq_ignore_ascii_case(main_fbx_guid)
+        {
             continue;
         }
-        let Ok(g) = crate::unity::Guid::parse(&guid) else {
+        nested.push(instance);
+    }
+    if nested.is_empty() {
+        return Ok(None);
+    }
+    if nested.len() != 1 {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "副Prefabの解決は1件に限る（{}件）（{}）",
+                nested.len(),
+                crate::escape_diag(label),
+            ),
+        ));
+    }
+    let nested = nested[0];
+    let guid = nested.source_guid.clone();
+    let Ok(guid_key) = crate::unity::Guid::parse(&guid) else {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "PrefabInstanceのGUIDが不正である（{}）",
+                crate::escape_diag(label),
+            ),
+        ));
+    };
+    let Some(record) = index.get(&guid_key) else {
+        // 索引にないGUIDは解決できず失敗する。黙って落とさない。
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "PrefabInstanceの参照先が索引にない: {}（{}）",
+                crate::escape_diag(&guid),
+                crate::escape_diag(label),
+            ),
+        ));
+    };
+    // 副階層はprefabに限る。FBX直置き等は未対応として失敗する。
+    if !record.path.ends_with(".prefab") {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "副階層の参照がprefabでないため未対応である: {}（{}）",
+                crate::escape_diag(&record.path),
+                crate::escape_diag(label),
+            ),
+        ));
+    }
+    let full = canonical_assets.join(&record.path);
+    let prefab_bytes = std::fs::read(&full).map_err(|e| {
+        VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!("副Prefabを読めない: {e}"),
+        )
+    })?;
+    // 副Prefab内のSmartPhone.fbx相当を探す。FBXインスタンス1件に限る。
+    let phone_parsed = parse_prefab_docs_from_bytes(&prefab_bytes, label)?;
+    let mut phone_instances: Vec<&ParsedInstance> = phone_parsed
+        .instances
+        .iter()
+        .filter(|i| !i.source_guid.is_empty())
+        .collect();
+    if phone_instances.len() != 1 {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "副Prefab内のFBX参照が{}件あるため未対応である（{}）",
+                phone_instances.len(),
+                crate::escape_diag(label),
+            ),
+        ));
+    }
+    let phone_instance = phone_instances.pop().expect("件数は確かめた");
+    let phone_instance_doc = phone_instance.doc;
+    let phone_fbx_guid = phone_instance.source_guid.clone();
+    let Ok(phone_key) = crate::unity::Guid::parse(&phone_fbx_guid) else {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "副PrefabのFBX参照GUIDが不正である（{}）",
+                crate::escape_diag(label)
+            ),
+        ));
+    };
+    let Some(fbx_record) = index.get(&phone_key) else {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "副PrefabのFBXが索引にない: {}（{}）",
+                crate::escape_diag(&phone_fbx_guid),
+                crate::escape_diag(label),
+            ),
+        ));
+    };
+    if !fbx_record.path.ends_with(".fbx") && !fbx_record.path.ends_with(".FBX") {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "副Prefabの参照先がFBXでないため未対応である: {}（{}）",
+                crate::escape_diag(&fbx_record.path),
+                crate::escape_diag(label),
+            ),
+        ));
+    }
+    let fbx_full = canonical_assets.join(&fbx_record.path);
+    let fbx_bytes = std::fs::read(&fbx_full)
+        .map_err(|e| VrmError::new(VrmErrorKind::InvalidPrefab, format!("副FBXを読めない: {e}")))?;
+    let fbx_asset_path = format!("Assets/{}", fbx_record.path);
+    let fbx_sha256 = {
+        use sha2::Digest;
+        let digest = sha2::Sha256::digest(&fbx_bytes);
+        let mut sha = String::with_capacity(64);
+        for byte in digest {
+            sha.push(char::from_digit(u32::from(byte >> 4), 16).expect("hexである"));
+            sha.push(char::from_digit(u32::from(byte & 0x0f), 16).expect("hexである"));
+        }
+        sha
+    };
+    // 副FBXの階層を所有側へ写す。借用を残さない。
+    let models = read_phone_models(&fbx_bytes, label)?;
+    let (children_sorted, roots_sorted) = sort_phone_hierarchy(&models, label)?;
+    Ok(Some(PhoneSubtree {
+        guid,
+        asset_path: format!("Assets/{}", record.path),
+        parsed: phone_parsed,
+        phone_instance_doc,
+        fbx_guid: phone_fbx_guid,
+        fbx_asset_path,
+        fbx_sha256,
+        models,
+        children_sorted,
+        roots_sorted,
+    }))
+}
+
+/// 副FBXのモデル列を所有側へ写す。階層の組み立てだけに使う。
+#[cfg(not(target_arch = "wasm32"))]
+fn read_phone_models(bytes: &[u8], label: &str) -> Result<Vec<PhoneModel>, VrmError> {
+    let file = FbxFile::parse(bytes, &FbxOptions::default()).map_err(|e| {
+        VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!("副FBXを読めない（{}）: {e}", crate::escape_diag(label)),
+        )
+    })?;
+    let models = file.models();
+    let at: HashMap<i64, usize> = models
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.id.value(), i))
+        .collect();
+    let mut out = Vec::with_capacity(models.len());
+    for model in models {
+        let parent = match model.parent {
+            None => None,
+            Some(p) => Some(at.get(&p.value()).copied().ok_or_else(|| {
+                VrmError::new(VrmErrorKind::InvalidPrefab, "副FBXの親モデルが一覧にない")
+            })?),
+        };
+        out.push(PhoneModel {
+            name: model.name.clone(),
+            parent,
+            transform: model.transform,
+        });
+    }
+    Ok(out)
+}
+
+/// 副FBXの子列とルート列を名前順に並べる。主FBXの取り込み順と同じ規則
+/// （小文字化した名前優先・同点はバイト順）であり、Unityの表示順と一致させる。
+#[cfg(not(target_arch = "wasm32"))]
+fn sort_phone_hierarchy(
+    models: &[PhoneModel],
+    label: &str,
+) -> Result<(Vec<Vec<usize>>, Vec<usize>), VrmError> {
+    for model in models {
+        if model.name.contains('/') {
             return Err(VrmError::new(
                 VrmErrorKind::InvalidPrefab,
                 format!(
-                    "PrefabInstanceのGUIDが不正である（{}）",
+                    "副FBXのモデル名に `/` を含むため階層パスが作れない: {}（{}）",
+                    crate::escape_diag(&model.name),
                     crate::escape_diag(label),
                 ),
             ));
-        };
-        let Some(record) = index.get(&g) else {
-            // 索引にないGUIDは解決できず失敗する。黙って落とさない。
-            return Err(VrmError::new(
-                VrmErrorKind::InvalidPrefab,
-                format!(
-                    "PrefabInstanceの参照先が索引にない: {}（{}）",
-                    crate::escape_diag(&guid),
-                    crate::escape_diag(label),
-                ),
-            ));
-        };
-        // FBXでなくprefabの場合だけ副階層として読む。
-        if record.path.ends_with(".prefab") {
-            let full = canonical_assets.join(&record.path);
-            let prefab_bytes = std::fs::read(&full).map_err(|e| {
-                VrmError::new(
-                    VrmErrorKind::InvalidPrefab,
-                    format!("副Prefabを読めない: {e}"),
-                )
-            })?;
-            // 副Prefab内のSmartPhone.fbxを探す。KumaPhoneの実体参照が対象である。
-            let phone_parsed = parse_prefab_docs_from_bytes(&prefab_bytes, label)?;
-            let mut phone_fbx_guid = String::new();
-            for instance in &phone_parsed.instances {
-                if !instance.source_guid.is_empty() {
-                    phone_fbx_guid = instance.source_guid.clone();
-                    break;
-                }
-            }
-            if phone_fbx_guid.is_empty() {
-                return Err(VrmError::new(
-                    VrmErrorKind::InvalidPrefab,
-                    format!(
-                        "副Prefab内に入力FBXへの参照がない（{}）",
-                        crate::escape_diag(label),
-                    ),
-                ));
-            }
-            let Ok(g2) = crate::unity::Guid::parse(&phone_fbx_guid) else {
-                return Err(VrmError::new(
-                    VrmErrorKind::InvalidPrefab,
-                    format!(
-                        "副PrefabのFBX参照GUIDが不正である（{}）",
-                        crate::escape_diag(label)
-                    ),
-                ));
-            };
-            let Some(fbx_record) = index.get(&g2) else {
-                return Err(VrmError::new(
-                    VrmErrorKind::InvalidPrefab,
-                    format!(
-                        "副PrefabのFBXが索引にない: {}（{}）",
-                        crate::escape_diag(&phone_fbx_guid),
-                        crate::escape_diag(label),
-                    ),
-                ));
-            };
-            let fbx_full = canonical_assets.join(&fbx_record.path);
-            let fbx_bytes = std::fs::read(&fbx_full).map_err(|e| {
-                VrmError::new(VrmErrorKind::InvalidPrefab, format!("副FBXを読めない: {e}"))
-            })?;
-            return Ok(Some(PhoneSubtree {
-                guid,
-                prefab_bytes,
-                fbx_bytes,
-                fbx_paths: Vec::new(),
-            }));
         }
     }
-    Ok(None)
+    let mut children_sorted: Vec<Vec<usize>> = vec![Vec::new(); models.len()];
+    let mut roots: Vec<usize> = Vec::new();
+    for (i, model) in models.iter().enumerate() {
+        match model.parent {
+            Some(p) => children_sorted[p].push(i),
+            None => roots.push(i),
+        }
+    }
+    for children in children_sorted.iter_mut() {
+        children.sort_by(|a, b| {
+            models[*a]
+                .name
+                .to_ascii_lowercase()
+                .cmp(&models[*b].name.to_ascii_lowercase())
+                .then(models[*a].name.cmp(&models[*b].name))
+        });
+    }
+    roots.sort_by(|a, b| {
+        models[*a]
+            .name
+            .to_ascii_lowercase()
+            .cmp(&models[*b].name.to_ascii_lowercase())
+            .then(models[*a].name.cmp(&models[*b].name))
+    });
+    Ok((children_sorted, roots))
 }
 
 /// YAML値からf64を読む。整数も受け付ける。Unityのfloat32へ量子化して返す。
@@ -1111,6 +1336,11 @@ struct TreeNode {
     // FBXモデル索引（Milfy.fbx由来の場合）。
     #[allow(dead_code)]
     fbx_index: Option<usize>,
+    /// 副FBXモデル索引（SmartPhone.fbx由来の場合）。参照姿勢はscene扱いである。
+    phone_model: Option<usize>,
+    /// 自身の有効状態。prefabの `m_IsActive` を反映し、祖先と合わせて
+    /// `activeInHierarchy` を判定する。主階層は常に真である。
+    active_self: bool,
     /// ローカルGOのfileID（シーン追加の場合）。参照解決に使う。
     #[allow(dead_code)]
     local_go: Option<FileId>,
@@ -1118,7 +1348,6 @@ struct TreeNode {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // スマホ graft 保留中の保持項目であり、次単位で配線する。
 struct TreeSource {
     model_id: String,
     path: Vec<String>,
@@ -1132,21 +1361,33 @@ fn assemble_tree(
     hier: &FbxHierarchy,
     parsed: &ParsedPrefab,
     phone: &Option<PhoneSubtree>,
+    main_fbx_guid: &str,
+    model_id_main: &str,
     label: &str,
 ) -> Result<Vec<TreeNode>, VrmError> {
-    // 実装は段階的に行う。まずMilfy.fbx単体の階層をDFSで出し、
-    // 追加物と副階層を graft する。
-    // 現段階ではMilfyの実データ構造に対応し、それ以外は明示的に失敗する。
-    let _ = phone;
-    build_milfy_tree(fbx, hier, parsed, label)
+    // Milfy.fbx単体の階層をDFSで出し、追加物と副階層を graft する。
+    // Milfyの実データ構造に対応し、それ以外は明示的に失敗する。
+    build_milfy_tree(
+        fbx,
+        hier,
+        parsed,
+        phone,
+        main_fbx_guid,
+        model_id_main,
+        label,
+    )
 }
 
-/// Milfy単体のツリーを組み立てる。副階層の graft は呼び出し側で行う。
+/// Milfy単体のツリーを組み立てる。副階層はHand.L相当の追加物を起点に graft する。
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
 fn build_milfy_tree(
     fbx: &FbxFile<'_>,
     hier: &FbxHierarchy,
     parsed: &ParsedPrefab,
+    phone: &Option<PhoneSubtree>,
+    main_fbx_guid: &str,
+    model_id_main: &str,
     label: &str,
 ) -> Result<Vec<TreeNode>, VrmError> {
     let models = fbx.models();
@@ -1188,33 +1429,42 @@ fn build_milfy_tree(
             .cmp(&models[*b].name.to_ascii_lowercase())
             .then(models[*a].name.cmp(&models[*b].name))
     });
-    // 追加物（Milfyルート直下のローカル）。
+    // 追加物（Milfyルート直下のローカル）。stripped等の非ローカルは副階層のはずであり、
+    // graft 対象でなければ明示的に失敗する。
     let root_tr = transform_file_id("");
     let mut root_added: Vec<FileId> = Vec::new();
     if let Some(list) = added_by_parent.get(&root_tr) {
         for object in list {
             if parsed.local_tr.contains_key(object) {
                 root_added.push(*object);
+            } else {
+                return Err(VrmError::new(
+                    VrmErrorKind::InvalidPrefab,
+                    format!(
+                        "ルート直下の非ローカル追加物は未対応である（文書{object}）（{}）",
+                        crate::escape_diag(label),
+                    ),
+                ));
             }
         }
     }
     // 出所の組み立てヘルパ。
-    let fbx_guid = find_fbx_guid(parsed, label)?;
-    // Armature部分木のDFS。子はFBX名前順、追加物は後に付ける。
+    let fbx_guid = main_fbx_guid;
+    // Armature部分木のDFS。子はFBX名前順、追加物は後に付け、副階層は最後に graft する。
     // Head配下の追加物（Head_Contact等）もここで付ける。
-    // Hand.L配下のスマホ graft は別途行う（副階層が必要）。
     let mut stack: Vec<BuildFrame> = vec![BuildFrame {
         kind: FrameKind::Fbx(armature_idx),
         parent: None,
         scene_path: vec![avatar_name.clone(), models[armature_idx].name.clone()],
     }];
-    // 反復DFS。子を逆順で積む。
+    // 反復DFS。子を逆順で積む。副階層の graft は全体で1回に限る。
+    let mut grafted = false;
     while let Some(frame) = stack.pop() {
         match frame.kind {
             FrameKind::Fbx(fbx_index) => {
                 let node_index = nodes.len();
                 let model = &models[fbx_index];
-                let source = fbx_source_of(hier, fbx_index, &fbx_guid, label)?;
+                let source = fbx_source_of(hier, fbx_index, model_id_main, fbx_guid, label)?;
                 nodes.push(TreeNode {
                     name: model.name.clone(),
                     parent: frame.parent,
@@ -1223,13 +1473,14 @@ fn build_milfy_tree(
                     source: Some(source),
                     added_trs: None,
                     fbx_index: Some(fbx_index),
+                    phone_model: None,
+                    active_self: true,
                     local_go: None,
                 });
                 if let Some(parent) = frame.parent {
                     nodes[parent].children.push(node_index);
                 }
-                // 子の収集：FBX子（名前順）＋追加物（登録順）。
-                // Hand.Lの場合はスマホ graft を最後に付ける（呼び出し側で解決）。
+                // 子の収集：FBX子（名前順）＋追加物（登録順）＋副階層（最後）。
                 let mut child_frames: Vec<BuildFrame> = Vec::new();
                 for child_fbx in hier.children_sorted[fbx_index].iter() {
                     let mut child_path = frame.scene_path.clone();
@@ -1241,11 +1492,11 @@ fn build_milfy_tree(
                     });
                 }
                 // 追加物（このFBXノードのTransform fileIDを親とする）。
+                // 非ローカルは副階層の graft 対象であり、該当は1件に限る。
+                let mut graft_here = false;
                 let tr_fid = hier.tr_fid_at[fbx_index];
                 if let Some(added) = added_by_parent.get(&tr_fid) {
                     for object in added {
-                        // KumaPhone由来（stripped）はスマホ graft として扱い、ここでは出さない。
-                        // Hand.L配下の633...が該当する。
                         if parsed.local_tr.contains_key(object) {
                             let local = parsed.local_tr.get(object).expect("存在は確かめた");
                             let go = parsed.local_go.get(&local.go).ok_or_else(|| {
@@ -1264,8 +1515,36 @@ fn build_milfy_tree(
                                 parent: Some(node_index),
                                 scene_path: child_path,
                             });
+                        } else if is_graft_object(parsed, phone, *object) {
+                            // 副階層の graft 対象。該当は1件に限り、子列の最後に付ける。
+                            // Unityはインスタンス根を既存子の後に足すため、ここで順序を確定する。
+                            if graft_here {
+                                return Err(VrmError::new(
+                                    VrmErrorKind::InvalidPrefab,
+                                    format!(
+                                        "副階層の graft 対象が複数ある（{}）",
+                                        crate::escape_diag(label),
+                                    ),
+                                ));
+                            }
+                            graft_here = true;
+                        } else {
+                            return Err(VrmError::new(
+                                VrmErrorKind::InvalidPrefab,
+                                format!(
+                                    "非ローカルの追加物は副階層でなければ未対応である（文書{object}）（{}）",
+                                    crate::escape_diag(label),
+                                ),
+                            ));
                         }
                     }
+                }
+                if graft_here {
+                    child_frames.push(BuildFrame {
+                        kind: FrameKind::Graft { parent: node_index },
+                        parent: Some(node_index),
+                        scene_path: frame.scene_path.clone(),
+                    });
                 }
                 // 逆順で積む。
                 for child in child_frames.into_iter().rev() {
@@ -1297,13 +1576,14 @@ fn build_milfy_tree(
                     source: None,
                     added_trs: Some((local.position, local.rotation, local.scale)),
                     fbx_index: None,
+                    phone_model: None,
+                    active_self: true,
                     local_go: Some(local.go),
                 });
                 if let Some(parent) = frame.parent {
                     nodes[parent].children.push(node_index);
                 }
-                // 追加物の子（m_Children順）。Colliders等が該当するが、
-                // Milfy直下の追加物は子を持たない。副階層の子は別途 graft する。
+                // 追加物の子（m_Children順）。副階層の子は graft 側で扱う。
                 for child_tr in local.children.iter().rev() {
                     let child_local = parsed.local_tr.get(child_tr).ok_or_else(|| {
                         VrmError::new(
@@ -1326,6 +1606,28 @@ fn build_milfy_tree(
                     });
                 }
             }
+            FrameKind::Graft { parent } => {
+                if grafted {
+                    return Err(VrmError::new(
+                        VrmErrorKind::InvalidPrefab,
+                        format!(
+                            "副階層の graft が複数あるため未対応である（{}）",
+                            crate::escape_diag(label)
+                        ),
+                    ));
+                }
+                grafted = true;
+                let phone = phone.as_ref().ok_or_else(|| {
+                    VrmError::new(
+                        VrmErrorKind::InvalidPrefab,
+                        format!(
+                            "副階層なしに graft できない（{}）",
+                            crate::escape_diag(label)
+                        ),
+                    )
+                })?;
+                build_graft_subtree(&mut nodes, parent, parsed, phone, label)?;
+            }
         }
     }
     // メッシュルート（26件）を名前順で出す。子を持たないはずである。
@@ -1342,7 +1644,7 @@ fn build_milfy_tree(
             ));
         }
         let node_index = nodes.len();
-        let source = fbx_source_of(hier, fbx_index, &fbx_guid, label)?;
+        let source = fbx_source_of(hier, fbx_index, model_id_main, fbx_guid, label)?;
         let scene_path = vec![avatar_name.clone(), model.name.clone()];
         nodes.push(TreeNode {
             name: model.name.clone(),
@@ -1352,6 +1654,8 @@ fn build_milfy_tree(
             source: Some(source),
             added_trs: None,
             fbx_index: Some(fbx_index),
+            phone_model: None,
+            active_self: true,
             local_go: None,
         });
         let _ = node_index;
@@ -1370,19 +1674,21 @@ fn build_milfy_tree(
             source: None,
             added_trs: Some((local.position, local.rotation, local.scale)),
             fbx_index: None,
+            phone_model: None,
+            active_self: true,
             local_go: Some(local.go),
         });
         let _ = node_index;
     }
-    // スマホ graft は呼び出し側（assemble_tree）で行う。ここでは出さない。
     Ok(nodes)
 }
 
-/// DFS展開フレームの種別。
+/// DFS展開フレームの種別。副階層の graft は親が確定してから行う。
 #[cfg(not(target_arch = "wasm32"))]
 enum FrameKind {
     Fbx(usize),
     Added(FileId),
+    Graft { parent: usize },
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1392,24 +1698,766 @@ struct BuildFrame {
     scene_path: Vec<String>,
 }
 
-/// 入力FBXのGUIDをPrefabInstanceから求める。
+/// 追加物が副階層の graft 起点かどうかを判定する。strippedで副Prefab由来であり、
+/// 副Prefab根のTransformに対応するものだけを graft 対象にする。
 #[cfg(not(target_arch = "wasm32"))]
-fn find_fbx_guid(parsed: &ParsedPrefab, label: &str) -> Result<String, VrmError> {
-    // Milfy.fbxを指すインスタンスを探す。副Prefab（KumaPhone）でないものを選ぶ。
-    // 判定は後段の副階層解決に任せ、ここでは最初のFBXらしいGUIDを返す。
-    // 複数ある場合は呼び出し側で絞る。
-    for instance in &parsed.instances {
-        if !instance.source_guid.is_empty() {
-            return Ok(instance.source_guid.clone());
+fn is_graft_object(parsed: &ParsedPrefab, phone: &Option<PhoneSubtree>, object: FileId) -> bool {
+    let Some(phone) = phone.as_ref() else {
+        return false;
+    };
+    if parsed.local_tr.contains_key(&object) {
+        return false;
+    }
+    let Some(stripped) = parsed.stripped_tr.get(&object) else {
+        return false;
+    };
+    stripped.source_guid.eq_ignore_ascii_case(&phone.guid)
+}
+
+/// 資産パス（`Assets/` 付き）からモデルIDを求める。stemの小文字である。
+/// 主FBXの既存規則（`.fbx` のみ剥がす）と同一にする。
+#[cfg(not(target_arch = "wasm32"))]
+fn model_id_from_asset_path(asset_path: &str) -> String {
+    asset_path
+        .rsplit('/')
+        .next()
+        .unwrap_or("model")
+        .strip_suffix(".fbx")
+        .or_else(|| asset_path.rsplit('/').next())
+        .unwrap_or("model")
+        .to_ascii_lowercase()
+}
+
+/// 副Prefab根の基準点。graft根の改変対象と追加物の親先の特定に使う。
+#[cfg(not(target_arch = "wasm32"))]
+struct PhoneAnchors {
+    /// 副Prefab内の取り込み根Transform（KumaPhone側のstripped文書）。
+    kuma_root_tr: FileId,
+    /// 副Prefab内の取り込み根GameObject（KumaPhone側のstripped文書）。
+    kuma_root_go: FileId,
+}
+
+/// 副Prefab根の基準点を求める。取り込み根に対応するstrippedが1件ずつあるはずであり、
+/// それ以外（複数・欠落）は明示的に失敗する。
+#[cfg(not(target_arch = "wasm32"))]
+fn phone_anchors(phone: &PhoneSubtree, label: &str) -> Result<PhoneAnchors, VrmError> {
+    let import_tr = transform_file_id("");
+    let import_go = crate::unity::game_object_file_id("");
+    let mut root_tr: Vec<FileId> = Vec::new();
+    let mut root_go: Vec<FileId> = Vec::new();
+    for (local, stripped) in phone.parsed.stripped_tr.iter() {
+        if stripped.source_fid == import_tr
+            && stripped.source_guid.eq_ignore_ascii_case(&phone.fbx_guid)
+        {
+            root_tr.push(*local);
         }
     }
-    Err(VrmError::new(
+    for (local, stripped) in phone.parsed.stripped_go.iter() {
+        if stripped.source_fid == import_go
+            && stripped.source_guid.eq_ignore_ascii_case(&phone.fbx_guid)
+        {
+            root_go.push(*local);
+        }
+    }
+    if root_tr.len() != 1 || root_go.len() != 1 {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "副Prefab根の対応が{}件・{}件あるため未対応である（{}）",
+                root_tr.len(),
+                root_go.len(),
+                crate::escape_diag(label),
+            ),
+        ));
+    }
+    Ok(PhoneAnchors {
+        kuma_root_tr: root_tr[0],
+        kuma_root_go: root_go[0],
+    })
+}
+
+/// Milfy側の副Prefabインスタンスを1件に定める。
+#[cfg(not(target_arch = "wasm32"))]
+fn find_kuma_instance<'p>(
+    parsed: &'p ParsedPrefab,
+    phone: &PhoneSubtree,
+    label: &str,
+) -> Result<&'p ParsedInstance, VrmError> {
+    let mut found: Vec<&ParsedInstance> = parsed
+        .instances
+        .iter()
+        .filter(|i| i.source_guid.eq_ignore_ascii_case(&phone.guid))
+        .collect();
+    if found.len() != 1 {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "副Prefabのインスタンスが{}件あるため未対応である（{}）",
+                found.len(),
+                crate::escape_diag(label),
+            ),
+        ));
+    }
+    Ok(found.pop().expect("件数は確かめた"))
+}
+
+/// Milfy側の graft 起点を1件に定める。副Prefab根に対応するstrippedである。
+#[cfg(not(target_arch = "wasm32"))]
+fn find_graft_object(
+    parsed: &ParsedPrefab,
+    phone: &PhoneSubtree,
+    kuma_doc: FileId,
+    anchors: &PhoneAnchors,
+    label: &str,
+) -> Result<FileId, VrmError> {
+    let mut found: Vec<FileId> = Vec::new();
+    for (local, stripped) in parsed.stripped_tr.iter() {
+        if stripped.source_guid.eq_ignore_ascii_case(&phone.guid) {
+            found.push(*local);
+        }
+    }
+    if found.len() != 1 {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "副階層の graft 起点が{}件あるため未対応である（{}）",
+                found.len(),
+                crate::escape_diag(label),
+            ),
+        ));
+    }
+    let object = found[0];
+    let stripped = parsed.stripped_tr.get(&object).expect("存在は確かめた");
+    if stripped.source_fid != anchors.kuma_root_tr || stripped.instance != kuma_doc {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "副階層の graft 起点が副Prefab根に届かない（{}）",
+                crate::escape_diag(label),
+            ),
+        ));
+    }
+    Ok(object)
+}
+
+/// 副階層全体を graft する。親ノードの下に graft 根・副FBX部・副Prefab追加物を足す。
+/// IDは追加順（DFS順）に `n:N` で決まり、呼び出し側の順序が正解と一致する。
+#[cfg(not(target_arch = "wasm32"))]
+fn build_graft_subtree(
+    nodes: &mut Vec<TreeNode>,
+    parent: usize,
+    parsed: &ParsedPrefab,
+    phone: &PhoneSubtree,
+    label: &str,
+) -> Result<(), VrmError> {
+    let kuma = find_kuma_instance(parsed, phone, label)?;
+    // 親の対応を確かめる。副Prefabインスタンスの親は親ノードの出所を指す。
+    let parent_source = nodes[parent].source.as_ref().ok_or_else(|| {
+        VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!("副階層の親に出所がない（{}）", crate::escape_diag(label)),
+        )
+    })?;
+    let parent_stripped = parsed.stripped_tr.get(&kuma.parent).ok_or_else(|| {
+        VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "副Prefabインスタンスの親を解決できない（{}）",
+                crate::escape_diag(label)
+            ),
+        )
+    })?;
+    if parent_stripped.source_fid != parent_source.local_id {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "副Prefabインスタンスの親が graft 先と一致しない（{}）",
+                crate::escape_diag(label),
+            ),
+        ));
+    }
+    let anchors = phone_anchors(phone, label)?;
+    let _ = find_graft_object(parsed, phone, kuma.doc, &anchors, label)?;
+    let (root_name, root_trs, root_active) = graft_root_state(phone, kuma, &anchors, label)?;
+    let model_id_phone = model_id_from_asset_path(&phone.fbx_asset_path);
+    // graft根。取り込み根の例外として `path` は自身名だけを持つ。
+    let mut scene_path = nodes[parent].scene_path.clone();
+    scene_path.push(root_name.clone());
+    let root_index = nodes.len();
+    nodes.push(TreeNode {
+        name: root_name.clone(),
+        parent: Some(parent),
+        children: Vec::new(),
+        scene_path,
+        source: Some(TreeSource {
+            model_id: model_id_phone.clone(),
+            path: vec![root_name.clone()],
+            asset_guid: phone.fbx_guid.clone(),
+            local_id: transform_file_id(""),
+        }),
+        added_trs: Some(root_trs),
+        fbx_index: None,
+        phone_model: None,
+        active_self: root_active,
+        local_go: None,
+    });
+    nodes[parent].children.push(root_index);
+    // 副Prefabの追加物の親別索引。対象は副FBXのTransformであり、
+    // 副Prefab文書の登録順を保つ。対象GUIDの検証は組み立て時に行う。
+    let phone_instance = phone
+        .parsed
+        .instances
+        .iter()
+        .find(|i| i.doc == phone.phone_instance_doc)
+        .ok_or_else(|| {
+            VrmError::new(
+                VrmErrorKind::InvalidPrefab,
+                format!(
+                    "副Prefab内のFBXインスタンスがない（{}）",
+                    crate::escape_diag(label)
+                ),
+            )
+        })?;
+    let mut phone_added_by_target: HashMap<FileId, Vec<FileId>> = HashMap::new();
+    for added in &phone_instance.added_objects {
+        if !added.target_guid.eq_ignore_ascii_case(&phone.fbx_guid) {
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidPrefab,
+                format!(
+                    "副Prefabの追加先が副FBXでないため未対応である（{}）",
+                    crate::escape_diag(label)
+                ),
+            ));
+        }
+        phone_added_by_target
+            .entry(added.target_fid)
+            .or_default()
+            .push(added.object);
+    }
+    // 副FBXのルート以下をDFSで出す。子順は名前順であり、Unityの取り込み順と一致する。
+    // 各節点の追加物（副Prefab由来）はFBX子の後に付ける。主階層と同じ規則である。
+    let mut full_paths: Vec<Vec<String>> = vec![Vec::new(); phone.models.len()];
+    for (i, model) in phone.models.iter().enumerate() {
+        let mut path = match model.parent {
+            Some(p) => full_paths[p].clone(),
+            None => Vec::new(),
+        };
+        path.push(model.name.clone());
+        full_paths[i] = path;
+    }
+    let mut stack: Vec<GraftFrame> = Vec::new();
+    // graft根直下の追加物（取り込み根対象）を先に積み、FBXルートを後に積む。
+    // 後に積んだFBXルートから先に訪ねるため、子順はFBX・追加物の順になる。
+    if let Some(added) = phone_added_by_target.get(&transform_file_id("")) {
+        for object in added.iter().rev() {
+            stack.push(GraftFrame::Added {
+                parent: root_index,
+                object: *object,
+            });
+        }
+    }
+    for root in phone.roots_sorted.iter().rev() {
+        let full = vec![phone.models[*root].name.clone()];
+        stack.push(GraftFrame::Fbx {
+            model: *root,
+            parent: root_index,
+            full,
+        });
+    }
+    while let Some(frame) = stack.pop() {
+        match frame {
+            GraftFrame::Fbx {
+                model: model_idx,
+                parent: tree_parent,
+                full,
+            } => {
+                let mut scene_path = nodes[tree_parent].scene_path.clone();
+                scene_path.push(phone.models[model_idx].name.clone());
+                let node_index = nodes.len();
+                nodes.push(TreeNode {
+                    name: phone.models[model_idx].name.clone(),
+                    parent: Some(tree_parent),
+                    children: Vec::new(),
+                    scene_path,
+                    source: Some(TreeSource {
+                        model_id: model_id_phone.clone(),
+                        path: full.clone(),
+                        asset_guid: phone.fbx_guid.clone(),
+                        local_id: transform_file_id(&full.join("/")),
+                    }),
+                    added_trs: None,
+                    fbx_index: None,
+                    phone_model: Some(model_idx),
+                    active_self: true,
+                    local_go: None,
+                });
+                nodes[tree_parent].children.push(node_index);
+                // 子の収集：FBX子（名前順）＋追加物（登録順）。
+                let tr_fid = transform_file_id(&full.join("/"));
+                if let Some(added) = phone_added_by_target.get(&tr_fid) {
+                    for object in added.iter().rev() {
+                        stack.push(GraftFrame::Added {
+                            parent: node_index,
+                            object: *object,
+                        });
+                    }
+                }
+                for child in phone.children_sorted[model_idx].iter().rev() {
+                    let mut child_full = full.clone();
+                    child_full.push(phone.models[*child].name.clone());
+                    stack.push(GraftFrame::Fbx {
+                        model: *child,
+                        parent: node_index,
+                        full: child_full,
+                    });
+                }
+            }
+            GraftFrame::Added { parent, object } => {
+                graft_added_node(nodes, parent, object, phone, &mut stack, label)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// graftのDFSフレーム。副FBX節点と副Prefab追加物を統一的に辿る。
+#[cfg(not(target_arch = "wasm32"))]
+enum GraftFrame {
+    Fbx {
+        model: usize,
+        parent: usize,
+        /// 副FBXルートからの名前列。出所とfileIDに使う。
+        full: Vec<String>,
+    },
+    Added {
+        parent: usize,
+        /// 副Prefab内のローカルTransform文書。
+        object: FileId,
+    },
+}
+
+/// 副Prefabの追加物1件をツリーに出し、子（`m_Children` 順）を積む。
+#[cfg(not(target_arch = "wasm32"))]
+fn graft_added_node(
+    nodes: &mut Vec<TreeNode>,
+    parent: usize,
+    object: FileId,
+    phone: &PhoneSubtree,
+    stack: &mut Vec<GraftFrame>,
+    label: &str,
+) -> Result<(), VrmError> {
+    let local = phone.parsed.local_tr.get(&object).ok_or_else(|| {
+        VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "副Prefabの追加物のTransformがない（文書{object}）（{}）",
+                crate::escape_diag(label)
+            ),
+        )
+    })?;
+    let go = phone.parsed.local_go.get(&local.go).ok_or_else(|| {
+        VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "副Prefabの追加物のゲームオブジェクトがない（文書{object}）（{}）",
+                crate::escape_diag(label)
+            ),
+        )
+    })?;
+    let mut scene_path = nodes[parent].scene_path.clone();
+    scene_path.push(go.name.clone());
+    let node_index = nodes.len();
+    nodes.push(TreeNode {
+        name: go.name.clone(),
+        parent: Some(parent),
+        children: Vec::new(),
+        scene_path,
+        source: None,
+        added_trs: Some((local.position, local.rotation, local.scale)),
+        fbx_index: None,
+        phone_model: None,
+        active_self: go.active,
+        local_go: Some(local.go),
+    });
+    nodes[parent].children.push(node_index);
+    for child_tr in local.children.iter().rev() {
+        stack.push(GraftFrame::Added {
+            parent: node_index,
+            object: *child_tr,
+        });
+    }
+    Ok(())
+}
+
+/// graft根の名前・ローカルTRS・有効状態を層化して求める。
+/// 基準値（副Prefab名・単位TRS・有効）の上に副Prefab内改変・Milfy側改変を重ねる。
+/// 物理に効く欄の想定外の改変は明示的に失敗し、描画系は無視する。
+#[cfg(not(target_arch = "wasm32"))]
+fn graft_root_state(
+    phone: &PhoneSubtree,
+    kuma: &ParsedInstance,
+    anchors: &PhoneAnchors,
+    label: &str,
+) -> Result<(String, TrsF64, bool), VrmError> {
+    let import_tr = transform_file_id("");
+    let import_go = crate::unity::game_object_file_id("");
+    let base_name = phone
+        .asset_path
+        .rsplit('/')
+        .next()
+        .unwrap_or("phone")
+        .strip_suffix(".prefab")
+        .or_else(|| phone.asset_path.rsplit('/').next())
+        .unwrap_or("phone")
+        .to_owned();
+    let mut name = base_name;
+    let mut pos = [0.0; 3];
+    let mut rot = [0.0, 0.0, 0.0, 1.0];
+    let mut scale = [1.0; 3];
+    let mut active = true;
+    // 副Prefab内の改変（取り込み根のTRS初期化・改名）。
+    let phone_instance = phone
+        .parsed
+        .instances
+        .iter()
+        .find(|i| i.doc == phone.phone_instance_doc)
+        .ok_or_else(|| {
+            VrmError::new(
+                VrmErrorKind::InvalidPrefab,
+                format!(
+                    "副Prefab内のFBXインスタンスがない（{}）",
+                    crate::escape_diag(label)
+                ),
+            )
+        })?;
+    for m in &phone_instance.modifications {
+        let guid_match = m
+            .target_guid
+            .as_ref()
+            .map(|g| g.eq_ignore_ascii_case(&phone.fbx_guid))
+            .unwrap_or(false);
+        if !guid_match {
+            continue;
+        }
+        if m.target_fid == import_tr {
+            apply_root_trs_mod(&mut pos, &mut rot, &mut scale, m, label)?;
+        } else if m.target_fid == import_go {
+            if m.path == "m_Name" {
+                name = mod_string_value(m, label)?;
+            } else if m.path == "m_IsActive" {
+                active = mod_bool_value(m, label)?;
+            } else if m.path.starts_with("m_LocalEulerAnglesHint") {
+                // 見かけの欄であり、姿勢に効かない。
+            } else {
+                return Err(unexpected_mod(label, m, "副Prefab内の取り込み根"));
+            }
+        } else if is_physics_path(&m.path) {
+            // 取り込み根以外の物理に効く改変は未対応として失敗する。
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidPrefab,
+                format!(
+                    "副Prefab内の想定外の改変である: {}（{}）",
+                    crate::escape_diag(&m.path),
+                    crate::escape_diag(label),
+                ),
+            ));
+        }
+        // 描画系（`m_RootBone`・`m_AABB`・`m_Materials` 等）は物理に効かないため無視する。
+    }
+    // Milfy側の改変（Hand.L相当への配置・改名・無効化）。
+    for m in &kuma.modifications {
+        let guid_match = m
+            .target_guid
+            .as_ref()
+            .map(|g| g.eq_ignore_ascii_case(&phone.guid))
+            .unwrap_or(false);
+        if !guid_match {
+            continue;
+        }
+        if m.target_fid == anchors.kuma_root_tr {
+            apply_root_trs_mod(&mut pos, &mut rot, &mut scale, m, label)?;
+        } else if m.target_fid == anchors.kuma_root_go {
+            if m.path == "m_Name" {
+                name = mod_string_value(m, label)?;
+            } else if m.path == "m_IsActive" {
+                active = mod_bool_value(m, label)?;
+            } else if m.path.starts_with("m_LocalEulerAnglesHint") {
+                // 見かけの欄であり、姿勢に効かない。
+            } else {
+                return Err(unexpected_mod(label, m, "Milfy側の副Prefab根"));
+            }
+        } else if m.path.starts_with("Sources.") {
+            // 制約の参照先であり、成分収集で重ねる。ここでは扱わない。
+        } else if is_physics_path(&m.path) {
+            // 副Prefab根以外の物理に効く改変は未対応として失敗する。
+            return Err(unexpected_mod(label, m, "Milfy側の副Prefab"));
+        } else {
+            // 描画系は物理に効かないため無視する。
+        }
+    }
+    if name.is_empty() {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "副階層の graft 根名が空である（{}）",
+                crate::escape_diag(label)
+            ),
+        ));
+    }
+    Ok((name, (pos, rot, scale), active))
+}
+
+/// 物理に効く改変欄かどうかを判定する。姿勢・名前・有効・参照が該当し、
+/// 見かけの欄（`m_LocalEulerAnglesHint`）と描画系は含まない。
+/// 想定外の対象への改変は明示的に失敗させるために使う。
+#[cfg(not(target_arch = "wasm32"))]
+fn is_physics_path(path: &str) -> bool {
+    path.starts_with("m_LocalPosition.")
+        || path.starts_with("m_LocalRotation.")
+        || path.starts_with("m_LocalScale.")
+        || path == "m_Name"
+        || path == "m_IsActive"
+        || path == "m_Enabled"
+        || path.starts_with("Sources.")
+}
+
+/// graft根のTRS改変1件を重ねる。`m_Local*` 以外は呼び出し側で振り分ける。
+#[cfg(not(target_arch = "wasm32"))]
+fn apply_root_trs_mod(
+    pos: &mut [f64; 3],
+    rot: &mut [f64; 4],
+    scale: &mut [f64; 3],
+    m: &PrefabMod,
+    label: &str,
+) -> Result<(), VrmError> {
+    let axis = |path: &str, prefix: &str| -> Option<usize> {
+        path.strip_prefix(prefix).and_then(|s| match s {
+            "x" => Some(0),
+            "y" => Some(1),
+            "z" => Some(2),
+            "w" => Some(3),
+            _ => None,
+        })
+    };
+    if let Some(i) = axis(&m.path, "m_LocalPosition.") {
+        if i < 3 {
+            pos[i] = mod_f64_value(m, label)?;
+            return Ok(());
+        }
+    } else if let Some(i) = axis(&m.path, "m_LocalRotation.") {
+        rot[i] = mod_f64_value(m, label)?;
+        return Ok(());
+    } else if let Some(i) = axis(&m.path, "m_LocalScale.") {
+        if i < 3 {
+            scale[i] = mod_f64_value(m, label)?;
+            return Ok(());
+        }
+    } else if m.path.starts_with("m_LocalEulerAnglesHint") {
+        // 見かけの欄であり、姿勢に効かない。
+        return Ok(());
+    }
+    Err(unexpected_mod(label, m, "graft根のTRS"))
+}
+
+/// 想定外の改変の失敗を作る。黙って無視しない。
+#[cfg(not(target_arch = "wasm32"))]
+fn unexpected_mod(label: &str, m: &PrefabMod, what: &str) -> VrmError {
+    VrmError::new(
         VrmErrorKind::InvalidPrefab,
         format!(
-            "入力FBXへのPrefabInstanceがない（{}）",
-            crate::escape_diag(label)
+            "{what}の想定外の改変である: {}（{}）",
+            crate::escape_diag(&m.path),
+            crate::escape_diag(label),
         ),
-    ))
+    )
+}
+
+/// 改変の数値を読む。Prefab値はUnityのfloat32へ量子化する。
+#[cfg(not(target_arch = "wasm32"))]
+fn mod_f64_value(m: &PrefabMod, label: &str) -> Result<f64, VrmError> {
+    let Some(value) = m.value.as_ref() else {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "改変に値がない: {}（{}）",
+                crate::escape_diag(&m.path),
+                crate::escape_diag(label),
+            ),
+        ));
+    };
+    read_f64_value(value, &m.path, label)
+}
+
+/// 改変の文字列を読む。
+#[cfg(not(target_arch = "wasm32"))]
+fn mod_string_value(m: &PrefabMod, label: &str) -> Result<String, VrmError> {
+    match m.value.as_ref() {
+        Some(Value::String(s)) => Ok(s.clone()),
+        _ => Err(VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "改変が文字列でない: {}（{}）",
+                crate::escape_diag(&m.path),
+                crate::escape_diag(label),
+            ),
+        )),
+    }
+}
+
+/// 改変の真偽値を読む。0/1も受け付ける。
+#[cfg(not(target_arch = "wasm32"))]
+fn mod_bool_value(m: &PrefabMod, label: &str) -> Result<bool, VrmError> {
+    let Some(value) = m.value.as_ref() else {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "改変に値がない: {}（{}）",
+                crate::escape_diag(&m.path),
+                crate::escape_diag(label),
+            ),
+        ));
+    };
+    read_bool_value(value, &m.path, label)
+}
+
+/// Milfy側の副Prefab改変のうち、成分文書を対象にする重ね合わせ表を作る。
+/// 制約の参照先（`Sources.*`）だけを扱う。成分文書への他の改変や、
+/// 副Prefabのローカル節点への物理に効く改変は未対応として失敗する。
+#[cfg(not(target_arch = "wasm32"))]
+fn phone_source_overlays(
+    parsed: &ParsedPrefab,
+    phone: &Option<PhoneSubtree>,
+    label: &str,
+) -> Result<HashMap<FileId, Vec<PrefabMod>>, VrmError> {
+    let mut overlays: HashMap<FileId, Vec<PrefabMod>> = HashMap::new();
+    let Some(phone) = phone.as_ref() else {
+        return Ok(overlays);
+    };
+    let kuma = find_kuma_instance(parsed, phone, label)?;
+    let anchors = phone_anchors(phone, label)?;
+    let mono_docs: HashSet<FileId> = phone.parsed.monos.iter().map(|m| m.doc).collect();
+    for m in &kuma.modifications {
+        let guid_match = m
+            .target_guid
+            .as_ref()
+            .map(|g| g.eq_ignore_ascii_case(&phone.guid))
+            .unwrap_or(false);
+        if !guid_match {
+            continue;
+        }
+        // graft根の欄はツリー組み立てで扱う。
+        if m.target_fid == anchors.kuma_root_tr || m.target_fid == anchors.kuma_root_go {
+            continue;
+        }
+        if mono_docs.contains(&m.target_fid) {
+            // 成分文書への改変は制約の参照先に限る。
+            if !m.path.starts_with("Sources.") {
+                return Err(VrmError::new(
+                    VrmErrorKind::InvalidPrefab,
+                    format!(
+                        "副Prefabの成分への想定外の改変である: {}（文書{}）（{}）",
+                        crate::escape_diag(&m.path),
+                        m.target_fid,
+                        crate::escape_diag(label),
+                    ),
+                ));
+            }
+            overlays.entry(m.target_fid).or_default().push(m.clone());
+        } else if is_physics_path(&m.path) {
+            // 副Prefabのローカル節点への物理に効く改変は未対応として失敗する。
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidPrefab,
+                format!(
+                    "副Prefabの節点への想定外の改変である: {}（文書{}）（{}）",
+                    crate::escape_diag(&m.path),
+                    m.target_fid,
+                    crate::escape_diag(label),
+                ),
+            ));
+        }
+        // 描画系は物理に効かないため無視する。
+    }
+    Ok(overlays)
+}
+
+/// 制約の参照先の重ね合わせを適用する。`Sources.source{i}.SourceTransform` と
+/// `Sources.source{i}.Weight` だけを扱い、他は明示的に失敗する。
+/// 対象の入れ物がなければ失敗し、黙って足さない。
+#[cfg(not(target_arch = "wasm32"))]
+fn overlay_constraint_sources(
+    extra: &yaml_serde::Mapping,
+    mods: &[PrefabMod],
+    label: &str,
+) -> Result<yaml_serde::Mapping, VrmError> {
+    let mut out = extra.clone();
+    let Some(Value::Mapping(sources)) = out.get_mut(Value::String("Sources".to_owned())) else {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!("制約に参照入れ物がない（{}）", crate::escape_diag(label)),
+        ));
+    };
+    for m in mods {
+        let Some(rest) = m.path.strip_prefix("Sources.") else {
+            return Err(unexpected_mod(label, m, "制約の参照先"));
+        };
+        let Some((slot, field)) = rest.split_once('.') else {
+            return Err(unexpected_mod(label, m, "制約の参照先"));
+        };
+        if !slot.starts_with("source") {
+            return Err(unexpected_mod(label, m, "制約の参照先"));
+        }
+        let slot_key = Value::String(slot.to_owned());
+        let Some(Value::Mapping(slot_map)) = sources.get_mut(&slot_key) else {
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidPrefab,
+                format!(
+                    "制約の参照入れ物がない: {slot}（{}）",
+                    crate::escape_diag(label)
+                ),
+            ));
+        };
+        if field == "SourceTransform" {
+            let fid = m.obj_ref.as_ref().map(|r| r.fid).unwrap_or(0);
+            let mut mapping = yaml_serde::Mapping::new();
+            mapping.insert(
+                Value::String("fileID".to_owned()),
+                Value::Number(yaml_serde::Number::from(fid)),
+            );
+            slot_map.insert(
+                Value::String("SourceTransform".to_owned()),
+                Value::Mapping(mapping),
+            );
+        } else if field == "Weight" {
+            let Some(value) = m.value.as_ref() else {
+                return Err(VrmError::new(
+                    VrmErrorKind::InvalidPrefab,
+                    format!(
+                        "制約の重みに値がない: {slot}（{}）",
+                        crate::escape_diag(label)
+                    ),
+                ));
+            };
+            let weight = value
+                .as_f64()
+                .or_else(|| value.as_i64().map(|n| n as f64))
+                .ok_or_else(|| {
+                    VrmError::new(
+                        VrmErrorKind::InvalidPrefab,
+                        format!(
+                            "制約の重みが数値でない: {slot}（{}）",
+                            crate::escape_diag(label)
+                        ),
+                    )
+                })?;
+            slot_map.insert(
+                Value::String("Weight".to_owned()),
+                Value::Number(yaml_serde::Number::from(weight)),
+            );
+        } else {
+            return Err(unexpected_mod(label, m, "制約の参照先"));
+        }
+    }
+    Ok(out)
 }
 
 /// FBXノードの出所を組み立てる。
@@ -1417,12 +2465,11 @@ fn find_fbx_guid(parsed: &ParsedPrefab, label: &str) -> Result<String, VrmError>
 fn fbx_source_of(
     hier: &FbxHierarchy,
     fbx_index: usize,
+    model_id: &str,
     fbx_guid: &str,
     label: &str,
 ) -> Result<TreeSource, VrmError> {
     let full = hier.paths[fbx_index].clone();
-    // モデルIDは資産パス由来であり、呼び出し側で上書きする。
-    // ここでは仮に空にし、emit時に確定させる。
     let _ = label;
     let path: Vec<String> = if full.is_empty() {
         Vec::new()
@@ -1430,7 +2477,7 @@ fn fbx_source_of(
         full.split('/').map(|s| s.to_owned()).collect()
     };
     Ok(TreeSource {
-        model_id: String::new(),
+        model_id: model_id.to_owned(),
         path,
         asset_guid: fbx_guid.to_owned(),
         local_id: hier.tr_fid_at[fbx_index],
@@ -1442,37 +2489,13 @@ fn fbx_source_of(
 fn avatar_name_from_label(label: &str) -> String {
     // `path/to/Milfy.prefab` または `Milfy.prefab` のstemを使う。
     // 区切りは `/` と `\` の両方に対応する。
-    let base = label.rsplit(['/', '\\']).next().unwrap_or(label);
+    // CLIは表示名を `format!("{path:?}")` で作るため、両端の `"` を落とす。
+    let unquoted = label.trim_matches('"');
+    let base = unquoted.rsplit(['/', '\\']).next().unwrap_or(unquoted);
     base.strip_suffix(".prefab")
         .or_else(|| base.strip_suffix(".PREFAB"))
         .unwrap_or(base)
         .to_owned()
-}
-
-/// Hand.LのTransform fileIDを求める。KumaPhoneの graft 位置の特定に使う。
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)] // スマホ graft 保留中の保持項目であり、次単位で配線する。
-fn find_hand_transform(
-    models: &[crate::fbx::Model],
-    hier: &FbxHierarchy,
-) -> Result<FileId, VrmError> {
-    for (i, m) in models.iter().enumerate() {
-        if m.name == "Hand.L" {
-            return Ok(hier.tr_fid_at[i]);
-        }
-    }
-    Err(VrmError::new(
-        VrmErrorKind::InvalidPrefab,
-        "Hand.Lが見つからない",
-    ))
-}
-
-/// KumaPhone由来の追加物（SmartPhoneルート）かどうかを判定する。
-#[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)] // スマホ graft 保留中の保持項目であり、次単位で配線する。
-fn is_phone_root_object(parsed: &ParsedPrefab, object: FileId) -> bool {
-    // 633...はstripped（KumaPhone由来）であり、local_trにない。
-    !parsed.local_tr.contains_key(&object)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1603,12 +2626,16 @@ fn compute_reference_locals(
     fbx: &FbxFile<'_>,
     tree: &[TreeNode],
     bind: &BindSelection,
+    phone: &Option<PhoneSubtree>,
+    label: &str,
 ) -> Result<Vec<ReferenceLocal>, VrmError> {
     // Unityの `Matrix4x4`（float32）と同順で計算し、sidecarと一致させる。
     // bind対象は親のbind世界またはscene世界の逆行列とbind世界の積を分解する。
     // 非対象はsceneのローカルTRSをそのまま使う（float32に丸める）。
     let models = fbx.models();
-    // bind世界行列（FBX BindPose）をfloat32で持つ。
+    // bind世界行列（FBX BindPose）をUnity空間へ写してfloat32で持つ。
+    // Unityは `meshWorld * bindpose.inverse` をbind世界にするため、
+    // 実データ（Milfy）ではFBXのbind行列の鏡像と一致する。
     let bind_nodes = fbx.bind_pose_nodes().map_err(|e| {
         VrmError::new(
             VrmErrorKind::InvalidPrefab,
@@ -1627,34 +2654,49 @@ fn compute_reference_locals(
             for (i, v) in node.matrix.iter().enumerate() {
                 m[i] = *v as f32;
             }
-            bind_world_f32.insert(idx, m);
+            bind_world_f32.insert(idx, mirror_matrix_f32(&m));
         }
     }
-    // sceneローカルTRS（float32）。FBX由来はlocal_matrixの分解、追加物はprefab値である。
+    // sceneローカルTRS（float32・Unity空間）。
+    // FBX由来はlocal_matrixを分解してから写し、副FBX由来も同じ手順でscene値を求める。
+    // prefab由来の追加物はUnity空間のためそのまま使う。混合しない。
     let mut scene_trs: Vec<([f32; 3], [f32; 4], [f32; 3])> = Vec::with_capacity(tree.len());
     for node in tree {
         if let Some(fbx_index) = node.fbx_index {
             let model = &models[fbx_index];
-            let local = model.transform.local_matrix().map_err(|e| {
-                VrmError::new(
-                    VrmErrorKind::InvalidPrefab,
-                    format!("ローカル行列を作れない: {e}"),
-                )
-            })?;
-            let mut m32 = [0f32; 16];
-            for (i, v) in local.iter().enumerate() {
-                m32[i] = *v as f32;
-            }
-            let (p, r, s) = decompose_bind_local_f32(&m32).map_err(|_| {
+            let (p, r, s) = scene_trs_from_local_transform(&model.transform, &node.name, label)?;
+            let (pos, rot, scale) = fbx_trs_to_unity(p, r, s);
+            scene_trs.push((
+                [pos[0] as f32, pos[1] as f32, pos[2] as f32],
+                [rot[0] as f32, rot[1] as f32, rot[2] as f32, rot[3] as f32],
+                [scale[0] as f32, scale[1] as f32, scale[2] as f32],
+            ));
+        } else if let Some(phone_model) = node.phone_model {
+            let phone = phone.as_ref().ok_or_else(|| {
                 VrmError::new(
                     VrmErrorKind::InvalidPrefab,
                     format!(
-                        "sceneローカルを分解できない: {}",
+                        "副階層なしに副FBXノードを解決できない: {}",
                         crate::escape_diag(&node.name)
                     ),
                 )
             })?;
-            scene_trs.push((p, r, s));
+            let model = phone.models.get(phone_model).ok_or_else(|| {
+                VrmError::new(
+                    VrmErrorKind::InvalidPrefab,
+                    format!(
+                        "副FBXのモデル索引が範囲外である: {}",
+                        crate::escape_diag(&node.name)
+                    ),
+                )
+            })?;
+            let (p, r, s) = scene_trs_from_local_transform(&model.transform, &node.name, label)?;
+            let (pos, rot, scale) = fbx_trs_to_unity(p, r, s);
+            scene_trs.push((
+                [pos[0] as f32, pos[1] as f32, pos[2] as f32],
+                [rot[0] as f32, rot[1] as f32, rot[2] as f32, rot[3] as f32],
+                [scale[0] as f32, scale[1] as f32, scale[2] as f32],
+            ));
         } else if let Some((p, r, s)) = node.added_trs {
             scene_trs.push((
                 [p[0] as f32, p[1] as f32, p[2] as f32],
@@ -1717,27 +2759,87 @@ fn compute_reference_locals(
                     format!("親世界が特異である: {}", crate::escape_diag(&node.name)),
                 )
             })?;
+            // 差分はUnity空間で求まっているため、そのまま分解して使う。
+            // FBX空間で分解してから写すと回転の符号が変わる。
             let local = mul_f32(&inv, bind_world);
             match decompose_bind_local_f32(&local) {
                 Ok((p, r, s)) => {
-                    let (pos, rot, scale) = fbx_trs_to_unity(p, r, s);
-                    out.push((pos, rot, scale, "bind"));
+                    out.push((
+                        [p[0] as f64, p[1] as f64, p[2] as f64],
+                        [r[0] as f64, r[1] as f64, r[2] as f64, r[3] as f64],
+                        [s[0] as f64, s[1] as f64, s[2] as f64],
+                        "bind",
+                    ));
                 }
                 Err(_) => {
                     // せん断等でTRSに戻らない行列。申告して近似として出す。
-                    // 正確な近似値は後段で求める。ここではscene値を仮置きする。
+                    // 正確な近似値は後段で求める。ここではscene値（Unity空間）を仮置きする。
                     let (p, r, s) = scene_trs[i];
-                    let (pos, rot, scale) = fbx_trs_to_unity(p, r, s);
-                    out.push((pos, rot, scale, "bind-decomposed-approx"));
+                    out.push((
+                        [p[0] as f64, p[1] as f64, p[2] as f64],
+                        [r[0] as f64, r[1] as f64, r[2] as f64, r[3] as f64],
+                        [s[0] as f64, s[1] as f64, s[2] as f64],
+                        "bind-decomposed-approx",
+                    ));
                 }
             }
         } else {
+            // scene値（Unity空間）をそのまま使う。
             let (p, r, s) = scene_trs[i];
-            let (pos, rot, scale) = fbx_trs_to_unity(p, r, s);
-            out.push((pos, rot, scale, "scene"));
+            out.push((
+                [p[0] as f64, p[1] as f64, p[2] as f64],
+                [r[0] as f64, r[1] as f64, r[2] as f64, r[3] as f64],
+                [s[0] as f64, s[1] as f64, s[2] as f64],
+                "scene",
+            ));
         }
     }
     Ok(out)
+}
+
+/// FBXのローカル変換からsceneローカルTRS（float32）を求める。
+/// `local_matrix` の分解であり、Unityの取り込みTRSと同じ手順である。
+#[cfg(not(target_arch = "wasm32"))]
+fn scene_trs_from_local_transform(
+    transform: &LocalTransform,
+    node_name: &str,
+    label: &str,
+) -> Result<TrsF32, VrmError> {
+    let local = transform.local_matrix().map_err(|e| {
+        VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!("ローカル行列を作れない: {e}"),
+        )
+    })?;
+    let mut m32 = [0f32; 16];
+    for (i, v) in local.iter().enumerate() {
+        m32[i] = *v as f32;
+    }
+    decompose_bind_local_f32(&m32).map_err(|_| {
+        VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "sceneローカルを分解できない: {}（{}）",
+                crate::escape_diag(node_name),
+                crate::escape_diag(label)
+            ),
+        )
+    })
+}
+
+/// float32行列をUnity空間へ写す。`Mx * M * Mx^-1`（`Mx = diag(-1,1,1,1)`）であり、
+/// FBXの右手系からUnityの左手系への写像である。TRS行列の写像は
+/// `fbx_trs_to_unity` と一致するが、一般行列の回転抽出は写像後に行う。
+/// Unityはbind差分を行列で求めてから分解するため、こちらに合わせる。
+#[cfg(not(target_arch = "wasm32"))]
+fn mirror_matrix_f32(m: &[f32; 16]) -> [f32; 16] {
+    let mut out = *m;
+    out[1] = -out[1];
+    out[2] = -out[2];
+    out[4] = -out[4];
+    out[8] = -out[8];
+    out[12] = -out[12];
+    out
 }
 
 /// FBXの右手系TRSをUnityの左手系TRSへ写す。実測（Milfy）で位置Xと回転Y/Zの符号が反転するため。
@@ -1925,7 +3027,11 @@ fn decompose_bind_local_f32(m: &[f32; 16]) -> Result<TrsF32, ()> {
     Ok((position, rotation, scale))
 }
 
-/// 回転行列（3列）から四元数を求める。Unityの `Matrix4x4.rotation` 相当である。
+/// 回転行列（3列）から四元数を求める。Unityの `Matrix4x4.rotation` と同じ分岐規則である。
+///
+/// 対角和が正の場合はそこから求め、そうでなければ最大の対角成分を持つ分岐を選ぶ。
+/// 平方根を成分ごとに取る方式とは180度付近の符号が変わるため、こちらに合わせる。
+/// 取り出し後の符号はUnityの行列と一致し、再合成で元に戻る。
 #[cfg(not(target_arch = "wasm32"))]
 fn quat_from_rotation_matrix_f32(cols: [[f32; 3]; 3]) -> [f32; 4] {
     // 列ベクトルを行列要素に直す。m[row][col] = cols[col][row] である。
@@ -2102,7 +3208,7 @@ struct CollectedKey {
 fn collect_components(
     parsed: &ParsedPrefab,
     tree: &[TreeNode],
-    _phone: &Option<PhoneSubtree>,
+    phone: &Option<PhoneSubtree>,
     _fbx_guid: &str,
     label: &str,
 ) -> Result<Collected, VrmError> {
@@ -2112,12 +3218,12 @@ fn collect_components(
     let mut go_to_node: HashMap<FileId, usize> = HashMap::new();
     // FBX由来ノードは、Transform/GameObjectのfileIDから引けるよう表を作る。
     // treeのsource.local_idはTransform fileIDである。GameObject fileIDは別途求める。
+    // 取り込み根の例外は graft 根（FBX由来でなくsourceを持つ節点）だけに使う。
+    // 単一区画のFBXパス（例: `Armature`）は通常のGameObject fileIDで引く。
     for (i, node) in tree.iter().enumerate() {
         if let Some(source) = node.source.as_ref() {
             tr_to_node.insert(source.local_id, i);
-            // GameObject fileIDはpathから求める。import root例外に注意する。
-            let go_fid = if source.path.len() == 1 && is_import_root_path(&source.path, &node.name)
-            {
+            let go_fid = if node.fbx_index.is_none() && node.phone_model.is_none() {
                 crate::unity::game_object_file_id("")
             } else {
                 crate::unity::game_object_file_id(&source.path.join("/"))
@@ -2125,18 +3231,42 @@ fn collect_components(
             go_to_node.insert(go_fid, i);
         }
     }
+    // 副Prefab側のstripped対応付け。local fid → source fid → tree node である。
+    // 副階層の graft 根・SmartPhone相当はここで結ぶ。
+    if let Some(phone) = phone.as_ref() {
+        for (local, stripped) in phone.parsed.stripped_tr.iter() {
+            if let Some(&node) = tr_to_node.get(&stripped.source_fid) {
+                tr_to_node.insert(*local, node);
+            }
+        }
+        for (local, stripped) in phone.parsed.stripped_go.iter() {
+            if let Some(&node) = go_to_node.get(&stripped.source_fid) {
+                go_to_node.insert(*local, node);
+            }
+        }
+    }
     // strippedの対応付け。local fid → source fid → tree node である。
+    // 取り込み根由来（import root）は graft 根と混同するため結ばない。
+    // 該当はAvatarDescriptor等の所属だけであり、参照解決時に失敗させる。
+    let import_tr = transform_file_id("");
+    let import_go = crate::unity::game_object_file_id("");
     for (local, stripped) in parsed.stripped_tr.iter() {
+        if stripped.source_fid == import_tr {
+            continue;
+        }
         if let Some(&node) = tr_to_node.get(&stripped.source_fid) {
             tr_to_node.insert(*local, node);
         }
     }
     for (local, stripped) in parsed.stripped_go.iter() {
+        if stripped.source_fid == import_go {
+            continue;
+        }
         // GameObjectのsource fidからtree nodeを引く。
         if let Some(&node) = go_to_node.get(&stripped.source_fid) {
             go_to_node.insert(*local, node);
         }
-        // 解決できないstripped GO（import root等）は参照解決時に失敗させる。
+        // 解決できないstripped GOは参照解決時に失敗させる。
         let _ = local;
     }
     // MonoBehaviourのdoc fid → tree node（所属GO経由）。
@@ -2147,8 +3277,13 @@ fn collect_components(
             local_go_to_node.insert(go, i);
         }
     }
+    // 主Prefabと副PrefabのMonoBehaviourを合わせる。副階層の成分も同じ規則で収集する。
+    let mut all_monos: Vec<&ParsedMono> = parsed.monos.iter().collect();
+    if let Some(phone) = phone.as_ref() {
+        all_monos.extend(phone.parsed.monos.iter());
+    }
     let mut doc_to_node: HashMap<FileId, usize> = HashMap::new();
-    for mono in &parsed.monos {
+    for mono in all_monos.iter().copied() {
         if let Some(&node) = go_to_node.get(&mono.go) {
             doc_to_node.insert(mono.doc, node);
         } else if let Some(&node) = local_go_to_node.get(&mono.go) {
@@ -2156,6 +3291,9 @@ fn collect_components(
         }
         // 解決できない所属（import root等のstripped GO）は、参照解決時に失敗させる。
     }
+    // 副Prefab側の改変のうち、成分文書を対象にする重ね合わせ表を作る。
+    // 制約の参照先（`Sources.*`）だけを扱い、他は呼び出し側で失敗させる。
+    let mut source_overlays = phone_source_overlays(parsed, phone, label)?;
     // 成分の判別と収集。未知のDLL型は明示的に失敗し、Contact等は無視する。
     let mut ignored: Vec<String> = Vec::new();
     let mut ignored_set: HashSet<String> = HashSet::new();
@@ -2163,7 +3301,7 @@ fn collect_components(
     let mut colliders: Vec<CollectedCollider> = Vec::new();
     let mut constraints: Vec<CollectedConstraint> = Vec::new();
     let mut descriptor: Option<CollectedDescriptor> = None;
-    for mono in &parsed.monos {
+    for mono in all_monos.iter().copied() {
         if mono.script_guid.is_empty() {
             return Err(VrmError::new(
                 VrmErrorKind::InvalidPrefab,
@@ -2218,15 +3356,28 @@ fn collect_components(
                             ),
                         ));
                     };
-                    let mut bone = parse_phys_bone(mono, node, &tr_to_node, label)?;
-                    // 有効 chain の計算。FBX由来は真、追加物はprefabのactiveである。
-                    // 祖先はすべて有効である（Milfyの実データ）。
-                    // 無効なものはsidecarに含めない（Unityヘルパと同順）。
-                    let active = node_active(tree, node, parsed);
-                    bone.active_chain = active;
-                    if bone.enabled && active {
-                        bones.push(bone);
+                    if source_overlays.contains_key(&mono.doc) {
+                        return Err(VrmError::new(
+                            VrmErrorKind::InvalidPrefab,
+                            format!(
+                                "PhysBoneへの参照先の重ね合わせは未対応である（文書{}）（{}）",
+                                mono.doc,
+                                crate::escape_diag(label)
+                            ),
+                        ));
                     }
+                    // 有効 chain の計算を先に行い、無効なものは読まずに省く。
+                    // Unityヘルパも有効な成分だけを読み取るため、
+                    // 無効な旧版の欄構成でも失敗しない。
+                    // 無効なものはsidecarに含めない（Unityヘルパと同順）。
+                    // 副階層の graft 根は無効であり、子孫はすべて無効になる。
+                    let active = node_active(tree, node, parsed);
+                    if !(mono.enabled && active) {
+                        continue;
+                    }
+                    let mut bone = parse_phys_bone(mono, node, &tr_to_node, label)?;
+                    bone.active_chain = true;
+                    bones.push(bone);
                 }
                 KnownScript::PhysBoneCollider => {
                     let Some(&node) = doc_to_node.get(&mono.doc) else {
@@ -2239,12 +3390,23 @@ fn collect_components(
                             ),
                         ));
                     };
-                    let mut collider = parse_collider(mono, node, &tr_to_node, label)?;
-                    let active = node_active(tree, node, parsed);
-                    collider.active_chain = active;
-                    if collider.enabled && active {
-                        colliders.push(collider);
+                    if source_overlays.contains_key(&mono.doc) {
+                        return Err(VrmError::new(
+                            VrmErrorKind::InvalidPrefab,
+                            format!(
+                                "colliderへの参照先の重ね合わせは未対応である（文書{}）（{}）",
+                                mono.doc,
+                                crate::escape_diag(label)
+                            ),
+                        ));
                     }
+                    let active = node_active(tree, node, parsed);
+                    if !(mono.enabled && active) {
+                        continue;
+                    }
+                    let mut collider = parse_collider(mono, node, &tr_to_node, label)?;
+                    collider.active_chain = true;
+                    colliders.push(collider);
                 }
                 KnownScript::RotationConstraint
                 | KnownScript::ParentConstraint
@@ -2262,13 +3424,25 @@ fn collect_components(
                             ),
                         ));
                     };
+                    // Milfy側の改変で参照先を差し替える（副Prefabの制約）。
+                    // 対象外の文書への重ね合わせはここで消費し、残りは後段で失敗させる。
+                    let effective = match source_overlays.remove(&mono.doc) {
+                        Some(mods) => {
+                            let patched = overlay_constraint_sources(&mono.extra, &mods, label)?;
+                            ParsedMono {
+                                extra: patched,
+                                ..mono.clone()
+                            }
+                        }
+                        None => mono.clone(),
+                    };
                     // 同一Transform上のVRC制約の順序を求める。
                     let order_index = constraints
                         .iter()
                         .filter(|c: &&CollectedConstraint| c.component_node == node)
                         .count();
                     let constraint = parse_vrc_constraint(
-                        mono,
+                        &effective,
                         kind,
                         node,
                         tree,
@@ -2288,10 +3462,30 @@ fn collect_components(
                             ),
                         ));
                     }
+                    if source_overlays.contains_key(&mono.doc) {
+                        return Err(VrmError::new(
+                            VrmErrorKind::InvalidPrefab,
+                            format!(
+                                "descriptorへの参照先の重ね合わせは未対応である（文書{}）（{}）",
+                                mono.doc,
+                                crate::escape_diag(label)
+                            ),
+                        ));
+                    }
                     descriptor = Some(parse_descriptor(mono, &tr_to_node, label)?);
                 }
             },
         }
+    }
+    // 消費されなかった重ね合わせは未対応として失敗する。
+    if let Some((doc, _)) = source_overlays.iter().next() {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "制約でない文書への参照先の重ね合わせは未対応である（文書{doc}）（{}）",
+                crate::escape_diag(label)
+            ),
+        ));
     }
     // ノードDFS順→取得順（文書順）で並べ直す。Unityヘルパと同じ決定性規則である。
     // component_node（tree索引）がDFS順であり、docが取得順である。
@@ -2322,11 +3516,15 @@ fn collect_components(
 }
 
 /// ノードのactiveInHierarchyを求める。FBX由来は真、追加物はprefabのactiveである。
+/// 副階層の graft 根はMilfy側の改変で無効であり、子孫はすべて無効になる。
 #[cfg(not(target_arch = "wasm32"))]
 fn node_active(tree: &[TreeNode], node: usize, parsed: &ParsedPrefab) -> bool {
     let mut current = Some(node);
     while let Some(index) = current {
         let tree_node = &tree[index];
+        if !tree_node.active_self {
+            return false;
+        }
         if let Some(go_fid) = tree_node.local_go {
             // 追加物。prefabのm_IsActiveである。
             let active = parsed
@@ -2449,12 +3647,6 @@ fn read_eye_pose(value: &Value, doc: FileId, label: &str) -> Result<EyePose, Vrm
         None => [0.0, 0.0, 0.0, 1.0],
     };
     Ok(([linked], left, right))
-}
-
-/// import rootのpath例外かどうかを判定する。`["SmartPhone"]` 等が該当する。
-#[cfg(not(target_arch = "wasm32"))]
-fn is_import_root_path(path: &[String], node_name: &str) -> bool {
-    path.len() == 1 && path[0] == node_name
 }
 
 /// collider1件をMonoBehaviourから読む。
@@ -3138,7 +4330,7 @@ fn emit_sidecar(
     locals: &[ReferenceLocal],
     collector: &Collected,
     meta: &AssetMeta,
-    _phone: &Option<PhoneSubtree>,
+    phone: &Option<PhoneSubtree>,
     fbx_guid: &str,
     bind: &BindSelection,
     label: &str,
@@ -3146,7 +4338,8 @@ fn emit_sidecar(
     use sha2::Digest;
     // ノードIDの付番。DFS順に `n:N` である。
     let node_id_of = |index: usize| format!("n:{index}");
-    // sourceModels。Milfyのみ（副階層は後段で追加する）。
+    // sourceModels。主FBXと副FBX（ある場合）を資産パス順に並べる。
+    // Unityの `SortedDictionary` と同じ決定性規則である。
     let digest = sha2::Sha256::digest(input.fbx_bytes);
     let mut sha = String::with_capacity(64);
     for byte in digest {
@@ -3155,15 +4348,7 @@ fn emit_sidecar(
     }
     let avatar_name = avatar_name_from_label(label);
     // モデルIDは資産パスのstemを小文字化する。
-    let model_id = input
-        .fbx_asset_path
-        .rsplit('/')
-        .next()
-        .unwrap_or("model")
-        .strip_suffix(".fbx")
-        .or_else(|| input.fbx_asset_path.rsplit('/').next())
-        .unwrap_or("model")
-        .to_ascii_lowercase();
+    let model_id = model_id_from_asset_path(input.fbx_asset_path);
     // ノード列の組み立て。
     let mut nodes_json = Vec::with_capacity(tree.len());
     for (i, node) in tree.iter().enumerate() {
@@ -3187,13 +4372,10 @@ fn emit_sidecar(
         };
         let source_json = match node.source.as_ref() {
             Some(source) => {
-                let path = source.path.clone();
-                // import root例外は呼び出し側で解決済みである。
-                let _ = &path;
                 serde_json::json!({
-                    "modelId": model_id,
+                    "modelId": source.model_id,
                     "path": source.path,
-                    "assetGuid": fbx_guid,
+                    "assetGuid": source.asset_guid,
                     "localId": source.local_id,
                 })
             }
@@ -3391,14 +4573,28 @@ fn emit_sidecar(
     let _ = constraints_json;
     let _ = look_at_json;
     // humanoidは.metaから組み立てる。
-    let humanoid_json = build_humanoid_json(meta, tree, label)?;
-    // sourceModelsはMilfyのみ（副階層は後段で追加する）。
-    let source_models_json = vec![serde_json::json!({
+    let humanoid_json = build_humanoid_json(meta, tree, &model_id, label)?;
+    // sourceModelsは主FBXと副FBX（ある場合）を資産パス順に並べる。
+    let mut source_models_json = vec![serde_json::json!({
         "id": model_id,
         "sha256": sha,
         "assetGuid": fbx_guid,
         "assetPath": input.fbx_asset_path,
     })];
+    if let Some(phone) = phone.as_ref() {
+        source_models_json.push(serde_json::json!({
+            "id": model_id_from_asset_path(&phone.fbx_asset_path),
+            "sha256": phone.fbx_sha256,
+            "assetGuid": phone.fbx_guid,
+            "assetPath": phone.fbx_asset_path,
+        }));
+        source_models_json.sort_by(|a, b| {
+            a.get("assetPath")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .cmp(b.get("assetPath").and_then(|v| v.as_str()).unwrap_or(""))
+        });
+    }
     // captureはbind-pose相当である。
     let root_scale = locals
         .first()
@@ -3411,7 +4607,7 @@ fn emit_sidecar(
     unsupported_sorted.sort();
     unsupported_sorted.dedup();
     // 最終JSONの組み立て。DTOのフィールド順に並べる。
-    let sidecar_json = serde_json::json!({
+    let mut sidecar_json = serde_json::json!({
         "format": "vrctom.physics",
         "schemaVersion": 1,
         "generator": {
@@ -3434,6 +4630,8 @@ fn emit_sidecar(
         "unsupportedFeatures": unsupported_sorted,
         "lookAt": look_at_json,
     });
+    // `-0.0` を `+0.0` に正規化する。Unityの出力に `-0.0` は現れない。
+    normalize_neg_zero(&mut sidecar_json);
     // 検証を通してから返す。検証済みDTOの不変条件を確認する。
     let bytes = serde_json::to_vec_pretty(&sidecar_json).map_err(|e| {
         VrmError::new(
@@ -3465,6 +4663,7 @@ fn emit_sidecar(
 fn build_humanoid_json(
     meta: &AssetMeta,
     tree: &[TreeNode],
+    model_id_main: &str,
     label: &str,
 ) -> Result<serde_json::Value, VrmError> {
     // humanDescriptionのhumanとskeletonを読む。
@@ -3588,10 +4787,16 @@ fn build_humanoid_json(
         "RightLittleIntermediate",
         "RightLittleDistal",
     ];
-    // Transform名からtree索引を引く。FBX由来ノードが対象である。
+    // Transform名からtree索引を引く。主FBX由来ノードだけが対象であり、
+    // 副階層（同名があり得る）はAnimatorの骨解決に現れないため除く。
     let mut name_to_nodes: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, node) in tree.iter().enumerate() {
-        if node.source.is_some() {
+        if node
+            .source
+            .as_ref()
+            .map(|s| s.model_id == model_id_main)
+            .unwrap_or(false)
+        {
             name_to_nodes.entry(node.name.as_str()).or_default().push(i);
         }
     }
@@ -3611,12 +4816,13 @@ fn build_humanoid_json(
             ));
         }
         let node_index = candidates[0];
-        // `.meta` の skeleton はFBX空間（右手系）のため、Unity空間（左手系）へ写す。
-        // 参照実装の capture と同じく位置Xと回転Y/Zの符号を反転させる。
+        // `.meta` の skeleton はUnity空間のため、そのまま使う。
+        // 参照実装の capture と同じく Transform 名で引いた humanoid の T-pose を記録する。
+        // 回転はavatar空間の姿勢であり、写像は行わない。
         let t_pose = match skeleton_map.get(transform_name.as_str()) {
             Some((p, r, s)) => serde_json::json!({
-                "position": [-p[0], p[1], p[2]],
-                "rotation": [r[0], -r[1], -r[2], r[3]],
+                "position": p,
+                "rotation": r,
                 "scale": s,
             }),
             None => serde_json::Value::Null,
@@ -3631,6 +4837,33 @@ fn build_humanoid_json(
         "isHuman": is_human,
         "bones": bones_json,
     }))
+}
+
+/// JSON内の `-0.0` を `+0.0` に正規化する。Unityの出力に `-0.0` は現れない。
+/// Prefabの `-0` 表記や行列演算の符号付きゼロが対象である。
+/// 呼び出し側の数値比較では区別できないが、バイト一致には効く。
+#[cfg(not(target_arch = "wasm32"))]
+fn normalize_neg_zero(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Number(n) => {
+            if n.as_f64().is_some_and(|v| v == 0.0 && v.is_sign_negative()) {
+                *value = serde_json::Value::Number(
+                    serde_json::Number::from_f64(0.0).expect("0.0は表せる"),
+                );
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                normalize_neg_zero(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                normalize_neg_zero(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// カーブをsidecar JSON形式にする。
@@ -3844,5 +5077,237 @@ mod tests {
         let meta_bytes = b"fileFormatVersion: 2\nguid: 9ef94258554e06b4ab03fbe9fc914c5c\nModelImporter:\n  fileIdsGeneration: 1\n";
         let meta = crate::unity::AssetMeta::parse(meta_bytes).expect("最小の.metaは読める");
         assert!(check_file_ids_generation(&meta, "test").is_err());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn 回転の抽出は鏡像の適用順序で符号が定まる() {
+        // 単位行列は恒等四元数に戻る。
+        let q = quat_from_rotation_matrix_f32([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        assert!((q[3] - 1.0).abs() < 1e-7);
+        assert_eq!([q[0], q[1], q[2]], [0.0, 0.0, 0.0]);
+        // X軸90度回転は正符号の四元数に戻る。
+        // 列は `[[1,0,0],[0,0,1],[0,-1,0]]` である。
+        let q = quat_from_rotation_matrix_f32([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, -1.0, 0.0]]);
+        assert!((q[0] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        assert!((q[3] - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        // 実データ（Breast.R.001相当）では、FBX空間で分解してから写すと符号が反転する。
+        // 行列を先にUnity空間へ写してから分解すると、Unityの符号と一致する。
+        let truth = [0.512_978_85_f32, 0.145_400_26, 0.834_192_4, -0.140_835];
+        let rebuilt = compose_trs_f32([0.0, 0.0, 0.0], truth, [1.0, 1.0, 1.0]);
+        // FBX空間の行列に戻す（Unity空間の鏡像を外す）。
+        let mirrored_back = mirror_matrix_f32(&rebuilt);
+        let cols = [
+            [mirrored_back[0], mirrored_back[1], mirrored_back[2]],
+            [mirrored_back[4], mirrored_back[5], mirrored_back[6]],
+            [mirrored_back[8], mirrored_back[9], mirrored_back[10]],
+        ];
+        let q = quat_from_rotation_matrix_f32(cols);
+        // FBX空間の抽出を写すと、Unityの符号とは反対になる。
+        let mapped = [q[0], -q[1], -q[2], q[3]];
+        let dot_wrong = mapped[0] * truth[0]
+            + mapped[1] * truth[1]
+            + mapped[2] * truth[2]
+            + mapped[3] * truth[3];
+        assert!(dot_wrong < 0.0, "dot_wrong={dot_wrong}");
+        // 行列を先に写してから抽出すると、Unityの符号と一致する。
+        let cols = [
+            [rebuilt[0], rebuilt[1], rebuilt[2]],
+            [rebuilt[4], rebuilt[5], rebuilt[6]],
+            [rebuilt[8], rebuilt[9], rebuilt[10]],
+        ];
+        let q = quat_from_rotation_matrix_f32(cols);
+        let dot = q[0] * truth[0] + q[1] * truth[1] + q[2] * truth[2] + q[3] * truth[3];
+        assert!(dot > 0.999_999_9, "dot={dot}");
+        for i in 0..4 {
+            assert!((q[i] - truth[i]).abs() < 1e-6, "q={q:?} truth={truth:?}");
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn 表示名の両端の引用符を落として幹を求める() {
+        // CLIは表示名を `format!("{path:?}")` で作るため `"` が付く。
+        assert_eq!(avatar_name_from_label("\"path/to/Milfy.prefab\""), "Milfy");
+        assert_eq!(avatar_name_from_label("Milfy.prefab"), "Milfy");
+        assert_eq!(avatar_name_from_label("Milfy"), "Milfy");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn 物理に効く改変欄を判定できる() {
+        assert!(is_physics_path("m_LocalPosition.x"));
+        assert!(is_physics_path("m_LocalRotation.w"));
+        assert!(is_physics_path("m_LocalScale.y"));
+        assert!(is_physics_path("m_Name"));
+        assert!(is_physics_path("m_IsActive"));
+        assert!(is_physics_path("m_Enabled"));
+        assert!(is_physics_path("Sources.source0.SourceTransform"));
+        assert!(!is_physics_path("m_LocalEulerAnglesHint.x"));
+        assert!(!is_physics_path("m_RootBone"));
+        assert!(!is_physics_path("m_AABB.m_Center.x"));
+        assert_eq!(
+            model_id_from_asset_path("Assets/PLUSONE/Milfy/FBX/Milfy.fbx"),
+            "milfy"
+        );
+        assert_eq!(
+            model_id_from_asset_path("Assets/PLUSONE/Milfy/FBX/SmartPhone.fbx"),
+            "smartphone"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn 主階層の骨への姿勢上書きは明示的に失敗する() {
+        // 骨Transformへの `m_LocalPosition` 上書きは参照姿勢の復元が変わるため拒否する。
+        // 取り込み根の初期化は想定内であり通す。
+        let main_guid = "9ef94258554e06b4ab03fbe9fc914c5c";
+        let bone_mod = PrefabMod {
+            target_fid: 123,
+            target_guid: Some(main_guid.to_owned()),
+            path: "m_LocalPosition.x".to_owned(),
+            value: Some(yaml_serde::Value::Number(1.into())),
+            obj_ref: None,
+        };
+        let root_mod = PrefabMod {
+            target_fid: transform_file_id(""),
+            target_guid: Some(main_guid.to_owned()),
+            path: "m_LocalPosition.x".to_owned(),
+            value: Some(yaml_serde::Value::Number(0.into())),
+            obj_ref: None,
+        };
+        let main = ParsedInstance {
+            doc: 1,
+            source_guid: main_guid.to_owned(),
+            parent: 0,
+            modifications: vec![root_mod],
+            added_objects: vec![],
+        };
+        let parsed = ParsedPrefab {
+            monos: vec![],
+            stripped_go: HashMap::new(),
+            stripped_tr: HashMap::new(),
+            local_go: HashMap::new(),
+            local_tr: HashMap::new(),
+            instances: vec![main],
+        };
+        assert!(check_main_instance_trs(&parsed, main_guid, "test").is_ok());
+        let bad = ParsedInstance {
+            doc: 1,
+            source_guid: main_guid.to_owned(),
+            parent: 0,
+            modifications: vec![bone_mod],
+            added_objects: vec![],
+        };
+        let parsed = ParsedPrefab {
+            monos: vec![],
+            stripped_go: HashMap::new(),
+            stripped_tr: HashMap::new(),
+            local_go: HashMap::new(),
+            local_tr: HashMap::new(),
+            instances: vec![bad],
+        };
+        assert!(check_main_instance_trs(&parsed, main_guid, "test").is_err());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn 制約の参照先の重ね合わせは入れ物の不足で失敗する() {
+        // 存在しない `source9` への差し替えは黙って足さず失敗させる。
+        let extra = yaml_serde::Mapping::new();
+        let mods = vec![PrefabMod {
+            target_fid: 7,
+            target_guid: None,
+            path: "Sources.source9.SourceTransform".to_owned(),
+            value: None,
+            obj_ref: Some(ParsedRef {
+                fid: 437313472444593835,
+                guid: None,
+            }),
+        }];
+        assert!(overlay_constraint_sources(&extra, &mods, "test").is_err());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn 制約の参照先の重ね合わせは変換と重みを差し替える() {
+        // `source0` の参照と重みを差し替え、他は保つ。
+        let mut slot = yaml_serde::Mapping::new();
+        slot.insert(
+            yaml_serde::Value::String("SourceTransform".to_owned()),
+            yaml_serde::Value::Mapping({
+                let mut m = yaml_serde::Mapping::new();
+                m.insert(
+                    yaml_serde::Value::String("fileID".to_owned()),
+                    yaml_serde::Value::Number(0.into()),
+                );
+                m
+            }),
+        );
+        slot.insert(
+            yaml_serde::Value::String("Weight".to_owned()),
+            yaml_serde::Value::Number(yaml_serde::Number::from(1.0)),
+        );
+        let mut extra = yaml_serde::Mapping::new();
+        extra.insert(
+            yaml_serde::Value::String("Sources".to_owned()),
+            yaml_serde::Value::Mapping({
+                let mut m = yaml_serde::Mapping::new();
+                m.insert(
+                    yaml_serde::Value::String("source0".to_owned()),
+                    yaml_serde::Value::Mapping(slot),
+                );
+                m
+            }),
+        );
+        let mods = vec![
+            PrefabMod {
+                target_fid: 7,
+                target_guid: None,
+                path: "Sources.source0.SourceTransform".to_owned(),
+                value: None,
+                obj_ref: Some(ParsedRef {
+                    fid: 437313472444593835,
+                    guid: None,
+                }),
+            },
+            PrefabMod {
+                target_fid: 7,
+                target_guid: None,
+                path: "Sources.source0.Weight".to_owned(),
+                value: Some(yaml_serde::Value::Number(yaml_serde::Number::from(0.5))),
+                obj_ref: None,
+            },
+        ];
+        let patched = overlay_constraint_sources(&extra, &mods, "test").expect("差し替えできる");
+        let sources = patched
+            .get("Sources")
+            .and_then(|v| v.as_mapping())
+            .expect("Sourcesは残る");
+        let slot = sources
+            .get("source0")
+            .and_then(|v| v.as_mapping())
+            .expect("source0は残る");
+        let fid = slot
+            .get("SourceTransform")
+            .and_then(|v| v.as_mapping())
+            .and_then(|m| m.get("fileID"))
+            .and_then(|v| v.as_i64())
+            .expect("参照が残る");
+        assert_eq!(fid, 437313472444593835);
+        let weight = slot
+            .get("Weight")
+            .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)))
+            .expect("重みが残る");
+        assert!((weight - 0.5).abs() < 1e-12);
+        // 欄名の誤りは失敗させる。
+        let bad = vec![PrefabMod {
+            target_fid: 7,
+            target_guid: None,
+            path: "Sources.source0.Foo".to_owned(),
+            value: None,
+            obj_ref: None,
+        }];
+        assert!(overlay_constraint_sources(&extra, &bad, "test").is_err());
     }
 }

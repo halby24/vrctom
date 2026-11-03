@@ -769,6 +769,18 @@ fn derive_physics_from_prefab(
     for ignored in &derived.ignored_types {
         eprintln!("物理導出の無視: {}", escape_diag(ignored));
     }
+    // 検証用に導出sidecarを保存する。空でなければ書き出す。
+    if let Ok(dump_path) = std::env::var("VRCTOM_PHYSICS_DUMP")
+        && !dump_path.is_empty()
+        && let Err(error) = std::fs::write(&dump_path, &derived.json)
+    {
+        eprintln!(
+            "導出sidecarを保存できない: {}: {}",
+            escape_diag(&dump_path),
+            escape_diag(&error.to_string())
+        );
+        return Err(1);
+    }
     let sidecar = match PhysicsSidecar::parse(&derived.json, &PhysicsLimits::new()) {
         Ok(sidecar) => sidecar,
         Err(error) => {
