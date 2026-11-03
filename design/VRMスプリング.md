@@ -3,9 +3,9 @@
 ## 担当責務
 
 この文書は、Unityヘルパが出力する物理sidecar（JSON）を読み、
-参照解決と座標検証、スプリングの最小出力を行う設計を担当する。
+参照解決と参照検査、スプリングの最小出力を行う設計を担当する。
 sidecarの目的・スキーマ・IDとパスの規則・完全一致の対応付け・
-座標ゲート・上限と失敗条件・出力範囲と制限を持つ。
+参照検査・上限と失敗条件・出力範囲と制限を持つ。
 完全な参照実装一致（endpoint・平均tail）・
 拘束の解釈・FX既定姿勢の評価は担当しない。
 関節値は参照実装の式どおりに求め、Unity出力と突き合わせる。
@@ -20,10 +20,10 @@ GLBへの書き出しは [`VRM書き出し`](VRM書き出し.md) が行う。
 flowchart LR
     helper[Unityヘルパ<br/>PhysBone・collider走査] --> json[sidecar JSON<br/>vrctom.physics v1]
     json --> parse[PhysicsSidecar::parse<br/>検証のみ]
-    fbx[FBXバイト列] --> resolve[VrmModel::resolve_physics_sidecar<br/>SHA照合・完全一致・座標ゲート]
+    fbx[FBXバイト列] --> resolve[VrmModel::resolve_physics_sidecar<br/>SHA照合・完全一致・参照検査]
     model[VrmModel<br/>ノード階層] --> resolve
     parse --> resolve
-    resolve --> out[PhysicsResolution<br/>対応表・未解決・変換行列]
+    resolve --> out[PhysicsResolution<br/>対応表・補助ノード]
     out --> comp[compile_springs<br/>分岐分割・式どおりの関節値]
     sidecar2[PhysicsSidecar<br/>値] --> comp
     comp --> bones[VrmSpringBones<br/>診断付き]
@@ -101,24 +101,34 @@ IDは `n:`・`pb:`・`c:` の接頭辞を持ち、sidecar全体で一意であ�
 ## 対応解決
 
 `VrmModel::resolve_physics_sidecar` は次の順で進める。
+`VrmModel` を可変で受け取り、補助ノードの追加で更新する。
 
 1. `capture.statePolicy` が `bind-pose` または `edit-mode` であることを確かめる。
    変換にはFBXのbind姿勢と一致する `bind-pose` を推奨する。
    それ以外は今回未対応として失敗する。
 2. FBXバイト列のSHA-256を求め、`sourceModels` と照合する。
    一致がちょうど1件でない場合は失敗する。
-3. 完全一致で対応付ける。0件・複数件・出所なしの参照は失敗する。
-4. `source: null` のノードは、参照されていなければ未解決報告に残して続ける。
-   平面colliderだけが参照するシーン専用ノードは、コンパイル時に補助ノードとして追加する。
-   それ以外の参照は次単位の補助ノード生成が必要なため、明示的に失敗する。
-   名前で近似しない。
+3. 完全一致で対応付ける。0件・複数件の対応は失敗する。
+   `source.path` が別モデル向きの場合は照合対象外であり、後段で検出する。
+4. sidecarにあって `VrmModel` に無いノードは、Transformのみの補助ノードとして
+   `VrmModel` の末尾に追加し、対応表に含める（sidecar順）。
+   Prefabで追加されたオブジェクト（シーン追加ノード）がスプリング・コライダー・
+   制約から参照される場合に必要になる。親子・名前・ローカル変換
+   （`referenceLocal` のVRM右手系換算）・兄弟順はsidecarの値を用いる。
+   追加ノードはmeshを持たず、skin・humanoidの写像は変えない。
+   追加した件数と名前は `PhysicsResolution::auxiliary_nodes` に残し、
+   CLIの標準エラーにも出す（例：`物理: 補助ノード5件を追加`）。
+   平面colliderだけに参照されるノードは、平面経路が基準ノードを直接合成するため
+   対象外にする（重複を避ける）。名前で近似しない。
+   決定性はsidecar順で保つ。重複IDは検証済みのため起きず、
+   循環は検証で拒否済み、親不在はここで失敗する。
 5. PhysBone・colliderの参照IDを対応表で引き、存在と一意性を確かめる。
    平面colliderは解決時点では出力対象外として除外し、`PhysicsResolution` に報告する。
    コンパイル側ではsidecarから直接出力するため、出力物には含まれる。
-6. 座標ゲートで単一の変換行列を確かめ、`PhysicsResolution` に保持する。
+6. 参照ローカルの一致で対応表を検証する。詳細は [`参照検査`](#参照検査) を見る。
 
 `PhysicsResolution` はsidecarノードIDからVrmノード索引への対応表・
-未解決の追加ノード・PhysBoneとcolliderの参照・座標変換行列を持つ。
+追加した補助ノード・PhysBoneとcolliderの参照を持つ。
 [`compile_springs`] が最小出力に使う。
 
 対応解決の後、スプリングの生成より前に [`apply_humanoid_t_pose`](VRM書き出し.md)
@@ -126,7 +136,7 @@ IDは `n:`・`pb:`・`c:` の接頭辞を持ち、sidecar全体で一意であ�
 無い骨はノードの姿勢のまま残す。参照実装もリグ構築直後に T-pose を当ててから
 物理を解決するため、同じ順序にする。
 
-## 座標ゲート
+## 参照検査
 
 sidecarの参照ローカルTRSから参照世界行列を、
 `VrmModel` の `root` とローカル行列から出力世界行列を組み立てる。
@@ -135,13 +145,24 @@ sidecarの `capture.coordinateSpace` はUnityの左手系
 変換してから比較する。変換は位置のX反転とクォータニオンの
 `(x, -y, -z, w)` であり、階層のローカルにも同じ変換を適用する。
 
-対応する物理参照ノードで `model_world * inverse(converted_sidecar_world)` が
-単一の行列に一致するか確かめる。許容差はsidecarがf32由来であることを考慮して
-`1e-4` とし、軸や単位を推測しない。一致しない場合は理由付きで失敗する。
+物理が実際に参照するノードごと（PhysBoneのcomponent・root・ignoreと
+colliderのcomponent・root）に世界行列を比べる。
+線形部（3x3）はモデルルートの一様な単位換算で割って正規化し、
+平行移動はメートルのまま比べる。w行は両方 `[0, 0, 0, 1]` のため除く。
+許容差は `5e-3` とし、平行移動（メートル）と線形部（無次元）を同じ尺度で評価する。
+sidecarはf32由来であり、bind姿勢の丸めと行列積の丸めを許す。
+実測ではManukaの脚鎖で最大 `1.5e-3` の偏差が出る。鎖の上流のわずかな
+回転差がレバーアームで増幅されたものであり、見た目では区別できない。
+ChiffonはFBXがセンチメートル単位であり、旧来の単一変換行列では破綻したため、
+モデルルート scale による正規化が必要になった。
+誤ったFBXとの照合はセンチメートル単位以上のずれになるため、この値でも検出できる。
 
-対象はPhysBoneのroot・ignoreとcolliderのrootとして参照されるノードだけである。
+対象から外すのは次のものである。補助ノードは親の鎖の比率を継承するため、
+骨鎖の世界とは一般に一致せず、一貫性は参照ローカルの換算そのもので保つ。
 メッシュ所有ノードは頂点ベイクで切り離されるため対象外とする。
-基準ノードはsidecar索引順に固定し、HashMapの反復順に依存させない。
+全身の関節を対象にすると指や表情用ボーンの編集時ポーズ差まで拾うため、
+物理参照ノードに絞る。基準ノードはsidecar索引順に固定し、
+HashMapの反復順に依存させない。対象が0件の場合は失敗する。
 
 ## 上限と失敗条件
 
@@ -155,8 +176,7 @@ sidecarの `capture.coordinateSpace` はUnityの左手系
 - 非有限値・範囲外（負の半径・正でないルート拡大率・正規化されていない回転など）。
 - 未知の重み付きカーブ。
 - SHA-256の不一致・複数一致。
-- 対応の0件・複数件・参照されるシーン追加ノード。
-- 座標ゲートの不一致。
+- 対応の0件・複数件・補助ノードの親不在・参照ローカルの不一致。
 - `bind-pose`・`edit-mode` 以外の参照姿勢。
 
 ## 保証しないこと
@@ -165,8 +185,9 @@ sidecarの `capture.coordinateSpace` はUnityの左手系
   参照実装の式による関節値・角度制限・平面collider（補助ノード付き）であり、
   制限は [`VRMスプリング`](#出力範囲と制限) に残す。
   endpoint・平均tailの出力は次の作業単位である。
-- シーン追加ノードの補助生成は、平面colliderの基準ノードに限る。
-  それ以外の参照があれば保留として失敗する。
+- シーン追加ノードの補助生成は、物理（スプリング・コライダー・制約・humanoid・視線）が
+  参照する範囲で行う。平面colliderだけに参照されるノードは平面経路が直接合成するため除く。
+  参照されない追加ノードは出さない。
 - 拘束・FX既定姿勢・animated・stretch系の評価はしない。
 - 推測での軸決定・単位決定・名前近似はしない。
 
@@ -350,6 +371,17 @@ FBXバイト列・Assets配置（`.meta` 読み取り用）・Prefab文書から
 - Collider・Constraint・lookAt・unsupportedFeaturesも同様にPrefabから読む。
   lookAtはdescriptorの生値を写し、目はノードID体系で空文字許容とする。
   決定性はノードDFS順→取得順（文書順）である。
+- 非graftのPrefab（Manuka・Chiffon・Ciel）は一般木で組み立てる。
+  father/childrenの配線・`m_RootOrder` の順序・TRS・`m_IsActive`・`m_Name` の
+  上書きを適用し、構造不明の改変があれば失敗する。Milfyのgraft経路は触らない。
+- Unity純正の `RotationConstraint`（classID `1818360609`）は `uc:` 制約として読む。
+  旧SDK由来で欠落しがちな `ignoreOtherPhysBones`・`version` は既定値で補う。
+- 同一ノードの複数成分の順序はfileID数値順ではなく文書順にする。
+  Ciel・Chiffonの制約・骨順の一致に必要である。
+- Cielは直接記述経路であり、ローカルのGameObject・Transform文書から木を作る。
+  FBX対応は `m_Mesh` のfileIDと名前経路で照合し、複数FBXを読み込む。
+  対応が取れないTransformは `source: null` のTransformのみ節点として出し、
+  一覧を報告する。物理が参照する未対応節点は失敗とする。
 
 失敗条件は次のとおりであり、いずれも黙って落とさず明示的に失敗する。
 
@@ -357,23 +389,88 @@ FBXバイト列・Assets配置（`.meta` 読み取り用）・Prefab文書から
 - 参照解決不能（対象・参照先・ignore・collider・制約の解決不能）。
 - 2019.3より前のFBX取り込み方式（`.meta` の `fileIdsGeneration != 2`）。
 - 無関係な成分（Contact等）は無視してよいが、無視した型名をレポートに残す。
+- 構造不明のPrefab改変・未知の制約種別。
 
-実測（Milfy）での一致状況は次のとおりである。
+実測での一致状況は次のとおりである。
 
-- ノードは **287/287** で一致（副階層のgraftを含む）。
+- Milfy：ノードは **287/287** で一致（副階層のgraftを含む）。
   `parentId`・`siblingIndex`・`scenePath`・`source` は全件一致し、
   `referenceLocal` の差は回転 最大0.000385度（`Ahoge.001`）、
   位置 最大5.2e-7 m（0.5µm）に収まる。0.001度を超えるノードは0件。
-- PhysBone 39・Collider 12・Constraint 11・humanoid 53・lookAt は
+  PhysBone 39・Collider 12・Constraint 11・humanoid 53・lookAt は
   **JSONとして完全一致**する。
-- 出力VRMは件数（spring 45 / joint 148 / collider 12 / center 43 /
+  出力VRMは件数（spring 45 / joint 148 / collider 12 / center 43 /
   constraint 8 / humanoid 53 / limit 71）が一致し、差分は516件すべて
   浮動小数の末尾（stiffness 最大2.2e-5、hitRadius 最大3.7e-8）である。
   バイト列は一致しない（49,565,696 対 49,565,728 バイト）が、
   構造・骨の姿勢・材質・表情に差はない。
+- Manuka：ノード **268/268** で対応・順序・出所が一致する。
+  ただし `referenceSource` は既知の11件だけ違う（Unity側のみ10件の脚鎖と、
+  導出側のみ1件の `n:36`）。回転差は最大0.044度（`Manuka_pants_ribbon_R` 系2件）、
+  位置差は最大2.1e-4 mに収まる。脚鎖10件はbind分解可否の違いである。
+  PhysBone 31・Collider 16・Constraint 4・humanoid 51・lookAt は
+  4ulp許容で一致する（`serde_json` の10進丸め由来の1〜2ulpを吸収する）。
+  `unsupportedFeatures` は導出のみ `trs-decomposition:n:36` の1件、
+  採取のみ10件（脚鎖）であり、由来が逆の差分は無い。
+  出力VRMは spring 49 / joint 165 / collider 16 / constraint 4 / T-pose 51、
+  補助ノード5件（`NadeNade_Head`・`Chest_C1`・`Chest_C2`・`Tail_C`・`Apron_ribbon_C`）である。
+- Chiffon：ノード **231/231** で対応・順序・出所が一致する。
+  `referenceLocal` の差は回転 最大1.3e-5度、位置 最大4.55e-7 mに収まる。
+  PhysBone 19・Collider 7・Constraint 0・humanoid 53・lookAt・
+  `unsupportedFeatures` 39件は4ulp許容で一致する。
+  出力VRMは spring 37 / joint 124 / collider 7 / constraint 0 / T-pose 53、
+  補助ノード29件である。FBXはセンチメートル単位であり、
+  モデルルート scale による正規化が無い参照検査では破綻する。
+- Ciel：ノード **288/288** で親子・名前・兄弟順・シーンパスが一致する。
+  出所はUnity側が空のため一致件数で確かめ、未対応の9件だけ一致する
+  （`Ciel_stick`・`FloorCollider`・`Stick Contact`・`Trail`・
+  `Trail Particle`・`VRoid服`・`インナー`・`服`・`髪`）。
+  残り279件は導出側だけが埋める（Unity側は空であり、仕様上の差である）。
+  `referenceSource` は既知の22件だけ違う（ツインテール・スカート鎖）。
+  回転差は最大0.06度、位置差は最大5.0e-4 mに収まる。
+  PhysBone 45・Collider 5・Constraint 0・humanoid・lookAt は4ulp許容で一致する。
+  `sourceModels` は正解が空であり、導出側はメッシュGUIDから2件
+  （`ciel_1.0`・`ciel_stick`）を埋める（仕様上の差である）。
+  出力VRMは spring 55 / joint 161 / collider 5 / constraint 0 / T-pose 51、
+  補助ノード29件、未対応9件（上記と同じ）である。
+
+既知の許容差分として残すのは次のものであり、修正しない。
+
+- `bind-decomposed-approx` 境界の不一致（Manuka 11件に `n:36` を含む、Ciel 22件）。
+  鎖の上流のわずかな回転差がレバーアームで増幅されたものであり、
+  見た目では区別できない。
+- Manukaのパンツリボン系の約0.04度のbind微小差異。
+  `PoseNode == TransformLink` が同一であることを確かめており、
+  由来はUnity側のf32パイプラインである。
+- JSONの10進表記に由来する最大4ulpの差異。
+  `serde_json` が `0.029999999329447746` を1ulp低く、
+  `-0.23119299113750459` を1ulp高く読む既知の丸めであり、
+  正しく丸める処理系（Python・Rustの `str::parse`）では両表記とも同じ値になる。
+  試験では4ulpまで許し、float32量子化の差（数千ulp相当）は通さない。
 
 以上から、導出経路はUnity採取のsidecarと**実用上等価**である。
 ただしバイト一致ではないため、CLIでは `--physics-from-prefab` を明示したときだけ
 導出経路を使い、既定ではsidecar（`--physics`）を要求する。既定に切り替えるのは、
 他アバターでの確認と、浮動小数差の由来（stiffnessの骨長依存の丸め）を
 詰めてからにする。
+
+### 他アバターでの確認
+
+購入アバターで、Unity採取のsidecarと導出sidecarを突き合わせた結果である。
+
+| アバター | sidecar | 導出 | ノード | ローカル姿勢差 | VRMの件数 | VRMの差分 |
+|---|---|---|---|---|---|---|
+| シフォン | 231ノード / PhysBone 19 / collider 7 | 同じ | 231/231 | 0.00001度・4.6e-7 m | 37 / 124 / 7 | 358件すべて数値（最大1.1e-5）、構造差なし |
+| マヌカ | 268 / 31 / 16 | 同じ | 268/268 | 0.044度・2.1e-4 m | 49 / 165 / 16 | 603件すべて数値（最大1.6e-3）、構造差なし |
+| シエル | 採取できるが `sourceModels` が空 | 導出のみ | — | — | 55 / 161 / 5 | 比較対象なし |
+
+- マヌカの差が大きめなのは、Prefab が主FBXの骨のローカル姿勢
+  （`m_LocalRotation` 等）を上書きしているためで、上書きの適用順・float32量子化に
+  由来する0.2mm級の差である。件数・構造・参照関係は一致する。
+- **シエルのsidecarは `sourceModels` が空**になる。Prefab にレンダラが直接書かれ、
+  FBX のインスタンスを持たないため、UnityヘルパがノードをFBXへ帰属できない。
+  当方の導出経路は `m_Mesh` の fileID から対応を取れるので導出だけで変換できる。
+  この制限は `tools/unity/README.md` にも記載する。
+- シフォンでは導出時に補助ノード29件（Prefabで追加されたオブジェクト）を
+  出力へ加えている。sidecar経路でも同じ補助ノードが生成され、件数が一致する。
+
