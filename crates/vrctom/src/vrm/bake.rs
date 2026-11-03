@@ -1,4 +1,4 @@
-//! テクスチャのベイク（Native限定）。
+//! テクスチャのベイク。
 //!
 //! Unityの `.mat` と参照実装（`SoulFlameBake.shader` の各パス・
 //! `BakeJobBuilder` の組み方・`BakeExecutor.Bind` の渡し方）に沿い、
@@ -130,19 +130,100 @@ fn decode_byte(value: u8, srgb: bool) -> f32 {
 /// PNGは8bit RGBA/RGB・グレースケール（1/2/4/8bit）・16bit・パレットを、
 /// JPEGはグレースケールとRGBを受ける。CMYKなどは読み替えず失敗させる。
 /// `srgb` は `.meta` の `sRGBTexture` であり、標本化時の復号に使う。
+/// `max_pixels` は1枚の画素数の上限であり、画素バッファの確保前に
+/// 寸法だけを見て判定するため、巨大な寸法の申告では確保が起きない。
 ///
 /// # Errors
 ///
-/// 対応外の形式・壊れた画像・空の寸法の場合に返す。
+/// 対応外の形式・壊れた画像・空の寸法・画素上限の超過の場合に返す。
+/// 上限超過は [`MaterialErrorKind::LimitExceeded`] であり、文面に
+/// 寸法と上限を含む。
 pub fn load_bake_image(
     bytes: &[u8],
     mime: VrmImageMime,
     srgb: bool,
     sampler: VrmSampler,
+    max_pixels: u64,
 ) -> Result<BakeImage, MaterialError> {
     match mime {
-        VrmImageMime::Png => decode_png(bytes, srgb, sampler),
-        VrmImageMime::Jpeg => decode_jpeg(bytes, srgb, sampler),
+        VrmImageMime::Png => decode_png(bytes, srgb, sampler, max_pixels),
+        VrmImageMime::Jpeg => decode_jpeg(bytes, srgb, sampler, max_pixels),
+    }
+}
+
+/// 画素数が1枚の上限に収まることを確かめる。
+///
+/// 画素バッファの確保前に呼ぶ。超過は確保を行わず失敗させる。
+fn check_image_pixels(
+    width: u32,
+    height: u32,
+    max_pixels: u64,
+    format: &str,
+) -> Result<(), MaterialError> {
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if pixels > max_pixels {
+        return Err(MaterialError::new(
+            MaterialErrorKind::LimitExceeded,
+            format!("{format}の画素数が上限を超えた: {width}x{height}（上限{max_pixels}画素）"),
+        ));
+    }
+    Ok(())
+}
+
+/// 画像の寸法だけをヘッダから読む。
+///
+/// 画素データの確保は行わないため、巨大な寸法の申告でも確保が起きない。
+/// 焼き・縮小の要否にかかわらず埋め込む画像の寸法検査に使い、
+/// 未検査の画像を埋め込まない。
+///
+/// # Errors
+///
+/// ヘッダを読めない・寸法が0の場合に [`MaterialErrorKind::InvalidMaterial`] で返す。
+pub fn image_dimensions(bytes: &[u8], mime: VrmImageMime) -> Result<(u32, u32), MaterialError> {
+    match mime {
+        VrmImageMime::Png => {
+            let fail = |reason: &str| {
+                MaterialError::new(
+                    MaterialErrorKind::InvalidMaterial,
+                    format!("PNGの寸法を読めない: {reason}"),
+                )
+            };
+            // `output_buffer_size()` や `next_frame()` は呼ばず、
+            // ヘッダの寸法だけを見る。
+            let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+            let reader = decoder
+                .read_info()
+                .map_err(|error| fail(&error.to_string()))?;
+            let (width, height) = {
+                let info = reader.info();
+                (info.width, info.height)
+            };
+            if width == 0 || height == 0 {
+                return Err(fail("寸法が0である"));
+            }
+            Ok((width, height))
+        }
+        VrmImageMime::Jpeg => {
+            let fail = |reason: String| {
+                MaterialError::new(
+                    MaterialErrorKind::InvalidMaterial,
+                    format!("JPEGの寸法を読めない: {reason}"),
+                )
+            };
+            // 画素の復号は行わず、ヘッダの寸法だけを見る。
+            let mut decoder = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(bytes));
+            decoder
+                .decode_headers()
+                .map_err(|error| fail(error.to_string()))?;
+            let (width, height) = match decoder.info() {
+                Some(info) => (u32::from(info.width), u32::from(info.height)),
+                None => return Err(fail("寸法を読めない".to_string())),
+            };
+            if width == 0 || height == 0 {
+                return Err(fail("寸法が0である".to_string()));
+            }
+            Ok((width, height))
+        }
     }
 }
 
@@ -150,7 +231,12 @@ pub fn load_bake_image(
 ///
 /// `png` クレートは展開（パレット・低ビット・16bit）を呼び出し側で行う。
 /// 16bitは上位バイトではなく `(v * 255 + 32895) >> 16` で丸める。
-fn decode_png(bytes: &[u8], srgb: bool, sampler: VrmSampler) -> Result<BakeImage, MaterialError> {
+fn decode_png(
+    bytes: &[u8],
+    srgb: bool,
+    sampler: VrmSampler,
+    max_pixels: u64,
+) -> Result<BakeImage, MaterialError> {
     let fail = |reason: &str| {
         MaterialError::new(
             MaterialErrorKind::InvalidMaterial,
@@ -161,6 +247,22 @@ fn decode_png(bytes: &[u8], srgb: bool, sampler: VrmSampler) -> Result<BakeImage
     let mut reader = decoder
         .read_info()
         .map_err(|error| fail(&error.to_string()))?;
+    // 画素バッファの確保前に寸法だけを見て上限を判定する。
+    // 申告寸法が巨大な入力では `output_buffer_size` の確保が起きない。
+    let (width, height) = {
+        let info = reader.info();
+        (info.width, info.height)
+    };
+    if width == 0 || height == 0 {
+        return Err(fail("寸法が0である"));
+    }
+    check_image_pixels(width, height, max_pixels, "PNG").map_err(|error| {
+        // 寸法と上限を含む文面はそのまま残し、接頭辞だけを揃える。
+        MaterialError::new(
+            MaterialErrorKind::LimitExceeded,
+            format!("PNGを焼き用に復号できない: {error}"),
+        )
+    })?;
     let mut raw = vec![
         0u8;
         reader
@@ -343,7 +445,15 @@ fn expand_16bit(raw: &[u8], color: png::ColorType) -> Result<Vec<u8>, MaterialEr
 }
 
 /// JPEGをRGBA8へ復号する。グレースケールとRGBだけを受け、CMYKは失敗させる。
-fn decode_jpeg(bytes: &[u8], srgb: bool, sampler: VrmSampler) -> Result<BakeImage, MaterialError> {
+///
+/// 先に `decode_headers` で寸法だけを読み、画素上限を判定してから
+/// `decode` するため、巨大な寸法の申告では画素バッファの確保が起きない。
+fn decode_jpeg(
+    bytes: &[u8],
+    srgb: bool,
+    sampler: VrmSampler,
+    max_pixels: u64,
+) -> Result<BakeImage, MaterialError> {
     let fail = |reason: String| {
         MaterialError::new(
             MaterialErrorKind::InvalidMaterial,
@@ -351,6 +461,22 @@ fn decode_jpeg(bytes: &[u8], srgb: bool, sampler: VrmSampler) -> Result<BakeImag
         )
     };
     let mut decoder = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(bytes));
+    decoder
+        .decode_headers()
+        .map_err(|error| fail(error.to_string()))?;
+    let (width, height) = match decoder.info() {
+        Some(info) => (u32::from(info.width), u32::from(info.height)),
+        None => return Err(fail("寸法を読めない".to_string())),
+    };
+    if width == 0 || height == 0 {
+        return Err(fail("寸法が0である".to_string()));
+    }
+    if let Err(error) = check_image_pixels(width, height, max_pixels, "JPEG") {
+        return Err(MaterialError::new(
+            MaterialErrorKind::LimitExceeded,
+            format!("JPEGを焼き用に復号できない: {error}"),
+        ));
+    }
     let pixels = decoder.decode().map_err(|error| fail(error.to_string()))?;
     let info = decoder
         .info()
@@ -1568,8 +1694,14 @@ mod tests {
         } else {
             encode_data_png(pixels, size)
         };
-        load_bake_image(&bytes, VrmImageMime::Png, color, VrmSampler::default())
-            .expect("自作のPNGは復号できる")
+        load_bake_image(
+            &bytes,
+            VrmImageMime::Png,
+            color,
+            VrmSampler::default(),
+            u64::MAX,
+        )
+        .expect("自作のPNGは復号できる")
     }
 
     #[test]
@@ -1614,8 +1746,14 @@ mod tests {
             drop(writer);
             out
         };
-        let image =
-            load_bake_image(&gray, VrmImageMime::Png, false, VrmSampler::default()).unwrap();
+        let image = load_bake_image(
+            &gray,
+            VrmImageMime::Png,
+            false,
+            VrmSampler::default(),
+            u64::MAX,
+        )
+        .unwrap();
         assert_eq!((image.width(), image.height()), (2, 1));
         let left = tap_color(&input_of(image, BakeChannel::Rgb), [0.25, 0.5]);
         assert_eq!(left[0], 0.0);
@@ -1634,8 +1772,14 @@ mod tests {
             drop(writer);
             out
         };
-        let image =
-            load_bake_image(&wide, VrmImageMime::Png, false, VrmSampler::default()).unwrap();
+        let image = load_bake_image(
+            &wide,
+            VrmImageMime::Png,
+            false,
+            VrmSampler::default(),
+            u64::MAX,
+        )
+        .unwrap();
         let got = tap_color(&input_of(image, BakeChannel::Rgb), [0.5, 0.5]);
         // 0x8000/0xFFFF = 0.5000076… → 丸め後は128/255付近である。
         assert!((got[0] - 0.5).abs() < 0.004, "{got:?}");
@@ -1652,8 +1796,14 @@ mod tests {
             drop(writer);
             out
         };
-        let image =
-            load_bake_image(&paletted, VrmImageMime::Png, true, VrmSampler::default()).unwrap();
+        let image = load_bake_image(
+            &paletted,
+            VrmImageMime::Png,
+            true,
+            VrmSampler::default(),
+            u64::MAX,
+        )
+        .unwrap();
         let got = tap_color(&input_of(image, BakeChannel::Rgb), [0.5, 0.5]);
         assert!((got[0] - 1.0).abs() < 0.002, "{got:?}");
         assert!(got[1] < 0.002 && got[2] < 0.002, "{got:?}");
@@ -1666,7 +1816,8 @@ mod tests {
                 &[0x89, 0x50],
                 VrmImageMime::Png,
                 true,
-                VrmSampler::default()
+                VrmSampler::default(),
+                u64::MAX,
             )
             .is_err()
         );
@@ -1675,7 +1826,8 @@ mod tests {
                 &[0xFF, 0xD8, 0x00],
                 VrmImageMime::Jpeg,
                 true,
-                VrmSampler::default()
+                VrmSampler::default(),
+                u64::MAX,
             )
             .is_err()
         );

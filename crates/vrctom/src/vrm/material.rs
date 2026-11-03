@@ -1,9 +1,10 @@
 //! Unityの `.mat` とテクスチャからVRM 1.0の材質を作る層。
 //!
-//! 入口は [`VrmMaterials::load`]（Native限定）であり、展開済みディレクトリの
-//! `Assets` 配下だけを索引化してFBXの材質スロット名を `.mat` に対応付け、
+//! 入口は [`VrmMaterials::load_with`]（ターゲット非依存）であり、
+//! [`crate::unity::AssetSource`] 越しにFBXの材質スロット名を `.mat` に対応付け、
 //! 色・透明度・テクスチャを読み取る。
-//! 型と写像規則はターゲット非依存であり、wasmでは読み取りだけを使わない。
+//! native向けの従来入口 [`VrmMaterials::load`] はこの読み手を使う薄いラッパであり、
+//! `Assets` 配下だけを索引化する方針は変えない。
 //! 得られた [`VrmMaterials`] は [`VrmExportOptions`](super::export::VrmExportOptions) に渡す。
 //!
 //! ```mermaid
@@ -25,27 +26,26 @@
 
 use crate::escape_diag;
 
-#[cfg(not(target_arch = "wasm32"))]
 use std::collections::{HashMap, HashSet};
+// `Path` はnative限定の薄いラッパだけで使う。
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
-#[cfg(not(target_arch = "wasm32"))]
 use std::rc::Rc;
 
-#[cfg(not(target_arch = "wasm32"))]
 use super::bake::{
     AlphaMaskInput, BakeChannel, BakeImage, BakeInput, BakeSize, BakeSt, BaseColorJob, EmissionJob,
     EmissionMask, NormalJob, NpotScale, RepackJob, ShadeJob, bake_base_color, bake_channel_repack,
     bake_emission, bake_normal, bake_output_size, bake_shade, downscale_bake_image,
-    encode_color_png, encode_data_png, encode_rgba_png, import_fitted_size, load_bake_image,
-    matcap_disc_average, shade_layer_weights,
+    encode_color_png, encode_data_png, encode_rgba_png, image_dimensions, import_fitted_size,
+    load_bake_image, matcap_disc_average, shade_layer_weights,
 };
 
-#[cfg(not(target_arch = "wasm32"))]
 use crate::unity::{
-    AssetIndex, AssetKind, Guid, IndexOptions, ParseOptions, SerializedFile, TypedObject,
-    scan_directory,
+    AssetIndex, AssetKind, AssetSource, Guid, ParseOptions, SerializedFile, TypedObject,
 };
+// 索引化と正規化はnative限定の薄いラッパだけで使う。
+#[cfg(not(target_arch = "wasm32"))]
+use crate::unity::{FsAssetSource, IndexOptions, scan_directory};
 
 /// 画像1枚の既定上限（64MiB）。
 ///
@@ -55,6 +55,16 @@ const DEFAULT_MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 ///
 /// 実データの数百MBが収まる大きさにし、破損由来の膨張を抑える。
 const DEFAULT_MAX_TOTAL_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
+/// 画像1枚の画素数の既定上限（8192x8192）。
+///
+/// 圧縮バイト数の上限だけでは巨大な画素寸法の復号時の確保を抑えられないため、
+/// 確保前に寸法で判定する。等身大の8Kテクスチャが収まる大きさにする。
+const DEFAULT_MAX_IMAGE_PIXELS: u64 = 67_108_864;
+/// 復号結果の保持量の既定予算（画素数）。
+///
+/// 焼きの共有表が保持する画素数の目安であり、超えたら古い保持を捨てて
+/// 再復号するため、変換は失敗しない。1枚上限の4枚分にしている。
+const DEFAULT_MAX_TOTAL_IMAGE_PIXELS: u64 = 268_435_456;
 /// 材質数の既定上限（1024件）。
 ///
 /// 実データの数十件より十分大きく、破損由来の大量生成の暴走を抑える.
@@ -62,18 +72,15 @@ const DEFAULT_MAX_MATERIALS: usize = 1024;
 /// `.mat` 1件の読み取り上限（8MiB）。
 ///
 /// テキストYAMLの実測より十分大きく、破損由来の膨張を抑える。
-#[cfg(not(target_arch = "wasm32"))]
 const MAX_MATERIAL_BYTES: u64 = 8 * 1024 * 1024;
 /// `.shader` 1件の読み取り上限（4MiB）。
 ///
 /// 先頭のシェーダ名だけを見るため、本文全体は読まない。
-#[cfg(not(target_arch = "wasm32"))]
 const MAX_SHADER_BYTES: u64 = 4 * 1024 * 1024;
 
 /// 不透明lilToonシェーダのGUID表（小文字）。
 ///
 /// `.shader` が索引に無い場合の系列判定に使う。
-#[cfg(not(target_arch = "wasm32"))]
 const OPAQUE_SHADER_GUIDS: [&str; 4] = [
     "df12117ecd77c31469c224178886498e",
     "efa77a80ca0344749b4f19fdd5891cbe",
@@ -81,7 +88,6 @@ const OPAQUE_SHADER_GUIDS: [&str; 4] = [
     "583a88005abb81a4ebbce757b4851a0d",
 ];
 /// カットアウトlilToonシェーダのGUID表（小文字）。
-#[cfg(not(target_arch = "wasm32"))]
 const MASK_SHADER_GUIDS: [&str; 4] = [
     "85d6126cae43b6847aff4b13f4adb8ec",
     "3b4aa19949601f046a20ca8bdaee929f",
@@ -89,7 +95,6 @@ const MASK_SHADER_GUIDS: [&str; 4] = [
     "8cf5267d397b04846856f6d3d9561da0",
 ];
 /// 半透明lilToonシェーダのGUID表（小文字）。
-#[cfg(not(target_arch = "wasm32"))]
 const BLEND_SHADER_GUIDS: [&str; 4] = [
     "165365ab7100a044ca85fc8c33548a62",
     "3c79b10c7e0b2784aaa4c2f8dd17d55e",
@@ -102,7 +107,6 @@ const BLEND_SHADER_GUIDS: [&str; 4] = [
 /// lilToon 2.3.4の `.shader.meta` で裏付けした6件であり、
 /// シリーズ判定の表と直交する。参照実装の `HasOutline`
 /// （名前に `Outline` を含み `OutlineOnly` を含まない）と対応する。
-#[cfg(not(target_arch = "wasm32"))]
 const OUTLINE_SHADER_GUIDS: [&str; 6] = [
     "efa77a80ca0344749b4f19fdd5891cbe",
     "583a88005abb81a4ebbce757b4851a0d",
@@ -116,7 +120,6 @@ const OUTLINE_SHADER_GUIDS: [&str; 6] = [
 ///
 /// リム色のアルファ重み付けが通常lilToonと異なるため区別する。
 /// 参照実装の `IsLite`（名前に `Lite` を含む）と対応する。
-#[cfg(not(target_arch = "wasm32"))]
 const LITE_SHADER_GUIDS: [&str; 6] = [
     "381af8ba8e1740a41b9768ccfb0416c2",
     "583a88005abb81a4ebbce757b4851a0d",
@@ -127,10 +130,8 @@ const LITE_SHADER_GUIDS: [&str; 6] = [
 ];
 
 /// PNGの先頭バイト。
-#[cfg(not(target_arch = "wasm32"))]
 const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 /// JPEGの先頭バイト。
-#[cfg(not(target_arch = "wasm32"))]
 const JPEG_MAGIC: [u8; 3] = [0xFF, 0xD8, 0xFF];
 
 /// FBXの材質スロット名から引ける材質と画像の集合。
@@ -167,12 +168,59 @@ impl VrmMaterials {
         &self.images
     }
 
+    /// 資産の読み手から材質を読み取る（ターゲット非依存）。
+    ///
+    /// `source` は `Assets` 直下を基準とする読み手、`index` はその索引、
+    /// `fbx_relative` は `Assets` 基準の `/` 区切りのFBXパスである。
+    /// `.fbx.meta` の `UnityEngine:Material` 置換表を順に解決し、
+    /// `.mat` とテクスチャを読む。
+    ///
+    /// 置換表が無い・FBXが索引に無い場合は材質なしとして `(None, 報告)` を返す。
+    /// 未対応の材質は灰色材質へ落とし、警告を残して続ける。
+    ///
+    /// # Errors
+    ///
+    /// `.mat` や画像の読み込み失敗・上限の超過などの場合に返す。
+    pub fn load_with(
+        source: &dyn AssetSource,
+        index: &AssetIndex,
+        fbx_relative: &str,
+        options: &MaterialOptions,
+    ) -> Result<(Option<VrmMaterials>, MaterialReport), MaterialError> {
+        let mut context = LoadContext::new(source, index, options);
+        let Some(record) = index.get_by_path(fbx_relative) else {
+            context.warn(format!("FBXが索引にないため材質を読まない: {fbx_relative}"));
+            return Ok((None, context.report()));
+        };
+        let remaps = record.meta.external_object_remaps().map_err(|error| {
+            MaterialError::new(
+                MaterialErrorKind::Unity,
+                format!("FBXの置換表を読めない: {error}"),
+            )
+            .with_source(error)
+        })?;
+        let remaps: Vec<_> = remaps
+            .into_iter()
+            .filter(|entry| entry.original_type == "UnityEngine:Material")
+            .collect();
+        if remaps.is_empty() {
+            context.warn("FBXに材質の置換表がないため材質を読まない");
+            return Ok((None, context.report()));
+        }
+        for entry in &remaps {
+            context.load_slot(entry)?;
+        }
+        context.assign_render_queue_offsets();
+        let (materials, report) = context.finish();
+        Ok((Some(materials), report))
+    }
+
     /// 展開済みディレクトリから材質を読み取る（Native限定）。
     ///
     /// `root` は `Assets` を含むUnityプロジェクトの配置を指し、
     /// `fbx_path` は `Assets` 配下のFBXを指す。`Assets` 配下だけを索引化して
-    /// `.fbx.meta` の `UnityEngine:Material` 置換表を順に解決し、
-    /// `.mat` とテクスチャを読む。
+    /// [`load_with`](Self::load_with) に委譲する。正規化・走査・相対化の
+    /// 挙動とエラー分類は従来のまま保つ。
     ///
     /// 置換表が無い・FBXが索引に無い場合は材質なしとして `(None, 報告)` を返す。
     /// 未対応の材質は灰色材質へ落とし、警告を残して続ける。
@@ -237,7 +285,7 @@ impl VrmMaterials {
                 }
                 failure
             })?;
-        let mut context = LoadContext::new(&canonical_assets, &index, options);
+        let source = FsAssetSource::new(&canonical_assets);
         let relative = canonical_fbx
             .strip_prefix(&canonical_assets)
             .ok()
@@ -249,38 +297,11 @@ impl VrmMaterials {
             })
             .map(|parts| parts.join("/").replace('\\', "/"));
         let Some(relative) = relative else {
+            let mut context = LoadContext::new(&source, &index, options);
             context.warn("FBXがAssets配下にないため材質を読まない");
             return Ok((None, context.report()));
         };
-        let Some(record) = index.get_by_path(&relative) else {
-            context.warn(format!("FBXが索引にないため材質を読まない: {relative}"));
-            return Ok((None, context.report()));
-        };
-        let remaps = record.meta.external_object_remaps().map_err(|error| {
-            MaterialError::new(
-                MaterialErrorKind::Unity,
-                format!("FBXの置換表を読めない: {error}"),
-            )
-            .with_source(error)
-        })?;
-        let remaps: Vec<_> = remaps
-            .into_iter()
-            .filter(|entry| entry.original_type == "UnityEngine:Material")
-            .collect();
-        if remaps.is_empty() {
-            context.warn("FBXに材質の置換表がないため材質を読まない");
-            return Ok((None, context.report()));
-        }
-        for entry in &remaps {
-            context.load_slot(entry)?;
-        }
-        context.assign_render_queue_offsets();
-        let materials = VrmMaterials::new(
-            std::mem::take(&mut context.entries),
-            std::mem::take(&mut context.images),
-        );
-        let report = context.report();
-        Ok((Some(materials), report))
+        Self::load_with(&source, &index, &relative, options)
     }
 }
 
@@ -526,17 +547,23 @@ pub struct MaterialOptions {
     max_image_bytes: u64,
     max_total_image_bytes: u64,
     max_materials: usize,
+    max_image_pixels: u64,
+    max_total_image_pixels: u64,
 }
 
 impl MaterialOptions {
     /// 既定の上限を持つ設定を生成する。
     ///
-    /// 画像1枚64MiB、合計512MiB、材質1024件である。
+    /// 画像1枚64MiB、合計512MiB、材質1024件、
+    /// 画像1枚67108864画素（8192x8192）の上限、
+    /// 復号結果の保持量の予算268435456画素である。
     pub fn new() -> Self {
         Self {
             max_image_bytes: DEFAULT_MAX_IMAGE_BYTES,
             max_total_image_bytes: DEFAULT_MAX_TOTAL_IMAGE_BYTES,
             max_materials: DEFAULT_MAX_MATERIALS,
+            max_image_pixels: DEFAULT_MAX_IMAGE_PIXELS,
+            max_total_image_pixels: DEFAULT_MAX_TOTAL_IMAGE_PIXELS,
         }
     }
 
@@ -555,6 +582,21 @@ impl MaterialOptions {
     /// 材質数の上限を変更する。
     pub fn with_max_materials(mut self, count: usize) -> Self {
         self.max_materials = count;
+        self
+    }
+
+    /// 画像1枚の画素数の上限を変更する。
+    pub fn with_max_image_pixels(mut self, pixels: u64) -> Self {
+        self.max_image_pixels = pixels;
+        self
+    }
+
+    /// 復号結果の保持量の予算を変更する。
+    ///
+    /// 焼きの共有表が保持する画素数の目安であり、超えたら古い保持を捨てて
+    /// 再復号する。予算の超過では失敗しない。
+    pub fn with_max_total_image_pixels(mut self, pixels: u64) -> Self {
+        self.max_total_image_pixels = pixels;
         self
     }
 }
@@ -593,7 +635,6 @@ pub struct MaterialError {
 }
 
 impl MaterialError {
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn new(kind: MaterialErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
@@ -603,13 +644,11 @@ impl MaterialError {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn with_path(mut self, path: impl Into<String>) -> Self {
         self.path = Some(path.into().into_boxed_str());
         self
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn with_source(
         mut self,
         source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -688,7 +727,6 @@ pub(crate) fn placeholder(slot: &str) -> VrmMaterial {
 }
 
 /// lilToonシェーダの透明度系列。
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShaderSeries {
     /// 不透明。
@@ -705,7 +743,6 @@ enum ShaderSeries {
 /// 描画するかどうか、Multiは描画方式を使うかどうかに使う。
 /// 参照実装の `ShaderCapabilityResult`（`RenderMode`・`HasOutline`・
 /// `IsMulti`）と対応する。
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ShaderCapability {
     /// 透明度系列。
@@ -719,9 +756,8 @@ struct ShaderCapability {
 }
 
 /// 読み取り作業域。警告・材質・画像と重複排除表を持つ。
-#[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct LoadContext<'a> {
-    root: &'a Path,
+    source: &'a dyn AssetSource,
     index: &'a AssetIndex,
     options: &'a MaterialOptions,
     warnings: Vec<String>,
@@ -732,6 +768,11 @@ pub(crate) struct LoadContext<'a> {
     images: Vec<VrmImage>,
     image_at: HashMap<Guid, usize>,
     total_image_bytes: u64,
+    /// 焼きの共有表（`baked_inputs`）が現在保持している画素数の合計。
+    ///
+    /// 合計は保持量の予算であり、超えたら捨てて再復号する。ピークは
+    /// 予算＋処理中の数枚に抑える。
+    cached_image_pixels: u64,
     /// 焼き用に復号した画像の共有表。復号失敗時は `None` を覚えて直載せへ落とす。
     /// キーはGUIDと色・データ区分の対であり、同じGUIDでも用途区分が違えば
     /// 別の版（縮小の色空間が違う）として持つ。同じ対は1回だけ復号する。
@@ -740,11 +781,14 @@ pub(crate) struct LoadContext<'a> {
     baked_outputs: HashMap<[u8; 32], usize>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl<'a> LoadContext<'a> {
-    pub(crate) fn new(root: &'a Path, index: &'a AssetIndex, options: &'a MaterialOptions) -> Self {
+    pub(crate) fn new(
+        source: &'a dyn AssetSource,
+        index: &'a AssetIndex,
+        options: &'a MaterialOptions,
+    ) -> Self {
         Self {
-            root,
+            source,
             index,
             options,
             warnings: Vec::new(),
@@ -754,6 +798,7 @@ impl<'a> LoadContext<'a> {
             images: Vec::new(),
             image_at: HashMap::new(),
             total_image_bytes: 0,
+            cached_image_pixels: 0,
             baked_inputs: HashMap::new(),
             baked_outputs: HashMap::new(),
         }
@@ -769,6 +814,48 @@ impl<'a> LoadContext<'a> {
         MaterialReport {
             warnings: std::mem::take(&mut self.warnings),
         }
+    }
+
+    /// 1枚の画素数が上限に収まることを確かめる。
+    ///
+    /// 復号の実体は [`load_bake_image`](super::bake::load_bake_image) 側でも確保前に
+    /// 判定するため、二重の確認になる。超過は [`MaterialErrorKind::LimitExceeded`]
+    /// であり、文面に寸法と上限を含む。`detail` は対象の表示（スロットと
+    /// プロパティ）である。
+    fn check_image_pixels(
+        &self,
+        width: u32,
+        height: u32,
+        detail: &str,
+    ) -> Result<(), MaterialError> {
+        let pixels = u64::from(width).saturating_mul(u64::from(height));
+        if pixels > self.options.max_image_pixels {
+            return Err(MaterialError::new(
+                MaterialErrorKind::LimitExceeded,
+                format!(
+                    "画像の画素数が上限を超えた: {detail}: {width}x{height}（上限{}画素）",
+                    self.options.max_image_pixels,
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 復号結果を保持量の予算に入れる。
+    ///
+    /// 現在の保持量に新しい画像の画素数を足して予算（`max_total_image_pixels`）を
+    /// 超えるなら、共有表（`baked_inputs`）を全消去して保持量を0に戻してから
+    /// 入れる。失敗にしない。同じ画像を複数回・複数用途で復号すると復号の累計は
+    /// 保持量より大きくなるため、累計での失敗はしない。消去時に処理中の画像は
+    /// `Rc` で生きたまま残るため、処理中の画像は壊れない。
+    /// ピークは予算＋処理中の数枚に抑える。
+    fn admit_bake_cache(&mut self, width: u32, height: u32) {
+        let pixels = u64::from(width).saturating_mul(u64::from(height));
+        if self.cached_image_pixels.saturating_add(pixels) > self.options.max_total_image_pixels {
+            self.baked_inputs.clear();
+            self.cached_image_pixels = 0;
+        }
+        self.cached_image_pixels = self.cached_image_pixels.saturating_add(pixels);
     }
 
     /// 置換表1件を解決して材質列に積む。
@@ -803,6 +890,8 @@ impl<'a> LoadContext<'a> {
     /// `slot` は材質プールの共有名であり、重複時は最初の読み取りを残す。
     /// `mat_path` はsidecarの `.mat` 資産パスであり、索引と食い違う場合は
     /// 警告して索引側を使う。
+    // レンダラ経路はnative限定のため、対象外ターゲットでは未使用になる。
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn load_renderer_material(
         &mut self,
         guid_text: &str,
@@ -953,7 +1042,7 @@ impl<'a> LoadContext<'a> {
                 "{subject}のパスが索引と一致しないため索引を使う: {slot}: {expected}に対して{path}"
             ));
         }
-        let bytes = match read_limited(&self.root.join(&path), MAX_MATERIAL_BYTES) {
+        let bytes = match self.source.read_limited(&path, MAX_MATERIAL_BYTES) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
                 return Err(MaterialError::new(
@@ -1053,7 +1142,7 @@ impl<'a> LoadContext<'a> {
             if let Some(record) = self.index.get(&guid)
                 && record.kind == AssetKind::Shader
             {
-                match read_limited(&self.root.join(&record.path), MAX_SHADER_BYTES) {
+                match self.source.read_limited(&record.path, MAX_SHADER_BYTES) {
                     Ok(bytes) => match std::str::from_utf8(&bytes) {
                         Ok(text) => {
                             if let Some(name) = first_shader_name(text)
@@ -1412,6 +1501,8 @@ impl<'a> LoadContext<'a> {
     ///
     /// プロパティ無し・未割り当ては `None`、索引に無い・形式外は警告して `None`、
     /// 画像の読み込み失敗・上限超過だけは失敗として返す。
+    /// 埋め込む画像は焼き・縮小の要否にかかわらず寸法をヘッダから検査し、
+    /// 未検査のまま埋め込まない。寸法を読めない画像は警告して省く。
     /// 同じGUIDの画像は1件だけ読み、索引を共有する。
     fn resolve_texture(
         &mut self,
@@ -1455,7 +1546,10 @@ impl<'a> LoadContext<'a> {
         }
         let path = record.path.clone();
         // 上限を超える分は読む前に打ち切り、超過は失敗として返す。
-        let bytes = match read_limited(&self.root.join(&path), self.options.max_image_bytes) {
+        let bytes = match self
+            .source
+            .read_limited(&path, self.options.max_image_bytes)
+        {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
                 return Err(MaterialError::new(
@@ -1483,10 +1577,36 @@ impl<'a> LoadContext<'a> {
             ));
             return Ok(None);
         };
+        // 焼き・縮小の要否にかかわらず、埋め込む画像の寸法をヘッダから検査する。
+        // 画素データの確保は行わない。上限超過は失敗して対象パスを付け、
+        // ヘッダを読めない画像は未検査のまま埋め込まず警告して省く。
+        // 変換全体は失敗させない。
+        match image_dimensions(&bytes, mime) {
+            Ok((width, height)) => {
+                if let Err(error) =
+                    self.check_image_pixels(width, height, &format!("{slot}: {property}"))
+                {
+                    return Err(error.with_path(path.clone()));
+                }
+            }
+            Err(error) => {
+                self.warn(format!(
+                    "画像の寸法を読めないため省く: {slot}: {property}: {path}: {error}"
+                ));
+                return Ok(None);
+            }
+        };
         // PNGは付加チャンクを落としてから埋め込む。JPEGはそのまま扱う。
         // チャンク構造が読めないPNGは壊さず元のまま残し、警告する。
         // 合計バイト数と `VrmImage.data` は縮小後・除去後のバイト列で数える。
-        let (bytes, mime) = self.shrink_passthrough(slot, property, bytes, mime, &record.meta);
+        // 復号時の画素上限の超過だけは失敗として返し、対象パスを付ける。
+        let (bytes, mime) = match self.shrink_passthrough(slot, property, bytes, mime, &record.meta)
+        {
+            Ok(done) => done,
+            Err(error) => {
+                return Err(error.with_path(path.clone()));
+            }
+        };
         let total = self.total_image_bytes.saturating_add(bytes.len() as u64);
         if total > self.options.max_total_image_bytes {
             return Err(MaterialError::new(
@@ -1519,7 +1639,11 @@ impl<'a> LoadContext<'a> {
     /// NPOTを適用する。縮小が必要な場合だけ復号・再符号化し、
     /// 縮小後はRGBAのPNGとして埋め込む（JPEGの縮小もPNGになる）。
     /// 取り込み上限が無い場合と復号できない画像は、付加チャンクだけを落とした
-    /// 元のバイト列のまま残す（警告は増やさない）。
+    /// 元のバイト列のまま残す。縮小用の復号結果は保持しないため、
+    /// 保持量の予算の対象にはならない。
+    ///
+    /// 復号時の1枚の画素上限の超過だけは呼び出し側へ伝播し、それ以外の
+    /// 復号失敗は警告して元のバイト列へ落とす。
     fn shrink_passthrough(
         &mut self,
         slot: &str,
@@ -1527,47 +1651,68 @@ impl<'a> LoadContext<'a> {
         bytes: Vec<u8>,
         mime: VrmImageMime,
         meta: &crate::unity::AssetMeta,
-    ) -> (Vec<u8>, VrmImageMime) {
+    ) -> Result<(Vec<u8>, VrmImageMime), MaterialError> {
         let (max_size, npot, unknown_npot) = import_limit_of(meta);
         if unknown_npot {
             self.warn(format!(
                 "NPOT指定が読めないためそのままの寸法で扱う: {slot}: {property}"
             ));
         }
-        if (max_size.is_some() || npot != NpotScale::None)
-            && let Ok(image) = load_bake_image(&bytes, mime, srgb_of(meta), sampler_of(meta))
-        {
-            let (fitted_w, fitted_h) =
-                import_fitted_size(image.width(), image.height(), max_size, npot);
-            if (fitted_w, fitted_h) != (image.width(), image.height()) {
-                let linear = !is_color_property(property);
-                let small = downscale_bake_image(&image, fitted_w, fitted_h, linear);
-                return (
-                    encode_rgba_png(
-                        small.pixels(),
-                        BakeSize {
-                            width: fitted_w,
-                            height: fitted_h,
-                        },
-                    ),
-                    VrmImageMime::Png,
-                );
+        if max_size.is_some() || npot != NpotScale::None {
+            match load_bake_image(
+                &bytes,
+                mime,
+                srgb_of(meta),
+                sampler_of(meta),
+                self.options.max_image_pixels,
+            ) {
+                Ok(image) => {
+                    self.check_image_pixels(
+                        image.width(),
+                        image.height(),
+                        &format!("{slot}: {property}"),
+                    )?;
+                    let (fitted_w, fitted_h) =
+                        import_fitted_size(image.width(), image.height(), max_size, npot);
+                    if (fitted_w, fitted_h) != (image.width(), image.height()) {
+                        let linear = !is_color_property(property);
+                        let small = downscale_bake_image(&image, fitted_w, fitted_h, linear);
+                        return Ok((
+                            encode_rgba_png(
+                                small.pixels(),
+                                BakeSize {
+                                    width: fitted_w,
+                                    height: fitted_h,
+                                },
+                            ),
+                            VrmImageMime::Png,
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == MaterialErrorKind::LimitExceeded => {
+                    return Err(error);
+                }
+                Err(error) => {
+                    self.warn(format!(
+                        "直載せの縮小用に復号できないため元のまま埋め込む: {slot}: {property}: {error}"
+                    ));
+                }
             }
         }
         // PNGは画素に影響しない付加チャンクを落としてから埋め込む。JPEGはそのまま扱う。
         // チャンク構造が読めないPNGは壊さず元のまま残し、警告する。
         if mime == VrmImageMime::Png {
             match strip_png_ancillary_chunks(&bytes) {
-                Some(stripped) => (stripped, mime),
+                Some(stripped) => Ok((stripped, mime)),
                 None => {
                     self.warn(format!(
                         "PNGのチャンク構造が読めないためそのまま埋め込む: {slot}: {property}"
                     ));
-                    (bytes, mime)
+                    Ok((bytes, mime))
                 }
             }
         } else {
-            (bytes, mime)
+            Ok((bytes, mime))
         }
     }
 
@@ -1610,26 +1755,41 @@ impl<'a> LoadContext<'a> {
                 invert,
             }));
         }
-        let image = match load_bake_image(&bytes, mime, srgb, sampler) {
-            Ok(image) => {
-                // 焼きの入力も取り込み後の寸法にし、焼きの出力は縮小後の
-                // 入力に従う（`bake_output_size` は縮小後を見る）。
-                let (fitted_w, fitted_h) =
-                    import_fitted_size(image.width(), image.height(), max_size, npot);
-                if (fitted_w, fitted_h) == (image.width(), image.height()) {
-                    Rc::new(image)
-                } else {
-                    Rc::new(downscale_bake_image(&image, fitted_w, fitted_h, linear))
+        let image =
+            match load_bake_image(&bytes, mime, srgb, sampler, self.options.max_image_pixels) {
+                Ok(image) => {
+                    // 焼きの入力も取り込み後の寸法にし、焼きの出力は縮小後の
+                    // 入力に従う（`bake_output_size` は縮小後を見る）。
+                    // 1枚の画素上限の超過は直載せへ落とさず失敗として返す。
+                    // 対象パスは呼び出し側（`bake_input_of`）が付ける。
+                    self.check_image_pixels(
+                        image.width(),
+                        image.height(),
+                        &format!("{slot}: {property}"),
+                    )?;
+                    let (fitted_w, fitted_h) =
+                        import_fitted_size(image.width(), image.height(), max_size, npot);
+                    let shrunk = if (fitted_w, fitted_h) == (image.width(), image.height()) {
+                        Rc::new(image)
+                    } else {
+                        Rc::new(downscale_bake_image(&image, fitted_w, fitted_h, linear))
+                    };
+                    // 縮小後の実寸で保持量の予算に入れる。超えたら古い保持を
+                    // 捨てて再復号する。失敗にしない。
+                    self.admit_bake_cache(shrunk.width(), shrunk.height());
+                    shrunk
                 }
-            }
-            Err(error) => {
-                self.warn(format!(
-                    "焼き用に復号できないため直載せする: {slot}: {property}: {error}"
-                ));
-                self.baked_inputs.insert(key, None);
-                return Ok(None);
-            }
-        };
+                Err(error) if error.kind() == MaterialErrorKind::LimitExceeded => {
+                    return Err(error);
+                }
+                Err(error) => {
+                    self.warn(format!(
+                        "焼き用に復号できないため直載せする: {slot}: {property}: {error}"
+                    ));
+                    self.baked_inputs.insert(key, None);
+                    return Ok(None);
+                }
+            };
         self.baked_inputs.insert(key, Some(Rc::clone(&image)));
         Ok(Some(BakeInput {
             image,
@@ -1685,7 +1845,10 @@ impl<'a> LoadContext<'a> {
         };
         // 上限を超える分は読む前に打ち切り、超過は失敗として返す。
         let path = record.path.clone();
-        let bytes = match read_limited(&self.root.join(&path), self.options.max_image_bytes) {
+        let bytes = match self
+            .source
+            .read_limited(&path, self.options.max_image_bytes)
+        {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
                 return Err(MaterialError::new(
@@ -1724,6 +1887,15 @@ impl<'a> LoadContext<'a> {
         self.bake_input(
             slot, property, guid, bytes, mime, srgb, sampler, st, channel, invert, max_size, npot,
         )
+        .map_err(|error| {
+            // 画素上限の超過は対象パスを付けて失敗として返す。
+            // 復号失敗の警告は `bake_input` 側が残す。
+            if error.path().is_none() {
+                error.with_path(path.clone())
+            } else {
+                error
+            }
+        })
     }
 
     /// 焼き出力を画像列へ載せ、索引を返す。同じ内容は共有する。
@@ -1829,9 +2001,15 @@ impl<'a> LoadContext<'a> {
         // 焼き結果の復号は後の陰影・発光のアルベド入力に使い回す。
         // 埋め込んだバイト列そのものを復号するため、参照実装が焼き済み
         // テクスチャを読むのと同じ内容になる。
-        let albedo = load_bake_image(&bytes, VrmImageMime::Png, true, VrmSampler::default())
-            .map(Rc::new)
-            .ok();
+        let albedo = load_bake_image(
+            &bytes,
+            VrmImageMime::Png,
+            true,
+            VrmSampler::default(),
+            self.options.max_image_pixels,
+        )
+        .map(Rc::new)
+        .ok();
         Ok((index, albedo))
     }
 
@@ -2473,7 +2651,6 @@ impl<'a> LoadContext<'a> {
 }
 
 /// 発光へ折り込むMatCap2ndの内容。
-#[cfg(not(target_arch = "wasm32"))]
 struct MatcapFold {
     /// 平均色×重み（線形）。
     color: [f32; 3],
@@ -2482,7 +2659,6 @@ struct MatcapFold {
 }
 
 /// 陰影の2層目以降1層分（`ShadeLayer` と対応）。
-#[cfg(not(target_arch = "wasm32"))]
 struct ShadeExtraLayer {
     /// 境界・ぼかし。
     border: f32,
@@ -2498,7 +2674,6 @@ struct ShadeExtraLayer {
 ///
 /// アルファが0より大きい層だけを2層目・3層目の順に返す。
 /// 色テクスチャは色で代用するため読まない。
-#[cfg(not(target_arch = "wasm32"))]
 fn shade_extra_layers(material: &crate::unity::Material) -> Vec<ShadeExtraLayer> {
     let mut layers = Vec::new();
     for (prefix, border_default, blur_default) in [
@@ -2526,7 +2701,6 @@ fn shade_extra_layers(material: &crate::unity::Material) -> Vec<ShadeExtraLayer>
 }
 
 /// 発光色を線形で読む。1超の有無も返す（`ReadEmission` の係数と対応）。
-#[cfg(not(target_arch = "wasm32"))]
 fn emission_linear(material: &crate::unity::Material) -> ([f32; 3], bool) {
     let emission = color(material, "_EmissionColor").unwrap_or([1.0, 1.0, 1.0, 1.0]);
     let raw = [
@@ -2548,7 +2722,6 @@ fn emission_linear(material: &crate::unity::Material) -> ([f32; 3], bool) {
 }
 
 /// 浮動小数点プロパティを読む。整数も受け付ける。無ければ `default` である。
-#[cfg(not(target_arch = "wasm32"))]
 fn mode_of(material: &crate::unity::Material, name: &str) -> f64 {
     number(material, name).unwrap_or(0.0)
 }
@@ -2556,7 +2729,6 @@ fn mode_of(material: &crate::unity::Material, name: &str) -> f64 {
 /// MatCapが下の色をどれだけ取るか（`Matcap.Covers` と対応）。
 ///
 /// Normal・Multiply混合だけが0より大きくなり、加算系は0である。
-#[cfg(not(target_arch = "wasm32"))]
 fn matcap_covers(material: &crate::unity::Material, prefix: &str) -> f32 {
     let mode = number(material, &format!("{prefix}BlendMode")).unwrap_or(1.0) as i64;
     if mode != 0 && mode != 3 {
@@ -2567,7 +2739,6 @@ fn matcap_covers(material: &crate::unity::Material, prefix: &str) -> f32 {
 }
 
 /// テクスチャ環境から `_ST` を読む。環境が無ければ単位変換である。
-#[cfg(not(target_arch = "wasm32"))]
 fn bake_st_of(environment: Option<&crate::unity::TextureEnvironment>) -> BakeSt {
     match environment {
         Some(environment) => BakeSt {
@@ -2579,7 +2750,6 @@ fn bake_st_of(environment: Option<&crate::unity::TextureEnvironment>) -> BakeSt 
 }
 
 /// 主変換の後に個別変換を合成する（`BakeJobBuilder.Compose` と対応）。
-#[cfg(not(target_arch = "wasm32"))]
 fn compose_st(main: &BakeSt, own: &BakeSt) -> BakeSt {
     BakeSt {
         scale: [main.scale[0] * own.scale[0], main.scale[1] * own.scale[1]],
@@ -2591,7 +2761,6 @@ fn compose_st(main: &BakeSt, own: &BakeSt) -> BakeSt {
 }
 
 /// `.meta` からsRGB旗を読む。無ければ真（Unityの既定）に倒す。
-#[cfg(not(target_arch = "wasm32"))]
 fn srgb_of(meta: &crate::unity::AssetMeta) -> bool {
     let srgb = meta
         .importer()
@@ -2614,7 +2783,6 @@ fn srgb_of(meta: &crate::unity::AssetMeta) -> bool {
 /// 戻り値は（上限、NPOT、不明なNPOT値があったか）である。
 /// 上限 `None` は制限なし（0・未設定の場合）を表し、
 /// 不明なNPOT値は `None` として扱う。警告は呼び出し側が出す。
-#[cfg(not(target_arch = "wasm32"))]
 fn import_limit_of(meta: &crate::unity::AssetMeta) -> (Option<u32>, NpotScale, bool) {
     let settings = meta.importer().settings.as_mapping();
     let global = settings
@@ -2659,7 +2827,6 @@ fn import_limit_of(meta: &crate::unity::AssetMeta) -> (Option<u32>, NpotScale, b
 }
 
 /// 汎用YAML値から非負整数を読む。数値以外・負値・範囲外は `None` である。
-#[cfg(not(target_arch = "wasm32"))]
 fn as_u32(value: &yaml_serde::Value) -> Option<u32> {
     value.as_i64().and_then(|number| u32::try_from(number).ok())
 }
@@ -2668,7 +2835,6 @@ fn as_u32(value: &yaml_serde::Value) -> Option<u32> {
 ///
 /// 色は基準色・発光・MatCap・影色、データはマスク・法線・幅などである。
 /// 焼きの入力と直載せの両方で同じ区分を使い、Unityの取り込みに近づける。
-#[cfg(not(target_arch = "wasm32"))]
 fn is_color_property(property: &str) -> bool {
     matches!(
         property,
@@ -2683,7 +2849,6 @@ fn is_color_property(property: &str) -> bool {
 }
 
 /// MToonのひとつのMatCap枠に入れるlilToon MatCap。
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MatcapSlot {
     /// ひとつ目のMatCap（`_MatCap` 系）。
@@ -2695,7 +2860,6 @@ enum MatcapSlot {
 }
 
 /// `_UseXXX` が真でテクスチャの割り当てがあるかどうか。
-#[cfg(not(target_arch = "wasm32"))]
 fn has_matcap(material: &crate::unity::Material, prefix: &str) -> bool {
     let bare = prefix.trim_start_matches('_');
     let toggle = format!("_Use{bare}");
@@ -2708,7 +2872,6 @@ fn has_matcap(material: &crate::unity::Material, prefix: &str) -> bool {
 /// 重み（`_MatCapBlend × saturate(_MatCapColor.a)`）が0より大きく、
 /// 加算・スクリーン系なら最大輝度が0より大きい場合に真になる。
 /// 参照実装の `Contributes` と対応する。
-#[cfg(not(target_arch = "wasm32"))]
 fn matcap_contributes(material: &crate::unity::Material, prefix: &str) -> bool {
     let blend = format!("{prefix}Blend");
     let color_name = format!("{prefix}Color");
@@ -2727,7 +2890,6 @@ fn matcap_contributes(material: &crate::unity::Material, prefix: &str) -> bool {
 ///
 /// MToonのMatCapは加算だけであり、均一な減光は表せても
 /// マスク越しの乗算は表せない。参照実装の `LeftOut` と対応する。
-#[cfg(not(target_arch = "wasm32"))]
 fn matcap_left_out(material: &crate::unity::Material, prefix: &str) -> bool {
     let mode = number(material, &format!("{prefix}BlendMode")).unwrap_or(1.0) as i64;
     mode == 3 && has_texture(material, &format!("{prefix}BlendMask"))
@@ -2737,7 +2899,6 @@ fn matcap_left_out(material: &crate::unity::Material, prefix: &str) -> bool {
 ///
 /// ひとつ目が無い・色を変えない・枠から外れる（`LeftOut`）場合に真になる。
 /// 参照実装の `SlotFreeFor2nd` と対応する。
-#[cfg(not(target_arch = "wasm32"))]
 fn matcap_slot_free_for_2nd(material: &crate::unity::Material) -> bool {
     !has_matcap(material, "_MatCap")
         || !matcap_contributes(material, "_MatCap")
@@ -2749,7 +2910,6 @@ fn matcap_slot_free_for_2nd(material: &crate::unity::Material) -> bool {
 /// MToonはリム倍率テクスチャをMatCapにも掛けるため、
 /// マスク付きの2ndは色テクスチャ・マスク付きのリムを損なう。
 /// 参照実装の `CostsTheRim` と対応する。
-#[cfg(not(target_arch = "wasm32"))]
 fn matcap_costs_the_rim(material: &crate::unity::Material) -> bool {
     if !has_texture(material, "_MatCap2ndBlendMask") {
         return false;
@@ -2766,7 +2926,6 @@ fn matcap_costs_the_rim(material: &crate::unity::Material) -> bool {
 /// 参照実装の `SlotMatcapPrefix` と対応する。2ndが色を変える場合だけ
 /// 枠を争い、枠が空いていてリムを損なわない場合に2ndが入る。
 /// 2ndが枠から外れる（`LeftOut`）場合は2ndを返し、呼び出し側で省く。
-#[cfg(not(target_arch = "wasm32"))]
 fn matcap_slot(material: &crate::unity::Material) -> MatcapSlot {
     let first = if has_matcap(material, "_MatCap") {
         Some(MatcapSlot::First)
@@ -2789,7 +2948,6 @@ fn matcap_slot(material: &crate::unity::Material) -> MatcapSlot {
 ///
 /// `_MatCapColor.rgb × (_MatCapBlend × saturate(_MatCapColor.a))` であり、
 /// 参照実装の `MatcapWeight` と対応する。RGBは線形、重みはそのまま掛ける。
-#[cfg(not(target_arch = "wasm32"))]
 fn matcap_weight(material: &crate::unity::Material, prefix: &str) -> [f32; 3] {
     let color_name = format!("{prefix}Color");
     let blend_name = format!("{prefix}Blend");
@@ -2803,7 +2961,6 @@ fn matcap_weight(material: &crate::unity::Material, prefix: &str) -> [f32; 3] {
 ///
 /// 参照実装の代替値は線形で宣言されているため、sRGB復号しない。
 /// 呼び出し側は代替値を線形で渡す。
-#[cfg(not(target_arch = "wasm32"))]
 fn linear_color_or(material: &crate::unity::Material, name: &str, fallback: [f32; 3]) -> [f32; 3] {
     match color(material, name) {
         Some(value) => [
@@ -2816,7 +2973,6 @@ fn linear_color_or(material: &crate::unity::Material, name: &str, fallback: [f32
 }
 
 /// シェーダ本文の先頭の `Shader "..."` 名を返す。
-#[cfg(not(target_arch = "wasm32"))]
 fn first_shader_name(text: &str) -> Option<String> {
     text.lines().find_map(|line| {
         line.trim_start()
@@ -2826,7 +2982,6 @@ fn first_shader_name(text: &str) -> Option<String> {
 }
 
 /// シェーダ名から能力を求める。lilToon名でなければ `None` である。
-#[cfg(not(target_arch = "wasm32"))]
 fn capability_of_name(name: &str, material: &crate::unity::Material) -> Option<ShaderCapability> {
     // `Cutout`/`Transparent` を含む他社シェーダをlilToonとして扱わないため、
     // 名前に `lilToon` を含むものだけを対象にする。
@@ -2867,7 +3022,6 @@ fn capability_of_name(name: &str, material: &crate::unity::Material) -> Option<S
 /// （不透明2000・カットアウト2450・半透明3000）を使い、Unityの
 /// `material.renderQueue`（未設定時はシェーダ既定を返す）と対応させる。
 /// 系列が不明な場合は-1であり、描画順の割り当てでは使わない。
-#[cfg(not(target_arch = "wasm32"))]
 fn effective_queue(material: &crate::unity::Material, series: Option<ShaderSeries>) -> i32 {
     if material.custom_render_queue != -1 {
         return material.custom_render_queue;
@@ -2878,23 +3032,6 @@ fn effective_queue(material: &crate::unity::Material, series: Option<ShaderSerie
         Some(ShaderSeries::Blend) => 3000,
         None => -1,
     }
-}
-
-/// 上限付きでファイルを読み取る。`limit` を超えたら `InvalidData` で失敗する。
-#[cfg(not(target_arch = "wasm32"))]
-fn read_limited(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
-    use std::io::Read as _;
-    let file = std::fs::File::open(path)?;
-    let mut limited = file.take(limit.saturating_add(1));
-    let mut bytes = Vec::new();
-    limited.read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > limit {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("読み取り上限を超えた: {limit}バイト"),
-        ));
-    }
-    Ok(bytes)
 }
 
 /// 材質値が有限かつ範囲内であることを確かめる。不正ならフィールド名を返す。
@@ -2986,7 +3123,6 @@ pub(crate) fn validate_material(material: &VrmMaterial) -> Result<(), &'static s
 /// 写像時の `clamp01` や `.max(0.0)` が非有限を正常値に潰す前に検出する。
 /// `floats` の値・`colors` の各成分・`tex_envs` の `scale`/`offset` を見る。
 /// 整数プロパティは非有限を取り得ないため対象外である。
-#[cfg(not(target_arch = "wasm32"))]
 fn has_non_finite(material: &crate::unity::Material) -> bool {
     if material.floats.iter().any(|entry| !entry.value.is_finite()) {
         return true;
@@ -3009,7 +3145,6 @@ fn has_non_finite(material: &crate::unity::Material) -> bool {
 }
 
 /// 浮動小数点プロパティの有無を返す。
-#[cfg(not(target_arch = "wasm32"))]
 fn has_float(material: &crate::unity::Material, name: &str) -> bool {
     material.floats.iter().any(|entry| entry.name == name)
         || material.ints.iter().any(|entry| entry.name == name)
@@ -3017,7 +3152,6 @@ fn has_float(material: &crate::unity::Material, name: &str) -> bool {
 
 /// 数値プロパティを読む。浮動小数点を先に、整数も受け付ける。
 /// 同名は最初の1件を採用する。
-#[cfg(not(target_arch = "wasm32"))]
 fn number(material: &crate::unity::Material, name: &str) -> Option<f64> {
     if let Some(entry) = material.floats.iter().find(|entry| entry.name == name) {
         return Some(entry.value);
@@ -3030,7 +3164,6 @@ fn number(material: &crate::unity::Material, name: &str) -> Option<f64> {
 }
 
 /// 色プロパティを読む。同名は最初の1件を採用する。
-#[cfg(not(target_arch = "wasm32"))]
 fn color(material: &crate::unity::Material, name: &str) -> Option<[f64; 4]> {
     material
         .colors
@@ -3040,7 +3173,6 @@ fn color(material: &crate::unity::Material, name: &str) -> Option<[f64; 4]> {
 }
 
 /// テクスチャ環境を読む。同名は最初の1件を採用する。
-#[cfg(not(target_arch = "wasm32"))]
 fn texture<'m>(
     material: &'m crate::unity::Material,
     name: &str,
@@ -3053,13 +3185,11 @@ fn texture<'m>(
 }
 
 /// テクスチャ参照の有無を返す。割り当て済み（nullでない）かどうかを見る。
-#[cfg(not(target_arch = "wasm32"))]
 fn has_texture(material: &crate::unity::Material, name: &str) -> bool {
     texture(material, name).is_some_and(|environment| !environment.texture.is_null())
 }
 
 /// 先頭バイトからMIMEを求める。PNGとJPEGだけを受け付ける。
-#[cfg(not(target_arch = "wasm32"))]
 fn sniff_mime(bytes: &[u8]) -> Option<VrmImageMime> {
     if bytes.starts_with(&PNG_MAGIC) {
         Some(VrmImageMime::Png)
@@ -3073,7 +3203,6 @@ fn sniff_mime(bytes: &[u8]) -> Option<VrmImageMime> {
 /// PNGの必須チャンク名の許可表。
 ///
 /// 大文字小文字ではなく名前で判定し、小文字を含む `tRNS` も残す。
-#[cfg(not(target_arch = "wasm32"))]
 const PNG_ESSENTIAL_CHUNKS: [[u8; 4]; 5] = [*b"IHDR", *b"PLTE", *b"tRNS", *b"IDAT", *b"IEND"];
 
 /// PNGから画素に影響しない付加チャンクを落とす。
@@ -3081,7 +3210,6 @@ const PNG_ESSENTIAL_CHUNKS: [[u8; 4]; 5] = [*b"IHDR", *b"PLTE", *b"tRNS", *b"IDA
 /// 必須チャンクだけを元のバイト列のまま（長さ・型・データ・CRCをそのまま）残し、
 /// 先頭8バイトの署名もそのまま保つ。再エンコードはしない。
 /// チャンク構造（長さ・型・データ・CRC・IENDまで）が読めない場合は `None` を返す。
-#[cfg(not(target_arch = "wasm32"))]
 fn strip_png_ancillary_chunks(bytes: &[u8]) -> Option<Vec<u8>> {
     if !bytes.starts_with(&PNG_MAGIC) {
         return None;
@@ -3113,7 +3241,6 @@ fn strip_png_ancillary_chunks(bytes: &[u8]) -> Option<Vec<u8>> {
 /// `.meta` のTextureImporter設定からサンプラを作る。
 ///
 /// 設定が無い項目は既定（繰り返し・双線形・mipmapあり）に倒す。
-#[cfg(not(target_arch = "wasm32"))]
 fn sampler_of(meta: &crate::unity::AssetMeta) -> VrmSampler {
     let mut sampler = VrmSampler::default();
     let settings = meta.importer().settings.as_mapping();
@@ -3140,13 +3267,11 @@ fn sampler_of(meta: &crate::unity::AssetMeta) -> VrmSampler {
 }
 
 /// 汎用YAML写像から整数を読む。数値以外は `None` である。
-#[cfg(not(target_arch = "wasm32"))]
 fn number_of(mapping: &yaml_serde::Mapping, key: &str) -> Option<i64> {
     mapping.get(key).and_then(|value| value.as_i64())
 }
 
 /// 繰り返し設定値を写像する。0/1/2以外は繰り返しに倒す。
-#[cfg(not(target_arch = "wasm32"))]
 fn wrap_of(value: Option<i64>) -> VrmWrap {
     match value {
         Some(1) => VrmWrap::ClampToEdge,
@@ -3156,7 +3281,6 @@ fn wrap_of(value: Option<i64>) -> VrmWrap {
 }
 
 /// フィルタ設定値を写像する。0点・1双線形・2三線形、他は双線形に倒す。
-#[cfg(not(target_arch = "wasm32"))]
 fn filter_of(value: Option<i64>) -> VrmFilter {
     match value {
         Some(0) => VrmFilter::Nearest,
@@ -3166,23 +3290,68 @@ fn filter_of(value: Option<i64>) -> VrmFilter {
 }
 
 /// 0〜1に丸める。
-#[cfg(not(target_arch = "wasm32"))]
 fn clamp01(value: f64) -> f64 {
     value.clamp(0.0, 1.0)
 }
 
 /// sRGB符号化値を線形に直し、0〜1に丸める。
-#[cfg(not(target_arch = "wasm32"))]
 fn srgb_to_linear(value: f64) -> f32 {
     clamp01(srgb_to_linear_raw(value)) as f32
 }
 
 /// sRGB符号化値を線形に直す。丸めは呼び出し側で行う。
-#[cfg(not(target_arch = "wasm32"))]
 fn srgb_to_linear_raw(value: f64) -> f64 {
     if value <= 0.04045 {
         value / 12.92
     } else {
         ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::unity::{AssetIndex, AssetSource};
+
+    // テスト名は日本語で書く（テストは仕様・契約であるため）。
+
+    /// 何も持たない読み手。保持量の単体確認だけに使う。
+    struct EmptySource;
+
+    impl AssetSource for EmptySource {
+        fn read_limited(&self, _path: &str, _limit: u64) -> std::io::Result<Vec<u8>> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "持たない",
+            ))
+        }
+    }
+
+    #[test]
+    fn 保持予算を超えると古い保持を捨てて失敗しない() {
+        let options = MaterialOptions::new()
+            .with_max_image_pixels(100)
+            .with_max_total_image_pixels(100);
+        let source = EmptySource;
+        let index = AssetIndex::default();
+        let mut context = LoadContext::new(&source, &index, &options);
+        let guid = Guid::parse("00000000000000000000000000000001").expect("GUIDは読める");
+        // 10x10（100画素）を入れて共有表に載せる。
+        context.admit_bake_cache(10, 10);
+        context.baked_inputs.insert((guid, false), None);
+        assert_eq!(context.cached_image_pixels, 100);
+        // 予算を超える挿入では古い保持を全消去し、失敗にしない。
+        context.admit_bake_cache(10, 10);
+        assert!(
+            context.baked_inputs.is_empty(),
+            "古い保持は捨てる: {:?}",
+            context.baked_inputs.keys()
+        );
+        assert_eq!(context.cached_image_pixels, 100);
+        // 1枚の上限は従来どおり失敗する。
+        let 失敗 = context
+            .check_image_pixels(11, 10, "検査")
+            .expect_err("1枚の上限超過は失敗する");
+        assert_eq!(失敗.kind(), MaterialErrorKind::LimitExceeded);
     }
 }

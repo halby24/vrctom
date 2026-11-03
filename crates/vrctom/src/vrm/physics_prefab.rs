@@ -5,13 +5,19 @@
 //! 型判定はスクリプトfileIDのMD4計算で行い、`(guid, fileID)` の表を持たない。
 //! 旧方式（2019.3より前の取り込みfileID）・参照切れ・未知型は黙って落とさず失敗する。
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::{HashMap, HashSet};
 
+#[cfg(not(target_arch = "wasm32"))]
 use yaml_serde::Value;
 
 use super::error::{VrmError, VrmErrorKind};
-use crate::fbx::{FbxFile, FbxOptions, LocalTransform};
-use crate::unity::{AssetMeta, FileId, SerializedFile, TypedObject};
+use crate::fbx::FbxFile;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::fbx::{FbxOptions, LocalTransform};
+use crate::unity::SerializedFile;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::unity::{AssetMeta, FileId, TypedObject};
 
 /// 参照ローカル1件。位置・回転・拡大率と出所（`bind`・`scene` 等）の組である。
 /// 戻り値や引数の型が長くなるため別名にする。
@@ -30,10 +36,12 @@ type TrsF64 = ([f64; 3], [f64; 4], [f64; 3]);
 #[cfg(not(target_arch = "wasm32"))]
 type EyePose = ([bool; 1], [f64; 4], [f64; 4]);
 
+#[cfg(not(target_arch = "wasm32"))]
 /// MD4の既知ベクタ（空文字）。依存の取り違えを検出する。単体テストで使う。
 #[allow(dead_code)]
 const MD4_EMPTY: &str = "31d6cfe0d16ae931b73c59d7e0c089c0";
 
+#[cfg(not(target_arch = "wasm32"))]
 /// MD4ハッシュを求める。RFC 1320の純Rust実装であり、外部依存を増やさない。
 fn md4(message: &[u8]) -> [u8; 16] {
     fn rol(x: u32, n: u32) -> u32 {
@@ -156,6 +164,7 @@ fn md4(message: &[u8]) -> [u8; 16] {
     out
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// テスト用の16進表示。単体テストで使う。
 #[allow(dead_code)]
 fn md4_hex(message: &[u8]) -> String {
@@ -169,6 +178,7 @@ fn md4_hex(message: &[u8]) -> String {
     out
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// スクリプトfileIDをMD4で計算する。
 fn script_file_id(namespace: &str, class_name: &str) -> i32 {
     let mut input = Vec::with_capacity(4 + namespace.len() + class_name.len());
@@ -179,6 +189,7 @@ fn script_file_id(namespace: &str, class_name: &str) -> i32 {
     i32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]])
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// VRChatのDLLとみなすGUID集合。
 const VRCHAT_DLL_GUIDS: &[&str] = &[
     "2a2c05204084d904aa4945ccff20d8e5",
@@ -188,6 +199,7 @@ const VRCHAT_DLL_GUIDS: &[&str] = &[
     "4ecd63eff847044b68db9453ce219299",
 ];
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KnownScript {
     PhysBone,
@@ -204,6 +216,7 @@ enum KnownScript {
     LookAtConstraint,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn script_identity(kind: KnownScript) -> (&'static str, &'static str) {
     match kind {
         KnownScript::PhysBone => ("VRC.SDK3.Dynamics.PhysBone.Components", "VRCPhysBone"),
@@ -245,6 +258,7 @@ fn script_identity(kind: KnownScript) -> (&'static str, &'static str) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScriptJudgment {
     Known(KnownScript),
@@ -252,6 +266,7 @@ enum ScriptJudgment {
     External,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn judge_script(guid: &str, file_id: i32) -> ScriptJudgment {
     let guid_lower = guid.to_ascii_lowercase();
     if !VRCHAT_DLL_GUIDS.contains(&guid_lower.as_str()) {
@@ -1428,6 +1443,7 @@ struct MainModTables<'a> {
     import_go: FileId,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 fn classify_main_mod(
     tables: &MainModTables<'_>,

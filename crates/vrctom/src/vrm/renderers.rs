@@ -793,7 +793,8 @@ pub fn load_renderer_materials_with_index(
 ) -> Result<(VrmMaterials, MaterialReport), super::material::MaterialError> {
     use super::material::LoadContext;
 
-    let mut context = LoadContext::new(assets, index, options);
+    let source = crate::unity::FsAssetSource::new(assets);
+    let mut context = LoadContext::new(&source, index, options);
     for entry in pool {
         context.load_renderer_material(&entry.guid, &entry.path, &slot_key_of(entry))?;
     }

@@ -13,3 +13,15 @@ run = ["cargo fmt --all --check", "cargo clippy --workspace --all-targets -- -D 
 [tasks.test]
 description = "nextestでワークスペースのテストを実行する"
 run = "cargo nextest run --workspace"
+
+[tasks.wasm]
+description = "vrctom-wasmをwasm32向けに構築しweb向けglueを出す"
+run = "sh web/scripts/build-wasm.sh"
+
+[tasks.web-dev]
+description = "webの開発サーバを起動する"
+run = "pnpm --dir web dev"
+
+[tasks.web-build]
+description = "webをビルドする"
+run = "pnpm --dir web build"

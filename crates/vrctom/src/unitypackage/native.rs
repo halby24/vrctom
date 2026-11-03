@@ -2,39 +2,32 @@
 //!
 //! 公開契約の入口は [`crate::unitypackage`] を参照。
 //!
-//! gzip/tarを一回だけ読み、`asset` と `asset.meta` をGUID別に一時領域へ
-//! 退避してから対応関係・パス・出力衝突を検証する。`asset` が `pathname`
-//! より先に現れても動く。内容は固定バッファで回し、メモリ使用量を内容
-//! サイズに比例させない。
+//! tar走査・検証は共通核（[`super`](crate::unitypackage) の `core`）に任せ、
+//! ここでは一時領域への退避と出力先の排他的新規作成・後始末だけを受け持つ。
+//! `asset` が `pathname` より先に現れても動く。内容は固定バッファで回し、
+//! メモリ使用量を内容サイズに比例させない。
 //!
 //! 限界として、`asset` を持たない正常フォルダと `asset` の欠けた壊れた
 //! ファイルはtar構造だけでは区別できない。`asset.meta` の意味解析や
 //! meta内GUIDとの照合は行わない。
 
-use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use flate2::read::MultiGzDecoder;
-use tar::{Archive, EntryType};
 use tempfile::TempDir;
 
-use super::{
-    Entry, EntryKind, UnpackError, UnpackErrorKind, UnpackOptions, UnpackReport, escape_diag,
+use super::core::{
+    Failure, Plan, StagingSink, copy_entry_to_writer, scan_and_validate, staging_name,
 };
+use super::{EntryKind, UnpackError, UnpackErrorKind, UnpackOptions, UnpackReport, escape_diag};
 
 /// 出力コピーに使う固定バッファの大きさ。
 ///
 /// 資産の大きさに依らずこの大きさで回すことで、メモリ使用量を内容サイズに
 /// 比例させない。値は性能上の目安であり、正確さには影響しない。
+/// tar走査側の大きさは共通核が持つ。
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
-
-/// `pathname` 読み取りに使う固定バッファの大きさ。
-const PATHNAME_BUFFER_SIZE: usize = 4096;
-
-/// `pathname` の先頭成分として受け付ける名前。
-const ASSETS_ROOT: &str = "Assets";
 
 /// gzip圧縮tarのUnityPackageを読み、検証してから出力先へ展開する。
 ///
@@ -161,249 +154,71 @@ pub fn unpack_to<R: Read>(
     }
 }
 
-/// 展開途中の失敗。出力先を作った印は [`UnpackError`] 側に保持する。
-#[derive(Debug)]
-struct Failure {
-    error: UnpackError,
+/// 一時領域への退避。共通核の差し替え点のnative側である。
+struct FileSink<'a> {
+    staging: &'a Path,
 }
 
-impl Failure {
-    fn new(error: UnpackError) -> Self {
-        Self { error }
+impl StagingSink for FileSink<'_> {
+    fn spill_asset<R2: Read>(
+        &mut self,
+        entry: &mut tar::Entry<'_, R2>,
+        guid: &str,
+        raw_path: &[u8],
+    ) -> Result<u64, Failure> {
+        self.spill(entry, guid, raw_path, ".asset")
     }
 
-    /// 出力先を作った後の失敗に印を付け、呼び出し側の後始末に使う。
-    fn with_output_created(error: UnpackError) -> Self {
-        Self {
-            error: error.with_output_created(),
-        }
-    }
-}
-
-/// 呼び出し側リーダーの転送失敗である印。gzipより下で付けて上で剥がす。
-///
-/// flate2は内側の読み取り失敗をそのまま返すため、印は層を越えて残る。
-#[derive(Debug)]
-struct InputMarker(io::Error);
-
-impl std::fmt::Display for InputMarker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+    fn spill_meta<R2: Read>(
+        &mut self,
+        entry: &mut tar::Entry<'_, R2>,
+        guid: &str,
+        raw_path: &[u8],
+    ) -> Result<u64, Failure> {
+        self.spill(entry, guid, raw_path, ".asset.meta")
     }
 }
 
-impl std::error::Error for InputMarker {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
+impl FileSink<'_> {
+    /// `asset` と `asset.meta` を一時領域へ退避し、バイト数を返す。
+    fn spill<R2: Read>(
+        &self,
+        entry: &mut tar::Entry<'_, R2>,
+        guid: &str,
+        raw_path: &[u8],
+        suffix: &str,
+    ) -> Result<u64, Failure> {
+        let target = self.staging.join(staging_name(guid, suffix));
+        // 退避先の重複は呼び出し側の検証で先に弾くため、ここでは予期しない扱いにする。
+        let mut output = File::create_new(&target).map_err(|error| {
+            Failure::new(
+                UnpackError::new(
+                    UnpackErrorKind::Storage,
+                    format!(
+                        "一時退避先を作れない: {target:?}: {}",
+                        escape_diag(&error.to_string())
+                    ),
+                )
+                .with_guid(guid.to_owned())
+                .with_source(error),
+            )
+        })?;
+        copy_entry_to_writer(entry, &mut output, guid, raw_path, "退避内容を書けない")
     }
-}
-
-/// 総読み取り量の上限到達の印。[`Meter`] が上限超過を読んだときの失敗に付ける。
-#[derive(Debug)]
-struct LimitMarker;
-
-impl std::fmt::Display for LimitMarker {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "総読み取り量の上限に達した")
-    }
-}
-
-impl std::error::Error for LimitMarker {}
-
-/// 呼び出し側リーダーの転送失敗に印を付ける読み取り層。
-struct TaggedReader<R>(R);
-
-impl<R> TaggedReader<R> {
-    fn new(reader: R) -> Self {
-        Self(reader)
-    }
-}
-
-impl<R: Read> Read for TaggedReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0
-            .read(buf)
-            .map_err(|error| io::Error::new(error.kind(), InputMarker(error)))
-    }
-}
-
-/// 展開後バイト数を数え、上限超過を上限到達印の失敗で打ち切る読み取り層。
-///
-/// gzipの外側に置くことで、ヘッダ・padding・読み捨て分も含めて数える。
-/// 上限ちょうどの入力は成功させ、上限を超える読み取りだけを失敗にする。
-struct Meter<R> {
-    inner: R,
-    total: u64,
-    max: u64,
-}
-
-impl<R> Meter<R> {
-    fn new(inner: R, max: u64) -> Self {
-        Self {
-            inner,
-            total: 0,
-            max,
-        }
-    }
-}
-
-impl<R: Read> Read for Meter<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let read = self.inner.read(buf)?;
-        if read > 0 {
-            self.total = self.total.saturating_add(read as u64);
-            if self.total > self.max {
-                return Err(io::Error::other(LimitMarker));
-            }
-        }
-        Ok(read)
-    }
-}
-
-/// エラー連鎖から指定の印を探す。
-///
-/// `io::Error::source()` は Custom の payload 自体を飛ばして payload の
-/// `source()` を返すため、`get_ref()` で payload を直接見る。
-/// tar/flate2 は読み取り失敗を包まずに返すため、外側の `io::Error` 連鎖を
-/// `get_ref()` で辿れば十分である。
-fn find_marker<M>(error: &io::Error) -> Option<&M>
-where
-    M: std::error::Error + Send + Sync + 'static,
-{
-    use std::error::Error as _;
-    let mut current: Option<&io::Error> = Some(error);
-    while let Some(io_error) = current {
-        if let Some(payload) = io_error.get_ref()
-            && let Some(marker) = payload.downcast_ref::<M>()
-        {
-            return Some(marker);
-        }
-        current = match io_error.source() {
-            Some(source) => source.downcast_ref::<io::Error>(),
-            None => None,
-        };
-    }
-    None
-}
-
-/// 読み取り失敗の原因分類。呼び出し側が文脈の診断文を付ける。
-fn classify_read(error: &io::Error) -> UnpackErrorKind {
-    if find_marker::<LimitMarker>(error).is_some() {
-        return UnpackErrorKind::LimitExceeded;
-    }
-    if let Some(marker) = find_marker::<InputMarker>(error) {
-        // 末尾欠けは壊れたパッケージとして扱い、それ以外の転送失敗は `Input` とする。
-        if marker.0.kind() == io::ErrorKind::UnexpectedEof {
-            return UnpackErrorKind::InvalidPackage;
-        }
-        return UnpackErrorKind::Input;
-    }
-    UnpackErrorKind::InvalidPackage
-}
-
-/// 外部入力のバイト列を表示用にエスケープする。
-///
-/// 引用符で囲んで示し、中身は [`escape_diag`] と同じ可視エスケープにする。
-/// 非UTF-8は代替文字に置き換える。GUIDは32桁ASCII hex検証済みのため、
-/// `{:?}` のままで制御文字を含まない。
-fn escape_bytes(bytes: &[u8]) -> String {
-    format!("\"{}\"", escape_diag(&String::from_utf8_lossy(bytes)))
-}
-
-/// GUID別の退避状況。メンバー順やGUID間交錯に依らず検証できるよう保持する。
-#[derive(Debug, Default)]
-struct Slot {
-    has_dir: bool,
-    pathname: Option<Vec<u8>>,
-    has_asset: bool,
-    asset_size: u64,
-    has_meta: bool,
-    meta_size: u64,
-    has_preview: bool,
-}
-
-/// 一時退避ファイルの名前を組み立てる。GUIDは小文字hexに統一済みのため安全。
-fn staging_name(guid: &str, suffix: &str) -> String {
-    format!("{guid}{suffix}")
-}
-
-/// 検証済みGUIDの出力計画。
-#[derive(Debug)]
-struct PlannedEntry {
-    guid: String,
-    pathname: String,
-    kind: EntryKind,
-    asset_size: u64,
-    meta_size: u64,
-}
-
-/// 出力計画全体。ファイルは退避元と対にし、ディレクトリは相対パスのみ持つ。
-#[derive(Debug)]
-struct Plan {
-    entries: Vec<Entry>,
-    files: Vec<(PathBuf, PathBuf)>,
-    dirs: Vec<PathBuf>,
-    output_bytes: u64,
 }
 
 /// 読み取りから出力までの本体。出力先の後始末要否は [`Failure`] で返す。
+///
+/// tar走査・検証は共通核で行い、ここでは検証済み計画の書き出しだけを行う。
+/// 全検証完了まで出力先を作らない保証は共通核と [`create_output`] で保つ。
 fn run<R: Read>(
     reader: R,
     destination: &Path,
     staging: &Path,
     options: &UnpackOptions,
 ) -> Result<UnpackReport, Failure> {
-    let meter = Meter::new(
-        MultiGzDecoder::new(TaggedReader::new(reader)),
-        options.max_total_bytes,
-    );
-    let mut archive = Archive::new(meter);
-    let mut slots: HashMap<String, Slot> = HashMap::new();
-    let mut entry_count: u64 = 0;
-    let mut pathname_total: u64 = 0;
-    {
-        let mut raw_entries = archive
-            .entries()
-            .map_err(|error| invalid_package_read(error, "tar一覧を開始できない"))?
-            .raw(true);
-        // `raw(true)` で拡張解決を無効化し、GNU・PAX等の拡張型も本来の種別で見る。
-        while let Some(mut entry) = raw_entries
-            .next()
-            .transpose()
-            .map_err(|error| invalid_package_read(error, "tarエントリを読めない"))?
-        {
-            entry_count = entry_count.saturating_add(1);
-            if entry_count > options.max_entries {
-                return Err(Failure::new(UnpackError::new(
-                    UnpackErrorKind::LimitExceeded,
-                    format!("tarエントリ数が上限を超えた: {entry_count}"),
-                )));
-            }
-            collect_entry(
-                &mut entry,
-                &mut slots,
-                staging,
-                options,
-                &mut pathname_total,
-            )?;
-        }
-    }
-    // tar終端で早期成功せずgzip終端まで読み、CRC・途中切れと終端後データを確認する。
-    let mut meter = archive.into_inner();
-    drain_trailing(&mut meter).map_err(|error| {
-        let kind = classify_read(&error);
-        Failure::new(
-            UnpackError::new(
-                kind,
-                format!(
-                    "終端後の読み取りに失敗した: {}",
-                    escape_diag(&error.to_string())
-                ),
-            )
-            .with_source(error),
-        )
-    })?;
-    let plan = validate_and_plan(slots)?;
+    let mut sink = FileSink { staging };
+    let plan = scan_and_validate(reader, &mut sink, options)?;
     create_output(destination, staging, &plan, options)?;
     Ok(UnpackReport {
         file_count: plan
@@ -420,539 +235,6 @@ fn run<R: Read>(
         output_bytes: plan.output_bytes,
     })
 }
-
-/// tar一覧開始やエントリ取得の読み取り失敗を分類する。
-fn invalid_package_read(error: io::Error, context: &str) -> Failure {
-    let kind = classify_read(&error);
-    let detail = format!("{}: {}", context, escape_diag(&error.to_string()));
-    Failure::new(UnpackError::new(kind, detail).with_source(error))
-}
-
-/// 1エントリを検証して退避する。内容の対応付けは全件読み終えてから行う。
-fn collect_entry<R2: Read>(
-    entry: &mut tar::Entry<'_, R2>,
-    slots: &mut HashMap<String, Slot>,
-    staging: &Path,
-    options: &UnpackOptions,
-    pathname_total: &mut u64,
-) -> Result<(), Failure> {
-    // 通常ファイルとディレクトリだけを受け付け、symlink・hardlink・特殊・sparse・
-    // 未知やGNU・PAX等の拡張型は拒否する。`raw(true)` のため解決前の種別が見える。
-    let entry_type = entry.header().entry_type();
-    if !matches!(entry_type, EntryType::Regular | EntryType::Directory) {
-        return Err(Failure::new(UnpackError::new(
-            UnpackErrorKind::InvalidPackage,
-            format!(
-                "未対応のtar種別である: {}: 0x{:02x}",
-                escape_bytes(&entry.path_bytes()),
-                entry_type.as_byte(),
-            ),
-        )));
-    }
-    let is_dir = matches!(entry_type, EntryType::Directory);
-    let raw_path = entry.path_bytes().into_owned();
-    // ディレクトリの末尾 `/` はtarの慣習であり、構造の一部として扱わない。
-    let body = if is_dir {
-        raw_path.strip_suffix(b"/").unwrap_or(&raw_path)
-    } else {
-        &raw_path[..]
-    };
-    if body.is_empty() || body.split(|byte| *byte == b'/').any(|part| part.is_empty()) {
-        return Err(Failure::new(UnpackError::new(
-            UnpackErrorKind::InvalidPackage,
-            format!(
-                "tar内パスが空または空成分を含む: {}",
-                escape_bytes(&raw_path)
-            ),
-        )));
-    }
-    let parts: Vec<&[u8]> = body.split(|byte| *byte == b'/').collect();
-    if (is_dir && parts.len() != 1) || (!is_dir && parts.len() != 2) {
-        return Err(Failure::new(UnpackError::new(
-            UnpackErrorKind::InvalidPackage,
-            format!("tar内パスの階層が不正である: {}", escape_bytes(&raw_path)),
-        )));
-    }
-    // GUIDは32桁ASCII hexとし、小文字に統一する。
-    // hex検証済みのためASCII確定であり、 UTF-8変換に失敗しない。
-    let guid_raw = parts[0];
-    if guid_raw.len() != 32 || !guid_raw.iter().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(Failure::new(UnpackError::new(
-            UnpackErrorKind::InvalidPackage,
-            format!("GUIDが32桁ASCII hexでない: {}", escape_bytes(&raw_path)),
-        )));
-    }
-    let guid: String = guid_raw
-        .to_ascii_lowercase()
-        .iter()
-        .map(|byte| *byte as char)
-        .collect();
-    let slot = slots.entry(guid.clone()).or_default();
-    if parts.len() == 1 {
-        if slot.has_dir {
-            return Err(Failure::new(
-                UnpackError::new(
-                    UnpackErrorKind::InvalidPackage,
-                    format!("GUIDディレクトリが重複する: {}", escape_bytes(&raw_path)),
-                )
-                .with_guid(guid),
-            ));
-        }
-        slot.has_dir = true;
-        return Ok(());
-    }
-    let member = parts[1];
-    if member == b"pathname" {
-        if slot.pathname.is_some() {
-            return Err(duplicate_member(&guid, &raw_path, "pathname"));
-        }
-        let content = read_bounded(entry, &guid, &raw_path, options, pathname_total)?;
-        slot.pathname = Some(content);
-    } else if member == b"asset" {
-        if slot.has_asset {
-            return Err(duplicate_member(&guid, &raw_path, "asset"));
-        }
-        slot.asset_size = spill(entry, &guid, &raw_path, staging, ".asset")?;
-        slot.has_asset = true;
-    } else if member == b"asset.meta" {
-        if slot.has_meta {
-            return Err(duplicate_member(&guid, &raw_path, "asset.meta"));
-        }
-        slot.meta_size = spill(entry, &guid, &raw_path, staging, ".asset.meta")?;
-        slot.has_meta = true;
-    } else if member == b"preview.png" {
-        if slot.has_preview {
-            return Err(duplicate_member(&guid, &raw_path, "preview.png"));
-        }
-        drain(entry, &guid, &raw_path)?;
-        slot.has_preview = true;
-    } else {
-        return Err(Failure::new(
-            UnpackError::new(
-                UnpackErrorKind::InvalidPackage,
-                format!("未対応のメンバーである: {}", escape_bytes(&raw_path)),
-            )
-            .with_guid(guid),
-        ));
-    }
-    Ok(())
-}
-
-/// 同一GUID・同一メンバーの再出現を拒否する。
-fn duplicate_member(guid: &str, raw_path: &[u8], member: &str) -> Failure {
-    Failure::new(
-        UnpackError::new(
-            UnpackErrorKind::InvalidPackage,
-            format!(
-                "同一GUIDの同一メンバーが重複する: {member}: {}",
-                escape_bytes(raw_path)
-            ),
-        )
-        .with_guid(guid.to_owned()),
-    )
-}
-
-/// `pathname` を上限付きで読む。合計量もここで積算する。
-fn read_bounded<R2: Read>(
-    entry: &mut tar::Entry<'_, R2>,
-    guid: &str,
-    raw_path: &[u8],
-    options: &UnpackOptions,
-    pathname_total: &mut u64,
-) -> Result<Vec<u8>, Failure> {
-    let mut content = Vec::new();
-    let mut chunk = [0u8; PATHNAME_BUFFER_SIZE];
-    loop {
-        let read = entry.read(&mut chunk).map_err(|error| {
-            let kind = classify_read(&error);
-            Failure::new(
-                UnpackError::new(
-                    kind,
-                    format!(
-                        "pathnameを読めない: {}: {}",
-                        escape_bytes(raw_path),
-                        escape_diag(&error.to_string())
-                    ),
-                )
-                .with_guid(guid.to_owned())
-                .with_source(error),
-            )
-        })?;
-        if read == 0 {
-            break;
-        }
-        if content.len().saturating_add(read) > options.max_pathname_bytes {
-            return Err(Failure::new(
-                UnpackError::new(
-                    UnpackErrorKind::LimitExceeded,
-                    format!("pathnameが一件の上限を超えた: {}", escape_bytes(raw_path)),
-                )
-                .with_guid(guid.to_owned()),
-            ));
-        }
-        content.extend_from_slice(&chunk[..read]);
-    }
-    *pathname_total = pathname_total.saturating_add(content.len() as u64);
-    if *pathname_total > options.max_pathname_total_bytes {
-        return Err(Failure::new(
-            UnpackError::new(
-                UnpackErrorKind::LimitExceeded,
-                format!("pathnameの合計が上限を超えた: {pathname_total}"),
-            )
-            .with_guid(guid.to_owned()),
-        ));
-    }
-    Ok(content)
-}
-
-/// `asset` と `asset.meta` を一時領域へ退避し、バイト数を返す。
-fn spill<R2: Read>(
-    entry: &mut tar::Entry<'_, R2>,
-    guid: &str,
-    raw_path: &[u8],
-    staging: &Path,
-    suffix: &str,
-) -> Result<u64, Failure> {
-    let target = staging.join(staging_name(guid, suffix));
-    // 退避先の重複は呼び出し側の検証で先に弾くため、ここでは予期しない扱いにする。
-    let mut output = File::create_new(&target).map_err(|error| {
-        Failure::new(
-            UnpackError::new(
-                UnpackErrorKind::Storage,
-                format!(
-                    "一時退避先を作れない: {target:?}: {}",
-                    escape_diag(&error.to_string())
-                ),
-            )
-            .with_guid(guid.to_owned())
-            .with_source(error),
-        )
-    })?;
-    copy_stream(entry, &mut output, guid, raw_path, "退避内容を書けない")
-}
-
-/// 読み捨てメンバーを固定バッファで読み切る。総量の計数は [`Meter`] が行う。
-fn drain<R2: Read>(
-    entry: &mut tar::Entry<'_, R2>,
-    guid: &str,
-    raw_path: &[u8],
-) -> Result<(), Failure> {
-    let mut chunk = [0u8; COPY_BUFFER_SIZE];
-    loop {
-        let read = entry.read(&mut chunk).map_err(|error| {
-            let kind = classify_read(&error);
-            Failure::new(
-                UnpackError::new(
-                    kind,
-                    format!(
-                        "読み捨て内容を読めない: {}: {}",
-                        escape_bytes(raw_path),
-                        escape_diag(&error.to_string())
-                    ),
-                )
-                .with_guid(guid.to_owned())
-                .with_source(error),
-            )
-        })?;
-        if read == 0 {
-            return Ok(());
-        }
-    }
-}
-
-/// 入力から出力へ固定バッファで写し、バイト数を返す。
-fn copy_stream<R2: Read>(
-    input: &mut tar::Entry<'_, R2>,
-    output: &mut File,
-    guid: &str,
-    raw_path: &[u8],
-    context: &str,
-) -> Result<u64, Failure> {
-    let mut moved: u64 = 0;
-    let mut chunk = [0u8; COPY_BUFFER_SIZE];
-    loop {
-        let read = input.read(&mut chunk).map_err(|error| {
-            let kind = classify_read(&error);
-            Failure::new(
-                UnpackError::new(
-                    kind,
-                    format!(
-                        "{context}: {}: {}",
-                        escape_bytes(raw_path),
-                        escape_diag(&error.to_string())
-                    ),
-                )
-                .with_guid(guid.to_owned())
-                .with_source(error),
-            )
-        })?;
-        if read == 0 {
-            return Ok(moved);
-        }
-        output.write_all(&chunk[..read]).map_err(|error| {
-            Failure::new(
-                UnpackError::new(
-                    UnpackErrorKind::Storage,
-                    format!(
-                        "{context}: {}: {}",
-                        escape_bytes(raw_path),
-                        escape_diag(&error.to_string())
-                    ),
-                )
-                .with_guid(guid.to_owned())
-                .with_source(error),
-            )
-        })?;
-        moved = moved.saturating_add(read as u64);
-    }
-}
-
-/// gzip終端まで読み切り、tar終端後の非ゼロデータを拒否する。
-fn drain_trailing<R: Read>(reader: &mut R) -> io::Result<()> {
-    let mut chunk = [0u8; COPY_BUFFER_SIZE];
-    loop {
-        let read = reader.read(&mut chunk)?;
-        if read == 0 {
-            return Ok(());
-        }
-        if chunk[..read].iter().any(|byte| *byte != 0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "tar終端後に非ゼロデータがある",
-            ));
-        }
-    }
-}
-
-/// 対応関係・パス・出力衝突を検証し、出力計画を作る。
-fn validate_and_plan(slots: HashMap<String, Slot>) -> Result<Plan, Failure> {
-    let mut planned: Vec<PlannedEntry> = Vec::with_capacity(slots.len());
-    for (guid, slot) in &slots {
-        let Some(pathname_raw) = &slot.pathname else {
-            return Err(Failure::new(
-                UnpackError::new(
-                    UnpackErrorKind::InvalidPackage,
-                    format!("pathnameが無いGUIDがある: {guid:?}"),
-                )
-                .with_guid(guid.clone()),
-            ));
-        };
-        if !slot.has_meta {
-            return Err(Failure::new(
-                UnpackError::new(
-                    UnpackErrorKind::InvalidPackage,
-                    format!("asset.metaが無いGUIDがある: {guid:?}"),
-                )
-                .with_guid(guid.clone()),
-            ));
-        }
-        let pathname = String::from_utf8(pathname_raw.clone()).map_err(|_| {
-            Failure::new(
-                UnpackError::new(
-                    UnpackErrorKind::InvalidPath,
-                    format!("pathnameがUTF-8でない: {}", escape_bytes(pathname_raw)),
-                )
-                .with_guid(guid.clone()),
-            )
-        })?;
-        // `workspace` の検証を内部で再利用し、UnityPackage用に包み直す。公開はしない。
-        if let Err(workspace) = crate::workspace::validate_path(&pathname, false) {
-            return Err(Failure::new(
-                UnpackError::new(
-                    UnpackErrorKind::InvalidPath,
-                    format!(
-                        "出力パスが契約に違反する: {}: {workspace}",
-                        escape_bytes(pathname.as_bytes())
-                    ),
-                )
-                .with_guid(guid.clone())
-                .with_pathname(pathname.clone()),
-            ));
-        }
-        let first = pathname.split('/').next().unwrap_or_default();
-        if !first.eq_ignore_ascii_case(ASSETS_ROOT) {
-            return Err(Failure::new(
-                UnpackError::new(
-                    UnpackErrorKind::InvalidPath,
-                    format!(
-                        "先頭成分がAssetsでない: {}",
-                        escape_bytes(pathname.as_bytes())
-                    ),
-                )
-                .with_guid(guid.clone())
-                .with_pathname(pathname.clone()),
-            ));
-        }
-        let kind = if slot.has_asset {
-            EntryKind::File
-        } else {
-            EntryKind::Directory
-        };
-        if pathname.eq_ignore_ascii_case(ASSETS_ROOT) && kind == EntryKind::File {
-            return Err(Failure::new(
-                UnpackError::new(
-                    UnpackErrorKind::InvalidPath,
-                    format!(
-                        "Assetsそのものをファイルにはできない: {}",
-                        escape_bytes(pathname.as_bytes())
-                    ),
-                )
-                .with_guid(guid.clone())
-                .with_pathname(pathname.clone()),
-            ));
-        }
-        planned.push(PlannedEntry {
-            guid: guid.clone(),
-            pathname,
-            kind,
-            asset_size: slot.asset_size,
-            meta_size: slot.meta_size,
-        });
-    }
-    // 別GUIDが同じpathnameを使う場合も内容同一でも拒否する。
-    // ASCII大小文字だけ異なる名前も衝突扱いにする。
-    let mut files: HashMap<String, String> = HashMap::new();
-    let mut insert_file = |rel: &str, guid: &str| -> Result<(), Failure> {
-        let key = rel.to_ascii_lowercase();
-        if let Some(existing) = files.get(&key) {
-            return Err(Failure::new(
-                UnpackError::new(
-                    UnpackErrorKind::Conflict,
-                    format!(
-                        "出力パスが重複する: {} と {}",
-                        escape_bytes(rel.as_bytes()),
-                        escape_bytes(existing.as_bytes())
-                    ),
-                )
-                .with_guid(guid.to_owned())
-                .with_pathname(rel.to_owned()),
-            ));
-        }
-        files.insert(key, rel.to_owned());
-        Ok(())
-    };
-    for entry in &planned {
-        if entry.kind == EntryKind::File {
-            insert_file(&entry.pathname, &entry.guid)?;
-        }
-        insert_file(&format!("{}.meta", entry.pathname), &entry.guid)?;
-    }
-    let mut dirs: HashMap<String, String> = HashMap::new();
-    let mut insert_dir = |rel: &str, guid: &str| -> Result<(), Failure> {
-        let key = rel.to_ascii_lowercase();
-        if let Some(existing) = files.get(&key) {
-            return Err(Failure::new(
-                UnpackError::new(
-                    UnpackErrorKind::Conflict,
-                    format!(
-                        "ファイルとディレクトリが衝突する: {} と {}",
-                        escape_bytes(rel.as_bytes()),
-                        escape_bytes(existing.as_bytes())
-                    ),
-                )
-                .with_guid(guid.to_owned())
-                .with_pathname(rel.to_owned()),
-            ));
-        }
-        if let Some(existing) = dirs.get(&key) {
-            if existing != rel {
-                return Err(Failure::new(
-                    UnpackError::new(
-                        UnpackErrorKind::Conflict,
-                        format!(
-                            "出力パスが重複する: {} と {}",
-                            escape_bytes(rel.as_bytes()),
-                            escape_bytes(existing.as_bytes())
-                        ),
-                    )
-                    .with_guid(guid.to_owned())
-                    .with_pathname(rel.to_owned()),
-                ));
-            }
-            return Ok(());
-        }
-        dirs.insert(key, rel.to_owned());
-        Ok(())
-    };
-    for entry in &planned {
-        // 暗黙の親ディレクトリも計画に含め、親がファイルになる構造を拒否する。
-        let components: Vec<&str> = entry.pathname.split('/').collect();
-        let mut prefix = String::new();
-        for (index, component) in components.iter().enumerate() {
-            if index + 1 == components.len() {
-                break;
-            }
-            if !prefix.is_empty() {
-                prefix.push('/');
-            }
-            prefix.push_str(component);
-            insert_dir(&prefix, &entry.guid)?;
-        }
-        if entry.kind == EntryKind::Directory {
-            insert_dir(&entry.pathname, &entry.guid)?;
-        }
-    }
-    for entry in &planned {
-        // 明示フォルダ自体がファイル計画と衝突しないことを確かめる。
-        if entry.kind == EntryKind::Directory
-            && let Some(existing) = files.get(&entry.pathname.to_ascii_lowercase())
-        {
-            return Err(Failure::new(
-                UnpackError::new(
-                    UnpackErrorKind::Conflict,
-                    format!(
-                        "ファイルとディレクトリが衝突する: {} と {}",
-                        escape_bytes(entry.pathname.as_bytes()),
-                        escape_bytes(existing.as_bytes())
-                    ),
-                )
-                .with_guid(entry.guid.clone())
-                .with_pathname(entry.pathname.clone()),
-            ));
-        }
-    }
-    let mut report_entries: Vec<Entry> = planned
-        .iter()
-        .map(|entry| Entry {
-            guid: entry.guid.clone(),
-            pathname: entry.pathname.clone(),
-            kind: entry.kind,
-        })
-        .collect();
-    // `String` の順序はUTF-8バイト列の辞書式順序と一致する。
-    report_entries.sort_by(|a, b| a.pathname.cmp(&b.pathname));
-    let mut files_out: Vec<(PathBuf, PathBuf)> = Vec::new();
-    let mut output_bytes: u64 = 0;
-    for entry in &planned {
-        if entry.kind == EntryKind::File {
-            files_out.push((
-                PathBuf::from(&entry.pathname),
-                PathBuf::from(staging_name(&entry.guid, ".asset")),
-            ));
-            output_bytes = output_bytes.saturating_add(entry.asset_size);
-        }
-        files_out.push((
-            PathBuf::from(format!("{}.meta", entry.pathname)),
-            PathBuf::from(staging_name(&entry.guid, ".asset.meta")),
-        ));
-        output_bytes = output_bytes.saturating_add(entry.meta_size);
-    }
-    files_out.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut dirs_out: Vec<PathBuf> = dirs.into_values().map(PathBuf::from).collect();
-    dirs_out.sort_by(|a, b| {
-        a.components()
-            .count()
-            .cmp(&b.components().count())
-            .then_with(|| a.cmp(b))
-    });
-    Ok(Plan {
-        entries: report_entries,
-        files: files_out,
-        dirs: dirs_out,
-        output_bytes,
-    })
-}
-
 /// 出力先を排他的に新規作成し、検証済み計画を書き出す。
 fn create_output(
     destination: &Path,
@@ -1067,6 +349,7 @@ fn storage_failure(error: io::Error, context: String) -> UnpackError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tar::EntryType;
 
     // テスト名は日本語で書く（テストは仕様・契約であるため）。
 

@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::{
-    AssetIndex, AssetMeta, IndexOptions, UnityError, UnityErrorKind,
+    AssetIndex, AssetMeta, AssetSource, IndexOptions, UnityError, UnityErrorKind,
     error::storage_failure_with_path,
 };
 
@@ -29,6 +29,38 @@ use super::{
 pub fn scan_directory(root: &Path, options: &IndexOptions) -> Result<AssetIndex, UnityError> {
     let staged = collect_staged(root, options)?;
     build_index(root, staged)
+}
+
+/// 展開済みディレクトリの `Assets` 直下を基準とする読み手。
+///
+/// `root` は [`scan_directory`] に渡す `Assets` そのものを指す。
+/// 上限付き読み取りの意味は材質層の旧 `read_limited` と同じであり、
+/// `limit` を超える内容は切り詰めず `InvalidData` で失敗する。
+pub(crate) struct FsAssetSource<'a> {
+    root: &'a Path,
+}
+
+impl<'a> FsAssetSource<'a> {
+    pub(crate) fn new(root: &'a Path) -> Self {
+        Self { root }
+    }
+}
+
+impl AssetSource for FsAssetSource<'_> {
+    fn read_limited(&self, path: &str, limit: u64) -> std::io::Result<Vec<u8>> {
+        use std::io::Read as _;
+        let file = std::fs::File::open(self.root.join(path))?;
+        let mut limited = file.take(limit.saturating_add(1));
+        let mut bytes = Vec::new();
+        limited.read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("読み取り上限を超えた: {limit}バイト"),
+            ));
+        }
+        Ok(bytes)
+    }
 }
 
 /// 走査で集めた中間情報。
@@ -189,59 +221,13 @@ fn read_staged_meta(
 }
 
 /// 対応関係と実体有無を検証し、決定的な順序で索引を作る。
+///
+/// 実体の有無と種別はファイルシステムに問い合わせる。
+/// 読み取り中の入力変更に対するスナップショット保証はしない。
 fn build_index(root: &Path, staged: Staged) -> Result<AssetIndex, UnityError> {
-    // 実体有無の照合は小文字化せず厳密に行う。大小文字の衝突は挿入時に拒否する。
-    let asset_set: std::collections::HashSet<&str> =
-        staged.assets.iter().map(String::as_str).collect();
-    let dir_set: std::collections::HashSet<&str> = staged.dirs.iter().map(String::as_str).collect();
-    // metaのない通常ファイルは拒否する。
-    for asset in &staged.assets {
-        if !staged.metas.contains_key(asset.as_str()) {
-            return Err(UnityError::new(
-                UnityErrorKind::MissingMetadata,
-                "metaのない通常ファイルがある",
-            )
-            .with_path(asset.clone()));
-        }
-    }
-    let mut paths: Vec<&String> = staged.metas.keys().collect();
-    paths.sort();
-    let mut index = AssetIndex::new();
-    for path in paths {
-        let meta = staged.metas.get(path.as_str()).expect("列挙元である");
-        let full = root.join(path);
-        let entity = fs::symlink_metadata(&full).map_err(|_| {
-            UnityError::new(
-                UnityErrorKind::MissingMetadata,
-                "対応する実体がないmetaがある",
-            )
-            .with_path(path.clone())
-        })?;
-        // フォルダmetaと実体の対応を確かめる。実体のない配置はここで落とす。
-        let is_dir = entity.is_dir();
-        if meta.is_folder() != is_dir {
-            // 実体種別とmetaの不一致はどちら側とも言えないため内容不良として扱う。
-            return Err(UnityError::new(
-                UnityErrorKind::InvalidMetadata,
-                "metaと実体の種別が合わない",
-            )
-            .with_path(path.clone()));
-        }
-        if !is_dir && !asset_set.contains(path.as_str()) {
-            return Err(UnityError::new(
-                UnityErrorKind::MissingMetadata,
-                "対応する実体がないmetaがある",
-            )
-            .with_path(path.clone()));
-        }
-        if is_dir && !dir_set.contains(path.as_str()) {
-            return Err(UnityError::new(
-                UnityErrorKind::MissingMetadata,
-                "対応する実体がないmetaがある",
-            )
-            .with_path(path.clone()));
-        }
-        index.insert(path, meta.clone())?;
-    }
-    Ok(index)
+    AssetIndex::build_from_parts(staged.metas, &staged.assets, &staged.dirs, |path| {
+        fs::symlink_metadata(root.join(path))
+            .ok()
+            .map(|entity| entity.is_dir())
+    })
 }

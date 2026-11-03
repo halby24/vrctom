@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%232f6fed'/%3E%3Ctext x='32' y='45' font-size='38' text-anchor='middle' fill='white' font-family='sans-serif'%3EV%3C/text%3E%3C/svg%3E"
+    />
+    <title>vrctom — .unitypackage から VRM へ</title>
+  </head>
+  <body>
+    <header class="page-header">
+      <h1>vrctom</h1>
+      <p class="lead">
+        VRChat向けアバターの<code>.unitypackage</code>をブラウザ内でVRMに変換します。
+        <a href="https://github.com/halby24/vrctom">GitHub: halby24/vrctom</a>
+      </p>
+      <p class="privacy">ファイルはブラウザ内だけで処理され、送信・保存されません。</p>
+      <p class="limits">Prefabの材質割当・有効状態と物理（揺れ）は反映されません。</p>
+    </header>
+    <main class="layout">
+      <section class="panel controls" aria-label="操作">
+        <h2>変換</h2>
+        <div
+          class="drop-zone"
+          data-testid="drop-zone"
+          role="button"
+          tabindex="0"
+          aria-label=".unitypackageファイルをここにドロップ、またはEnterキーで選択"
+        >
+          <p>.unitypackageをここにドロップ、またはクリックして選択</p>
+          <p class="hint">拡張子<code>.unitypackage</code>・512MiBまで</p>
+          <input
+            type="file"
+            accept=".unitypackage"
+            data-testid="file-input"
+            aria-label=".unitypackageファイルの選択"
+          />
+        </div>
+        <p class="status" data-testid="status" data-state="idle" aria-live="polite">
+          ファイルを選択してください
+        </p>
+        <div class="error-panel" data-testid="error-panel" hidden></div>
+        <fieldset class="candidates-field">
+          <legend>変換するFBX</legend>
+          <div data-testid="candidates">
+            <p class="hint">パッケージを開くと候補が並びます</p>
+          </div>
+        </fieldset>
+        <div class="settings">
+          <label>
+            作品名
+            <input type="text" data-testid="name-input" autocomplete="off" placeholder="空ならFBX名" />
+          </label>
+          <label>
+            作者（カンマ区切り）
+            <input type="text" data-testid="authors-input" autocomplete="off" placeholder="unknown" />
+          </label>
+          <label class="check">
+            <input type="checkbox" data-testid="expressions-check" checked />
+            VRChat向け表情を生成する
+          </label>
+        </div>
+        <div class="buttons">
+          <button type="button" data-testid="convert-button" disabled>変換</button>
+          <button type="button" data-testid="cancel-button" disabled>キャンセル</button>
+          <button type="button" data-testid="download-button" disabled>ダウンロード</button>
+        </div>
+        <h2>レポート</h2>
+        <div data-testid="report">
+          <p class="hint">変換すると結果が表示されます</p>
+        </div>
+        <h2>警告</h2>
+        <div data-testid="warnings">
+          <p class="hint">警告はありません</p>
+        </div>
+      </section>
+      <section class="panel preview" aria-label="プレビュー">
+        <h2>プレビュー</h2>
+        <div class="preview-wrap">
+          <canvas data-testid="preview-canvas"></canvas>
+        </div>
+        <p class="hint">ドラッグで回転・ホイールでズーム</p>
+      </section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

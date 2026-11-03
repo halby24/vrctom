@@ -973,6 +973,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vrctom-wasm"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "vrctom",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "wasi"
 version = "0.11.1+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

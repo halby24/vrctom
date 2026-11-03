@@ -1,0 +1,78 @@
+# GitHub Pages（project pages）へweb/のViteアプリを配信する
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "web/**"
+      - "mise.toml"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: リポジトリを取得する
+        uses: actions/checkout@v4
+      - name: Rustツールチェーンを入れる
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: 1.96.0
+          target: wasm32-unknown-unknown
+          components: clippy, rustfmt
+      - name: wasm-bindgenを入れる
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen@0.2.129
+      - name: フォーマットを確認する
+        run: cargo fmt --all --check
+      - name: Clippyで検査する
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: テストを実行する
+        run: cargo test --workspace
+      - name: pnpmを入れる
+        uses: pnpm/action-setup@v4
+        with:
+          # `packageManager`は`web/package.json`にあるため、参照先を明示する。
+          package_json_file: web/package.json
+      - name: Nodeを入れる
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Webの依存パッケージを入れる
+        run: pnpm --dir web install --frozen-lockfile
+      - name: Webをテストする
+        run: pnpm --dir web test
+      - name: Webをビルドする
+        run: pnpm --dir web build
+      - name: Pages用アーティファクトを上げる
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Pagesへデプロイする
+        id: deployment
+        uses: actions/deploy-pages@v4

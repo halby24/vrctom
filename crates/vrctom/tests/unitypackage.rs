@@ -25,7 +25,10 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 #[cfg(unix)]
 use tar::Archive;
-use vrctom::unitypackage::{EntryKind, UnpackErrorKind, UnpackOptions, UnpackReport, unpack_to};
+use vrctom::unity::{AssetKind, AssetSource, IndexOptions, UnityErrorKind};
+use vrctom::unitypackage::{
+    EntryKind, UnpackErrorKind, UnpackOptions, UnpackReport, unpack_in_memory, unpack_to,
+};
 
 // テスト名は日本語で書く（テストは仕様・契約であるため）.
 
@@ -267,6 +270,48 @@ fn ファイルと空ファイルと空フォルダの内容が一致する() {
     assert_eq!(report.entries()[1].kind, EntryKind::File);
     assert_eq!(report.entries()[0].kind, EntryKind::Directory);
     assert_eq!(report.entries()[0].guid, guid(3));
+}
+
+#[test]
+fn メモリ展開でmetaを相対パスで読める() {
+    // `asset` と `asset.meta` の両方を相対パスから実際の出力パスへの表に登録し、
+    // native の読み手と同じく `.meta` を読めることの回帰として残す。
+    // ファイルmetaとフォルダmetaの両方で確かめる。
+    let members = vec![
+        Member::Pathname {
+            guid: guid(1),
+            content: b"Assets/Model.fbx".to_vec(),
+        },
+        Member::Asset {
+            guid: guid(1),
+            content: b"fbx-body".to_vec(),
+        },
+        Member::Meta {
+            guid: guid(1),
+            content: b"fbx-meta".to_vec(),
+        },
+        Member::Dir { guid: guid(2) },
+        Member::Pathname {
+            guid: guid(2),
+            content: b"Assets/Empty".to_vec(),
+        },
+        Member::Meta {
+            guid: guid(2),
+            content: b"empty-meta".to_vec(),
+        },
+    ];
+    let package = unpack_in_memory(&package_bytes(&members)[..], &UnpackOptions::default())
+        .expect("展開できる");
+    for (全体, 相対) in [
+        ("Assets/Model.fbx.meta", "Model.fbx.meta"),
+        ("Assets/Empty.meta", "Empty.meta"),
+    ] {
+        let 全文 = package.read(全体).expect("metaはある");
+        let 読めた = package
+            .read_limited(相対, 1024)
+            .expect("相対パスでmetaを読める");
+        assert_eq!(読めた, 全文, "同じバイト列である: {相対}");
+    }
 }
 
 #[test]
@@ -1458,4 +1503,567 @@ fn 実fixtureの全件内容一致と計測値を記録する() {
         growth_kib * 1024 < largest_asset,
         "RSS増加{growth_kib}KiBは最大asset{largest_asset}バイトより小さい"
     );
+}
+
+/// 最小のフォルダmetaを組み立てる。GUIDはtar側と合わせる。
+fn folder_meta(n: u128) -> Vec<u8> {
+    format!(
+        "fileFormatVersion: 2\nguid: {}\nfolderAsset: yes\nDefaultImporter:\n  externalObjects: {{}}\n  userData: \n  assetBundleName: \n  assetBundleVariant: \n",
+        guid(n)
+    )
+    .into_bytes()
+}
+
+/// 最小のファイルmetaを組み立てる。GUIDはtar側と合わせる。
+fn file_meta(n: u128, importer: &str, body: &str) -> Vec<u8> {
+    format!(
+        "fileFormatVersion: 2\nguid: {}\n{importer}:\n{body}",
+        guid(n)
+    )
+    .into_bytes()
+}
+
+#[test]
+fn メモリ展開は出力展開と同じ一覧と内容になる() {
+    // ファイル・空ファイル・フォルダ・読み捨て（preview）を含む配置で、
+    // 退避先の違いが結果に影響しないことを確かめる。
+    let members = vec![
+        Member::Pathname {
+            guid: guid(1),
+            content: b"Assets/a.txt".to_vec(),
+        },
+        Member::Asset {
+            guid: guid(1),
+            content: b"hello".to_vec(),
+        },
+        Member::Meta {
+            guid: guid(1),
+            content: b"meta-a".to_vec(),
+        },
+        Member::Preview {
+            guid: guid(1),
+            content: b"preview-bytes".to_vec(),
+        },
+        Member::Pathname {
+            guid: guid(2),
+            content: b"Assets/empty.bin".to_vec(),
+        },
+        Member::Asset {
+            guid: guid(2),
+            content: Vec::new(),
+        },
+        Member::Meta {
+            guid: guid(2),
+            content: Vec::new(),
+        },
+        Member::Dir { guid: guid(3) },
+        Member::Pathname {
+            guid: guid(3),
+            content: b"Assets/Empty".to_vec(),
+        },
+        Member::Meta {
+            guid: guid(3),
+            content: b"meta-empty".to_vec(),
+        },
+    ];
+    let pkg = package_bytes(&members);
+    let options = UnpackOptions::default();
+    let (_parent, destination, result) = unpack_fixture(&pkg, &options);
+    let report = result.expect("出力展開は成功する");
+    let memory = unpack_in_memory(&pkg[..], &options).expect("メモリ展開は成功する");
+    // 一覧と集計が一致する。
+    assert_eq!(memory.entries(), report.entries());
+    assert_eq!(memory.file_count(), report.file_count());
+    assert_eq!(memory.directory_count(), report.directory_count());
+    assert_eq!(memory.output_bytes(), report.output_bytes());
+    // 読み出し内容が出力先の実ファイルと一致する。
+    for entry in report.entries() {
+        if entry.kind == EntryKind::File {
+            let expected = fs::read(destination.join(&entry.pathname)).expect("出力は読める");
+            assert_eq!(
+                memory.read(&entry.pathname),
+                Some(expected.as_slice()),
+                "実体の内容が一致する: {}",
+                entry.pathname,
+            );
+        } else {
+            // ディレクトリ自体に内容はない。
+            assert_eq!(
+                memory.read(&entry.pathname),
+                None,
+                "フォルダ自体は読めない: {}",
+                entry.pathname,
+            );
+        }
+        let meta_path = format!("{}.meta", entry.pathname);
+        let expected = fs::read(destination.join(&meta_path)).expect("metaは読める");
+        assert_eq!(
+            memory.read(&meta_path),
+            Some(expected.as_slice()),
+            "metaの内容が一致する: {meta_path}",
+        );
+    }
+    // 読み捨て（preview）や存在しないパスは読めない。
+    assert_eq!(memory.read("Assets/preview.png"), None);
+    assert_eq!(memory.read("Assets/ない.txt"), None);
+}
+
+#[test]
+fn メモリ展開も壊れた入力を同じ分類で拒否する() {
+    /// メモリ展開の失敗種別だけを取り出す。
+    fn memory_kind(pkg: &[u8]) -> UnpackErrorKind {
+        unpack_in_memory(pkg, &UnpackOptions::default())
+            .expect_err("壊れた入力は失敗する")
+            .kind()
+    }
+
+    // tar構造の破損。
+    let mut tar = tar_bytes(&basic_members());
+    tar[148] ^= 0xff;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&tar).expect("gzip書き込みは成功する");
+    assert_eq!(
+        memory_kind(&encoder.finish().expect("gzipは完成する")),
+        UnpackErrorKind::InvalidPackage,
+        "tar破損は壊れたパッケージになる",
+    );
+
+    // 同一GUIDの同一メンバー再出現。
+    let pkg = package_bytes(&[
+        Member::Pathname {
+            guid: guid(1),
+            content: b"Assets/a.txt".to_vec(),
+        },
+        Member::Asset {
+            guid: guid(1),
+            content: b"one".to_vec(),
+        },
+        Member::Asset {
+            guid: guid(1),
+            content: b"two".to_vec(),
+        },
+        Member::Meta {
+            guid: guid(1),
+            content: b"m".to_vec(),
+        },
+    ]);
+    assert_eq!(
+        memory_kind(&pkg),
+        UnpackErrorKind::InvalidPackage,
+        "asset重複は壊れたパッケージになる",
+    );
+
+    // 必須欠損。
+    let pkg = package_bytes(&[
+        Member::Asset {
+            guid: guid(1),
+            content: b"x".to_vec(),
+        },
+        Member::Meta {
+            guid: guid(1),
+            content: b"m".to_vec(),
+        },
+    ]);
+    assert_eq!(
+        memory_kind(&pkg),
+        UnpackErrorKind::InvalidPackage,
+        "pathname欠損は壊れたパッケージになる",
+    );
+
+    // 未対応のtar種別（symlink）。
+    let pkg = package_bytes(&[Member::Raw {
+        path: format!("{}/asset", guid(1)).into_bytes(),
+        typeflag: b'2',
+        link: b"Assets/target".to_vec(),
+        content: b"x".to_vec(),
+    }]);
+    assert_eq!(
+        memory_kind(&pkg),
+        UnpackErrorKind::InvalidPackage,
+        "symlinkは壊れたパッケージになる",
+    );
+
+    // 未対応のメンバー。
+    let pkg = package_bytes(&[Member::Raw {
+        path: format!("{}/unknown", guid(1)).into_bytes(),
+        typeflag: b'0',
+        link: Vec::new(),
+        content: b"x".to_vec(),
+    }]);
+    assert_eq!(
+        memory_kind(&pkg),
+        UnpackErrorKind::InvalidPackage,
+        "未対応メンバーは壊れたパッケージになる",
+    );
+
+    // 別GUIDの同一pathname。
+    let pkg = package_bytes(&[
+        Member::Pathname {
+            guid: guid(1),
+            content: b"Assets/same.txt".to_vec(),
+        },
+        Member::Asset {
+            guid: guid(1),
+            content: b"same".to_vec(),
+        },
+        Member::Meta {
+            guid: guid(1),
+            content: b"same".to_vec(),
+        },
+        Member::Pathname {
+            guid: guid(2),
+            content: b"Assets/same.txt".to_vec(),
+        },
+        Member::Asset {
+            guid: guid(2),
+            content: b"same".to_vec(),
+        },
+        Member::Meta {
+            guid: guid(2),
+            content: b"same".to_vec(),
+        },
+    ]);
+    assert_eq!(
+        memory_kind(&pkg),
+        UnpackErrorKind::Conflict,
+        "別GUIDの同一pathnameは衝突になる",
+    );
+
+    // ファイルとディレクトリの衝突。
+    let pkg = package_bytes(&[
+        Member::Pathname {
+            guid: guid(1),
+            content: b"Assets/a".to_vec(),
+        },
+        Member::Asset {
+            guid: guid(1),
+            content: b"file".to_vec(),
+        },
+        Member::Meta {
+            guid: guid(1),
+            content: b"m1".to_vec(),
+        },
+        Member::Pathname {
+            guid: guid(2),
+            content: b"Assets/a/b.txt".to_vec(),
+        },
+        Member::Asset {
+            guid: guid(2),
+            content: b"nested".to_vec(),
+        },
+        Member::Meta {
+            guid: guid(2),
+            content: b"m2".to_vec(),
+        },
+    ]);
+    assert_eq!(
+        memory_kind(&pkg),
+        UnpackErrorKind::Conflict,
+        "親がファイルになる構造は衝突になる",
+    );
+
+    // 大小文字だけ異なる名前の混在。
+    let pkg = package_bytes(&[
+        Member::Pathname {
+            guid: guid(1),
+            content: b"Assets/Foo.txt".to_vec(),
+        },
+        Member::Asset {
+            guid: guid(1),
+            content: b"a".to_vec(),
+        },
+        Member::Meta {
+            guid: guid(1),
+            content: b"m1".to_vec(),
+        },
+        Member::Pathname {
+            guid: guid(2),
+            content: b"Assets/foo.txt".to_vec(),
+        },
+        Member::Asset {
+            guid: guid(2),
+            content: b"b".to_vec(),
+        },
+        Member::Meta {
+            guid: guid(2),
+            content: b"m2".to_vec(),
+        },
+    ]);
+    assert_eq!(
+        memory_kind(&pkg),
+        UnpackErrorKind::Conflict,
+        "大小文字の衝突は衝突になる",
+    );
+
+    // パス脱出。
+    let pkg = package_bytes(&[
+        Member::Pathname {
+            guid: guid(1),
+            content: b"Assets/../escape.txt".to_vec(),
+        },
+        Member::Asset {
+            guid: guid(1),
+            content: b"x".to_vec(),
+        },
+        Member::Meta {
+            guid: guid(1),
+            content: b"m".to_vec(),
+        },
+    ]);
+    assert_eq!(
+        memory_kind(&pkg),
+        UnpackErrorKind::InvalidPath,
+        "パス脱出は不正パスになる",
+    );
+
+    // Assets外。
+    let pkg = package_bytes(&[
+        Member::Pathname {
+            guid: guid(1),
+            content: b"Packages/foo.prefab".to_vec(),
+        },
+        Member::Asset {
+            guid: guid(1),
+            content: b"x".to_vec(),
+        },
+        Member::Meta {
+            guid: guid(1),
+            content: b"m".to_vec(),
+        },
+    ]);
+    assert_eq!(
+        memory_kind(&pkg),
+        UnpackErrorKind::InvalidPath,
+        "Assets外は不正パスになる",
+    );
+
+    // gzipのCRC不一致。
+    let mut pkg = package_bytes(&basic_members());
+    let flip_at = pkg.len() / 2;
+    pkg[flip_at] ^= 0xff;
+    assert_eq!(
+        memory_kind(&pkg),
+        UnpackErrorKind::InvalidPackage,
+        "CRC不一致は壊れたパッケージになる",
+    );
+
+    // gzipの途中切れ。
+    let pkg = package_bytes(&basic_members());
+    assert_eq!(
+        memory_kind(&pkg[..pkg.len() / 2]),
+        UnpackErrorKind::InvalidPackage,
+        "途中切れは壊れたパッケージになる",
+    );
+
+    // tar終端後の非ゼロデータ。
+    let mut tar = tar_bytes(&basic_members());
+    tar.extend_from_slice(&[0xabu8; 512]);
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&tar).expect("gzip書き込みは成功する");
+    assert_eq!(
+        memory_kind(&encoder.finish().expect("gzipは完成する")),
+        UnpackErrorKind::InvalidPackage,
+        "終端後データは壊れたパッケージになる",
+    );
+}
+
+#[test]
+fn メモリ展開も資源上限を同じ意味で適用する() {
+    let pkg = package_bytes(&basic_members());
+
+    // tarエントリ数は7件（GUIDディレクトリ2件を含む）であり、
+    // 上限ちょうどは成功し、1件不足では失敗する。
+    let options = UnpackOptions::new().with_max_entries(7);
+    unpack_in_memory(&pkg[..], &options).expect("上限ちょうどは成功する");
+    let options = UnpackOptions::new().with_max_entries(6);
+    assert_eq!(
+        unpack_in_memory(&pkg[..], &options)
+            .expect_err("上限超過は失敗する")
+            .kind(),
+        UnpackErrorKind::LimitExceeded,
+        "エントリ数超過は上限超過になる",
+    );
+
+    // 総読み取り量も上限ちょうどは成功し、1バイト不足では失敗する。
+    let mut decoder = GzDecoder::new(&pkg[..]);
+    let mut total = Vec::new();
+    decoder.read_to_end(&mut total).expect("展開は成功する");
+    let exact = total.len() as u64;
+    let options = UnpackOptions::new().with_max_total_bytes(exact);
+    unpack_in_memory(&pkg[..], &options).expect("上限ちょうどは成功する");
+    let options = UnpackOptions::new().with_max_total_bytes(exact - 1);
+    assert_eq!(
+        unpack_in_memory(&pkg[..], &options)
+            .expect_err("上限超過は失敗する")
+            .kind(),
+        UnpackErrorKind::LimitExceeded,
+        "総量超過は上限超過になる",
+    );
+
+    // `pathname` 一件と合計の上限も同じ意味で効く。
+    let options = UnpackOptions::new().with_max_pathname_bytes(12);
+    unpack_in_memory(&pkg[..], &options).expect("一件の上限ちょうどは成功する");
+    let options = UnpackOptions::new().with_max_pathname_bytes(11);
+    assert_eq!(
+        unpack_in_memory(&pkg[..], &options)
+            .expect_err("上限超過は失敗する")
+            .kind(),
+        UnpackErrorKind::LimitExceeded,
+        "一件超過は上限超過になる",
+    );
+    let options = UnpackOptions::new().with_max_pathname_total_bytes(23);
+    assert_eq!(
+        unpack_in_memory(&pkg[..], &options)
+            .expect_err("上限超過は失敗する")
+            .kind(),
+        UnpackErrorKind::LimitExceeded,
+        "合計超過は上限超過になる",
+    );
+}
+
+#[test]
+fn メモリの索引は基準相対パスで走査と同じ解決になる() {
+    // モデル・材質・テクスチャ・フォルダ・Assets自体を含む配置で、
+    // 種別分類と所在解決が走査と一致することを確かめる。
+    let members = vec![
+        Member::Dir { guid: guid(1) },
+        Member::Pathname {
+            guid: guid(1),
+            content: b"Assets".to_vec(),
+        },
+        Member::Meta {
+            guid: guid(1),
+            content: folder_meta(1),
+        },
+        Member::Pathname {
+            guid: guid(2),
+            content: b"Assets/model.fbx".to_vec(),
+        },
+        Member::Asset {
+            guid: guid(2),
+            content: b"fake-fbx".to_vec(),
+        },
+        Member::Meta {
+            guid: guid(2),
+            content: file_meta(2, "ModelImporter", "  externalObjects: {}\n"),
+        },
+        Member::Pathname {
+            guid: guid(3),
+            content: b"Assets/Mats/hero.mat".to_vec(),
+        },
+        Member::Asset {
+            guid: guid(3),
+            content: b"fake-mat".to_vec(),
+        },
+        Member::Meta {
+            guid: guid(3),
+            content: file_meta(3, "NativeFormatImporter", "  externalObjects: {}\n"),
+        },
+        Member::Pathname {
+            guid: guid(4),
+            content: b"Assets/Textures/tex.png".to_vec(),
+        },
+        Member::Asset {
+            guid: guid(4),
+            content: b"\x89PNG-fake".to_vec(),
+        },
+        Member::Meta {
+            guid: guid(4),
+            content: file_meta(
+                4,
+                "TextureImporter",
+                "  externalObjects: {}\n  textureType: 0\n",
+            ),
+        },
+        Member::Dir { guid: guid(5) },
+        Member::Pathname {
+            guid: guid(5),
+            content: b"Assets/Mats".to_vec(),
+        },
+        Member::Meta {
+            guid: guid(5),
+            content: folder_meta(5),
+        },
+    ];
+    let pkg = package_bytes(&members);
+    let memory = unpack_in_memory(&pkg[..], &UnpackOptions::default()).expect("展開は成功する");
+    let index = memory
+        .asset_index(&IndexOptions::new())
+        .expect("索引は成功する");
+    // `Assets` 自体は索引のルートであり、件にしない。
+    let paths: Vec<&str> = index
+        .entries()
+        .iter()
+        .map(|record| record.path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["Mats", "Mats/hero.mat", "Textures/tex.png", "model.fbx"],
+    );
+    let kinds: Vec<AssetKind> = index.entries().iter().map(|record| record.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            AssetKind::Folder,
+            AssetKind::Material,
+            AssetKind::Texture,
+            AssetKind::Model,
+        ],
+    );
+    for (record, n) in index.entries().iter().zip([5u128, 3, 4, 2]) {
+        assert_eq!(record.guid.as_str(), guid(n).as_str(), "GUIDが一致する");
+    }
+    // 実体とmetaの読み出しもできる。
+    assert_eq!(
+        memory.read("Assets/model.fbx"),
+        Some(b"fake-fbx".as_slice())
+    );
+    assert_eq!(
+        memory.read("Assets/model.fbx.meta"),
+        Some(file_meta(2, "ModelImporter", "  externalObjects: {}\n").as_slice()),
+    );
+
+    // 同一ツリーを出力展開して `Assets` 下を走査した場合と同じ解決になる。
+    let (_parent, destination, result) = unpack_fixture(&pkg, &UnpackOptions::default());
+    result.expect("出力展開は成功する");
+    let scanned = vrctom::unity::scan_directory(&destination.join("Assets"), &IndexOptions::new())
+        .expect("走査は成功する");
+    assert_eq!(scanned.entries().len(), index.entries().len());
+    for (scanned, record) in scanned.entries().iter().zip(index.entries().iter()) {
+        assert_eq!(scanned.path, record.path, "パスが一致する");
+        assert_eq!(scanned.guid, record.guid, "GUIDが一致する");
+        assert_eq!(scanned.kind, record.kind, "種別が一致する");
+        // パス引きとGUID引きのどちらでも同じ件に届く。
+        assert_eq!(
+            index.get_by_path(&scanned.path).expect("ある").guid,
+            record.guid,
+        );
+        assert_eq!(index.get(&scanned.guid).expect("ある").path, record.path);
+    }
+}
+
+#[test]
+fn メモリの索引は実体とmetaの種別不一致を拒否する() {
+    // 実体（asset）があるのにフォルダmetaを持つ配置は、展開自体は通る。
+    // metaの意味を見ないためである。索引では種別不一致として失敗する。
+    let pkg = package_bytes(&[
+        Member::Pathname {
+            guid: guid(1),
+            content: b"Assets/a.txt".to_vec(),
+        },
+        Member::Asset {
+            guid: guid(1),
+            content: b"x".to_vec(),
+        },
+        Member::Meta {
+            guid: guid(1),
+            content: folder_meta(1),
+        },
+    ]);
+    let memory = unpack_in_memory(&pkg[..], &UnpackOptions::default()).expect("展開は成功する");
+    let error = memory
+        .asset_index(&IndexOptions::new())
+        .expect_err("種別不一致は失敗する");
+    assert_eq!(error.kind(), UnityErrorKind::InvalidMetadata);
+    assert_eq!(error.path(), Some("a.txt"));
 }

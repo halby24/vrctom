@@ -58,6 +58,11 @@ pub mod fbx;
 /// FBX読み取り結果からVRM 1.0へ書き出す前の中間モデル。
 pub mod vrm;
 
+/// CLIとWebが共有する基本変換の入口。
+pub mod conversion;
+
 /// UnityPackageの展開。
-#[cfg(not(target_arch = "wasm32"))]
+///
+/// nativeでは出力先への展開とメモリ内保持の両方を提供し、
+/// wasmではメモリ内保持だけを提供する。
 pub mod unitypackage;

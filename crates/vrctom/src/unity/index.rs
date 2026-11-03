@@ -150,6 +150,77 @@ impl AssetIndex {
         self.by_guid.get(guid).map(|index| &self.records[*index])
     }
 
+    /// 収集済みのmeta・実体一覧から対応関係を検証し、決定的な順序で索引を作る。
+    ///
+    /// [`scan_directory`](super::scan_directory)（native）とメモリ内パッケージの
+    /// 索引構築で共有する。`assets`・`dirs` は `.meta` 接尾辞を除いた相対パスであり、
+    /// `is_dir` は実体の有無（`None` は欠落）と種別を答える。
+    /// metaのない通常ファイル・対応する実体のないmeta・種別の不一致は拒否し、
+    /// 重複（大小文字のみの違いを含む）は [`insert`](Self::insert) で拒否する。
+    /// 挿入はmetaのパス順であり、決定的である。
+    ///
+    /// # Errors
+    ///
+    /// 対応不一致・種別不一致・重複・パス契約違反の場合にエラーを返す。
+    pub(crate) fn build_from_parts(
+        metas: HashMap<String, AssetMeta>,
+        assets: &[String],
+        dirs: &[String],
+        is_dir: impl Fn(&str) -> Option<bool>,
+    ) -> Result<Self, UnityError> {
+        use std::collections::HashSet;
+        // 実体有無の照合は小文字化せず厳密に行う。大小文字の衝突は挿入時に拒否する。
+        let asset_set: HashSet<&str> = assets.iter().map(String::as_str).collect();
+        let dir_set: HashSet<&str> = dirs.iter().map(String::as_str).collect();
+        // metaのない通常ファイルは拒否する。
+        for asset in assets {
+            if !metas.contains_key(asset.as_str()) {
+                return Err(UnityError::new(
+                    UnityErrorKind::MissingMetadata,
+                    "metaのない通常ファイルがある",
+                )
+                .with_path(asset.clone()));
+            }
+        }
+        let mut paths: Vec<&String> = metas.keys().collect();
+        paths.sort();
+        let mut index = AssetIndex::new();
+        for path in paths {
+            let meta = metas.get(path.as_str()).expect("列挙元である");
+            let Some(is_dir) = is_dir(path.as_str()) else {
+                return Err(UnityError::new(
+                    UnityErrorKind::MissingMetadata,
+                    "対応する実体がないmetaがある",
+                )
+                .with_path(path.clone()));
+            };
+            // フォルダmetaと実体の対応を確かめる。実体のない配置はここで落とす。
+            if meta.is_folder() != is_dir {
+                // 実体種別とmetaの不一致はどちら側とも言えないため内容不良として扱う。
+                return Err(UnityError::new(
+                    UnityErrorKind::InvalidMetadata,
+                    "metaと実体の種別が合わない",
+                )
+                .with_path(path.clone()));
+            }
+            if !is_dir && !asset_set.contains(path.as_str()) {
+                return Err(UnityError::new(
+                    UnityErrorKind::MissingMetadata,
+                    "対応する実体がないmetaがある",
+                )
+                .with_path(path.clone()));
+            }
+            if is_dir && !dir_set.contains(path.as_str()) {
+                return Err(UnityError::new(
+                    UnityErrorKind::MissingMetadata,
+                    "対応する実体がないmetaがある",
+                )
+                .with_path(path.clone()));
+            }
+            index.insert(path, meta.clone())?;
+        }
+        Ok(index)
+    }
     /// 相対パスで件を探す。完全一致のみ受け付ける。
     pub fn get_by_path(&self, relative_path: &str) -> Option<&AssetRecord> {
         self.by_path

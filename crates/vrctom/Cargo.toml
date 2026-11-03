@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+tar = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -18,15 +19,14 @@ unicode-normalization = "0.1"
 # Unity 2019.3 以降のFBX取り込みが生成する fileID（XXH64・seed 0）。
 # 純Rustでありwasmでも使う。
 xxhash-rust = { version = "0.8", default-features = false, features = ["xxh64"] }
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tempfile = "3"
-tar = "0.4"
-# テクスチャのベイクで使う画像コーデック。wasmでは使わない。
+# テクスチャのベイクで使う画像コーデック。wasmでも同じ写像・ベイクを通す。
 # PNGは8bit RGBA/RGB・グレースケール・16bit・パレットを受け、JPEGは
 # グレースケールとRGB（CMYKは対象外）を受ける。どちらも純Rustである。
 png = "0.18"
 zune-jpeg = "0.5"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tempfile = "3"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 opfs = "0.3"
@@ -36,8 +36,8 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = ["Crypto"] }
 
-# tar/tempfileは通常のnative依存としてhostテストから使えるため、
-# ここには置かない。wasm向けの依存ツリーに混ざらないようにする。
+# tarは展開の共通核で使うため共通依存に置く。wasmでも動く。
+# tempfileはnative退避だけで使うためnativeのままにする。
 # flate2は共通依存に移したため、テストでも直接使える。
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 futures = "0.3"

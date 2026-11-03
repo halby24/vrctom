@@ -27,6 +27,7 @@ mod index;
 mod meta;
 mod objects;
 mod reference;
+mod source;
 mod yaml;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -45,8 +46,11 @@ pub use objects::{
 };
 pub(crate) use reference::read_guid;
 pub use reference::{FileId, Guid, ObjectRef};
+pub use source::AssetSource;
 pub use yaml::{Document, ParseOptions, SerializedFile};
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use native::FsAssetSource;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::scan_directory;
 

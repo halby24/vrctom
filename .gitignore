@@ -3,3 +3,6 @@
 apm_modules/
 /target
 mise.local.toml
+web/src/wasm/
+web/node_modules/
+web/dist/

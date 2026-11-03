@@ -1,17 +1,24 @@
 //! UnityPackageの展開。
 //!
-//! 入口は [`crate::unitypackage::unpack_to()`] で、gzip圧縮tarを読むだけの展開処理を提供する。
+//! 入口は [`crate::unitypackage::unpack_to()`]（nativeの出力先展開）と
+//! [`crate::unitypackage::unpack_in_memory()`]（ターゲット非依存のメモリ内保持）
+//! で、gzip圧縮tarを読むだけの展開処理を提供する。
 //! 展開計画の検証を終えるまで出力先を作らず、出力開始後の失敗では自分が
 //! 作った出力先を削除して残存の有無をエラーに添える。ディレクトリ全体の
 //! 不可分な公開は保証しない。
+//! メモリ内保持も、全件の検証が終わるまで成功したパッケージとして公開しない。
 //!
 //! 展開に使う一時領域と最終出力先は呼び出し側が指定した場所の責務であり、
 //! [`crate::workspace`] の一時作業領域は使わない。詳細は設計文書を参照。
 
 use std::path::{Path, PathBuf};
 
+mod core;
+#[cfg(not(target_arch = "wasm32"))]
 mod native;
 
+pub use core::{MemoryPackage, unpack_in_memory};
+#[cfg(not(target_arch = "wasm32"))]
 pub use native::unpack_to;
 
 /// tarエントリ数の既定上限。
@@ -172,6 +179,8 @@ pub struct UnpackError {
     message: Box<str>,
     guid: Option<Box<str>>,
     pathname: Option<Box<str>>,
+    // 出力後始末の印と残存報告はnativeの契約であり、対象外ターゲットでは未使用になり得る。
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     output_created: bool,
     output_path: Option<Box<Path>>,
     temp_path: Option<Box<Path>>,
@@ -210,24 +219,34 @@ impl UnpackError {
         self
     }
 
+    // 出力後始末の印と残存報告はnativeの契約であり、対象外ターゲットでは未使用になり得る。
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn with_output_created(mut self) -> Self {
         self.output_created = true;
         self
     }
 
+    // 出力後始末の印と残存報告はnativeの契約であり、対象外ターゲットでは未使用になり得る。
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn take_output_created(&mut self) -> bool {
         std::mem::replace(&mut self.output_created, false)
     }
 
+    // 出力後始末の印と残存報告はnativeの契約であり、対象外ターゲットでは未使用になり得る。
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn set_partial_output(&mut self, path: PathBuf) {
         self.output_path = Some(path.into_boxed_path());
     }
 
+    // 出力後始末の印と残存報告はnativeの契約であり、対象外ターゲットでは未使用になり得る。
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn set_partial_temp(&mut self, path: PathBuf) {
         self.temp_path = Some(path.into_boxed_path());
     }
 
     /// 失敗の後始末自体が失敗した場合に、主原因の文面へ併記する。
+    // 出力後始末の印と残存報告はnativeの契約であり、対象外ターゲットでは未使用になり得る。
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn append_cleanup(&mut self, detail: impl Into<String>) {
         let mut message = self.message.to_string();
         message.push_str("; ");

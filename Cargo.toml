@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/vrctom", "crates/vrctom-cli"]
+members = ["crates/vrctom", "crates/vrctom-cli", "crates/vrctom-wasm"]
 
 [workspace.package]
 edition = "2024"

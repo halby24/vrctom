@@ -9,16 +9,18 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
+use vrctom::conversion::{ConversionError, build_model, export_model};
 use vrctom::fbx::{FbxFile, FbxOptions};
 use vrctom::unitypackage::{UnpackOptions, unpack_to};
 #[cfg(not(target_arch = "wasm32"))]
 use vrctom::vrm::load_renderer_materials;
 use vrctom::vrm::{
-    HumanoidBones, MaterialOptions, PhysicsLimits, PhysicsSidecar, RendererApplyReport,
-    RendererLimits, RendererMeshView, RendererSidecar, SpringCompileOptions, VrmAvatarPermission,
-    VrmCommercialUsage, VrmCreditNotation, VrmExportOptions, VrmExpressionProfile, VrmMaterials,
-    VrmMeta, VrmModel, VrmModification, VrmOptions, apply_humanoid_t_pose, apply_renderer_plan,
-    compile_springs, plan_renderer_assignment, resolve_look_at,
+    HumanoidBones, MaterialError, MaterialOptions, MaterialReport, PhysicsLimits, PhysicsSidecar,
+    RendererApplyReport, RendererLimits, RendererMeshView, RendererSidecar, SpringCompileOptions,
+    VrmAvatarPermission, VrmCommercialUsage, VrmCreditNotation, VrmExportOptions,
+    VrmExpressionProfile, VrmMaterials, VrmMeta, VrmModel, VrmModification, VrmOptions,
+    apply_humanoid_t_pose, apply_renderer_plan, compile_springs, plan_renderer_assignment,
+    resolve_look_at,
 };
 
 #[derive(Debug, Parser)]
@@ -448,6 +450,34 @@ fn export(
             return 1;
         }
     };
+    let mut vrm_options = VrmOptions::new();
+    if expressions == Some(ExpressionProfile::Vrc) {
+        vrm_options = vrm_options.with_expressions(VrmExpressionProfile::vrchat());
+    }
+    // 材質配置の解決は物理導出（Prefabからのsidecar生成）でも使うため、物理より先に確定させる。
+    // 指定時はその配置、省略時はFBXの祖先の `Assets` から求める。
+    // いずれも出力を持たない純粋な算出であり、診断順序に影響しない。
+    let explicit_assets = assets.is_some();
+    let assets_root = match assets {
+        Some(dir) => Some(assets_root_of(&dir)),
+        None => assets_root_from_ancestors(&input),
+    };
+    // 物理sidecar・Prefab・レンダラsidecarのいずれも使わない通常経路は、
+    // 共有の変換入口に寄せる。読み取りは `convert_fbx` に一度だけ渡す。
+    // 特殊経路はモデルを物理・割当のために保持する必要があるため、既存APIのまま残す。
+    if physics.is_none() && renderers.is_none() && prefab.is_none() {
+        return export_simple(
+            &input,
+            destination,
+            meta_name,
+            meta_authors,
+            assets_root,
+            explicit_assets,
+            &bytes,
+            &vrm_options,
+            meta_args,
+        );
+    }
     let file = match FbxFile::parse(&bytes, &FbxOptions::default()) {
         Ok(file) => file,
         Err(error) => {
@@ -455,10 +485,6 @@ fn export(
             return 1;
         }
     };
-    let mut vrm_options = VrmOptions::new();
-    if expressions == Some(ExpressionProfile::Vrc) {
-        vrm_options = vrm_options.with_expressions(VrmExpressionProfile::vrchat());
-    }
     let (mut model, report) = match VrmModel::from_fbx(&file, &vrm_options) {
         Ok(built) => built,
         Err(error) => {
@@ -473,13 +499,6 @@ fn export(
             report.bind_cluster_models, report.bind_rest_models
         );
     }
-    // 材質配置の解決は物理導出（Prefabからのsidecar生成）でも使うため、物理より先に確定させる。
-    // 指定時はその配置、省略時はFBXの祖先の `Assets` から求める。
-    let explicit_assets = assets.is_some();
-    let assets_root = match assets {
-        Some(dir) => Some(assets_root_of(&dir)),
-        None => assets_root_from_ancestors(&input),
-    };
     // 物理適用時はhumanoid検出を解決より先に行い、明示指定で引き継ぐ。
     // 解決で追加する補助ノードはFBXの骨と同名のノードを含むことがあり、
     // 書き出し時の名前基準の検出が重複で失敗するためである。
@@ -622,10 +641,11 @@ fn export(
             }
         }
     }
-    let vrm_bytes = match model.to_vrm(&export_options) {
+    // 最終書き出しは共有入口を使い、通常経路と診断を共通化する。
+    let vrm_bytes = match export_model(&model, &export_options) {
         Ok(vrm_bytes) => vrm_bytes,
         Err(error) => {
-            diagnose_stage("VRMの書き出しに失敗した", &error);
+            diagnose_conversion(&error);
             return 1;
         }
     };
@@ -669,6 +689,158 @@ fn export(
         eprintln!("物理: {summary}");
     }
     0
+}
+
+/// 通常経路（物理sidecar・Prefab・レンダラsidecarのいずれも使わない場合）の書き出し。
+///
+/// 中間モデルを先に作ってバインド代替の報告を残し、材質は所有権ごと
+/// 書き出し設定へ移してから書き出す。表示は診断順序（FBX・中間モデルの
+/// 失敗を先に返し、成功時はバインド代替・材質警告の順に出す）を保つ。
+/// 明示の材質失敗は書き出し失敗より先に返す。
+/// 終了コード・要約・警告の意味は既存どおりである。
+// 引数はCLI配線の束ねであり、分割より呼び出し側の見通しを優先するため許す。
+#[allow(clippy::too_many_arguments)]
+fn export_simple(
+    input: &Path,
+    destination: PathBuf,
+    meta_name: String,
+    meta_authors: Vec<String>,
+    assets_root: Option<PathBuf>,
+    explicit_assets: bool,
+    bytes: &[u8],
+    vrm_options: &VrmOptions,
+    meta_args: ExportMetaArgs,
+) -> i32 {
+    let mut meta = VrmMeta::new(meta_name, meta_authors);
+    apply_meta_args(&mut meta, meta_args);
+    // 材質の読み取りだけ先に済ませ、表示は変換後に回す。
+    // 読み取り自体に副作用は無く、変換に渡す設定へ反映するだけである。
+    let loaded = assets_root
+        .as_deref()
+        .map(|root| VrmMaterials::load(root, input, &MaterialOptions::new()));
+    // 中間モデルを先に作り、バインド代替の報告を残す。
+    // FBX・中間モデルの失敗は材質表示より先に返す。
+    // 従来は材質読み取りの前に返すためである。
+    let built = match build_model(bytes, &FbxOptions::default(), vrm_options) {
+        Ok(built) => built,
+        Err(error) => {
+            diagnose_conversion(&error);
+            return 1;
+        }
+    };
+    // バインド行列の代替を使った場合は、どの経路で何件補ったか残す。
+    // 書き出しの成否に関わらず出すため、書き出しより先に表示する。
+    if built.report.bind_cluster_models > 0 || built.report.bind_rest_models > 0 {
+        eprintln!(
+            "バインド行列の代替: Poseに無いモデルを補った（関節{}件・その他{}件）",
+            built.report.bind_cluster_models, built.report.bind_rest_models
+        );
+    }
+    // 明示の材質失敗は書き出し失敗より先に返す。
+    // 従来は材質読み取りが書き出しより先のためである。
+    if let Some(Err(load_error)) = &loaded
+        && explicit_assets
+    {
+        diagnose_stage("材質の読み取りに失敗した", load_error);
+        return 1;
+    }
+    // 材質と報告を分離し、材質は所有権ごと書き出し設定へ移す。
+    // `VrmMaterials` は画像データ全体を所有するため、複製は画像総量に
+    // 比例した複製になる。警告表示は報告側を使う。
+    let mut export_options = VrmExportOptions::new(meta);
+    let mut material_count = 0usize;
+    let material_outcome: Option<Result<MaterialReport, MaterialError>> = match loaded {
+        Some(Ok((materials, report))) => {
+            if let Some(materials) = materials {
+                material_count = materials.entries().len();
+                export_options = export_options.with_materials(materials);
+            }
+            Some(Ok(report))
+        }
+        Some(Err(error)) => Some(Err(error)),
+        None => None,
+    };
+    let vrm_bytes = match export_model(&built.model, &export_options) {
+        Ok(vrm_bytes) => vrm_bytes,
+        Err(error) => {
+            // 自動検出の失敗・警告は残し、書き出し失敗を返す。
+            emit_material_outcome_ref(&material_outcome, explicit_assets);
+            diagnose_conversion(&error);
+            return 1;
+        }
+    };
+    emit_material_outcome_ref(&material_outcome, explicit_assets);
+    // 既存ファイルは上書きしない。競合も失敗として1を返す。
+    let mut out = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&destination)
+    {
+        Ok(out) => out,
+        Err(error) => {
+            eprintln!(
+                "出力先を作成できない: {}: {}",
+                escape_diag(&format!("{destination:?}")),
+                escape_diag(&error.to_string())
+            );
+            return 1;
+        }
+    };
+    if let Err(error) = out.write_all(&vrm_bytes) {
+        eprintln!(
+            "書き込みに失敗した: {}: {}",
+            escape_diag(&format!("{destination:?}")),
+            escape_diag(&error.to_string())
+        );
+        return 1;
+    }
+    eprintln!(
+        "書き出しが完了した: ノード{}件 メッシュ{}件 スキン{}件 材質{}件 {}バイト: {}",
+        built.report.node_count,
+        built.report.mesh_count,
+        built.report.skin_count,
+        material_count,
+        vrm_bytes.len(),
+        escape_diag(&format!("{destination:?}"))
+    );
+    eprintln!("材質の解決: FBXの置換表経路であり、Prefab の割当・有効状態は未反映である");
+    0
+}
+
+/// 材質読み取り結果の警告表示。
+///
+/// 成功時の警告と自動検出の失敗警告を出す。明示指定の失敗は呼び出し側が
+/// 段階診断で返すため、ここでは何も出さない。
+fn emit_material_outcome_ref(
+    outcome: &Option<Result<MaterialReport, MaterialError>>,
+    explicit_assets: bool,
+) {
+    match outcome {
+        Some(Ok(report)) => {
+            for warning in report.warnings() {
+                eprintln!("材質の警告: {}", escape_diag(warning));
+            }
+        }
+        Some(Err(error)) if !explicit_assets => {
+            eprintln!(
+                "材質の警告: {}",
+                escape_diag(&format!("自動検出の配置では材質を読まずに続ける: {error}"))
+            );
+        }
+        Some(Err(_)) | None => {}
+    }
+}
+
+/// 共有変換入口の失敗を既存の段階文面で診断に出す。
+///
+/// 見出しは従来の各段階（`FbxFile::parse`・`VrmModel::from_fbx`・`to_vrm`）と
+/// 同じにし、本体と `source` の表示は各エラーの既存表示を保つ。
+fn diagnose_conversion(error: &ConversionError) {
+    match error {
+        ConversionError::Fbx(inner) => diagnose_stage("FBXの解析に失敗した", inner),
+        ConversionError::Model(inner) => diagnose_stage("中間モデルの生成に失敗した", inner),
+        ConversionError::Export(inner) => diagnose_stage("VRMの書き出しに失敗した", inner),
+    }
 }
 
 /// レンダラsidecarを中間モデルへ適用し、材質プールと適用報告を返す。
