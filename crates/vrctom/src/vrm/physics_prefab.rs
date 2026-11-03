@@ -1250,18 +1250,22 @@ fn check_direct_physics_refs(
             }
         }
     }
+    // FBX対応の無いノード（Prefabで追加した当たり判定用オブジェクト等）は、
+    // そのまま `source: null` で出し、Rust側が補助ノードとして作る。
+    // ここで失敗させると、追加オブジェクトにPhysBoneやColliderを付けた
+    // 一般的なアバターが変換できなくなる。ノードが木に無い場合だけ失敗する。
     for node in needed {
-        if tree.get(node).and_then(|n| n.source.as_ref()).is_none() {
-            let name = tree.get(node).map(|n| n.name.as_str()).unwrap_or("?");
+        if tree.get(node).is_none() {
             return Err(VrmError::new(
                 VrmErrorKind::InvalidPrefab,
                 format!(
-                    "物理に参照されるノードのFBX対応が取れない: {name}（{}）",
+                    "物理が参照するノードが木に無い: {node}（{}）",
                     crate::escape_diag(label),
                 ),
             ));
         }
     }
+    let _ = label;
     Ok(())
 }
 

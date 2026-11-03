@@ -198,7 +198,7 @@ humanoid の要約（`humanoid=骨数(tPose省略数)`）も出す。
 - FX レイヤーのデフォルト値は収集しない。
   Plane コライダーは記録し、`plane-colliders` として申告する（Rust 側は補助ノードと
   `VRMC_springBone_extended_collider` で出力する）。
-- Prefab にレンダラが直接書かれ、FBX のインスタンスを持たないアバター（シエル等）では、
+- Prefab にレンダラが直接書かれ、FBX のインスタンスを持たないアバター（シエル・ミルク・カリン）では、
   ノードを FBX へ帰属できないため `sourceModels` が空になる。この形の sidecar は
   参照モデルを照合できないので、Rust 側は受け付けない。材質・ノードは
   `--prefab` の導出経路で解決できる。
