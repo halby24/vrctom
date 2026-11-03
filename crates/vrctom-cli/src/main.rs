@@ -70,9 +70,12 @@ enum Command {
         /// Prefabのパス。指定時はPrefabの改変内容または直接記述から割当と有効状態を使う。
         #[arg(long, value_name = "FILE")]
         prefab: Option<PathBuf>,
-        /// 物理sidecarを `--prefab` から導出する（実験的）。`--physics` 指定時は使わない。
+        /// 物理sidecarを `--prefab` から導出する。現在は既定であり、互換のため受け付ける。
         #[arg(long, requires = "prefab")]
         physics_from_prefab: bool,
+        /// 物理を載せない。`--prefab` 指定時の導出を止める。
+        #[arg(long, conflicts_with_all = ["physics", "physics_from_prefab"])]
+        no_physics: bool,
         /// アバターの人格権の扱い。既定は `only-author`。
         #[arg(long, value_enum, value_name = "PERMISSION")]
         avatar_permission: Option<AvatarPermissionArg>,
@@ -228,7 +231,8 @@ fn main() {
             physics,
             renderers,
             prefab,
-            physics_from_prefab,
+            physics_from_prefab: _,
+            no_physics,
             avatar_permission,
             commercial_usage,
             credit_notation,
@@ -248,7 +252,7 @@ fn main() {
             physics,
             renderers,
             prefab,
-            physics_from_prefab,
+            no_physics,
             ExportMetaArgs {
                 avatar_permission,
                 commercial_usage,
@@ -404,7 +408,7 @@ fn export(
     physics: Option<PathBuf>,
     renderers: Option<PathBuf>,
     prefab: Option<PathBuf>,
-    physics_from_prefab: bool,
+    no_physics: bool,
     meta_args: ExportMetaArgs,
 ) -> i32 {
     // 既定出力先は入力の拡張子を `vrm` に変えたパスとする。
@@ -475,6 +479,17 @@ fn export(
         Some(dir) => Some(assets_root_of(&dir)),
         None => assets_root_from_ancestors(&input),
     };
+    // 物理適用時はhumanoid検出を解決より先に行い、明示指定で引き継ぐ。
+    // 解決で追加する補助ノードはFBXの骨と同名のノードを含むことがあり、
+    // 書き出し時の名前基準の検出が重複で失敗するためである。
+    // 検出できない場合は従来どおり書き出し時に失敗させる。
+    let mut explicit_humanoid = None;
+    if (physics.is_some() || (!no_physics && prefab.is_some()))
+        && let Ok(detected) = HumanoidBones::detect(&model)
+    {
+        explicit_humanoid = Some(detected);
+        // 検出できない場合は従来どおり書き出し時に失敗させる。
+    }
     // 物理sidecarの指定時は、解決とコンパイルが通ってから代入する。
     // 失敗時はモデルを部分更新しない。
     let mut spring_summary: Option<String> = None;
@@ -497,17 +512,17 @@ fn export(
                 return 1;
             }
         };
-        match apply_physics_sidecar(&mut model, &sidecar, &bytes) {
+        match apply_physics_sidecar(&mut model, &sidecar, &bytes, explicit_humanoid.as_ref()) {
             Ok(summary) => {
                 spring_summary = Some(summary);
             }
             Err(code) => return code,
         }
     }
-    // `--physics-from-prefab` 指定時は、Prefabから物理sidecarを導出して同じく適用する。
-    // 採取メタ以外のフィールド単位の一致を目標にし、レポートに導出元を出す。
-    // 失敗時は型判定不能・参照解決不能・旧FBX方式として明示的に失敗する。
-    else if physics_from_prefab && let Some(prefab_path) = prefab.as_ref() {
+    // `--physics` の指定が無く `--no-physics` でもなければ、Prefabから物理sidecarを導出して
+    // 同じく適用する（既定）。採取メタ以外のフィールド単位の一致を目標にし、
+    // レポートに導出元を出す。失敗時は型判定不能・参照解決不能・旧FBX方式として明示的に失敗する。
+    else if !no_physics && let Some(prefab_path) = prefab.as_ref() {
         match derive_physics_from_prefab(
             &mut model,
             &file,
@@ -515,6 +530,7 @@ fn export(
             prefab_path,
             &input,
             assets_root.as_deref(),
+            explicit_humanoid.as_ref(),
         ) {
             Ok(summary) => {
                 spring_summary = Some(summary);
@@ -571,6 +587,11 @@ fn export(
     };
     let mut export_options = VrmExportOptions::new(meta);
     let mut material_count = 0usize;
+    // 物理適用時に検出したhumanoidは明示指定で引き継ぐ。
+    // 補助ノードの同名ノードを避け、解決前の対応付けを保つ。
+    if let Some(humanoid) = explicit_humanoid {
+        export_options = export_options.with_humanoid(humanoid);
+    }
     if let Some((assigned_materials, _)) = assignment_out {
         material_count = assigned_materials.entries().len();
         export_options = export_options.with_materials(assigned_materials);
@@ -669,6 +690,7 @@ fn derive_physics_from_prefab(
     prefab_path: &std::path::Path,
     input: &std::path::Path,
     assets_root: Option<&std::path::Path>,
+    humanoid: Option<&HumanoidBones>,
 ) -> Result<String, i32> {
     use vrctom::unity::{ParseOptions, SerializedFile};
     use vrctom::vrm::derive_physics_sidecar;
@@ -769,6 +791,18 @@ fn derive_physics_from_prefab(
     for ignored in &derived.ignored_types {
         eprintln!("物理導出の無視: {}", escape_diag(ignored));
     }
+    if !derived.unmatched_nodes.is_empty() {
+        eprintln!(
+            "物理導出の未対応{}件: {}",
+            derived.unmatched_nodes.len(),
+            derived
+                .unmatched_nodes
+                .iter()
+                .map(|name| escape_diag(name))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
     // 検証用に導出sidecarを保存する。空でなければ書き出す。
     if let Ok(dump_path) = std::env::var("VRCTOM_PHYSICS_DUMP")
         && !dump_path.is_empty()
@@ -788,7 +822,7 @@ fn derive_physics_from_prefab(
             return Err(1);
         }
     };
-    apply_physics_sidecar(model, &sidecar, fbx_bytes)
+    apply_physics_sidecar(model, &sidecar, fbx_bytes, humanoid)
 }
 
 /// 解決済みの物理sidecarを中間モデルへ適用し、要約文を返す。
@@ -800,9 +834,26 @@ fn apply_physics_sidecar(
     model: &mut VrmModel,
     sidecar: &PhysicsSidecar,
     fbx_bytes: &[u8],
+    humanoid: Option<&HumanoidBones>,
 ) -> Result<String, i32> {
     let resolution = match model.resolve_physics_sidecar(sidecar, fbx_bytes) {
-        Ok(resolution) => resolution,
+        Ok(resolution) => {
+            if resolution.auxiliary_nodes.is_empty() {
+                eprintln!("物理: 補助ノードの追加は無い");
+            } else {
+                let names: Vec<&str> = resolution
+                    .auxiliary_nodes
+                    .iter()
+                    .map(|aux| aux.name.as_str())
+                    .collect();
+                eprintln!(
+                    "物理: 補助ノード{}件を追加（{}）",
+                    resolution.auxiliary_nodes.len(),
+                    names.join(", "),
+                );
+            }
+            resolution
+        }
         Err(error) => {
             diagnose_stage("物理sidecarの解決に失敗した", &error);
             return Err(1);
@@ -832,26 +883,21 @@ fn apply_physics_sidecar(
         };
     // 視線の解決。sidecarに視線記録が無い旧形式では何もしない。
     // 測定も既定もここで確定する。モデルは変更しないため、
-    // 失敗時は部分更新なく打ち切る。humanoidの検出は鎖の生成より前に行い、
-    // 平面用の補助ノードの影響を受けない。
-    let look_at = match sidecar.look_at.as_ref() {
-        Some(_) => {
-            let humanoid = match HumanoidBones::detect(model) {
-                Ok(humanoid) => humanoid,
-                Err(error) => {
-                    diagnose_stage("視線の解決に失敗した", &error);
-                    return Err(1);
-                }
-            };
-            match resolve_look_at(sidecar, model, &resolution, &humanoid) {
-                Ok(look_at) => look_at,
-                Err(error) => {
-                    diagnose_stage("視線の解決に失敗した", &error);
-                    return Err(1);
-                }
+    // 失敗時は部分更新なく打ち切る。humanoidは解決より前に検出したものを
+    // 使い、補助ノード（同名ノードを含む）の影響を受けない。
+    let look_at = match (sidecar.look_at.as_ref(), humanoid) {
+        (Some(_), Some(detected)) => match resolve_look_at(sidecar, model, &resolution, detected) {
+            Ok(look_at) => look_at,
+            Err(error) => {
+                diagnose_stage("視線の解決に失敗した", &error);
+                return Err(1);
             }
+        },
+        (Some(_), None) => {
+            eprintln!("視線の解決に失敗した: humanoidを検出できない");
+            return Err(1);
         }
-        None => None,
+        (None, _) => None,
     };
     match compile_springs(sidecar, model, &resolution, &SpringCompileOptions::new()) {
         Ok(compiled) => {
