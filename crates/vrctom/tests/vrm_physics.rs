@@ -268,10 +268,10 @@ fn 左右の対応を作る(
     (モデル, 文)
 }
 
-/// 完全パスで左右を区別して対応付ける。シーン追加ノードは報告に残る。
+/// 完全パスで左右を区別して対応付ける。シーン追加ノードは補助ノードになる。
 #[test]
 fn 完全パスで左右を区別して対応付ける() {
-    // 左右非対称の点で、名前の取り違えが座標ゲートに響く配置にする。
+    // 左右非対称の点で、名前の取り違えが無い配置にする。
     let fbxバイト列 = b"fake-fbx";
     let 位置 = [
         [0.0, 0.0, 0.0],
@@ -279,8 +279,8 @@ fn 完全パスで左右を区別して対応付ける() {
         [0.3, 1.0, 0.1],
         [-0.5, 1.0, 0.2],
     ];
-    let (モデル, 文) = 左右の対応を作る(fbxバイト列, 位置, 位置);
-    // Groundは参照されないシーン追加ノードであり、解決後も報告に残る。
+    let (mut モデル, 文) = 左右の対応を作る(fbxバイト列, 位置, 位置);
+    // Groundは参照されないシーン追加ノードであり、解決後は補助ノードになる。
     let mut 値: serde_json::Value = serde_json::from_str(&文).expect("合成sidecarは読める");
     値["nodes"]
         .as_array_mut()
@@ -295,6 +295,7 @@ fn 完全パスで左右を区別して対応付ける() {
         ));
     let sidecar = PhysicsSidecar::from_json(&値.to_string(), &PhysicsLimits::new())
         .expect("合成sidecarは検証を通る");
+    let 前件数 = モデル.nodes.len();
     let 解決: PhysicsResolution = モデル
         .resolve_physics_sidecar(&sidecar, fbxバイト列)
         .expect("左右は完全パスで対応付く");
@@ -307,10 +308,14 @@ fn 完全パスで左右を区別して対応付ける() {
     assert_eq!(解決.phys_bones[0].component_node, 2);
     assert_eq!(解決.colliders.len(), 1);
     assert_eq!(解決.colliders[0].component_node, 3);
-    assert_eq!(解決.unmapped_nodes.len(), 1);
-    assert_eq!(解決.unmapped_nodes[0].id, "n:9");
-    // 単位行列の対応では変換も単位行列になる。
-    assert_eq!(解決.coordinate_transform, 単位行列());
+    // 参照されないシーン追加ノードも補助ノードとして追加する。
+    // 既存索引は維持し、末尾に足す。
+    assert_eq!(解決.auxiliary_nodes.len(), 1);
+    assert_eq!(解決.auxiliary_nodes[0].id, "n:9");
+    assert_eq!(解決.auxiliary_nodes[0].name, "Ground");
+    assert_eq!(解決.auxiliary_nodes[0].node, 前件数);
+    assert_eq!(解決.node_map.get("n:9"), Some(&前件数));
+    assert_eq!(モデル.nodes.len(), 前件数 + 1);
 }
 
 /// 存在しないパスは未解決で失敗する。接尾辞での自動補完はしない。
@@ -318,7 +323,7 @@ fn 完全パスで左右を区別して対応付ける() {
 fn 存在しないパスは未解決で失敗する() {
     let fbxバイト列 = b"fake-fbx";
     let 位置 = [[0.0, 0.0, 0.0]; 4];
-    let (モデル, _) = 左右の対応を作る(fbxバイト列, 位置, 位置);
+    let (mut モデル, _) = 左右の対応を作る(fbxバイト列, 位置, 位置);
     let mut 値: serde_json::Value =
         serde_json::from_str(&左右の対応を作る(fbxバイト列, 位置, 位置).1)
             .expect("合成sidecarは読める");
@@ -340,7 +345,7 @@ fn 重複パスは複数一致で失敗する() {
     let 名前 = ["Hips", "Dup", "Dup"];
     let 親 = [None, Some(0), Some(0)];
     let ローカル = [平行移動行列([0.0, 0.0, 0.0]); 3];
-    let モデル = 合成モデルを作る(&名前, &親, &ローカル);
+    let mut モデル = 合成モデルを作る(&名前, &親, &ローカル);
     let ノード = vec![
         ノードjson(
             "n:0",
@@ -367,12 +372,12 @@ fn 重複パスは複数一致で失敗する() {
     assert_eq!(エラー.kind(), VrmErrorKind::UnresolvedPhysicsNode);
 }
 
-/// 参照されるシーン追加ノードは補助ノード保留で失敗する。
+/// 参照されるシーン追加ノードは補助ノードとして追加する。
 #[test]
-fn 参照されるシーン追加ノードは補助ノード保留で失敗する() {
+fn 参照されるシーン追加ノードは補助ノードとして追加する() {
     let fbxバイト列 = b"fake-fbx";
     let 位置 = [[0.0, 0.0, 0.0]; 4];
-    let (モデル, 文) = 左右の対応を作る(fbxバイト列, 位置, 位置);
+    let (mut モデル, 文) = 左右の対応を作る(fbxバイト列, 位置, 位置);
     let mut 値: serde_json::Value = serde_json::from_str(&文).expect("合成sidecarは読める");
     let 追加 = ノードjson(
         "n:9",
@@ -386,13 +391,56 @@ fn 参照されるシーン追加ノードは補助ノード保留で失敗す�
         .as_array_mut()
         .expect("nodesは配列である")
         .push(追加);
-    // PhysBoneの起点をシーン追加ノードに向け、勝手な近似をしないことを確かめる。
+    // PhysBoneの起点をシーン追加ノードに向け、対応表に入ることを確かめる。
     値["physBones"][0]["rootNodeId"] = serde_json::json!("n:9");
+    let sidecar =
+        PhysicsSidecar::from_json(&値.to_string(), &PhysicsLimits::new()).expect("書式自体は通る");
+    let 前件数 = モデル.nodes.len();
+    let 解決 = モデル
+        .resolve_physics_sidecar(&sidecar, fbxバイト列)
+        .expect("参照される追加ノードは補助ノードになる");
+    assert_eq!(解決.auxiliary_nodes.len(), 1);
+    assert_eq!(解決.auxiliary_nodes[0].id, "n:9");
+    assert_eq!(解決.auxiliary_nodes[0].name, "Cardigan_Con");
+    assert_eq!(解決.node_map.get("n:9"), Some(&前件数));
+    // 親子・ローカル変換を引き継ぐ。
+    assert_eq!(モデル.nodes[前件数].parent, Some(0));
+    assert_eq!(モデル.nodes[前件数].local, 平行移動行列([0.0, 0.0, 0.0]));
+    assert!(モデル.nodes[0].children.contains(&前件数));
+}
+
+/// 親より先に並んだ補助ノードは親不在で失敗する。
+#[test]
+fn 親より先に並んだ補助ノードは親不在で失敗する() {
+    let fbxバイト列 = b"fake-fbx";
+    let 位置 = [[0.0, 0.0, 0.0]; 4];
+    let (mut モデル, 文) = 左右の対応を作る(fbxバイト列, 位置, 位置);
+    let mut 値: serde_json::Value = serde_json::from_str(&文).expect("合成sidecarは読める");
+    let 親 = ノードjson(
+        "n:10",
+        Some("n:0"),
+        "Parent",
+        &["Milfy", "Parent"],
+        None,
+        [0.0, 0.0, 0.0],
+    );
+    let 子 = ノードjson(
+        "n:9",
+        Some("n:10"),
+        "Child",
+        &["Milfy", "Parent", "Child"],
+        None,
+        [0.0, 0.0, 0.0],
+    );
+    // 子を親より先に並べ、単一走査で親を引けない配置にする。
+    let 配列 = 値["nodes"].as_array_mut().expect("nodesは配列である");
+    配列.push(子);
+    配列.push(親);
     let sidecar =
         PhysicsSidecar::from_json(&値.to_string(), &PhysicsLimits::new()).expect("書式自体は通る");
     let エラー = モデル
         .resolve_physics_sidecar(&sidecar, fbxバイト列)
-        .expect_err("参照される追加ノードは保留になる");
+        .expect_err("親不在の補助ノードは失敗する");
     assert_eq!(エラー.kind(), VrmErrorKind::UnresolvedPhysicsNode);
 }
 
@@ -401,7 +449,7 @@ fn 参照されるシーン追加ノードは補助ノード保留で失敗す�
 fn shaが一致しない場合は失敗する() {
     let fbxバイト列 = b"fake-fbx";
     let 位置 = [[0.0, 0.0, 0.0]; 4];
-    let (モデル, 文) = 左右の対応を作る(fbxバイト列, 位置, 位置);
+    let (mut モデル, 文) = 左右の対応を作る(fbxバイト列, 位置, 位置);
     let sidecar =
         PhysicsSidecar::from_json(&文, &PhysicsLimits::new()).expect("合成sidecarは検証を通る");
     let エラー = モデル
@@ -597,7 +645,7 @@ fn 制約の破損を拒否する() {
 fn 編集時以外の参照姿勢は未対応で失敗する() {
     let fbxバイト列 = b"fake-fbx";
     let 位置 = [[0.0, 0.0, 0.0]; 4];
-    let (モデル, 文) = 左右の対応を作る(fbxバイト列, 位置, 位置);
+    let (mut モデル, 文) = 左右の対応を作る(fbxバイト列, 位置, 位置);
     let mut 値: serde_json::Value = serde_json::from_str(&文).expect("合成sidecarは読める");
     値["capture"]["statePolicy"] = serde_json::json!("fx-default");
     let sidecar =
@@ -613,7 +661,7 @@ fn 編集時以外の参照姿勢は未対応で失敗する() {
 fn 平面colliderは未対応として除外する() {
     let fbxバイト列 = b"fake-fbx";
     let 位置 = [[0.0, 0.0, 0.0]; 4];
-    let (モデル, 文) = 左右の対応を作る(fbxバイト列, 位置, 位置);
+    let (mut モデル, 文) = 左右の対応を作る(fbxバイト列, 位置, 位置);
     let mut 値: serde_json::Value = serde_json::from_str(&文).expect("合成sidecarは読める");
     値["colliders"][0]["shapeType"] = serde_json::json!("Plane");
     let sidecar =
@@ -628,27 +676,44 @@ fn 平面colliderは未対応として除外する() {
     assert_eq!(解決.skipped_colliders.len(), 1, "平面を除外として報告する");
 }
 
-/// 軸回転と単位換算が単一の変換行列に一致する。
+/// 単位換算つきで参照ローカルが一致する。
 #[test]
-fn 軸回転と単位換算が単一の変換に一致する() {
-    // sidecarはメートル・Y-up、モデルはセンチ・Z-up相当の回転をルートに持つ。
-    // 全関節が同じ変換を共有するため、ゲートは通る。
+fn 単位換算つきで参照ローカルが一致する() {
+    // モデルはセンチ単位・sidecarはメートル単位である。
+    // モデルのローカル100cmが参照ローカル1mに一致するため、ゲートは通る。
     let fbxバイト列 = b"fake-fbx";
     let 原点 = [[0.0, 0.0, 0.0]; 4];
-    let (mut モデル, 文) = 左右の対応を作る(fbxバイト列, 原点, 原点);
-    // X軸+90度回転と100倍（cm→m換算の逆向き）を合成したルートである。
+    let センチ = [
+        [0.0, 0.0, 0.0],
+        [0.0, 100.0, 0.0],
+        [30.0, 100.0, 10.0],
+        [-50.0, 100.0, 20.0],
+    ];
+    let (mut モデル, 文) = 左右の対応を作る(fbxバイト列, センチ, 原点);
+    // 100倍ではなく100分の1（cm→m換算）のルートである。
     モデル.root = [
-        100.0, 0.0, 0.0, 0.0, //
-        0.0, 0.0, 100.0, 0.0, //
-        0.0, -100.0, 0.0, 0.0, //
+        0.01, 0.0, 0.0, 0.0, //
+        0.0, 0.01, 0.0, 0.0, //
+        0.0, 0.0, 0.01, 0.0, //
         0.0, 0.0, 0.0, 1.0, //
     ];
-    let sidecar =
-        PhysicsSidecar::from_json(&文, &PhysicsLimits::new()).expect("合成sidecarは検証を通る");
-    let 解決 = モデル
+    // 参照側はメートル単位の対応する位置である。
+    let mut 値: serde_json::Value = serde_json::from_str(&文).expect("合成sidecarは読める");
+    let 参照 = [
+        [0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.3, 1.0, 0.1],
+        [-0.5, 1.0, 0.2],
+    ];
+    for (i, 位置) in 参照.iter().enumerate() {
+        値["nodes"][i]["referenceLocal"]["position"] =
+            serde_json::json!([-位置[0], 位置[1], 位置[2]]);
+    }
+    let sidecar = PhysicsSidecar::from_json(&値.to_string(), &PhysicsLimits::new())
+        .expect("合成sidecarは検証を通る");
+    モデル
         .resolve_physics_sidecar(&sidecar, fbxバイト列)
-        .expect("全関節で共通の変換は通る");
-    assert_eq!(解決.coordinate_transform, モデル.root);
+        .expect("単位換算つきの一致は通る");
 }
 
 /// 一部の関節だけ変換が違う場合は失敗する。
@@ -663,7 +728,7 @@ fn 一部だけ変換が違う場合は失敗する() {
         [0.3, 1.0, 0.1],
         [9.9, 9.9, 9.9],
     ];
-    let (モデル, 文) = 左右の対応を作る(fbxバイト列, モデル位置, 参照位置);
+    let (mut モデル, 文) = 左右の対応を作る(fbxバイト列, モデル位置, 参照位置);
     let sidecar = PhysicsSidecar::from_json(&文, &PhysicsLimits::new()).expect("書式自体は通る");
     let エラー = モデル
         .resolve_physics_sidecar(&sidecar, fbxバイト列)
@@ -728,7 +793,7 @@ fn 実fixtureと実sidecarで参照を解決する() {
     let sidecar文 = std::fs::read(&sidecar経路).expect("実sidecarは読める");
     let 解析 = vrctom::fbx::FbxFile::parse(&fbxバイト列, &vrctom::fbx::FbxOptions::new())
         .expect("実fixtureは読める");
-    let (モデル, _) =
+    let (mut モデル, _) =
         VrmModel::from_fbx(&解析, &vrctom::vrm::VrmOptions::new()).expect("実fixtureは変換できる");
     let sidecar =
         PhysicsSidecar::parse(&sidecar文, &PhysicsLimits::new()).expect("実sidecarは検証を通る");
@@ -753,21 +818,20 @@ fn 実fixtureと実sidecarで参照を解決する() {
     // body collider相当の解決件数を確かめる。シーン追加由来は報告に残る。
     let 解決済み衝突体 = 解決.colliders.len();
     assert_eq!(解決済み衝突体, 期待衝突体, "collider件数が一致する");
-    // 対応表・未解決・座標行列を記録し、完了証拠にする。
+    // 対応表・補助ノードを記録し、完了証拠にする。
     let 対応表: HashMap<&str, usize> = 解決
         .node_map
         .iter()
         .map(|(id, index)| (id.as_str(), *index))
         .collect();
     eprintln!(
-        "実sidecar解決: 対応{}件 未解決{}件 座標{:?} 参照モデル{}",
+        "実sidecar解決: 対応{}件 補助{}件 参照モデル{}",
         対応表.len(),
-        解決.unmapped_nodes.len(),
-        解決.coordinate_transform,
+        解決.auxiliary_nodes.len(),
         解決.matched_source_model,
     );
-    for 未解決 in &解決.unmapped_nodes {
-        eprintln!("未解決: {} {}", 未解決.id, 未解決.name);
+    for 補助 in &解決.auxiliary_nodes {
+        eprintln!("補助: {} {}", 補助.id, 補助.name);
     }
 }
 
@@ -819,16 +883,11 @@ fn 単一ノードの対応を作る(
 /// tポーズは差分デルタを右から掛けてローカル回転だけ変える。位置・拡大率は不変である。
 #[test]
 fn tポーズは差分デルタを右から掛けてローカル回転だけ変える() {
-    // モデルは平行移動 [1,2,3]・Z軸90度回転・拡大率 [2,1,0.5] の行列を持つ。
+    // モデルは平行移動 [1,2,3] の行列を持ち、sidecarの参照姿勢と一致する。
     // sidecarの参照回転は恒等であり、tPoseはUnity空間のY軸90度回転である。
     // δ = tPose、VRM空間ではY軸-90度になる。ローカル行列に回転行列を
     // 右から掛けるため、平行移動は保ち、3x3部だけが回る。
-    let モデルローカル = [
-        0.0, 2.0, 0.0, 0.0, //
-        -1.0, 0.0, 0.0, 0.0, //
-        0.0, 0.0, 0.5, 0.0, //
-        1.0, 2.0, 3.0, 1.0, //
-    ];
+    let モデルローカル = 平行移動行列([1.0, 2.0, 3.0]);
     let fbxバイト列 = b"fake-fbx";
     let (mut モデル, 文) =
         単一ノードの対応を作る(fbxバイト列, モデルローカル, [-1.0, 2.0, 3.0]);
@@ -866,9 +925,9 @@ fn tポーズは差分デルタを右から掛けてローカル回転だけ変�
     );
     // local * R(Y軸-90度) の合成行列。平行移動は保つ。
     let 期待 = [
-        0.0, 0.0, 0.5, 0.0, //
+        0.0, 0.0, 1.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, //
         -1.0, 0.0, 0.0, 0.0, //
-        0.0, -2.0, 0.0, 0.0, //
         1.0, 2.0, 3.0, 1.0, //
     ];
     for (i, (実, 想)) in モデル.nodes[0].local.iter().zip(期待.iter()).enumerate() {
@@ -882,12 +941,8 @@ fn tポーズは差分デルタを右から掛けてローカル回転だけ変�
 /// 差分が無い骨は回転を変えず、変化記録にも残らない。
 #[test]
 fn 差分が無い骨は回転を変えない() {
-    let モデルローカル = [
-        0.0, 2.0, 0.0, 0.0, //
-        -1.0, 0.0, 0.0, 0.0, //
-        0.0, 0.0, 0.5, 0.0, //
-        1.0, 2.0, 3.0, 1.0, //
-    ];
+    // モデルはsidecarの参照姿勢と一致する平行移動だけの行列を持つ。
+    let モデルローカル = 平行移動行列([1.0, 2.0, 3.0]);
     let fbxバイト列 = b"fake-fbx";
     let (mut モデル, 文) =
         単一ノードの対応を作る(fbxバイト列, モデルローカル, [-1.0, 2.0, 3.0]);

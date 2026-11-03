@@ -201,13 +201,12 @@ fn 対応付けを作る() -> PhysicsResolution {
     PhysicsResolution {
         matched_source_model: "m".to_string(),
         fbx_sha256: String::new(),
-        coordinate_transform: 単位行列(),
         node_map: HashMap::from([
             ("n:2".to_string(), 2),
             ("n:3".to_string(), 3),
             ("n:4".to_string(), 4),
         ]),
-        unmapped_nodes: Vec::new(),
+        auxiliary_nodes: Vec::new(),
         phys_bones: Vec::new(),
         colliders: Vec::new(),
         skipped_colliders: Vec::new(),

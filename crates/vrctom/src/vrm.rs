@@ -46,15 +46,15 @@ pub use material::{
 };
 use matrix::IDENTITY;
 pub use physics::{
-    AppliedHumanoidBone, BranchSplit, CenterAssigned, CenterKind, ChangedHumanoidBone,
-    CompiledSprings, HumanoidPoseReport, JointTrace, LostNode, NoCenter, NoCenterReason,
-    OwnedSpring, PhysicsLimits, PhysicsResolution, PhysicsSidecar, ResolvedCollider,
-    ResolvedPhysBone, RootCut, SharedNode, SidecarCurve, SidecarHumanBone, SidecarHumanTransform,
-    SidecarHumanoid, SkippedBone, SkippedBoneReason, SkippedHumanoidBone, SkippedHumanoidReason,
-    SpringCompileOptions, SpringCompileReport, VrmAimAxis, VrmNodeConstraint,
-    VrmNodeConstraintKind, VrmRollAxis, VrmSpring, VrmSpringBones, VrmSpringCollider,
-    VrmSpringColliderExtension, VrmSpringColliderGroup, VrmSpringColliderShape, VrmSpringJoint,
-    VrmSpringJointLimit, ZeroLengthJoint, apply_humanoid_t_pose, compile_springs,
+    AppliedHumanoidBone, AuxiliaryNode, BranchSplit, CenterAssigned, CenterKind,
+    ChangedHumanoidBone, CompiledSprings, HumanoidPoseReport, JointTrace, LostNode, NoCenter,
+    NoCenterReason, OwnedSpring, PhysicsLimits, PhysicsResolution, PhysicsSidecar,
+    ResolvedCollider, ResolvedPhysBone, RootCut, SharedNode, SidecarCurve, SidecarHumanBone,
+    SidecarHumanTransform, SidecarHumanoid, SkippedBone, SkippedBoneReason, SkippedHumanoidBone,
+    SkippedHumanoidReason, SpringCompileOptions, SpringCompileReport, VrmAimAxis,
+    VrmNodeConstraint, VrmNodeConstraintKind, VrmRollAxis, VrmSpring, VrmSpringBones,
+    VrmSpringCollider, VrmSpringColliderExtension, VrmSpringColliderGroup, VrmSpringColliderShape,
+    VrmSpringJoint, VrmSpringJointLimit, ZeroLengthJoint, apply_humanoid_t_pose, compile_springs,
 };
 pub use physics_prefab::{DerivedSidecar, PrefabDeriveInput, derive_physics_sidecar};
 pub use prefab::{

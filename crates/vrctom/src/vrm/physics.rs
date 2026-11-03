@@ -1419,12 +1419,13 @@ pub struct PhysicsResolution {
     pub matched_source_model: String,
     /// 照合したFBXバイト列のSHA-256（小文字hex）。
     pub fbx_sha256: String,
-    /// sidecar参照世界からモデル出力世界への変換行列。
-    pub coordinate_transform: [f64; 16],
     /// sidecarノードIDからVrmノード索引への対応表。
+    /// sidecarにあってVrmに無かったノードは補助ノードとして追加済みであり、
+    /// 追加分も含む。
     pub node_map: HashMap<String, usize>,
-    /// 参照されずに残ったシーン追加ノード。
-    pub unmapped_nodes: Vec<UnmappedPhysicsNode>,
+    /// sidecarにあってVrmに無かったため、Transformのみの補助ノードとして
+    /// 追加した記録。sidecar順である。meshを持たず、skin・humanoidの写像は変えない。
+    pub auxiliary_nodes: Vec<AuxiliaryNode>,
     /// PhysBoneの参照解決。
     pub phys_bones: Vec<ResolvedPhysBone>,
     /// colliderの参照解決。平面colliderは含まない（平面はsidecarから直接出力する）。
@@ -1434,13 +1435,15 @@ pub struct PhysicsResolution {
     pub skipped_colliders: Vec<String>,
 }
 
-/// 参照されなかったシーン追加ノード。
+/// 補助ノード1件。sidecarにあってVrmに無かったノードをTransformのみで追加した記録である。
 #[derive(Debug, Clone)]
-pub struct UnmappedPhysicsNode {
+pub struct AuxiliaryNode {
     /// sidecarノードID。
     pub id: String,
     /// ノード名。
     pub name: String,
+    /// 追加したVrmノード索引。
+    pub node: usize,
 }
 
 /// PhysBone1件の参照解決。
@@ -1467,9 +1470,13 @@ pub struct ResolvedCollider {
     pub root_node: usize,
 }
 
-/// 座標ゲートの許容差。既存の行列演算の精度に合わせる。
-// Unity sidecarのTRSはf32由来であり、bind姿勢の丸め差を許容する。
-const COORDINATE_TOLERANCE: f64 = 1e-4;
+/// 参照ローカルの許容差。世界行列の要素差で評価する。
+/// 平行移動はメートル、線形部は無次元であり、同じ尺度で比べる。
+/// sidecarはf32由来であり、bind分解と行列積の丸めを許容する。
+/// 実測ではManukaの脚鎖で最大1.5e-3の偏差が出る。鎖の上流のわずかな
+/// 回転差がレバーアームで増幅されたものであり、見た目では区別できない。
+/// 誤ったFBXとの照合はcm単位以上のずれになるため、この値でも検出できる。
+const REFERENCE_WORLD_TOLERANCE: f64 = 5e-3;
 
 impl VrmModel {
     /// 物理sidecarを `VrmModel` のノードへ対応付ける。
@@ -1477,15 +1484,18 @@ impl VrmModel {
     /// FBXバイト列のSHA-256と `sourceModels` を照合し、一致がちょうど1件の
     /// 場合だけ進む。`VrmModel` のルートからの名前列を索引化し、sidecarの
     /// `source.path` と完全一致で対応付ける。接尾辞や一意名の自動補完はしない。
-    /// 参照姿勢は `edit-mode` だけ受け付け、座標ゲートで単一の変換行列を
-    /// 確かめる。スプリングのコンパイルや出力は行わない。
+    /// sidecarにあって `VrmModel` に無いノード（Prefabで追加された
+    /// オブジェクトなど）は、Transformのみの補助ノードとして `VrmModel` の
+    /// 末尾に追加し、対応表に含める。追加分は既存の索引をずらさない。
+    /// 参照姿勢は `edit-mode` だけ受け付け、参照ローカルの一致で
+    /// 対応表を検証する。スプリングのコンパイルや出力は行わない。
     ///
     /// # Errors
     ///
     /// SHA-256の不一致・参照姿勢の未対応・0件や複数件の対応・
-    /// 参照されるシーン追加ノード・座標の不一致・上限超過の場合に返す。
+    /// 補助ノードの親不在・参照ローカルの不一致・上限超過の場合に返す。
     pub fn resolve_physics_sidecar(
-        &self,
+        &mut self,
         sidecar: &PhysicsSidecar,
         fbx_bytes: &[u8],
     ) -> Result<PhysicsResolution, VrmError> {
@@ -1564,7 +1574,18 @@ impl VrmModel {
                 format!("対応が無い: {}", missing.join(", ")),
             ));
         }
-        // 参照されるID集合を集め、シーン追加ノードの参照を検出する。
+        // 物理が参照するID集合を集める。補助ノード化の要否と、
+        // 解決後の対応漏れ検査に使う。
+        // 平面colliderだけに参照されるノードは、平面経路が基準ノードを
+        // 直接合成するため、補助ノード化の対象から外す（重複を避ける）。
+        let mut plane_only: HashSet<&str> = HashSet::new();
+        for collider in &sidecar.colliders {
+            if collider.shape_type != SidecarShapeType::Plane {
+                continue;
+            }
+            plane_only.insert(collider.component_node_id.as_str());
+            plane_only.insert(collider.root_node_id.as_str());
+        }
         let mut referenced: HashSet<&str> = HashSet::new();
         for bone in &sidecar.phys_bones {
             referenced.insert(bone.component_node_id.as_str());
@@ -1574,51 +1595,164 @@ impl VrmModel {
             }
         }
         for collider in &sidecar.colliders {
-            // 平面colliderは今回の出力対象外であり、そのシーン追加ノードも
-            // 参照済みとして扱わない。除外は後段で報告する。
+            // 平面colliderの参照は補助ノード化の要否では数えない。
+            // 解決後の検査では平面も含めて数える。
             if collider.shape_type == SidecarShapeType::Plane {
                 continue;
             }
             referenced.insert(collider.component_node_id.as_str());
             referenced.insert(collider.root_node_id.as_str());
         }
-        let mut unmapped_nodes = Vec::new();
+        // 制約の対象・参照先も補助ノード化の要否に数える。
+        // 解決できない制約は後段で落とすが、ノード自体は出す。
+        for constraint in &sidecar.constraints {
+            let target = if constraint.target_node_id.is_empty() {
+                constraint.node_id.as_str()
+            } else {
+                constraint.target_node_id.as_str()
+            };
+            if !target.is_empty() {
+                referenced.insert(target);
+            }
+            if !constraint.node_id.is_empty() {
+                referenced.insert(constraint.node_id.as_str());
+            }
+            for source in &constraint.sources {
+                if !source.node_id.is_empty() {
+                    referenced.insert(source.node_id.as_str());
+                }
+            }
+        }
+        // humanoidと視線の参照先も補助ノード化の要否に数える。
+        if let Some(humanoid) = sidecar.humanoid.as_ref() {
+            for bone in &humanoid.bones {
+                referenced.insert(bone.node_id.as_str());
+            }
+        }
+        if let Some(look_at) = sidecar.look_at.as_ref() {
+            for eye in [&look_at.left_eye_node_id, &look_at.right_eye_node_id] {
+                if !eye.is_empty() {
+                    referenced.insert(eye.as_str());
+                }
+            }
+        }
+        // sidecarにあってVrmに無いノードは、Transformのみの補助ノードとして
+        // 追加する（sidecar順）。Prefabで追加されたオブジェクト（シーン追加ノード）が
+        // スプリング・コライダー・制約から参照される場合に必要になる。
+        // 親子・名前・ローカル変換（`referenceLocal` のVRM右手系換算）・兄弟順は
+        // sidecarの値を用いる。meshを持たず、skin・humanoidの写像は変えない。
+        // 決定性はsidecar順で保つ。重複IDは検証済みのため起きず、
+        // 循環は検証で拒否済み、親不在はここで失敗する。
+        let mut auxiliary_nodes = Vec::new();
+        let mut aux_parents: HashSet<usize> = HashSet::new();
+        // 補助ノードのsidecar ID集合。座標ゲートの対象から外す。
+        // 補助ノードは親の鎖の比率をそのまま継承するため、
+        // 骨鎖の単一変換行列とは一般に一致しない。
+        // （例：Armature直下の基準ノードはArmatureの比率になる。）
+        // 一貫性は参照ローカルの換算そのもので保つ。
+        let mut aux_ids: HashSet<String> = HashSet::new();
         for node in &sidecar.nodes {
-            if node.source.is_some() {
+            if node_map.contains_key(node.id.as_str()) {
                 continue;
             }
-            if referenced.contains(node.id.as_str()) {
-                return Err(VrmError::new(
-                    VrmErrorKind::UnresolvedPhysicsNode,
-                    format!(
-                        "シーン追加ノードが参照されている: {}（次単位の補助ノード生成が必要）",
-                        node.id
-                    ),
-                ));
+            // 平面colliderだけに参照されるノードは補助ノード化しない。
+            // 平面経路が基準ノードを直接合成するため、重複を避ける。
+            if plane_only.contains(node.id.as_str()) && !referenced.contains(node.id.as_str()) {
+                continue;
             }
-            unmapped_nodes.push(UnmappedPhysicsNode {
+            let parent = match node.parent_id.as_deref() {
+                None => None,
+                Some(parent_id) => Some(*node_map.get(parent_id).ok_or_else(|| {
+                    VrmError::new(
+                        VrmErrorKind::UnresolvedPhysicsNode,
+                        format!("補助ノードの親が無い: {} -> {parent_id}", node.id),
+                    )
+                })?),
+            };
+            // Unity左手系の参照ローカルをVRM右手系へ換算し、ローカル行列に戻す。
+            // 座標ゲートと同じ換算であり、親が同じ鎖にあれば単一の変換行列に一致する。
+            let converted = SidecarTrs {
+                position: mirror_point(node.reference_local.position),
+                rotation: mirror_quat(node.reference_local.rotation),
+                scale: node.reference_local.scale,
+            };
+            let local = trs_to_matrix(&converted);
+            let index = self.nodes.len();
+            self.nodes.push(super::VrmNode {
+                name: node.name.clone(),
+                parent,
+                children: Vec::new(),
+                local,
+            });
+            if let Some(parent) = parent {
+                self.nodes[parent].children.push(index);
+                aux_parents.insert(parent);
+            }
+            node_map.insert(node.id.clone(), index);
+            aux_ids.insert(node.id.clone());
+            auxiliary_nodes.push(AuxiliaryNode {
                 id: node.id.clone(),
                 name: node.name.clone(),
+                node: index,
             });
         }
-        // 参照されるFBX由来ノードが対応表に無い場合は失敗する。
-        // `source.path` が別モデル向きの場合は照合対象外のため、ここで検出する。
-        for id in &referenced {
-            let node = sidecar.nodes.iter().find(|node| node.id.as_str() == *id);
-            let Some(node) = node else {
-                return Err(VrmError::new(
-                    VrmErrorKind::InvalidPhysicsSidecar,
-                    format!("参照IDに対応するノードが無い: {id}"),
-                ));
-            };
-            if node.source.is_none() {
-                continue;
+        // 兄弟順の再整列。補助ノードを受けた親だけをsidecarの`siblingIndex`順に並べる。
+        // sidecarに対応が無い子（mesh所有等）は末尾に残し、既存の相対順序を保つ。
+        {
+            let order_of: HashMap<usize, (u32, usize)> = sidecar
+                .nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(sidecar_index, node)| {
+                    node_map
+                        .get(node.id.as_str())
+                        .map(|&vrm| (vrm, (node.sibling_index, sidecar_index)))
+                })
+                .collect();
+            for parent in aux_parents {
+                let mut keyed: Vec<(u8, u32, usize, usize)> = self.nodes[parent]
+                    .children
+                    .iter()
+                    .enumerate()
+                    .map(|(position, &child)| match order_of.get(&child) {
+                        Some(&(sibling, sidecar_index)) => (0, sibling, sidecar_index, child),
+                        None => (1, 0, position, child),
+                    })
+                    .collect();
+                keyed.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+                self.nodes[parent].children =
+                    keyed.into_iter().map(|(_, _, _, child)| child).collect();
             }
-            if !node_map.contains_key(*id) {
-                return Err(VrmError::new(
-                    VrmErrorKind::UnresolvedPhysicsNode,
-                    format!("参照ノードの対応が無い: {id}"),
-                ));
+        }
+        // 参照されるノードが対応表に無い場合は失敗する。
+        // 骨と平面以外のcolliderの参照は解決が必須であり、
+        // ここに無い参照はsidecar自体にノードが無い破損である。
+        // 検証で拒否済みのはずだが、念のため確かめる。
+        // 制約・humanoid・視線の参照は後段で飛ばして記録するため、ここでは数えない。
+        // 平面colliderの参照は平面経路が直接扱うため、ここでは数えない。
+        {
+            let mut required: HashSet<&str> = HashSet::new();
+            for bone in &sidecar.phys_bones {
+                required.insert(bone.component_node_id.as_str());
+                required.insert(bone.root_node_id.as_str());
+                for ignore in &bone.ignore_node_ids {
+                    required.insert(ignore.as_str());
+                }
+            }
+            for collider in &sidecar.colliders {
+                if collider.shape_type == SidecarShapeType::Plane {
+                    continue;
+                }
+                required.insert(collider.component_node_id.as_str());
+                required.insert(collider.root_node_id.as_str());
+            }
+            for id in &required {
+                if !node_map.contains_key(*id) {
+                    return Err(VrmError::new(
+                        VrmErrorKind::UnresolvedPhysicsNode,
+                        format!("参照ノードの対応が無い: {id}"),
+                    ));
+                }
             }
         }
         let mut phys_bones = Vec::with_capacity(sidecar.phys_bones.len());
@@ -1678,13 +1812,12 @@ impl VrmModel {
                 root_node: lookup_mapped(&node_map, &collider.root_node_id, &collider.id)?,
             });
         }
-        let coordinate_transform = check_coordinate_gate(self, sidecar, &node_map)?;
+        check_reference_locals(self, sidecar, &node_map, &aux_ids)?;
         Ok(PhysicsResolution {
             matched_source_model: single.id.clone(),
             fbx_sha256: digest,
-            coordinate_transform,
             node_map,
-            unmapped_nodes,
+            auxiliary_nodes,
             phys_bones,
             colliders,
             skipped_colliders,
@@ -1986,16 +2119,23 @@ fn model_world_matrices(model: &VrmModel) -> Result<Vec<[f64; 16]>, VrmError> {
     Ok(worlds)
 }
 
-/// 座標ゲートを確認し、単一の変換行列を返す。
+/// 参照ローカルの一致を確認する。
 ///
-/// 対応する関節ノードで `model_world * inverse(sidecar_world)` が
-/// 単一の行列に一致するか確かめる。対象はスキンの関節に含まれる対応ノードであり、
-/// 関節が無い場合はメッシュ所有を除く対応ノードを使う。どちらも無い場合は失敗する。
-fn check_coordinate_gate(
+/// sidecarの参照世界行列と、`VrmModel` の出力世界行列をノードごとに比べる。
+/// 対象は物理が参照する対応済みノードであり、mesh所有・補助ノードは除く。
+/// 世界行列の比較は親鎖の比率選びに左右されないため、bind姿勢で作られて
+/// いないアバター（bindとsceneが乖離）でも、鎖の上流の取り違えが無ければ通る。
+/// 対応表の検証であり、スプリングの生成や出力は行わない。
+///
+/// # Errors
+///
+/// 世界行列の不一致・対象不在・循環や範囲外の不整合の場合に返す。
+fn check_reference_locals(
     model: &VrmModel,
     sidecar: &PhysicsSidecar,
     node_map: &HashMap<String, usize>,
-) -> Result<[f64; 16], VrmError> {
+    aux_ids: &HashSet<String>,
+) -> Result<(), VrmError> {
     let sidecar_worlds = sidecar_world_matrices(sidecar)?;
     let model_worlds = model_world_matrices(model)?;
     let sidecar_at: HashMap<&str, usize> = sidecar
@@ -2004,23 +2144,55 @@ fn check_coordinate_gate(
         .enumerate()
         .map(|(index, node)| (node.id.as_str(), index))
         .collect();
+    // モデルルートは一様な単位換算のはずである。`from_fbx` が作る行列であり、
+    // 対角が等しい正の有限値、非対角と平行移動は0のはずである。
+    // 世界行列の線形部はこの拡大を含むため、比較前に割って正規化する。
+    // 平行移動は既にメートルであり、そのまま比べる。
+    let root_scale = model.root[0];
+    if !root_scale.is_finite()
+        || root_scale <= 0.0
+        || model.root[5] != root_scale
+        || model.root[10] != root_scale
+        || model.root[1] != 0.0
+        || model.root[2] != 0.0
+        || model.root[4] != 0.0
+        || model.root[6] != 0.0
+        || model.root[8] != 0.0
+        || model.root[9] != 0.0
+    {
+        return Err(VrmError::new(
+            VrmErrorKind::UnsupportedUnitScale,
+            "モデルルートが一様な単位換算でない",
+        ));
+    }
     let mesh_nodes: HashSet<usize> = model.meshes.iter().map(|mesh| mesh.node).collect();
-    // 物理が実際に参照するノードだけを gate の対象にする。
+    // 物理が実際に参照するノードだけを対象にする。
     // 全身の関節を対象にすると、指や表情用ボーンの編集時ポーズ差で
     // スプリングに無関係な不一致まで拾ってしまうためである。
     let mut physics_ids: HashSet<&str> = HashSet::new();
     for bone in &sidecar.phys_bones {
+        physics_ids.insert(bone.component_node_id.as_str());
         physics_ids.insert(bone.root_node_id.as_str());
         for ignore in &bone.ignore_node_ids {
             physics_ids.insert(ignore.as_str());
         }
     }
     for collider in &sidecar.colliders {
+        physics_ids.insert(collider.component_node_id.as_str());
         physics_ids.insert(collider.root_node_id.as_str());
     }
-    let mut targets: Vec<(usize, usize)> = Vec::new();
+    // 対象ノードごとに世界行列を比べ、最大の要素差を集める。
+    // 平行移動と線形部は別々に記録し、診断しやすくする。
+    let mut worst: Vec<(String, f64, f64)> = Vec::new();
+    let mut compared = 0usize;
     for (sidecar_id, &vrm_index) in node_map {
         if !physics_ids.contains(sidecar_id.as_str()) {
+            continue;
+        }
+        // 補助ノードは対象外にする。親の鎖の比率を継承するため、
+        // 骨鎖の世界とは一般に一致しない。
+        // 一貫性は参照ローカルの換算そのもので保つ。
+        if aux_ids.contains(sidecar_id.as_str()) {
             continue;
         }
         let Some(&sidecar_index) = sidecar_at.get(sidecar_id.as_str()) else {
@@ -2030,80 +2202,52 @@ fn check_coordinate_gate(
         if mesh_nodes.contains(&vrm_index) {
             continue;
         }
-        targets.push((sidecar_index, vrm_index));
+        // 世界行列を比べる。線形部（3x3）はモデルルートの拡大で割り、
+        // 平行移動はメートルのまま比べる。w行は両方 `[0, 0, 0, 1]` のため除く。
+        let translation_dev = model_worlds[vrm_index][12..15]
+            .iter()
+            .zip(sidecar_worlds[sidecar_index][12..15].iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max);
+        let linear_dev = model_worlds[vrm_index][..12]
+            .iter()
+            .zip(sidecar_worlds[sidecar_index][..12].iter())
+            .map(|(a, b)| (a / root_scale - b).abs())
+            .fold(0.0f64, f64::max);
+        let deviation = linear_dev.max(translation_dev);
+        worst.push((sidecar_id.clone(), translation_dev, deviation));
+        compared += 1;
     }
-    if targets.is_empty() {
+    if compared == 0 {
         return Err(VrmError::new(
             VrmErrorKind::PhysicsCoordinateMismatch,
             "座標ゲートの対象ノードが無い",
         ));
     }
-    // HashMapの反復順に依存せず、最初の基準ノードを安定させる。
-    targets.sort_unstable();
-    // 最初の対応から基準変換を求め、残りが同じ変換に一致するか確かめる。
-    // 軸や単位を推測せず、行列の一致だけを見る。
-    let mut baseline: Option<[f64; 16]> = None;
-    let mut scale_hint = 1.0;
-    for (sidecar_index, vrm_index) in &targets {
-        let Some(inverse) = matrix::inverse(&sidecar_worlds[*sidecar_index]) else {
-            return Err(VrmError::new(
-                VrmErrorKind::PhysicsCoordinateMismatch,
-                "sidecarの参照世界行列が特異である",
-            ));
-        };
-        let candidate = matrix::mul(&model_worlds[*vrm_index], &inverse);
-        match baseline {
-            None => {
-                scale_hint = candidate
-                    .iter()
-                    .map(|v| v.abs())
-                    .fold(0.0f64, f64::max)
-                    .max(1.0);
-                baseline = Some(candidate);
-            }
-            Some(base) => {
-                let tolerance = COORDINATE_TOLERANCE * scale_hint.max(1.0);
-                let mismatch = candidate
-                    .iter()
-                    .zip(base.iter())
-                    .any(|(a, b)| (a - b).abs() > tolerance || !a.is_finite() || !b.is_finite());
-                if mismatch {
-                    let name = model.nodes[*vrm_index].name.as_str();
-                    let path = vrm_full_path(model, *vrm_index)
-                        .map(|path| path.join("/"))
-                        .unwrap_or_default();
-                    let side = sidecar
-                        .nodes
-                        .get(*sidecar_index)
-                        .map(|node| (node.name.as_str(), node.scene_path.join("/")))
-                        .unwrap_or(("?", String::new()));
-                    let model_pos = [
-                        model_worlds[*vrm_index][12],
-                        model_worlds[*vrm_index][13],
-                        model_worlds[*vrm_index][14],
-                    ];
-                    let side_pos = [
-                        sidecar_worlds[*sidecar_index][12],
-                        sidecar_worlds[*sidecar_index][13],
-                        sidecar_worlds[*sidecar_index][14],
-                    ];
-                    return Err(VrmError::new(
-                        VrmErrorKind::PhysicsCoordinateMismatch,
-                        format!(
-                            "座標変換が単一の行列に一致しない: model={name} path={path} sidecar={} scene={} modelPos={model_pos:?} sidePos={side_pos:?} base={base:?} candidate={candidate:?}",
-                            side.0, side.1
-                        ),
-                    ));
-                }
-            }
-        }
-    }
-    baseline.ok_or_else(|| {
-        VrmError::new(
+    worst.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+    if worst
+        .iter()
+        .any(|(_, _, deviation)| *deviation > REFERENCE_WORLD_TOLERANCE)
+    {
+        let over: Vec<String> = worst
+            .iter()
+            .take(8)
+            .map(|(id, translation, deviation)| format!("{id}:t{translation:.3e} m{deviation:.3e}"))
+            .collect();
+        let top = worst
+            .iter()
+            .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+            .expect("対象がある");
+        return Err(VrmError::new(
             VrmErrorKind::PhysicsCoordinateMismatch,
-            "座標ゲートの対象ノードが無い",
-        )
-    })
+            format!(
+                "参照ローカルが一致しない: {} worst=[{}]",
+                top.0,
+                over.join(" ")
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// スプリング出力の上限。

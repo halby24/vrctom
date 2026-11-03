@@ -3362,10 +3362,10 @@ fn 起点がルート自体はcenterなしである() {
     );
 }
 
-/// 未マップのノードを含む鎖は落とし、飛ばして接続しない。
+/// 補助ノードを含む鎖はつなげて出力する。飛ばして接続はしない。
 #[test]
-fn 未マップを含む鎖は落とす() {
-    // Gはscene追加で未マップ。Hの下にぶら下がる。
+fn 補助ノードを含む鎖はつなげる() {
+    // Gはscene追加で対応表に無いため、補助ノードとして追加する。Hの下にぶら下がる。
     let 名前 = ["Top", "H", "G"];
     let 親: Vec<Option<usize>> = vec![None, Some(0), Some(1)];
     let 位置 = [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]];
@@ -3437,14 +3437,12 @@ fn 未マップを含む鎖は落とす() {
     .to_string();
     let (_, _, コンパイル済み) =
         文から解決してコンパイルする(&文, fbxバイト列, &mut モデル);
-    assert_eq!(コンパイル済み.report.spring_count, 0);
-    assert_eq!(コンパイル済み.report.skipped_bones.len(), 1);
-    match &コンパイル済み.report.skipped_bones[0].reason {
-        vrctom::vrm::SkippedBoneReason::UnmappedJoint { node } => {
-            assert_eq!(node, "n:2");
-        }
-        他 => panic!("未マップで落とす: {他:?}"),
-    }
+    assert_eq!(コンパイル済み.report.spring_count, 1);
+    assert!(コンパイル済み.report.skipped_bones.is_empty());
+    let spring = &コンパイル済み.bones.springs[0];
+    assert_eq!(spring.joints.len(), 2, "Hと補助ノードGをつなげる");
+    assert_eq!(spring.joints[0].node, 1, "先頭はHである");
+    assert_eq!(spring.joints[1].node, 3, "末端は追加したGである");
 }
 
 /// 循環するsidecarは検証で拒否する。
