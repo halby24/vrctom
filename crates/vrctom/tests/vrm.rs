@@ -1941,7 +1941,51 @@ fn 表情最小ファイル(
 }
 
 #[test]
-fn 見つからない表情ターゲットは失敗する() {
+fn 部分一致は存在する式だけを作り欠落を警告する() {
+    // 要求3件のうち2件だけが採用メッシュにある。存在する式だけを作る。
+    let bytes = 表情最小ファイル(
+        &[
+            ("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None),
+            (
+                "t2",
+                "t2-shape",
+                &[1],
+                &[0.0, 0.5, 0.0],
+                Some(0.0),
+                Some(&[100.0]),
+            ),
+        ],
+        vec![],
+        vec![],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("表情付きは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![
+            束ね("aa", "t1"),
+            束ね("blink", "t2"),
+            束ね("ou", "無い名前"),
+        ],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    let (model, report) = VrmModel::from_fbx(&parsed, &options).expect("部分一致は成功する");
+    // 存在する2式だけが要求順に残る。
+    assert_eq!(model.expressions.preset.len(), 2);
+    assert_eq!(model.expressions.preset[0].name, "aa");
+    assert_eq!(model.expressions.preset[1].name, "blink");
+    assert_eq!(report.expression_count, 2, "式数は生成式数と一致する");
+    // 欠落警告は要求順に1件ずつであり、名前・未適用・採用メッシュ識別を含む。
+    assert_eq!(report.warnings.len(), 1);
+    assert!(
+        report.warnings[0].contains("無い名前"),
+        "欠落名を含む: {}",
+        report.warnings[0]
+    );
+}
+
+#[test]
+fn 一致0件は成功し式なしで全要求を警告する() {
+    // 要求のどれにも一致しない場合は表情を作らず、全要求を警告する。
     let bytes = 表情最小ファイル(
         &[("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None)],
         vec![],
@@ -1950,13 +1994,620 @@ fn 見つからない表情ターゲットは失敗する() {
     );
     let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("表情付きは読める");
     let profile = VrmExpressionProfile {
-        bindings: vec![束ね("aa", "無い名前")],
+        bindings: vec![束ね("aa", "無い1"), 束ね("blink", "無い2")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    let (model, report) = VrmModel::from_fbx(&parsed, &options).expect("0件一致は成功する");
+    assert!(model.expressions.preset.is_empty());
+    assert!(model.meshes[0].targets.is_empty());
+    assert_eq!(report.expression_count, 0);
+    // 欠落警告は要求順に全件であり、追加の集約警告は重ねない。
+    assert_eq!(report.warnings.len(), 2);
+    assert!(
+        report.warnings[0].contains("無い1"),
+        "要求順: {}",
+        report.warnings[0]
+    );
+    assert!(
+        report.warnings[1].contains("無い2"),
+        "要求順: {}",
+        report.warnings[1]
+    );
+}
+
+#[test]
+fn 空プロファイルは警告なしで表情を作らない() {
+    // 表情指定なし・束ね空のいずれも表情なし・警告なしである。
+    let bytes = 表情最小ファイル(
+        &[("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None)],
+        vec![],
+        vec![],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("表情付きは読める");
+    for profile in [
+        None,
+        Some(VrmExpressionProfile {
+            bindings: Vec::new(),
+        }),
+    ] {
+        let mut options = VrmOptions::new();
+        if let Some(profile) = profile {
+            options = options.with_expressions(profile);
+        }
+        let (model, report) = VrmModel::from_fbx(&parsed, &options).expect("要求なしは変換できる");
+        assert!(model.expressions.preset.is_empty());
+        assert!(report.warnings.is_empty());
+        assert_eq!(report.expression_count, 0);
+    }
+}
+
+#[test]
+fn 顔メッシュが最多なら他メッシュの少数一致より選ばれる() {
+    // 顔メッシュが2件一致・他メッシュが1件一致なら顔メッシュを採用する。
+    let bytes = 表情最小ファイル(
+        &[
+            ("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None),
+            ("t2", "t2-shape", &[1], &[0.0, 0.5, 0.0], Some(0.0), None),
+        ],
+        vec![
+            model(3, b"Owner2\x00\x01Model", "Mesh"),
+            triangle_geometry(11, b"Second\x00\x01Geometry", vec![]),
+            形状(50, b"t1-copy\x00\x01Shape", &[0], &[0.0, 0.5, 0.0]),
+            伝達子(60, b"t1\x00\x01SubDeformer", Some(0.0), None),
+            束ねノード(70, b"SecondBlend\x00\x01Deformer"),
+        ],
+        vec![
+            conn(3, 1),
+            conn(11, 3),
+            conn(50, 60),
+            conn(60, 70),
+            conn(70, 11),
+        ],
+        &[(3, bind_matrix(0.0, 0.0, 0.0))],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("2メッシュは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1"), 束ね("blink", "t2")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    let (model, report) = VrmModel::from_fbx(&parsed, &options).expect("最多メッシュを採用する");
+    // 表情を持つのは顔メッシュ（先頭）だけであり、警告は無い。
+    assert!(!model.meshes[0].targets.is_empty());
+    assert!(model.meshes[1].targets.is_empty());
+    assert!(report.warnings.is_empty());
+    assert_eq!(model.expressions.preset.len(), 2);
+}
+
+#[test]
+fn 他メッシュだけにある要求は合成せず未適用で警告する() {
+    // 採用メッシュ（2件一致）に無い要求は、他メッシュにあっても警告する。
+    let bytes = 表情最小ファイル(
+        &[
+            ("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None),
+            ("t3", "t3-shape", &[2], &[0.0, 0.0, 0.5], Some(0.0), None),
+        ],
+        vec![
+            model(3, b"Owner2\x00\x01Model", "Mesh"),
+            triangle_geometry(11, b"Second\x00\x01Geometry", vec![]),
+            形状(50, b"t2-copy\x00\x01Shape", &[0], &[0.0, 0.5, 0.0]),
+            伝達子(60, b"t2\x00\x01SubDeformer", Some(0.0), None),
+            束ねノード(70, b"SecondBlend\x00\x01Deformer"),
+        ],
+        vec![
+            conn(3, 1),
+            conn(11, 3),
+            conn(50, 60),
+            conn(60, 70),
+            conn(70, 11),
+        ],
+        &[(3, bind_matrix(0.0, 0.0, 0.0))],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("2メッシュは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("a", "t1"), 束ね("b", "t2"), 束ね("c", "t3")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    let (model, report) = VrmModel::from_fbx(&parsed, &options).expect("部分適用は成功する");
+    // 他メッシュにだけある `t2` の式は作らず、採用メッシュ内の2件だけ作る。
+    assert_eq!(model.expressions.preset.len(), 2);
+    assert_eq!(model.expressions.preset[0].name, "a");
+    assert_eq!(model.expressions.preset[1].name, "c");
+    assert_eq!(report.warnings.len(), 1);
+    assert!(
+        report.warnings[0].contains("t2"),
+        "未適用名を含む: {}",
+        report.warnings[0]
+    );
+}
+
+#[test]
+fn 同名チャンネルが複数あっても一致数は増えない() {
+    // 採用候補の数え方は異なる名前の数であり、同名の重なりで加点しない。
+    // 先頭メッシュに `t1` が2件・後続メッシュに `t1` が1件なら同率であり、
+    // 重複側を採用して束ね重複で失敗するのではなく同率失敗になる。
+    let bytes = 表情最小ファイル(
+        &[("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None)],
+        vec![
+            model(3, b"Owner2\x00\x01Model", "Mesh"),
+            triangle_geometry(11, b"Second\x00\x01Geometry", vec![]),
+            形状(50, b"t1-dup\x00\x01Shape", &[1], &[0.0, 0.5, 0.0]),
+            伝達子(60, b"t1\x00\x01SubDeformer", Some(0.0), None),
+            形状(51, b"t1-second-dup\x00\x01Shape", &[2], &[0.0, 0.0, 0.5]),
+            伝達子(61, b"t1\x00\x01SubDeformer", Some(0.0), None),
+            束ねノード(70, b"SecondBlend\x00\x01Deformer"),
+            // 先頭メッシュ側にも同名を2件繋ぎ、両メッシュとも異なる名前数は1にする。
+            形状(52, b"t1-face-dup\x00\x01Shape", &[1], &[0.0, 0.5, 0.0]),
+            伝達子(62, b"t1\x00\x01SubDeformer", Some(0.0), None),
+        ],
+        vec![
+            conn(3, 1),
+            conn(11, 3),
+            conn(50, 60),
+            conn(60, 70),
+            conn(51, 61),
+            conn(61, 70),
+            conn(70, 11),
+            conn(52, 62),
+            conn(62, 3000),
+        ],
+        &[(3, bind_matrix(0.0, 0.0, 0.0))],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("重複があっても読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    let error = VrmModel::from_fbx(&parsed, &options).expect_err("同率は失敗する");
+    assert_eq!(error.kind(), VrmErrorKind::AmbiguousExpressionTarget);
+    assert!(
+        format!("{error}").contains("重複する"),
+        "同名重複は空扱いにせず重複失敗である: {error}"
+    );
+}
+
+#[test]
+fn 同一ターゲットの複数束ねでも欠落警告は1件である() {
+    // 同一ターゲットを指す束ねが複数あっても、欠落警告は要求ごとに1件である。
+    let bytes = 表情最小ファイル(
+        &[("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None)],
+        vec![],
+        vec![],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("表情付きは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "無い名前"), 束ね("blink", "無い名前")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    let (model, report) = VrmModel::from_fbx(&parsed, &options).expect("欠落は成功する");
+    assert!(model.expressions.preset.is_empty());
+    assert_eq!(
+        report.warnings.len(),
+        1,
+        "同一ターゲットの警告は重複排除する"
+    );
+    assert!(report.warnings[0].contains("無い名前"));
+}
+
+#[test]
+fn 正の最大一致数で同率なら失敗する() {
+    // 2件のメッシュが同じ最大一致数なら、採用を決められず失敗する。
+    let bytes = 表情最小ファイル(
+        &[("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None)],
+        vec![
+            model(3, b"Owner2\x00\x01Model", "Mesh"),
+            triangle_geometry(11, b"Second\x00\x01Geometry", vec![]),
+            形状(50, b"t1-copy\x00\x01Shape", &[0], &[0.0, 0.5, 0.0]),
+            伝達子(60, b"t1\x00\x01SubDeformer", Some(0.0), None),
+            束ねノード(70, b"SecondBlend\x00\x01Deformer"),
+        ],
+        vec![
+            conn(3, 1),
+            conn(11, 3),
+            conn(50, 60),
+            conn(60, 70),
+            conn(70, 11),
+        ],
+        &[(3, bind_matrix(0.0, 0.0, 0.0))],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("2メッシュは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1"), 束ね("blink", "無い名前")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    let error = VrmModel::from_fbx(&parsed, &options).expect_err("同率は失敗する");
+    assert_eq!(error.kind(), VrmErrorKind::AmbiguousExpressionTarget);
+}
+
+#[test]
+fn 採用メッシュに所有モデルが無い場合は失敗する() {
+    // 採用候補のメッシュに所有モデルが無い場合は束ねが宙に浮くため失敗する。
+    // 所有者ありの先頭メッシュには要求外のチャンネルだけを置き、
+    // 要求名を持つ所有者なしメッシュを採用候補にする。
+    let bytes = 表情最小ファイル(
+        &[(
+            "other",
+            "other-shape",
+            &[0],
+            &[0.5, 0.0, 0.0],
+            Some(0.0),
+            None,
+        )],
+        vec![
+            形状(50, b"t9-shape\x00\x01Shape", &[0], &[0.5, 0.0, 0.0]),
+            伝達子(60, b"t9\x00\x01SubDeformer", Some(0.0), None),
+            束ねノード(70, b"OrphanBlend\x00\x01Deformer"),
+            triangle_geometry(11, b"Orphan\x00\x01Geometry", vec![]),
+        ],
+        vec![conn(50, 60), conn(60, 70), conn(70, 11)],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("所有者なしも読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t9")],
     };
     let options = VrmOptions::new().with_expressions(profile);
     assert_eq!(
         VrmModel::from_fbx(&parsed, &options).unwrap_err().kind(),
-        VrmErrorKind::MissingExpressionTarget
+        VrmErrorKind::InvalidStructure
     );
+}
+
+/// 2メッシュ同率の合成ファイルを作る。先頭と後続のチャンネル差分を変えられる。
+#[allow(clippy::too_many_arguments)]
+fn 同率2メッシュファイル(
+    先頭差分: &[f64],
+    後続差分: &[f64],
+    追加bind: &[(i64, [f64; 16])],
+) -> Vec<u8> {
+    表情最小ファイル(
+        &[("t1", "t1-shape", &[0], 先頭差分, Some(0.0), None)],
+        vec![
+            model(3, b"Owner2\x00\x01Model", "Mesh"),
+            triangle_geometry(11, b"Second\x00\x01Geometry", vec![]),
+            形状(50, b"t1-copy\x00\x01Shape", &[0], 後続差分),
+            伝達子(60, b"t1\x00\x01SubDeformer", Some(0.0), None),
+            束ねノード(70, b"SecondBlend\x00\x01Deformer"),
+        ],
+        vec![
+            conn(3, 1),
+            conn(11, 3),
+            conn(50, 60),
+            conn(60, 70),
+            conn(70, 11),
+        ],
+        追加bind,
+    )
+}
+
+#[test]
+fn 同一集合で唯一非ゼロなら採用して選択警告を出す() {
+    // 後続メッシュの差分がゼロなら先頭を採用し、選択警告の後に欠落警告を置く。
+    let bytes = 同率2メッシュファイル(&[0.5, 0.0, 0.0], &[0.0, 0.0, 0.0], &[]);
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("2メッシュは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1"), 束ね("blink", "無い名前")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    let (model, report) = VrmModel::from_fbx(&parsed, &options).expect("限定解消は成功する");
+    assert_eq!(model.expressions.preset.len(), 1);
+    assert_eq!(model.expressions.preset[0].name, "aa");
+    // 表情を持つのは先頭メッシュだけである。
+    assert!(!model.meshes[0].targets.is_empty());
+    assert!(model.meshes[1].targets.is_empty());
+    assert_eq!(report.expression_count, 1);
+    assert_eq!(report.warnings.len(), 2);
+    assert!(
+        report.warnings[0].contains("同率候補から"),
+        "選択警告が先頭である: {}",
+        report.warnings[0]
+    );
+    assert!(
+        !report.warnings[0].contains("無い名前"),
+        "選択警告に欠落名は含まない: {}",
+        report.warnings[0]
+    );
+    assert!(
+        report.warnings[1].contains("無い名前"),
+        "欠落警告が要求順に続く: {}",
+        report.warnings[1]
+    );
+}
+
+#[test]
+fn 非ゼロが後続メッシュでも順序に依らず採用する() {
+    // 先頭がゼロ・後続が非ゼロなら後続を採用する。FBX順・ObjectId大小に依らない。
+    let bytes = 同率2メッシュファイル(&[0.0, 0.0, 0.0], &[0.5, 0.0, 0.0], &[]);
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("2メッシュは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    let (model, report) = VrmModel::from_fbx(&parsed, &options).expect("後続を採用する");
+    assert_eq!(model.expressions.preset.len(), 1);
+    let bind = &model.expressions.preset[0].morph_target_binds[0];
+    assert_eq!(bind.mesh, 1, "後続メッシュを指す");
+    assert!(model.meshes[0].targets.is_empty());
+    assert!(!model.meshes[1].targets.is_empty());
+    assert_eq!(report.warnings.len(), 1);
+    assert!(report.warnings[0].contains("同率候補から"));
+}
+
+#[test]
+fn 同一集合で全候補ゼロなら曖昧さエラーになる() {
+    let bytes = 同率2メッシュファイル(&[0.0, 0.0, 0.0], &[0.0, 0.0, 0.0], &[]);
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("2メッシュは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    let error = VrmModel::from_fbx(&parsed, &options).expect_err("全ゼロは失敗する");
+    assert_eq!(error.kind(), VrmErrorKind::AmbiguousExpressionTarget);
+}
+
+#[test]
+fn 同率で異なる集合なら曖昧さエラーになる() {
+    // 先頭 `{t1,t2}`・後続 `{t1,t3}` で同率2件の場合は集合が異なるため失敗する。
+    let bytes = 表情最小ファイル(
+        &[
+            ("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None),
+            ("t2", "t2-shape", &[1], &[0.0, 0.5, 0.0], Some(0.0), None),
+        ],
+        vec![
+            model(3, b"Owner2\x00\x01Model", "Mesh"),
+            triangle_geometry(11, b"Second\x00\x01Geometry", vec![]),
+            形状(50, b"t1-copy\x00\x01Shape", &[0], &[0.0, 0.5, 0.0]),
+            伝達子(60, b"t1\x00\x01SubDeformer", Some(0.0), None),
+            形状(51, b"t3-copy\x00\x01Shape", &[1], &[0.0, 0.0, 0.5]),
+            伝達子(61, b"t3\x00\x01SubDeformer", Some(0.0), None),
+            束ねノード(70, b"SecondBlend\x00\x01Deformer"),
+        ],
+        vec![
+            conn(3, 1),
+            conn(11, 3),
+            conn(50, 60),
+            conn(60, 70),
+            conn(51, 61),
+            conn(61, 70),
+            conn(70, 11),
+        ],
+        &[(3, bind_matrix(0.0, 0.0, 0.0))],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("2メッシュは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("a", "t1"), 束ね("b", "t2"), 束ね("c", "t3")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    let error = VrmModel::from_fbx(&parsed, &options).expect_err("集合が異なれば失敗する");
+    assert_eq!(error.kind(), VrmErrorKind::AmbiguousExpressionTarget);
+    assert!(
+        format!("{error}").contains("t2") && format!("{error}").contains("t3"),
+        "一致した要求名を診断に含める: {error}"
+    );
+}
+
+#[test]
+fn マイナスゼロと空と微小値の非ゼロ判定に従う() {
+    // `-0.0` はゼロ、微小でも非ゼロ（`1e-300`）は非ゼロである。
+    for (先頭, 後続, 成功か) in [
+        (&[-0.0, 0.0, 0.0][..], &[0.0, 0.0, 0.0][..], false),
+        (&[1e-300, 0.0, 0.0][..], &[0.0, 0.0, 0.0][..], true),
+    ] {
+        let bytes = 同率2メッシュファイル(先頭, 後続, &[]);
+        let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("2メッシュは読める");
+        let profile = VrmExpressionProfile {
+            bindings: vec![束ね("aa", "t1")],
+        };
+        let options = VrmOptions::new().with_expressions(profile);
+        if 成功か {
+            let (model, report) =
+                VrmModel::from_fbx(&parsed, &options).expect("微小非ゼロは採用する");
+            assert_eq!(model.expressions.preset.len(), 1);
+            assert_eq!(report.warnings.len(), 1);
+        } else {
+            assert_eq!(
+                VrmModel::from_fbx(&parsed, &options).unwrap_err().kind(),
+                VrmErrorKind::AmbiguousExpressionTarget,
+                "-0.0はゼロとして全ゼロ失敗になる"
+            );
+        }
+    }
+    // 空の形状（対象制御点なし）はゼロとして扱う。
+    let bytes = 表情最小ファイル(
+        &[("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None)],
+        vec![
+            model(3, b"Owner2\x00\x01Model", "Mesh"),
+            triangle_geometry(11, b"Second\x00\x01Geometry", vec![]),
+            形状(50, b"t1-empty\x00\x01Shape", &[], &[]),
+            伝達子(60, b"t1\x00\x01SubDeformer", Some(0.0), None),
+            束ねノード(70, b"SecondBlend\x00\x01Deformer"),
+        ],
+        vec![
+            conn(3, 1),
+            conn(11, 3),
+            conn(50, 60),
+            conn(60, 70),
+            conn(70, 11),
+        ],
+        &[(3, bind_matrix(0.0, 0.0, 0.0))],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("空形状も読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    let (model, _) =
+        VrmModel::from_fbx(&parsed, &options).expect("空形状はゼロ扱いで先頭を採用する");
+    assert_eq!(model.expressions.preset.len(), 1);
+}
+
+#[test]
+fn 同率候補の不正は空扱いにせず既存エラーを返す() {
+    // 後続候補の一致ターゲットが複数フレームなら、次点へ移らず失敗する。
+    let bytes = 表情最小ファイル(
+        &[("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None)],
+        vec![
+            model(3, b"Owner2\x00\x01Model", "Mesh"),
+            triangle_geometry(11, b"Second\x00\x01Geometry", vec![]),
+            形状(50, b"t1-copy\x00\x01Shape", &[0], &[0.0, 0.5, 0.0]),
+            形状(51, b"t1-second\x00\x01Shape", &[1], &[0.0, 0.0, 0.5]),
+            伝達子(60, b"t1\x00\x01SubDeformer", Some(0.0), None),
+            束ねノード(70, b"SecondBlend\x00\x01Deformer"),
+        ],
+        vec![
+            conn(3, 1),
+            conn(11, 3),
+            conn(50, 60),
+            conn(51, 60),
+            conn(60, 70),
+            conn(70, 11),
+        ],
+        &[(3, bind_matrix(0.0, 0.0, 0.0))],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("複数形状でも読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    assert_eq!(
+        VrmModel::from_fbx(&parsed, &options).unwrap_err().kind(),
+        VrmErrorKind::UnsupportedBlendShape,
+        "複数フレームは空扱いにしない"
+    );
+    // 非有限の重み率も空扱いにせず読み取り層の破損として失敗する。
+    let bytes = 表情最小ファイル(
+        &[("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None)],
+        vec![
+            model(3, b"Owner2\x00\x01Model", "Mesh"),
+            triangle_geometry(11, b"Second\x00\x01Geometry", vec![]),
+            形状(50, b"t1-copy\x00\x01Shape", &[0], &[0.0, 0.5, 0.0]),
+            伝達子(60, b"t1\x00\x01SubDeformer", Some(0.0), Some(&[f64::NAN])),
+            束ねノード(70, b"SecondBlend\x00\x01Deformer"),
+        ],
+        vec![
+            conn(3, 1),
+            conn(11, 3),
+            conn(50, 60),
+            conn(60, 70),
+            conn(70, 11),
+        ],
+        &[(3, bind_matrix(0.0, 0.0, 0.0))],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("破損値でも読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    assert_eq!(
+        VrmModel::from_fbx(&parsed, &options).unwrap_err().kind(),
+        VrmErrorKind::InvalidStructure,
+        "非有限の重み率は空扱いにしない"
+    );
+}
+
+#[test]
+fn 先頭非ゼロでも後続の不正は隠さず失敗する() {
+    // 両メッシュとも `{t1,t2}` に一致し、先頭の `t1` は非ゼロ。
+    // 後続の `t2` が複数フレームでも、非ゼロ確定で返さず全要求を検査する。
+    let bytes = 表情最小ファイル(
+        &[
+            ("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None),
+            ("t2", "t2-shape", &[1], &[0.0, 0.5, 0.0], Some(0.0), None),
+        ],
+        vec![
+            model(3, b"Owner2\x00\x01Model", "Mesh"),
+            triangle_geometry(11, b"Second\x00\x01Geometry", vec![]),
+            形状(50, b"t1-copy\x00\x01Shape", &[0], &[0.0, 0.5, 0.0]),
+            伝達子(60, b"t1\x00\x01SubDeformer", Some(0.0), None),
+            形状(51, b"t2-copy\x00\x01Shape", &[1], &[0.0, 0.0, 0.5]),
+            形状(52, b"t2-second\x00\x01Shape", &[2], &[0.5, 0.0, 0.0]),
+            伝達子(61, b"t2\x00\x01SubDeformer", Some(0.0), None),
+            束ねノード(70, b"SecondBlend\x00\x01Deformer"),
+        ],
+        vec![
+            conn(3, 1),
+            conn(11, 3),
+            conn(50, 60),
+            conn(60, 70),
+            conn(51, 61),
+            conn(52, 61),
+            conn(61, 70),
+            conn(70, 11),
+        ],
+        &[(3, bind_matrix(0.0, 0.0, 0.0))],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("複数形状でも読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("a", "t1"), 束ね("b", "t2")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    assert_eq!(
+        VrmModel::from_fbx(&parsed, &options).unwrap_err().kind(),
+        VrmErrorKind::UnsupportedBlendShape,
+        "後続ターゲットの不正は隠さない"
+    );
+}
+
+#[test]
+fn 同率候補でも総量上限の超過は形状不良より先に失敗する() {
+    // `max_morph_bytes(0)` では単独候補と同様に `LimitExceeded` になる。
+    let bytes = 同率2メッシュファイル(&[0.5, 0.0, 0.0], &[0.0, 0.0, 0.0], &[]);
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("2メッシュは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let options = VrmOptions::new()
+        .with_expressions(profile)
+        .with_max_morph_bytes(0);
+    assert_eq!(
+        VrmModel::from_fbx(&parsed, &options).unwrap_err().kind(),
+        VrmErrorKind::LimitExceeded,
+        "同率経路でも上限で拒否する"
+    );
+}
+
+#[test]
+fn 束ね省略後もモーフ索引は正しい() {
+    // 欠落した束ねを除いた後も、残る束ねは絞り込み後の正しい索引を指す。
+    let bytes = 表情最小ファイル(
+        &[
+            ("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None),
+            (
+                "vrc.v_aa",
+                "vaa-shape",
+                &[1],
+                &[0.0, 0.5, 0.0],
+                Some(0.0),
+                None,
+            ),
+            ("t2", "t2-shape", &[2], &[0.0, 0.0, 0.5], Some(0.0), None),
+        ],
+        vec![],
+        vec![],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("表情付きは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![
+            束ね("b2", "t2"),
+            束ね("b1", "t1"),
+            束ね("missing", "無い名前"),
+        ],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    let (model, report) = VrmModel::from_fbx(&parsed, &options).expect("部分適用は成功する");
+    // 絞り込み後はFBX順の3件であり、式は要求順（`t2`・`t1`）に正しい索引を指す。
+    let mesh = &model.meshes[0];
+    assert_eq!(mesh.targets.len(), 3);
+    assert_eq!(mesh.targets[0].name, "t1");
+    assert_eq!(mesh.targets[1].name, "vrc.v_aa");
+    assert_eq!(mesh.targets[2].name, "t2");
+    assert_eq!(model.expressions.preset.len(), 2);
+    assert_eq!(model.expressions.preset[0].morph_target_binds[0].target, 2);
+    assert_eq!(model.expressions.preset[1].morph_target_binds[0].target, 0);
+    assert_eq!(report.expression_count, 2);
+    assert_eq!(report.warnings.len(), 1);
 }
 
 #[test]

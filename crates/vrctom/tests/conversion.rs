@@ -419,3 +419,193 @@ fn build_modelの中間結果でexport_modelがto_vrmと同じバイト列を返
         "共有入口と直接書き出しは同じバイト列である"
     );
 }
+
+impl Props {
+    /// 倍精度浮動小数点のプロパティを書く。
+    fn d(&mut self, v: f64) {
+        self.prop(b'D', &v.to_le_bytes());
+    }
+}
+
+/// `Deformer` ノードを組み立てる。
+fn 変形子(id: i64, 名前: &[u8], 種別: &str, 子ら: Vec<TNode>) -> TNode {
+    let mut props = Props::default();
+    props.l(id);
+    props.s(名前);
+    props.s(種別.as_bytes());
+    TNode::branch(b"Deformer", props, 子ら)
+}
+
+/// ブレンドシェイプの `Shape` ジオメトリを組み立てる。
+fn 形状(id: i64, 名前: &[u8], 制御点: &[i32], 差分: &[f64]) -> TNode {
+    let mut index_props = Props::default();
+    index_props.i_raw(制御点);
+    let mut delta_props = Props::default();
+    delta_props.d_raw(差分);
+    let mut props = Props::default();
+    props.l(id);
+    props.s(名前);
+    props.s(b"Shape");
+    TNode::branch(
+        b"Geometry",
+        props,
+        vec![
+            TNode::leaf(b"Indexes", index_props),
+            TNode::leaf(b"Vertices", delta_props),
+        ],
+    )
+}
+
+/// ブレンドシェイプチャンネルを組み立てる。初期値はゼロ・重み率なしである。
+fn 伝達子(id: i64, 名前: &[u8]) -> TNode {
+    let mut deform_props = Props::default();
+    deform_props.d(0.0);
+    変形子(
+        id,
+        名前,
+        "BlendShapeChannel",
+        vec![TNode::leaf(b"DeformPercent", deform_props)],
+    )
+}
+
+/// 表情チャンネル付きのFBXを組み立てる。必須骨と三角形1枚を持ち、変換から書き出しまで通る。
+fn 表情付きfbxを組み立てる(チャンネル名ら: &[&str]) -> Vec<u8> {
+    let mut objs: Vec<TNode> = 必須骨モデル列()
+        .iter()
+        .map(|(id, name, _)| {
+            let subtype = if *name == "Owner" { "Mesh" } else { "LimbNode" };
+            model(*id, name, subtype)
+        })
+        .collect();
+    objs.push(geometry(
+        100,
+        "Tri",
+        vec![
+            vertices_node(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+            pvi_node(&[0, 1, -3]),
+        ],
+    ));
+    objs.push(変形子(
+        3000,
+        b"Blend\x00\x01Deformer",
+        "BlendShape",
+        vec![],
+    ));
+    let mut conns_extra = Vec::new();
+    for (offset, 名前) in チャンネル名ら.iter().enumerate() {
+        let shape_id = 1000 + offset as i64;
+        let channel_id = 2000 + offset as i64;
+        let mut channel_full = 名前.as_bytes().to_vec();
+        channel_full.extend_from_slice(b"\x00\x01SubDeformer");
+        let mut shape_full = format!("{名前}-shape").into_bytes();
+        shape_full.extend_from_slice(b"\x00\x01Shape");
+        objs.push(形状(shape_id, &shape_full, &[0], &[0.5, 0.0, 0.0]));
+        objs.push(伝達子(channel_id, &channel_full));
+        conns_extra.push(conn(shape_id, channel_id));
+        conns_extra.push(conn(channel_id, 3000));
+    }
+    conns_extra.push(conn(3000, 100));
+    let mut pose_props = Props::default();
+    pose_props.l(200);
+    pose_props.s(b"Bind\x00\x01Pose");
+    pose_props.s(b"BindPose");
+    let binds: Vec<TNode> = 必須骨モデル列()
+        .iter()
+        .map(|(id, _, _)| pose_node(*id, &bind_matrix(0.0, 0.0, 0.0)))
+        .collect();
+    objs.push(TNode::branch(b"Pose", pose_props, binds));
+    let mut conns: Vec<TNode> = 必須骨モデル列()
+        .iter()
+        .filter_map(|(id, _, parent)| parent.map(|parent| conn(*id, parent)))
+        .collect();
+    conns.push(conn(100, 16));
+    conns.push(conn(1, 0));
+    conns.extend(conns_extra);
+    file(vec![objects(objs), connections(conns)])
+}
+
+/// GLBのJSON塊を取り出す。式数の突き合わせに使う。
+fn glbのjsonを取り出す(バイト列: &[u8]) -> serde_json::Value {
+    assert!(バイト列.len() >= 12, "GLBは12バイトのヘッダを持つ");
+    assert_eq!(&バイト列[0..4], b"glTF");
+    let json_len = u32::from_le_bytes(
+        バイト列[12..16]
+            .try_into()
+            .expect("JSON塊長は4バイトである"),
+    ) as usize;
+    let json_bytes = &バイト列[20..20 + json_len];
+    serde_json::from_slice(json_bytes).expect("GLBのJSONは読める")
+}
+
+#[test]
+fn build_modelで部分適用の警告と件数が伝わる() {
+    use vrctom::vrm::{VrmExpressionBinding, VrmExpressionProfile};
+    let bytes = 表情付きfbxを組み立てる(&["t1", "t2"]);
+    let profile = VrmExpressionProfile {
+        bindings: vec![
+            VrmExpressionBinding {
+                expression: "aa".to_owned(),
+                target: "t1".to_owned(),
+            },
+            VrmExpressionBinding {
+                expression: "blink".to_owned(),
+                target: "t2".to_owned(),
+            },
+            VrmExpressionBinding {
+                expression: "ou".to_owned(),
+                target: "無い名前".to_owned(),
+            },
+        ],
+    };
+    let built = build_model(
+        &bytes,
+        &FbxOptions::new(),
+        &VrmOptions::new().with_expressions(profile),
+    )
+    .expect("部分適用は成功する");
+    // 適用できた2式だけが件数になり、欠落1件が警告に残る。
+    assert_eq!(built.report.expression_count, 2);
+    assert_eq!(built.model.expressions.preset.len(), 2);
+    assert_eq!(built.report.warnings.len(), 1);
+    assert!(built.report.warnings[0].contains("無い名前"));
+}
+
+#[test]
+fn convert_fbxでglbの実際の式とレポート件数が一致する() {
+    use vrctom::vrm::{VrmExpressionBinding, VrmExpressionProfile};
+    let bytes = 表情付きfbxを組み立てる(&["t1", "t2"]);
+    let profile = VrmExpressionProfile {
+        bindings: vec![
+            VrmExpressionBinding {
+                expression: "aa".to_owned(),
+                target: "t1".to_owned(),
+            },
+            VrmExpressionBinding {
+                expression: "blink".to_owned(),
+                target: "t2".to_owned(),
+            },
+            VrmExpressionBinding {
+                expression: "ou".to_owned(),
+                target: "無い名前".to_owned(),
+            },
+        ],
+    };
+    let (vrm_bytes, report) = convert_fbx(
+        &bytes,
+        &FbxOptions::new(),
+        &VrmOptions::new().with_expressions(profile),
+        &書き出し設定を作る(),
+    )
+    .expect("部分適用でも書き出せる");
+    // GLBの実際のプリセット式数がレポート件数と一致する。
+    let json = glbのjsonを取り出す(&vrm_bytes);
+    let preset = &json["extensions"]["VRMC_vrm"]["expressions"]["preset"];
+    let glb_count = preset.as_object().map(|map| map.len()).unwrap_or(0);
+    assert_eq!(glb_count, 2, "GLBの式は適用できた分だけである");
+    assert_eq!(
+        report.expression_count, glb_count,
+        "レポート件数はGLBと一致する"
+    );
+    assert_eq!(report.warnings.len(), 1);
+    assert!(report.warnings[0].contains("無い名前"));
+}

@@ -2202,3 +2202,242 @@ fn yaml対象の拡張子だけを読み非yamlを跳ばす() {
         .expect_err("壊れたprefabは失敗する");
     assert_eq!(error.kind(), UnityErrorKind::InvalidYaml);
 }
+
+/// ModelImporterのmetaを組み立てる。本文は呼び出し側が渡す。
+fn モデルmeta(本文: &str) -> Vec<u8> {
+    file_meta(7, "ModelImporter", 本文)
+}
+
+/// humanDescriptionのhuman1件のYAMLを作る。
+fn 対応項目(ノード名: &str, 骨名: &str) -> String {
+    format!("    - boneName: {ノード名}\n      humanName: {骨名}\n")
+}
+
+/// human対応表を持つmetaを組み立てる。付帯欄は呼び出し側が渡す。
+fn 対応表meta(項目ら: &[String], 付帯: &str) -> Vec<u8> {
+    let mut 本文 = String::from("  humanDescription:\n    serializedVersion: 3\n    human:\n");
+    for 項目 in 項目ら {
+        本文.push_str(項目);
+    }
+    本文.push_str(付帯);
+    モデルmeta(&本文)
+}
+
+#[test]
+fn 空白入りhuman名とノード名をそのまま保つ() {
+    // `.meta` の空白入り表記（`Left Thumb Proximal`・`Left Shoulder`）は
+    // 呼び出し側の照合に残すため、そのまま保つ。
+    let meta = 対応表meta(
+        &[
+            対応項目("Wrist.L", "LeftHand"),
+            対応項目("Left Shoulder", "LeftShoulder"),
+            対応項目("Thumb.L.001", "Left Thumb Intermediate"),
+        ],
+        "",
+    );
+    let 資産 = AssetMeta::parse(&meta).expect("対応表は読める");
+    let 対応 = 資産.human_bone_mappings().expect("対応表は読める");
+    assert_eq!(対応.len(), 3, "3件の対応が読める");
+    assert_eq!(対応[0].bone_name, "Wrist.L");
+    assert_eq!(対応[0].human_name, "LeftHand");
+    assert_eq!(対応[1].bone_name, "Left Shoulder", "ノード名の空白は保つ");
+    assert_eq!(対応[1].human_name, "LeftShoulder");
+    assert_eq!(対応[2].bone_name, "Thumb.L.001");
+    assert_eq!(
+        対応[2].human_name, "Left Thumb Intermediate",
+        "human名の空白は保つ"
+    );
+}
+
+#[test]
+fn 記述が無い対応表は空を返す() {
+    // `humanDescription` が無い場合は名前推測に委ねるため空になる。
+    let 無し = モデルmeta("  animationType: 3\n");
+    let 資産 = AssetMeta::parse(&無し).expect("対応表なしも読める");
+    assert!(
+        資産
+            .human_bone_mappings()
+            .expect("欠落は空になる")
+            .is_empty(),
+        "humanDescriptionが無い場合は空である"
+    );
+    // nullの場合も同じである。
+    let null = モデルmeta("  humanDescription: null\n  animationType: 3\n");
+    let 資産 = AssetMeta::parse(&null).expect("nullも読める");
+    assert!(
+        資産
+            .human_bone_mappings()
+            .expect("nullは空になる")
+            .is_empty(),
+        "humanDescriptionがnullの場合は空である"
+    );
+    // `human` が空の場合も同じである。
+    let 空 = モデルmeta("  humanDescription:\n    serializedVersion: 3\n    human: []\n");
+    let 資産 = AssetMeta::parse(&空).expect("空も読める");
+    assert!(
+        資産.human_bone_mappings().expect("空は空になる").is_empty(),
+        "humanが空の場合は空である"
+    );
+    // `human` 欄自体が無い場合も同じである。
+    let human無し = モデルmeta("  humanDescription:\n    serializedVersion: 3\n");
+    let 資産 = AssetMeta::parse(&human無し).expect("humanなしも読める");
+    assert!(
+        資産
+            .human_bone_mappings()
+            .expect("humanなしは空になる")
+            .is_empty(),
+        "human欄が無い場合は空である"
+    );
+}
+
+#[test]
+fn 非humanoidの取り込み方式では対応表を採用しない() {
+    // 明示的にGenericの場合は対応表があっても採用しない。
+    let 項目 = [対応項目("Wrist.L", "LeftHand")];
+    let meta = 対応表meta(&項目, "  animationType: 2\n");
+    let 資産 = AssetMeta::parse(&meta).expect("非humanoidも読める");
+    assert!(
+        資産
+            .human_bone_mappings()
+            .expect("非humanoidは空になる")
+            .is_empty(),
+        "animationTypeがGenericの場合は空である"
+    );
+    // 省略時は有効な対応表があれば採用する。
+    let meta = 対応表meta(&項目, "");
+    let 資産 = AssetMeta::parse(&meta).expect("省略も読める");
+    assert_eq!(
+        資産.human_bone_mappings().expect("省略は採用する").len(),
+        1,
+        "animationType省略時は対応表を採用する"
+    );
+    // Humanの明示は採用する。
+    let meta = 対応表meta(&項目, "  animationType: 3\n");
+    let 資産 = AssetMeta::parse(&meta).expect("humanoidも読める");
+    assert_eq!(
+        資産
+            .human_bone_mappings()
+            .expect("humanoidは採用する")
+            .len(),
+        1,
+        "animationTypeがHumanの場合は対応表を採用する"
+    );
+}
+
+#[test]
+fn 空の対応は無視する() {
+    // 空の `boneName` はその骨を補完対象に残すため無視する。
+    let meta = 対応表meta(
+        &[
+            "    - boneName: \n      humanName: LeftHand\n".to_string(),
+            対応項目("Hips", "Hips"),
+            "    - boneName: Wrist.R\n      humanName: \n".to_string(),
+        ],
+        "",
+    );
+    let 資産 = AssetMeta::parse(&meta).expect("空混じりも読める");
+    let 対応 = 資産.human_bone_mappings().expect("空は無視する");
+    assert_eq!(対応.len(), 1, "空の対応は無視する");
+    assert_eq!(対応[0].bone_name, "Hips");
+}
+
+#[test]
+fn 壊れた対応表の形状は失敗する() {
+    // `human` がシーケンスでない場合は壊れている。
+    let meta = モデルmeta("  humanDescription:\n    human: {}\n");
+    let 資産 = AssetMeta::parse(&meta).expect("meta自体は読める");
+    let 失敗 = 資産
+        .human_bone_mappings()
+        .expect_err("humanが写像なら失敗する");
+    assert_eq!(失敗.kind(), UnityErrorKind::InvalidMetadata);
+    // 項目が写像でない場合は壊れている。
+    let meta = モデルmeta("  humanDescription:\n    human:\n    - LeftHand\n");
+    let 資産 = AssetMeta::parse(&meta).expect("meta自体は読める");
+    let 失敗 = 資産
+        .human_bone_mappings()
+        .expect_err("項目が文字列なら失敗する");
+    assert_eq!(失敗.kind(), UnityErrorKind::InvalidMetadata);
+    // `boneName` が文字列でない場合は壊れている。
+    let meta = モデルmeta(
+        "  humanDescription:\n    human:\n    - boneName: 1\n      humanName: LeftHand\n",
+    );
+    let 資産 = AssetMeta::parse(&meta).expect("meta自体は読める");
+    let 失敗 = 資産
+        .human_bone_mappings()
+        .expect_err("boneNameが数値なら失敗する");
+    assert_eq!(失敗.kind(), UnityErrorKind::InvalidMetadata);
+    // `animationType` が解釈できない形状の場合は壊れている。
+    let meta = 対応表meta(&[対応項目("Hips", "Hips")], "  animationType: [3]\n");
+    let 資産 = AssetMeta::parse(&meta).expect("meta自体は読める");
+    let 失敗 = 資産
+        .human_bone_mappings()
+        .expect_err("animationTypeが配列なら失敗する");
+    assert_eq!(失敗.kind(), UnityErrorKind::InvalidMetadata);
+}
+
+#[test]
+fn 取り込み方式の整数判定は小数や非有限値を拒否する() {
+    // 整数の `3` はHumanoidとして採用し、`2` は非Humanoidとして空になる。
+    let 項目 = [対応項目("Hips", "Hips")];
+    for (表記, 採用) in [("3", true), ("2", false)] {
+        let meta = 対応表meta(&項目, &format!("  animationType: {表記}\n"));
+        let 資産 = AssetMeta::parse(&meta).expect("整数metaは読める");
+        let 対応 = 資産.human_bone_mappings().expect("整数は判定できる");
+        assert_eq!(
+            !対応.is_empty(),
+            採用,
+            "animationType {表記} の採用が変わらない"
+        );
+    }
+    // 小数・非有限値は整数に丸めず、非Humanoidとしても扱わず失敗する。
+    for 表記 in ["3.0", "3.5", ".nan", ".inf", "-.inf"] {
+        let meta = 対応表meta(&項目, &format!("  animationType: {表記}\n"));
+        let 資産 = AssetMeta::parse(&meta).expect("meta自体は読める");
+        let 失敗 = 資産
+            .human_bone_mappings()
+            .expect_err(&format!("animationType {表記} は失敗する"));
+        assert_eq!(
+            失敗.kind(),
+            UnityErrorKind::InvalidMetadata,
+            "animationType {表記} は不正な値である"
+        );
+    }
+    // 文字列の既存扱いは変えない。`human`・数値文字列は採用し、
+    // `generic`・未知の文字列は従来どおり空・失敗になる。
+    let meta = 対応表meta(&項目, "  animationType: human\n");
+    let 資産 = AssetMeta::parse(&meta).expect("文字列metaは読める");
+    assert_eq!(
+        資産
+            .human_bone_mappings()
+            .expect("human文字列は採用する")
+            .len(),
+        1,
+        "human文字列は採用する"
+    );
+    let meta = 対応表meta(&項目, "  animationType: generic\n");
+    let 資産 = AssetMeta::parse(&meta).expect("文字列metaは読める");
+    assert!(
+        資産
+            .human_bone_mappings()
+            .expect("generic文字列は空になる")
+            .is_empty(),
+        "generic文字列は空である"
+    );
+}
+
+#[test]
+fn 骨名の型違いは文字列でないと診断する() {
+    // `boneName: []` のような型違いは「ない」ではなく「文字列でない」と出す。
+    // 欠落・null・空文字の許容は変えない。
+    let meta = モデルmeta(
+        "  humanDescription:\n    human:\n    - boneName: []\n      humanName: LeftHand\n",
+    );
+    let 資産 = AssetMeta::parse(&meta).expect("meta自体は読める");
+    let 失敗 = 資産
+        .human_bone_mappings()
+        .expect_err("boneNameが配列なら失敗する");
+    assert_eq!(失敗.kind(), UnityErrorKind::InvalidMetadata);
+    let 文面 = format!("{失敗}");
+    assert!(文面.contains("文字列でない"), "型違いの診断になる: {文面}");
+    assert!(!文面.contains("がない"), "欠落の診断と区別する: {文面}");
+}

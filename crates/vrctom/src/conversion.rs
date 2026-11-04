@@ -8,7 +8,7 @@
 use crate::fbx::{FbxError, FbxFile, FbxOptions};
 use crate::vrm::{VrmError, VrmExportError, VrmExportOptions, VrmModel, VrmOptions, VrmReport};
 
-/// 中間モデルとその件数報告の束ね。
+/// 中間モデルとその件数・警告の報告の束ね。
 ///
 /// 特殊経路（物理・割当のためにモデルを保持する呼び出し側）が
 /// [`build_model`] の結果を使い回すための形である。
@@ -16,7 +16,7 @@ use crate::vrm::{VrmError, VrmExportError, VrmExportOptions, VrmModel, VrmOption
 pub struct BuiltModel {
     /// 中間モデル。
     pub model: VrmModel,
-    /// 中間モデル生成の件数報告。
+    /// 中間モデル生成の件数と警告の報告。
     pub report: VrmReport,
 }
 
@@ -87,7 +87,7 @@ impl From<VrmExportError> for ConversionError {
     }
 }
 
-/// FBXバイト列から中間モデルと件数報告を作る。
+/// FBXバイト列から中間モデルと件数・警告の報告を作る。
 ///
 /// 読み取りは一度だけ行い、入力バイト列は保持しない。
 /// 材質の読み取りは呼び出し側の責務であり、ここでは扱わない。
@@ -120,7 +120,7 @@ pub fn export_model(
     model.to_vrm(options).map_err(ConversionError::Export)
 }
 
-/// FBXバイト列からVRMバイト列と件数報告を作る。
+/// FBXバイト列からVRMバイト列と件数・警告の報告を作る。
 ///
 /// [`build_model`] と [`export_model`] の合成であり、読み取りは一度だけ行う。
 /// 材質の読み取りは呼び出し側の責務であり、`export_options` に渡す。

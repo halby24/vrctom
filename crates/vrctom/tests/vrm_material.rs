@@ -2668,3 +2668,698 @@ fn 上限超過時は切り詰めず失敗する() {
         .expect_err("欠落は失敗する");
     assert_eq!(失敗.kind(), std::io::ErrorKind::NotFound);
 }
+
+/// 小さいPSDを組み立てる。規定値は幅x高さのRGB・Rawである。
+/// `平面` はR・G・B（Grayは1平面）の順に高さ行ずつのバイト列である。
+#[allow(clippy::too_many_arguments)]
+fn psdを組み立てる(
+    幅: u32,
+    高さ: u32,
+    チャンネル数: u16,
+    形式: u16,
+    深度: u16,
+    版: u16,
+    資源: &[(u16, &[u8])],
+    圧縮: u16,
+    平面: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"8BPS");
+    out.extend_from_slice(&版.to_be_bytes());
+    out.extend_from_slice(&[0; 6]);
+    out.extend_from_slice(&チャンネル数.to_be_bytes());
+    out.extend_from_slice(&高さ.to_be_bytes());
+    out.extend_from_slice(&幅.to_be_bytes());
+    out.extend_from_slice(&深度.to_be_bytes());
+    out.extend_from_slice(&形式.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    let mut resources = Vec::new();
+    for (id, data) in 資源 {
+        resources.extend_from_slice(b"8BIM");
+        resources.extend_from_slice(&id.to_be_bytes());
+        resources.extend_from_slice(&[0, 0]);
+        resources.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        resources.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            resources.push(0);
+        }
+    }
+    out.extend_from_slice(&(resources.len() as u32).to_be_bytes());
+    out.extend_from_slice(&resources);
+    out.extend_from_slice(&0u32.to_be_bytes());
+    out.extend_from_slice(&圧縮.to_be_bytes());
+    out.extend_from_slice(平面);
+    out
+}
+
+/// 2x2のRGB・RawのPSDを作る。画素は行優先でR・G・Bの順に平面を並べる。
+fn rgbのpsdを作る(画素: [[u8; 3]; 4]) -> Vec<u8> {
+    let mut 平面 = Vec::with_capacity(12);
+    for ch in 0..3 {
+        for pixel in &画素 {
+            平面.push(pixel[ch]);
+        }
+    }
+    psdを組み立てる(2, 2, 3, 3, 8, 1, &[], 0, &平面)
+}
+
+/// RLEの行（PackBitsの直写）を作る。
+fn 直写行(画素: &[u8]) -> Vec<u8> {
+    let mut out = vec![(画素.len() - 1) as u8];
+    out.extend_from_slice(画素);
+    out
+}
+
+/// 2x2のRGB・RLEのPSDを作る。
+fn rleのpsdを作る(画素: [[u8; 3]; 4]) -> Vec<u8> {
+    let mut 表 = Vec::new();
+    let mut 本体 = Vec::new();
+    for ch in [0, 1, 2] {
+        let 行0 = 直写行(&[画素[0][ch], 画素[1][ch]]);
+        let 行1 = 直写行(&[画素[2][ch], 画素[3][ch]]);
+        for 行 in [&行0, &行1] {
+            表.extend_from_slice(&(行.len() as u16).to_be_bytes());
+            本体.extend_from_slice(行);
+        }
+    }
+    psdを組み立てる(2, 2, 3, 3, 8, 1, &[], 1, &[表, 本体].concat())
+}
+
+/// 指定の `.meta` 本文でPSDテクスチャ資産を書く。
+fn psdテクスチャを書く(
+    root: &Path, 相対: &str, guid: &str, 内容: &[u8], 上限部: &str
+) {
+    資産を書く(root, 相対, 内容);
+    メタを書く(
+        root,
+        相対,
+        guid,
+        "TextureImporter",
+        &format!("  externalObjects: {{}}\n{上限部}"),
+    );
+}
+
+/// PSDの直載せに使う最小配置を作る。`.meta` 断片を指定できる。
+fn psd配置を作る(内容: &[u8], 上限部: &str) -> (tempfile::TempDir, PathBuf, String) {
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    let tex = guid(0x22);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    psdテクスチャを書く(&root, "Assets/Textures/Body.psd", &tex, 内容, 上限部);
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[("_MainTex", 参照::割当(&tex))],
+        &基本浮動小数(),
+        &基本色(),
+    );
+    (_guard, root, tex)
+}
+
+/// PSDの直載せではcompositeを復号してPNG化し、画素が一致する。
+#[test]
+fn psdの直載せは復号してpng化する() {
+    let 画素 = [[10, 20, 30], [40, 50, 60], [70, 80, 90], [100, 110, 120]];
+    let (_guard, root, _tex) = psd配置を作る(
+        &rgbのpsdを作る(画素),
+        "  textureSettings:\n    filterMode: 1\n    wrapU: 0\n    wrapV: 0\n  mipmaps:\n    enableMipMap: 1\n    sRGBTexture: 1\n",
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    assert!(
+        report.warnings().is_empty(),
+        "成功したPSD変換は警告にしない: {:?}",
+        report.warnings()
+    );
+    let 所有 = materials.expect("ある");
+    assert_eq!(所有.images().len(), 1);
+    let image = &所有.images()[0];
+    assert_eq!(image.mime, VrmImageMime::Png);
+    assert_eq!(image.name, "Body");
+    assert_eq!(
+        image.sampler,
+        VrmSampler {
+            wrap_u: VrmWrap::Repeat,
+            wrap_v: VrmWrap::Repeat,
+            filter: VrmFilter::Linear,
+            mipmaps: true,
+        }
+    );
+    let (幅, 高さ, 復号) = pngを復号する(&image.data);
+    assert_eq!((幅, 高さ), (2, 2));
+    // 復号コードと独立した固定値（組み立て時の画素＋不透明アルファ）と合う。
+    let mut 期待 = Vec::new();
+    for pixel in &画素 {
+        期待.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+    }
+    assert_eq!(復号, 期待);
+    let 材質 = 所有.get("Body").expect("ある");
+    assert_eq!(材質.base_color_image, Some(0));
+}
+
+/// RLEのPSDも同じ画素に復号する。
+#[test]
+fn rleのpsdも同じ画素に復号する() {
+    let 画素 = [[10, 20, 30], [40, 50, 60], [70, 80, 90], [100, 110, 120]];
+    let (_guard, root, _tex) = psd配置を作る(
+        &rleのpsdを作る(画素),
+        "  textureSettings:\n    filterMode: 1\n    wrapU: 0\n    wrapV: 0\n  mipmaps:\n    enableMipMap: 1\n    sRGBTexture: 1\n",
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    assert!(
+        report.warnings().is_empty(),
+        "成功したPSD変換は警告にしない: {:?}",
+        report.warnings()
+    );
+    let 所有 = materials.expect("ある");
+    let (幅, 高さ, 復号) = pngを復号する(&所有.images()[0].data);
+    assert_eq!((幅, 高さ), (2, 2));
+    let mut 期待 = Vec::new();
+    for pixel in &画素 {
+        期待.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+    }
+    assert_eq!(復号, 期待);
+}
+
+/// GrayscaleのPSDは複写して不透明にする。
+#[test]
+fn grayscaleのpsdは複写する() {
+    let (_guard, root, _tex) = psd配置を作る(
+        &psdを組み立てる(2, 1, 1, 1, 8, 1, &[], 0, &[0, 255]),
+        "  textureSettings:\n    filterMode: 1\n    wrapU: 0\n    wrapV: 0\n  mipmaps:\n    enableMipMap: 1\n    sRGBTexture: 1\n",
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    assert!(
+        report.warnings().is_empty(),
+        "成功したPSD変換は警告にしない: {:?}",
+        report.warnings()
+    );
+    let 所有 = materials.expect("ある");
+    let (幅, 高さ, 復号) = pngを復号する(&所有.images()[0].data);
+    assert_eq!((幅, 高さ), (2, 1));
+    assert_eq!(復号, vec![0, 0, 0, 255, 255, 255, 255, 255]);
+}
+
+/// 同じGUIDのPSDは1件だけ読んで索引を共有する。
+#[test]
+fn 同じpsdは索引を共有する() {
+    let (_guard, root) = 作業域を作る();
+    let mat_a = guid(0x11);
+    let mat_b = guid(0x12);
+    let tex = guid(0x22);
+    fbxメタを書く(
+        &root,
+        &guid(0x99),
+        &[("A", Some(&mat_a)), ("B", Some(&mat_b))],
+    );
+    let 画素 = [[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]];
+    psdテクスチャを書く(
+        &root,
+        "Assets/Textures/Body.psd",
+        &tex,
+        &rgbのpsdを作る(画素),
+        "  textureSettings:\n    filterMode: 1\n    wrapU: 0\n    wrapV: 0\n  mipmaps:\n    enableMipMap: 1\n    sRGBTexture: 1\n",
+    );
+    for (mat, 名) in [(&mat_a, "A"), (&mat_b, "B")] {
+        マテリアルを書く(
+            &root,
+            &format!("Assets/Materials/{名}.mat"),
+            mat,
+            名,
+            Some(SHADER_OPAQUE),
+            &[("_MainTex", 参照::割当(&tex))],
+            &基本浮動小数(),
+            &基本色(),
+        );
+    }
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    assert!(
+        report.warnings().is_empty(),
+        "成功したPSD変換は警告にしない: {:?}",
+        report.warnings()
+    );
+    let 所有 = materials.expect("ある");
+    assert_eq!(所有.images().len(), 1);
+    assert_eq!(所有.get("A").expect("ある").base_color_image, Some(0));
+    assert_eq!(所有.get("B").expect("ある").base_color_image, Some(0));
+}
+
+/// `.meta` の上限でPSD直載せが縮小され、NPOTとsRGB旗とサンプラが効く。
+#[test]
+fn psdの取り込み上限とnpotとサンプラが効く() {
+    // 4x4の各2x2塊をべた塗りにし、面積平均の手計算と合わせる。
+    // R・G・Bとも同じ面割りにする。
+    let 塊 = [
+        10, 10, 200, 200, 10, 10, 200, 200, 30, 30, 90, 90, 30, 30, 90, 90,
+    ];
+    let 平面 = [塊.as_slice(), 塊.as_slice(), 塊.as_slice()].concat();
+    let (_guard, root, _tex) = psd配置を作る(
+        &psdを組み立てる(4, 4, 3, 3, 8, 1, &[], 0, &平面),
+        "  maxTextureSize: 2\n  nPOTScale: 1\n  textureSettings:\n    filterMode: 0\n    wrapU: 1\n    wrapV: 2\n  mipmaps:\n    enableMipMap: 0\n    sRGBTexture: 1\n",
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    assert!(
+        report.warnings().is_empty(),
+        "成功したPSD変換は警告にしない: {:?}",
+        report.warnings()
+    );
+    let 所有 = materials.expect("ある");
+    let image = &所有.images()[0];
+    assert_eq!(image.mime, VrmImageMime::Png);
+    assert_eq!(
+        image.sampler,
+        VrmSampler {
+            wrap_u: VrmWrap::ClampToEdge,
+            wrap_v: VrmWrap::MirroredRepeat,
+            filter: VrmFilter::Nearest,
+            mipmaps: false,
+        }
+    );
+    let (幅, 高さ, 復号) = pngを復号する(&image.data);
+    assert_eq!((幅, 高さ), (2, 2));
+    // R・G・Bとも各塊の平均（左上10・右上200・左下30・右下90）である。
+    assert_eq!(
+        復号,
+        vec![
+            10, 10, 10, 255, //
+            200, 200, 200, 255, //
+            30, 30, 30, 255, //
+            90, 90, 90, 255, //
+        ]
+    );
+}
+
+/// NPOTの切り上げでPSDが拡大する。
+#[test]
+fn psdのnpot切り上げが効く() {
+    // 3x3のべた塗りは切り上げで4x4になり、画素値は変わらない。
+    let (_guard, root, _tex) = psd配置を作る(
+        &psdを組み立てる(3, 3, 3, 3, 8, 1, &[], 0, &[77; 27]),
+        "  nPOTScale: 2\n",
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    assert!(
+        report.warnings().is_empty(),
+        "成功したPSD変換は警告にしない: {:?}",
+        report.warnings()
+    );
+    let 所有 = materials.expect("ある");
+    let (幅, 高さ, 復号) = pngを復号する(&所有.images()[0].data);
+    assert_eq!((幅, 高さ), (4, 4));
+    assert!(復号.chunks_exact(4).all(|pixel| pixel == [77, 77, 77, 255]));
+}
+
+/// 法線用途の縮小ではsRGB旗で平均空間が変わる。
+#[test]
+fn psdの法線縮小はsrgb旗で平均空間が変わる() {
+    for (旗, 期待) in [(true, 92u8), (false, 64u8)] {
+        let (_guard, root) = 作業域を作る();
+        let mat = guid(0x11);
+        let tex = guid(0x22);
+        fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+        psdテクスチャを書く(
+            &root,
+            "Assets/Textures/Bump.psd",
+            &tex,
+            &psdを組み立てる(2, 1, 1, 1, 8, 1, &[], 0, &[0, 128]),
+            &format!(
+                "  maxTextureSize: 1\n  textureSettings:\n    filterMode: 1\n    wrapU: 0\n    wrapV: 0\n  mipmaps:\n    enableMipMap: 1\n    sRGBTexture: {}\n",
+                if 旗 { 1 } else { 0 }
+            ),
+        );
+        let mut 浮動 = 基本浮動小数();
+        浮動.push(("_UseBumpMap", 1.0));
+        マテリアルを書く(
+            &root,
+            "Assets/Materials/Body.mat",
+            &mat,
+            "Body",
+            Some(SHADER_OPAQUE),
+            &[("_BumpMap", 参照::割当(&tex))],
+            &浮動,
+            &基本色(),
+        );
+        let (materials, report) = VrmMaterials::load(
+            &root,
+            &root.join("Assets/Model.fbx"),
+            &MaterialOptions::new(),
+        )
+        .expect("読める");
+        assert!(
+            report.warnings().is_empty(),
+            "成功したPSD変換は警告にしない: {:?}",
+            report.warnings()
+        );
+        let 所有 = materials.expect("ある");
+        let 材質 = 所有.get("Body").expect("ある");
+        let 索引 = 材質.normal_image.expect("法線は載る");
+        let (幅, 高さ, 復号) = pngを復号する(&所有.images()[索引].data);
+        assert_eq!((幅, 高さ), (1, 1));
+        // sRGB標識は復号して平均して符号化し直す（92）、
+        // リニア標識は符号化済みのまま平均する（64）。
+        assert_eq!(復号, vec![期待, 期待, 期待, 255], "sRGB旗{旗}の結果が合う");
+    }
+}
+
+/// 対象外のPSDは警告して省き、変換は続ける。
+#[test]
+fn 対象外のpsdは警告して省く() {
+    // ZIP圧縮。
+    let (_guard, root, _tex) = psd配置を作る(
+        &psdを組み立てる(2, 2, 3, 3, 8, 1, &[], 2, &[0; 8]),
+        "  textureSettings:\n    filterMode: 1\n    wrapU: 0\n    wrapV: 0\n  mipmaps:\n    enableMipMap: 1\n    sRGBTexture: 1\n",
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("対象外でも変換は続ける");
+    let 警告 = report.warnings().join("\n");
+    assert!(
+        警告.contains("PSDの圧縮方式が未対応のため省く"),
+        "ZIPの警告がある: {警告}"
+    );
+    assert!(警告.contains("Body.psd"), "資産の所在がある: {警告}");
+    let 所有 = materials.expect("ある");
+    assert_eq!(所有.images().len(), 0);
+    assert_eq!(所有.get("Body").expect("ある").base_color_image, None);
+}
+
+/// 版情報が偽のPSDは有効な合成画像なしとして省く。
+#[test]
+fn 結合なしのpsdは警告して省く() {
+    let mut 版情報 = vec![0, 0, 0, 1, 0];
+    版情報.extend_from_slice(b"reader");
+    let (_guard, root, _tex) = psd配置を作る(
+        &psdを組み立てる(2, 2, 3, 3, 8, 1, &[(1057, &版情報)], 0, &[0xFF; 12]),
+        "  textureSettings:\n    filterMode: 1\n    wrapU: 0\n    wrapV: 0\n  mipmaps:\n    enableMipMap: 1\n    sRGBTexture: 1\n",
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("対象外でも変換は続ける");
+    let 警告 = report.warnings().join("\n");
+    assert!(
+        警告.contains("PSDに有効な合成画像がないため省く"),
+        "合成画像なしの警告がある: {警告}"
+    );
+    assert!(
+        警告.contains("Maximize Compatibility"),
+        "再保存の案内がある: {警告}"
+    );
+    let 所有 = materials.expect("ある");
+    assert_eq!(所有.images().len(), 0);
+}
+
+/// 追加チャンネルのPSDはRGBAとして扱わず省く。
+#[test]
+fn 追加チャンネルのpsdは省く() {
+    let (_guard, root, _tex) = psd配置を作る(
+        &psdを組み立てる(2, 2, 4, 3, 8, 1, &[], 0, &[7; 16]),
+        "  textureSettings:\n    filterMode: 1\n    wrapU: 0\n    wrapV: 0\n  mipmaps:\n    enableMipMap: 1\n    sRGBTexture: 1\n",
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("対象外でも変換は続ける");
+    let 警告 = report.warnings().join("\n");
+    assert!(
+        警告.contains("PSDのチャンネル数が未対応のため省く"),
+        "追加チャンネルの警告がある: {警告}"
+    );
+    let 所有 = materials.expect("ある");
+    assert_eq!(所有.images().len(), 0);
+}
+
+/// 16bitのPSDは警告して省く。
+#[test]
+fn 高深度のpsdは省く() {
+    let (_guard, root, _tex) = psd配置を作る(
+        &psdを組み立てる(2, 2, 3, 3, 16, 1, &[], 0, &[0; 24]),
+        "  textureSettings:\n    filterMode: 1\n    wrapU: 0\n    wrapV: 0\n  mipmaps:\n    enableMipMap: 1\n    sRGBTexture: 1\n",
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("対象外でも変換は続ける");
+    let 警告 = report.warnings().join("\n");
+    assert!(
+        警告.contains("PSDの色深度が未対応のため省く"),
+        "深度の警告がある: {警告}"
+    );
+    let 所有 = materials.expect("ある");
+    assert_eq!(所有.images().len(), 0);
+}
+
+/// PSDの画素上限は一致で通り1超過で失敗する。
+#[test]
+fn psdの画素上限は一致で通り超過で失敗する() {
+    let 内容 = rgbのpsdを作る([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]]);
+    let (_guard, root, _tex) = psd配置を作る(
+        &内容,
+        "  textureSettings:\n    filterMode: 1\n    wrapU: 0\n    wrapV: 0\n  mipmaps:\n    enableMipMap: 1\n    sRGBTexture: 1\n",
+    );
+    VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new().with_max_image_pixels(4),
+    )
+    .expect("上限一致は通る");
+    let 失敗 = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new().with_max_image_pixels(3),
+    )
+    .expect_err("1超過は失敗する");
+    assert_eq!(
+        失敗.kind(),
+        vrctom::vrm::MaterialErrorKind::LimitExceeded,
+        "{失敗}"
+    );
+}
+
+/// PSDの入力バイト上限と出力合計上限は失敗する。
+#[test]
+fn psdのバイト上限超過は失敗する() {
+    let 内容 = rgbのpsdを作る([[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]]);
+    let 長さ = 内容.len() as u64;
+    let (_guard, root, _tex) = psd配置を作る(
+        &内容,
+        "  textureSettings:\n    filterMode: 1\n    wrapU: 0\n    wrapV: 0\n  mipmaps:\n    enableMipMap: 1\n    sRGBTexture: 1\n",
+    );
+    // 入力上限の一致は通り、1不足は失敗する。
+    VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new().with_max_image_bytes(長さ),
+    )
+    .expect("入力上限一致は通る");
+    let 失敗 = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new().with_max_image_bytes(長さ - 1),
+    )
+    .expect_err("入力1不足は失敗する");
+    assert_eq!(
+        失敗.kind(),
+        vrctom::vrm::MaterialErrorKind::LimitExceeded,
+        "{失敗}"
+    );
+    // 出力合計が残り予算に収まらない場合はPNG符号化で失敗する。
+    let 失敗 = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new().with_max_total_image_bytes(10),
+    )
+    .expect_err("出力超過は失敗する");
+    assert_eq!(
+        失敗.kind(),
+        vrctom::vrm::MaterialErrorKind::LimitExceeded,
+        "{失敗}"
+    );
+}
+
+/// PSDを主入力にする焼き（アルファマスク）が実行できる。
+#[test]
+fn psdの焼き込みはマスクを反映する() {
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    let 主 = guid(0x22);
+    let 覆 = guid(0x33);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    let 主画素 = [
+        [200, 100, 50],
+        [200, 100, 50],
+        [200, 100, 50],
+        [200, 100, 50],
+    ];
+    psdテクスチャを書く(
+        &root,
+        "Assets/Textures/Main.psd",
+        &主,
+        &rgbのpsdを作る(主画素),
+        "  textureSettings:\n    filterMode: 1\n    wrapU: 0\n    wrapV: 0\n  mipmaps:\n    enableMipMap: 1\n    sRGBTexture: 1\n",
+    );
+    // マスクはRだけを使い、アルファ置換（方式1）で載せる。
+    let 覆平面 = vec![0, 64, 128, 255];
+    psdテクスチャを書く(
+        &root,
+        "Assets/Textures/Mask.psd",
+        &覆,
+        &psdを組み立てる(2, 2, 1, 1, 8, 1, &[], 0, &覆平面),
+        "  textureSettings:\n    filterMode: 1\n    wrapU: 0\n    wrapV: 0\n  mipmaps:\n    enableMipMap: 1\n    sRGBTexture: 0\n",
+    );
+    let mut 浮動 = 基本浮動小数();
+    浮動.push(("_AlphaMaskMode", 1.0));
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[
+            ("_MainTex", 参照::割当(&主)),
+            ("_AlphaMask", 参照::割当(&覆)),
+        ],
+        &浮動,
+        &基本色(),
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("PSDの焼きは実行できる");
+    assert!(
+        report.warnings().is_empty(),
+        "成功したPSD変換は警告にしない: {:?}",
+        report.warnings()
+    );
+    let 所有 = materials.expect("ある");
+    let 材質 = 所有.get("Body").expect("ある");
+    let 索引 = 材質.base_color_image.expect("焼いた基準色は載る");
+    assert_eq!(所有.images()[索引].name, "bake:Body:BaseColor");
+    let (幅, 高さ, 復号) = pngを復号する(&所有.images()[索引].data);
+    assert_eq!((幅, 高さ), (2, 2));
+    // RGBは主入力、マスク方式1の置換でアルファはマスクのRである。
+    // 主入力はsRGB標識のため復号で線形化されるが、焼き出力はsRGBへ戻す。
+    // 200・100・50はsRGBの往復で量子化以内に収まる。
+    let 期待 = [
+        [200, 100, 50, 0],
+        [200, 100, 50, 64],
+        [200, 100, 50, 128],
+        [200, 100, 50, 255],
+    ];
+    let 実際: Vec<[u8; 4]> = 復号
+        .chunks_exact(4)
+        .map(|p| [p[0], p[1], p[2], p[3]])
+        .collect();
+    for (得, 想) in 実際.iter().zip(期待.iter()) {
+        assert_eq!(得[3], 想[3], "アルファはマスク通り: {実際:?}");
+        for ch in 0..3 {
+            assert!(
+                (i16::from(得[ch]) - i16::from(想[ch])).abs() <= 1,
+                "色は量子化以内: {実際:?}"
+            );
+        }
+    }
+}
+
+/// 小さい保持予算で退避が起きてもPSDの焼き出力は同じになる。
+#[test]
+fn 小さい保持予算でもpsdの焼き出力は同じになる() {
+    // 焼きを2回（基準色と陰影の主入力）起こし、予算1画素で毎回退避させる。
+    let 配置 = |予算: u64| {
+        let (_guard, root) = 作業域を作る();
+        let mat = guid(0x11);
+        let 主 = guid(0x22);
+        let 覆 = guid(0x33);
+        fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+        let 主画素 = [[200, 100, 50], [10, 20, 30], [40, 50, 60], [70, 80, 90]];
+        psdテクスチャを書く(
+            &root,
+            "Assets/Textures/Main.psd",
+            &主,
+            &rgbのpsdを作る(主画素),
+            "  textureSettings:\n    filterMode: 1\n    wrapU: 0\n    wrapV: 0\n  mipmaps:\n    enableMipMap: 1\n    sRGBTexture: 1\n",
+        );
+        let 覆平面 = vec![0, 64, 128, 255];
+        psdテクスチャを書く(
+            &root,
+            "Assets/Textures/Mask.psd",
+            &覆,
+            &psdを組み立てる(2, 2, 1, 1, 8, 1, &[], 0, &覆平面),
+            "  textureSettings:\n    filterMode: 1\n    wrapU: 0\n    wrapV: 0\n  mipmaps:\n    enableMipMap: 1\n    sRGBTexture: 0\n",
+        );
+        let mut 浮動 = 基本浮動小数();
+        浮動.push(("_AlphaMaskMode", 1.0));
+        マテリアルを書く(
+            &root,
+            "Assets/Materials/Body.mat",
+            &mat,
+            "Body",
+            Some(SHADER_OPAQUE),
+            &[
+                ("_MainTex", 参照::割当(&主)),
+                ("_AlphaMask", 参照::割当(&覆)),
+            ],
+            &浮動,
+            &基本色(),
+        );
+        let (materials, _) = VrmMaterials::load(
+            &root,
+            &root.join("Assets/Model.fbx"),
+            &MaterialOptions::new().with_max_total_image_pixels(予算),
+        )
+        .expect("予算が小さくても失敗しない");
+        let 所有 = materials.expect("ある");
+        let 一覧: Vec<Vec<u8>> = 所有
+            .images()
+            .iter()
+            .map(|image| image.data.clone())
+            .collect();
+        (_guard, 一覧)
+    };
+    let (_保, 通常) = 配置(u64::MAX);
+    let (_退, 退避) = 配置(1);
+    assert_eq!(通常, 退避, "退避しても出力は同じになる");
+}

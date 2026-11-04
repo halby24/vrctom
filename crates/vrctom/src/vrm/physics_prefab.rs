@@ -6523,6 +6523,7 @@ fn build_humanoid_json(
     model_id_main: &str,
     label: &str,
 ) -> Result<serde_json::Value, VrmError> {
+    use super::humanoid::UNITY_HUMANOID_BONE_TABLE;
     // humanDescriptionのhumanとskeletonを読む。
     let settings = meta.importer().settings.as_mapping().ok_or_else(|| {
         VrmError::new(
@@ -6549,7 +6550,9 @@ fn build_humanoid_json(
                 if !bone.is_empty() && !human_name.is_empty() {
                     // Unityの `HumanBodyBones` 名は空白を含まない（`LeftThumbProximal`）が、
                     // `.meta` の `humanName` は空白を含む（`Left Thumb Proximal`）。
-                    // 空白除去で正規化して突き合わせる。重複は最初の項目を残す。
+                    // 物理側の既存出力と合わせ、ASCII半角空白だけを除去して突き合わせる。
+                    // メタ解決側（`humanoid.rs`）のASCII空白全般の除去は変えない。
+                    // 重複は最初の項目を残す。
                     let normalized: String = human_name.chars().filter(|c| *c != ' ').collect();
                     human_map.entry(normalized).or_insert(bone.to_owned());
                 }
@@ -6587,63 +6590,8 @@ fn build_humanoid_json(
     }
     let is_human = !human_map.is_empty();
     // UnityのHumanBodyBones順に並べる。LastBoneは除く。
-    const ORDER: &[&str] = &[
-        "Hips",
-        "LeftUpperLeg",
-        "RightUpperLeg",
-        "LeftLowerLeg",
-        "RightLowerLeg",
-        "LeftFoot",
-        "RightFoot",
-        "Spine",
-        "Chest",
-        "UpperChest",
-        "Neck",
-        "Head",
-        "LeftShoulder",
-        "RightShoulder",
-        "LeftUpperArm",
-        "RightUpperArm",
-        "LeftLowerArm",
-        "RightLowerArm",
-        "LeftHand",
-        "RightHand",
-        "LeftToes",
-        "RightToes",
-        "LeftEye",
-        "RightEye",
-        "Jaw",
-        "LeftThumbProximal",
-        "LeftThumbIntermediate",
-        "LeftThumbDistal",
-        "LeftIndexProximal",
-        "LeftIndexIntermediate",
-        "LeftIndexDistal",
-        "LeftMiddleProximal",
-        "LeftMiddleIntermediate",
-        "LeftMiddleDistal",
-        "LeftRingProximal",
-        "LeftRingIntermediate",
-        "LeftRingDistal",
-        "LeftLittleProximal",
-        "LeftLittleIntermediate",
-        "LeftLittleDistal",
-        "RightThumbProximal",
-        "RightThumbIntermediate",
-        "RightThumbDistal",
-        "RightIndexProximal",
-        "RightIndexIntermediate",
-        "RightIndexDistal",
-        "RightMiddleProximal",
-        "RightMiddleIntermediate",
-        "RightMiddleDistal",
-        "RightRingProximal",
-        "RightRingIntermediate",
-        "RightRingDistal",
-        "RightLittleProximal",
-        "RightLittleIntermediate",
-        "RightLittleDistal",
-    ];
+    // 順序・内容は [`UNITY_HUMANOID_BONE_TABLE`] に従い、既存出力を変えない。
+    // `VrmModel` 用の解決関数は適用せず、主FBX由来ノードに限定する既存条件を維持する。
     // Transform名からtree索引を引く。主FBX由来ノードだけが対象であり、
     // 副階層（同名があり得る）はAnimatorの骨解決に現れないため除く。
     let mut name_to_nodes: HashMap<&str, Vec<usize>> = HashMap::new();
@@ -6658,7 +6606,7 @@ fn build_humanoid_json(
         }
     }
     let mut bones_json = Vec::new();
-    for bone in ORDER {
+    for (bone, _) in UNITY_HUMANOID_BONE_TABLE {
         let Some(transform_name) = human_map.get(*bone) else {
             continue;
         };
@@ -7196,5 +7144,100 @@ mod tests {
             obj_ref: None,
         }];
         assert!(overlay_constraint_sources(&extra, &bad, "test").is_err());
+    }
+
+    /// 主FBX由来のノード1件を作る。副階層の場合は `model_id` を変える。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn 試験ノード(名前: &str, model_id: &str) -> TreeNode {
+        TreeNode {
+            name: 名前.to_owned(),
+            parent: None,
+            children: Vec::new(),
+            scene_path: vec!["Avatar".to_owned(), 名前.to_owned()],
+            source: Some(TreeSource {
+                model_id: model_id.to_owned(),
+                path: vec![名前.to_owned()],
+                asset_guid: "30293896140a4d24a914010a2a8349fc".to_owned(),
+                local_id: crate::unity::game_object_file_id(名前),
+            }),
+            added_trs: None,
+            fbx_index: None,
+            phone_model: None,
+            active_self: true,
+            local_go: None,
+            local_tr: None,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn humanoidの順序と内容が共通表で変わらない() {
+        // Wol風の対応（空白入りhuman名・Jaw・skeleton付き・欠落混じり）で組み立てる。
+        // 共通表への切り替えで既存の出力（順序・内容）を変えない。
+        let meta_bytes = b"fileFormatVersion: 2\nguid: 30293896140a4d24a914010a2a8349fc\nModelImporter:\n  fileIdsGeneration: 2\n  humanDescription:\n    serializedVersion: 3\n    human:\n    - boneName: Hips\n      humanName: Hips\n    - boneName: Wrist.L\n      humanName: LeftHand\n    - boneName: JawBone\n      humanName: Jaw\n    - boneName: Thumb.L\n      humanName: Left Thumb Proximal\n    - boneName: Foot.L\n      humanName: LeftFoot\n    skeleton:\n    - name: Hips\n      position: {x: 0, y: 1, z: 0}\n      rotation: {x: 0, y: 0, z: 0, w: 1}\n      scale: {x: 1, y: 1, z: 1}\n  animationType: 3\n";
+        let meta = AssetMeta::parse(meta_bytes).expect("Wol風metaは読める");
+        let tree = vec![
+            試験ノード("Hips", "wol"),
+            試験ノード("Wrist.L", "wol"),
+            試験ノード("JawBone", "wol"),
+            試験ノード("Thumb.L", "wol"),
+            // 副階層の同名ノードは主FBX由来に限定する既存条件で対象外である。
+            試験ノード("Wrist.L", "phone"),
+        ];
+        let json = build_humanoid_json(&meta, &tree, "wol", "test").expect("組み立てられる");
+        assert_eq!(json["isHuman"], serde_json::json!(true));
+        let bones = json["bones"].as_array().expect("bonesは配列である");
+        // 順序は共通表どおりであり、対応の無い骨は出ない。
+        let 名前: Vec<&str> = bones
+            .iter()
+            .map(|bone| {
+                bone.get("bone")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("boneがある")
+            })
+            .collect();
+        assert_eq!(
+            名前,
+            vec!["Hips", "LeftHand", "Jaw", "LeftThumbProximal"],
+            "順序は共通表どおりである"
+        );
+        // 欠落（Foot.L）は黙って省き、副階層の同名は主FBXの1件に定まる。
+        let 取り出し = |番号: usize| &bones[番号];
+        assert_eq!(取り出し(0)["nodeId"], serde_json::json!("n:0"));
+        assert_eq!(取り出し(1)["nodeId"], serde_json::json!("n:1"));
+        assert_eq!(取り出し(2)["nodeId"], serde_json::json!("n:2"));
+        assert_eq!(取り出し(3)["nodeId"], serde_json::json!("n:3"));
+        // T-poseはskeletonの値をそのまま記録し、無い場合はnullである。
+        assert_eq!(
+            取り出し(0)["tPose"],
+            serde_json::json!({
+                "position": [0.0, 1.0, 0.0],
+                "rotation": [0.0, 0.0, 0.0, 1.0],
+                "scale": [1.0, 1.0, 1.0],
+            })
+        );
+        assert_eq!(取り出し(1)["tPose"], serde_json::Value::Null);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn タブ含みhuman名は旧挙動どおり骨を出さない() {
+        // 物理側の正規化はASCII半角空白だけを除去する旧挙動である。
+        // `Left\tHand` は `LeftHand` に寄せないため、骨が出ない。
+        // メタ解決側（`humanoid.rs`）のASCII空白全般の除去は変えない。
+        let meta_bytes = b"fileFormatVersion: 2\nguid: 30293896140a4d24a914010a2a8349fc\nModelImporter:\n  fileIdsGeneration: 2\n  humanDescription:\n    serializedVersion: 3\n    human:\n    - boneName: Wrist.L\n      humanName: \"Left\tHand\"\n    - boneName: Hips\n      humanName: Hips\n  animationType: 3\n";
+        let meta = AssetMeta::parse(meta_bytes).expect("タブ混じりmetaは読める");
+        let tree = vec![試験ノード("Hips", "wol"), 試験ノード("Wrist.L", "wol")];
+        let json = build_humanoid_json(&meta, &tree, "wol", "test").expect("組み立てられる");
+        let bones = json["bones"].as_array().expect("bonesは配列である");
+        let 名前: Vec<&str> = bones
+            .iter()
+            .map(|bone| {
+                bone.get("bone")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("boneがある")
+            })
+            .collect();
+        assert_eq!(名前, vec!["Hips"], "タブ含みは旧挙動で省く");
     }
 }

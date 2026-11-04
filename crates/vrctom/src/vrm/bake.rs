@@ -83,6 +83,48 @@ impl BakeImage {
     pub fn pixels(&self) -> &[u8] {
         &self.rgba
     }
+
+    /// 行優先のRGBA8から焼き入力画像を作る。
+    ///
+    /// PSDの保存済みcompositeなど、既に復号済みの画素を焼きや縮小の
+    /// 共通処理へ載せる入口である。中間PNGを作らず直接載せる。
+    /// 寸法と画素長の対応だけを確かめ、画素上限の判定は呼び出し側で行う。
+    ///
+    /// # Errors
+    ///
+    /// 寸法が0・画素長が寸法と合わない場合に [`MaterialErrorKind::InvalidMaterial`] で返す。
+    pub(crate) fn from_rgba8(
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+        srgb: bool,
+        sampler: VrmSampler,
+    ) -> Result<Self, MaterialError> {
+        let fail = |reason: &str| {
+            MaterialError::new(
+                MaterialErrorKind::InvalidMaterial,
+                format!("RGBA8から焼き画像を作れない: {reason}"),
+            )
+        };
+        if width == 0 || height == 0 {
+            return Err(fail("寸法が0である"));
+        }
+        let expect = (u64::from(width))
+            .checked_mul(u64::from(height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .and_then(|len| usize::try_from(len).ok())
+            .ok_or_else(|| fail("寸法が大きすぎる"))?;
+        if rgba.len() != expect {
+            return Err(fail("画素数が寸法と合わない"));
+        }
+        Ok(Self {
+            width,
+            height,
+            rgba,
+            srgb,
+            sampler,
+        })
+    }
 }
 
 /// sRGB復号の参照表。`LUT[v] = linear(v / 255)` である。
@@ -1216,12 +1258,163 @@ pub fn downscale_bake_image(image: &BakeImage, width: u32, height: u32, linear: 
     }
 }
 
+/// 焼き入力を取り込み後の寸法へ縮小する（所有権版）。
+///
+/// 同じ寸法の場合は複製せず所有権を移して返し、違う寸法の場合だけ
+/// [`downscale_bake_image`] と同じ縮小を行う。直載せ・焼きの両方で
+/// 等倍時の全体複製を避けるための入口である。公開の借用版は保つ。
+pub(crate) fn downscale_bake_image_owned(
+    image: BakeImage,
+    width: u32,
+    height: u32,
+    linear: bool,
+) -> BakeImage {
+    if (width, height) == (image.width, image.height) {
+        return image;
+    }
+    downscale_bake_image(&image, width, height, linear)
+}
+
 /// RGBA8をPNGへ符号化する。
 ///
 /// 取り込み縮小後の直載せ用であり、圧縮は既定の決定論的設定である。
 /// 時刻などの非決定要素は含めない。
 pub fn encode_rgba_png(raw: &[u8], size: BakeSize) -> Vec<u8> {
     encode_png(raw, size, png::ColorType::Rgba)
+}
+
+/// RGBA8を残り合計予算の範囲でPNGへ符号化する。
+///
+/// PSD由来の直載せ用であり、出力が残り予算を超える場合は確保を続けず
+/// [`MaterialErrorKind::LimitExceeded`] で返す。種別は上限超過に統一するが、
+/// 文面は原因を誤認させない形にする。`CappedVec` の予算超過は上限超過と
+/// 分かる文面にし、符号化器自体の失敗は失敗として伝播する
+/// （`expect` に流さない）。時刻などの非決定要素は含めない.
+///
+/// 行単位で流して符号化するため、全画像分の内部複製を作らない。
+/// 追加の確保は行バッファ3行分と出力塊（[`PNG_STREAM_CHUNK`]）だけであり、
+/// 既定圧縮経路の圧縮器状態と flate2 の固定バッファ（約32KiB）も含めて
+/// 有界に収まる。残り予算の超過は行の途中で打ち切る。圧縮設定は既定の
+/// 決定論的な設定のまま保ち、`write_image_data` の一括符号化とは使わない。
+///
+/// # Errors
+///
+/// 画素長が寸法と合わない場合は [`MaterialErrorKind::InvalidMaterial`]、
+/// 出力が `remaining` を超える場合は [`MaterialErrorKind::LimitExceeded`] を返す。
+/// 符号化に失敗する場合も [`MaterialErrorKind::LimitExceeded`] として返す。
+pub(crate) fn encode_rgba_png_limited(
+    raw: &[u8],
+    size: BakeSize,
+    remaining: u64,
+    target: &str,
+) -> Result<Vec<u8>, MaterialError> {
+    // 呼び出し側は正確な画素列を渡す。不足・過剰は内部矛盾として受け付けない。
+    let stride = (u64::from(size.width))
+        .checked_mul(4)
+        .and_then(|row| usize::try_from(row).ok())
+        .ok_or_else(|| {
+            MaterialError::new(
+                MaterialErrorKind::InvalidMaterial,
+                format!("{target}のPNG符号化に渡す寸法が大きすぎる"),
+            )
+        })?;
+    let expect = (stride as u64)
+        .checked_mul(u64::from(size.height))
+        .and_then(|len| usize::try_from(len).ok())
+        .ok_or_else(|| {
+            MaterialError::new(
+                MaterialErrorKind::InvalidMaterial,
+                format!("{target}のPNG符号化に渡す寸法が大きすぎる"),
+            )
+        })?;
+    if raw.len() != expect {
+        return Err(MaterialError::new(
+            MaterialErrorKind::InvalidMaterial,
+            format!("{target}のPNG符号化に渡す画素数が寸法と合わない"),
+        ));
+    }
+    // 種別は上限超過に統一する。文面は `CappedVec` の予算超過か
+    // 符号化器自体の失敗かが分かる形にし、原因を誤認させない。
+    let limit = |error: png::EncodingError| {
+        MaterialError::new(
+            MaterialErrorKind::LimitExceeded,
+            format!("{target}のPNG符号化に失敗した（上限超過として扱う）: {error}"),
+        )
+    };
+    let io_limit = |error: std::io::Error| {
+        // `CappedVec` の書き込み失敗は予算超過だけであり、
+        // その他の入出力失敗は起きない。
+        MaterialError::new(
+            MaterialErrorKind::LimitExceeded,
+            format!("{target}のPNG符号化が上限を超えた: {error}"),
+        )
+    };
+    let mut capped = CappedVec::new(remaining);
+    let mut encoder = png::Encoder::new(&mut capped, size.width, size.height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(limit)?;
+    {
+        let mut stream = writer
+            .stream_writer_with_size(PNG_STREAM_CHUNK)
+            .map_err(limit)?;
+        for row in raw.chunks_exact(stride) {
+            std::io::Write::write_all(&mut stream, row).map_err(io_limit)?;
+        }
+        // データ不足や圧縮失敗をここで伝播する。Dropに任せると握り潰す。
+        stream.finish().map_err(limit)?;
+    }
+    // IENDを明示的に書き、終端の失敗も握り潰さない。
+    writer.finish().map_err(limit)?;
+    Ok(capped.into_inner())
+}
+
+/// 行単位の符号化に使う出力塊の大きさ。
+///
+/// `StreamWriter` の内部塊であり、行バッファ（3行分）とは別に有界に保つ。
+/// 全画像分の内部複製を作らないための上限であり、出力の内容には影響しない。
+const PNG_STREAM_CHUNK: usize = 4096;
+
+/// 残り予算で打ち切る書き込み先。超過分は書かず失敗させる。
+struct CappedVec {
+    /// 書き込んだバイト列。
+    inner: Vec<u8>,
+    /// あと書けるバイト数。
+    remaining: u64,
+}
+
+impl CappedVec {
+    /// 書き込み先を作る。
+    fn new(remaining: u64) -> Self {
+        Self {
+            inner: Vec::new(),
+            remaining,
+        }
+    }
+
+    /// 書き込んだバイト列を取り出す。
+    fn into_inner(self) -> Vec<u8> {
+        self.inner
+    }
+}
+
+impl std::io::Write for CappedVec {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let len = buf.len() as u64;
+        if len > self.remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::QuotaExceeded,
+                "PNG符号化の出力が残り合計予算を超えた",
+            ));
+        }
+        self.remaining -= len;
+        self.inner.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// 基準色合成の入力（`BaseColorComposite` パスと対応）。
@@ -2204,5 +2397,124 @@ mod tests {
         assert_eq!((small.width(), small.height()), (2, 2));
         assert!(!small.srgb);
         assert_eq!(small.pixels().len(), 2 * 2 * 4);
+    }
+
+    /// 制限付きPNG符号化の正常出力長を求める。2x2のべた塗りである。
+    fn 制限付き出力長() -> (Vec<u8>, BakeSize, usize) {
+        let raw = vec![
+            10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255,
+        ];
+        let size = BakeSize {
+            width: 2,
+            height: 2,
+        };
+        let 正常 =
+            encode_rgba_png_limited(&raw, size, u64::MAX, "検査").expect("十分な予算では書ける");
+        let 長さ = 正常.len();
+        (raw, size, 長さ)
+    }
+
+    /// 終端書き込みの失敗を握り潰さない。
+    ///
+    /// 正常出力長Nでは成功し、N−1〜N−12ではすべて上限超過で失敗する。
+    /// 予算不足でIEND不完全なPNGが成功扱いにならないことを確かめる。
+    #[test]
+    fn 終端不足の予算ではすべて失敗し正常出力はiendまで完全である() {
+        let (raw, size, 長さ) = 制限付き出力長();
+        assert!(長さ > 12, "IEND検査に足る長さがある: {長さ}");
+        let 正常 =
+            encode_rgba_png_limited(&raw, size, 長さ as u64, "検査").expect("上限一致は通る");
+        assert_eq!(正常.len(), 長さ);
+        // 終端12バイトは空のIENDチャンク（長さ0・型IEND・CRC）である。
+        assert_eq!(
+            &正常[長さ - 12..],
+            &[0, 0, 0, 0, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82],
+            "IENDまで完全である"
+        );
+        // 復号して画素が一致し、壊れた成功扱いがないことを確かめる。
+        let 復号 = load_bake_image(
+            &正常,
+            VrmImageMime::Png,
+            true,
+            VrmSampler::default(),
+            u64::MAX,
+        )
+        .expect("自作のPNGは復号できる");
+        assert_eq!(復号.pixels(), raw.as_slice());
+        for 不足 in 1..=12u64 {
+            let 失敗 = encode_rgba_png_limited(&raw, size, 長さ as u64 - 不足, "検査")
+                .expect_err(&format!("{不足}不足では失敗する"));
+            assert_eq!(失敗.kind(), MaterialErrorKind::LimitExceeded, "{失敗}");
+        }
+    }
+
+    /// 低予算かつ非圧縮性の巨大画像でも有界のまま即失敗する。
+    ///
+    /// 行単位で流して符号化するため、全画像分の内部複製を作らない。
+    /// 4096²の乱数列（67MiB・ほぼ非圧縮性）に対し、残り予算1024では
+    /// 先頭行の途中で打ち切り、上限超過で失敗する。
+    #[test]
+    fn 巨大な非圧縮性画像は低予算で即失敗する() {
+        let 幅 = 4096usize;
+        let 高 = 4096usize;
+        // 決定論的なxorshiftで非圧縮性の画素列を作る。
+        let mut 状態 = 0x1234_5678_9ABC_DEF1u64;
+        let mut raw = vec![0u8; 幅 * 高 * 4];
+        for slot in raw.chunks_exact_mut(8) {
+            状態 ^= 状態 << 13;
+            状態 ^= 状態 >> 7;
+            状態 ^= 状態 << 17;
+            slot.copy_from_slice(&状態.to_le_bytes());
+        }
+        let size = BakeSize {
+            width: 幅 as u32,
+            height: 高 as u32,
+        };
+        let 失敗 =
+            encode_rgba_png_limited(&raw, size, 1024, "検査").expect_err("低予算では失敗する");
+        assert_eq!(失敗.kind(), MaterialErrorKind::LimitExceeded, "{失敗}");
+    }
+
+    /// 所有権版の縮小は等倍で複製せず画素を保つ。
+    ///
+    /// 等倍分岐は所有権を移して返すだけであり、符号化前の全体複製は
+    /// 起きない（コード上の担保）。縮小時は借用版と同じ結果になる。
+    #[test]
+    fn 所有権版の縮小は等倍で画素を保つ() {
+        let image = BakeImage {
+            width: 2,
+            height: 2,
+            rgba: vec![1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255],
+            srgb: true,
+            sampler: VrmSampler::default(),
+        };
+        let 等倍 = downscale_bake_image_owned(image, 2, 2, false);
+        assert_eq!((等倍.width(), 等倍.height()), (2, 2));
+        assert_eq!(
+            等倍.pixels(),
+            &[1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255]
+        );
+        assert!(等倍.srgb);
+        let image = BakeImage {
+            width: 2,
+            height: 2,
+            rgba: vec![
+                0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+            ],
+            srgb: false,
+            sampler: VrmSampler::default(),
+        };
+        let 縮小 = downscale_bake_image_owned(image, 1, 1, false);
+        let 借用 = BakeImage {
+            width: 2,
+            height: 2,
+            rgba: vec![
+                0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+            ],
+            srgb: false,
+            sampler: VrmSampler::default(),
+        };
+        let 期待 = downscale_bake_image(&借用, 1, 1, false);
+        assert_eq!(縮小.pixels(), 期待.pixels());
     }
 }

@@ -27,6 +27,7 @@ mod mesh;
 pub mod physics;
 pub mod physics_prefab;
 pub mod prefab;
+pub(crate) mod psd;
 pub mod renderers;
 
 pub use error::{VrmError, VrmErrorKind};
@@ -254,7 +255,7 @@ pub struct VrmPrimitive {
     pub indices: Vec<u32>,
 }
 
-/// 中間モデル生成の件数報告。
+/// 中間モデル生成の件数と警告の報告。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VrmReport {
     /// ノード数。
@@ -283,7 +284,7 @@ pub struct VrmReport {
     pub morph_target_count: usize,
     /// 長さ0の法線を面法線で補った頂点数。
     pub degenerate_normals: usize,
-    /// プリセット式の数。
+    /// プリセット式の数。適用できた束ねの数と一致する。
     pub expression_count: usize,
     /// `BindPose` の行列を使ったモデル数。
     pub bind_pose_models: usize,
@@ -291,6 +292,8 @@ pub struct VrmReport {
     pub bind_cluster_models: usize,
     /// いずれも無くrestのワールド行列で補ったモデル数。
     pub bind_rest_models: usize,
+    /// 表情の欠落など、中間モデル生成時の警告文。失敗とは区別する。
+    pub warnings: Vec<String>,
 }
 
 /// 中間モデル生成の資源上限。
@@ -312,6 +315,8 @@ pub struct VrmOptions {
 /// 表情の要求は中間モデル側に持ち、材質の要求とは分け
 /// [`VrmOptions::with_expressions`] で渡す。材質と違い、表情は
 /// ソース（FBXのブレンドシェイプ）由来のためである。
+/// 要求は部分適用であり、見つかる分だけを生成して欠落は警告に残す。
+/// カスタムの対応付けも同じ規則であり、VRC専用の分岐は無い。
 #[derive(Debug, Clone)]
 pub struct VrmExpressionProfile {
     /// 式とターゲットの対応付け。`bindings` の順序がターゲットと式の順序になる。
@@ -435,12 +440,14 @@ impl VrmModel {
         let nodes = build_nodes(file, &bind.worlds, &joints)?;
         let skins = build_skins(file, &bind.worlds)?;
         // 表情の選択はメッシュ変換の前に確定させ、対象メッシュの変換時に差分を配る。
-        let plan = resolve_expressions(file, options)?;
+        // 欠落は警告として返し、見つかる分だけを適用する。
+        let (plan, expression_warnings) = resolve_expressions(file, options)?;
         let (meshes, mut report, expression_mesh) =
             build_meshes(file, options, &bind.worlds, plan.as_ref())?;
         report.bind_pose_models = bind.pose_models;
         report.bind_cluster_models = bind.link_models;
         report.bind_rest_models = bind.rest_models;
+        report.warnings = expression_warnings;
         let expressions = build_expressions(&meshes, plan.as_ref(), expression_mesh)?;
         let model = Self {
             root,
@@ -599,10 +606,17 @@ struct ResolvedChannel {
     data: crate::fbx::ShapeData,
 }
 
-/// 表情の選択指定を解決する。指定が無い場合と束ねが空の場合は `None` を返す。
+/// 表情の選択指定を解決する。指定が無い場合と束ねが空の場合は警告無しで `None` を返す。
 ///
-/// 要求された全ターゲット名を含むメッシュがちょうど1つであることを要求する。
-/// 候補が無い場合は見つからない名前を挙げて、複数ある場合はメッシュ名を挙げて失敗する。
+/// 要求ターゲット名の集合を重複排除・要求順で `wanted` とし、各メッシュについて
+/// `wanted` に含まれる異なる名前の一致数（同名チャンネルが複数あっても加点しない。
+/// 完全一致だけを見て、別名・大小文字・NFKC補正は要求名に加えない）を数える。
+/// 最大一致数が0の場合は表情無し・全要求の欠落警告、`None` を返す。正で該当が
+/// 1件の場合は採用して部分適用する。同率複数は一致ターゲット名の集合が同じで
+/// 非ゼロ差分を持つ候補がちょうど1件の場合だけ限定解消し、それ以外は失敗する。
+/// 採用メッシュに存在する
+/// ターゲットの束ねだけを元の順序で残し、欠落は採用メッシュ内で判定する
+/// （他メッシュにあるだけなら未適用として警告する）。
 /// 対象メッシュに所有モデルが無い場合も失敗する。後段の変換で束ねが宙に浮くためである。
 /// 対象メッシュの選定後、そのメッシュのチャンネルをFBX順に絞る。残すのは束ねが指す名前・
 /// `vrc.` 始まり（大文字小文字を無視）・MMD名（NFKC比較）のいずれかに当てはまる場合だけであり、
@@ -612,14 +626,276 @@ struct ResolvedChannel {
 /// 有限かつゼロの初期値）を満たすことを要求し、満たさない場合は未対応として失敗する。
 /// 落ちたチャンネルの複数フレームや非100の重み率は拒否しない。
 /// 他アバターの未使用チャンネルを壊さないためである。
+/// 最多候補が不正だからといって次点へ移ることはしない。
+/// 正の最大一致数で同率になった候補の限定解消を試みる。
+///
+/// 各候補の「要求名との積集合」（一致ターゲット名の集合）が異なる場合は、
+/// どれか1件を選ぶ根拠が無いため従来どおり失敗する。診断には各候補の
+/// メッシュ名・`ObjectId`・一致数・一致した要求名をFBXメッシュ順で挙げる。
+/// 集合が同じ場合だけ、一致ターゲットの位置差分を調べる。参照名の重複・
+/// 単一フレーム条件・初期値・重み率の検査を先に行い、`shape_data` を読む。
+/// 不正・非対応・デコード失敗は「空」扱いにせず既存の対応エラーを返す。
+/// 非ゼロ差分を持つ候補がちょうど1件で、他候補の一致ターゲットがすべて
+/// ゼロの場合だけ、その1件を採用して選択警告を1件返す。
+/// 非ゼロ候補が複数、または全候補ゼロの場合は失敗のままにする。
+/// 所有モデル名・頂点数・FBX順・`ObjectId` を採用根拠にせず、
+/// 最多候補が不正だからといって次点へ移ることもしない。
+/// 判定用の形状データは使い終わったら解放し、採用候補は通常の全保持
+/// チャンネル検査へ進める（ここで読み直さず、後段で改めて読む）。
+fn resolve_expression_tie(
+    file: &FbxFile<'_>,
+    options: &VrmOptions,
+    mesh_channels: &[(ObjectId, Vec<crate::fbx::BlendShapeChannel>)],
+    wanted: &[&str],
+    tied: &[ObjectId],
+) -> Result<(ObjectId, Vec<String>), VrmError> {
+    // 候補ごとの一致名（要求順）。集合比較は要求名との積集合で行う。
+    let matched_of = |id: ObjectId| -> Vec<&str> {
+        let names: HashSet<&str> = mesh_channels
+            .iter()
+            .find(|(each, _)| *each == id)
+            .map(|(_, channels)| channels.iter().map(|c| c.name.as_str()).collect())
+            .unwrap_or_default();
+        wanted
+            .iter()
+            .copied()
+            .filter(|want| names.contains(want))
+            .collect()
+    };
+    let matched: Vec<(ObjectId, Vec<&str>)> =
+        tied.iter().map(|id| (*id, matched_of(*id))).collect();
+    let same_sets = matched
+        .iter()
+        .map(|(_, names)| names.iter().copied().collect::<HashSet<&str>>())
+        .collect::<Vec<_>>()
+        .windows(2)
+        .all(|pair| pair[0] == pair[1]);
+    if !same_sets {
+        return Err(ambiguous_tie_error(file, &matched));
+    }
+    // 集合が同じ場合だけ、一致ターゲットの位置差分を見る。形状の展開前に
+    // 上限で拒否し、上限内の候補だけ `shape_data` を読む。単独候補経路の
+    // 既存検査（`max_morph_targets` 含む）は採用後に改めて行うため、ここでは
+    // バイト数だけを見る。出力側の上限検査は残し、単独候補経路は変えない。
+    for (id, _) in &matched {
+        reject_tie_candidate_over_budget(file, options, mesh_channels, wanted, *id)?;
+    }
+    let mut nonzero: Vec<ObjectId> = Vec::new();
+    for (id, names) in &matched {
+        if candidate_has_nonzero_matched_target(file, mesh_channels, *id, names)? {
+            nonzero.push(*id);
+        }
+    }
+    if let [single] = nonzero.as_slice() {
+        let adopted_name = file
+            .mesh(*single)
+            .map(|mesh| mesh.name.as_str())
+            .unwrap_or("(不明)");
+        let mut others: Vec<String> = Vec::with_capacity(matched.len() - 1);
+        for (id, _) in &matched {
+            if id == single {
+                continue;
+            }
+            let name = file
+                .mesh(*id)
+                .map(|mesh| mesh.name.as_str())
+                .unwrap_or("(不明)");
+            others.push(format!("{name} [object: ObjectId({})]", id.value()));
+        }
+        let selection_warning = format!(
+            "表情対象の同率候補から {adopted_name} [object: ObjectId({})] を採用: 他候補 {} の一致ターゲットはすべて位置差分がゼロ。",
+            single.value(),
+            others.join("、")
+        );
+        return Ok((*single, vec![selection_warning]));
+    }
+    // 非ゼロ候補が複数、または全候補ゼロの場合は曖昧さのまま失敗する。
+    Err(ambiguous_tie_error(file, &matched))
+}
+
+/// 同率候補を採用した場合の上限バイト数で拒否する。
+///
+/// 残すチャンネルは採用時と同じ絞り込み（束ね参照・`vrc.`・MMD名）の結果を
+/// 使い、既存と同じ `kept.len() * corner_count * 12`（`checked_*`）で数える。
+/// 超える候補があれば `LimitExceeded` を `with_object` 付きで返す。
+/// 形状のデコード前に行い、上限超過を形状不良より先に報告する。
+fn reject_tie_candidate_over_budget(
+    file: &FbxFile<'_>,
+    options: &VrmOptions,
+    mesh_channels: &[(ObjectId, Vec<crate::fbx::BlendShapeChannel>)],
+    wanted: &[&str],
+    geometry: ObjectId,
+) -> Result<(), VrmError> {
+    let bound: HashSet<&str> = wanted
+        .iter()
+        .copied()
+        .filter(|want| {
+            mesh_channels
+                .iter()
+                .find(|(id, _)| *id == geometry)
+                .is_some_and(|(_, channels)| {
+                    channels
+                        .iter()
+                        .any(|channel| channel.name.as_str() == *want)
+                })
+        })
+        .collect();
+    let kept = mesh_channels
+        .iter()
+        .find(|(id, _)| *id == geometry)
+        .map(|(_, channels)| channels)
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+        .iter()
+        .filter(|channel| {
+            bound.contains(channel.name.as_str())
+                || is_vrchat_shape_name(&channel.name)
+                || is_mmd_shape_name(&channel.name)
+        })
+        .count();
+    let corner_count = file
+        .mesh(geometry)
+        .map(|mesh| mesh.corner_count)
+        .unwrap_or(usize::MAX);
+    let upper_bytes = kept
+        .checked_mul(corner_count)
+        .and_then(|count| count.checked_mul(12))
+        .unwrap_or(usize::MAX);
+    if upper_bytes > options.max_morph_bytes {
+        return Err(VrmError::new(
+            VrmErrorKind::LimitExceeded,
+            "モーフターゲットの量が上限を超えた",
+        )
+        .with_object(geometry));
+    }
+    Ok(())
+}
+
+/// 同率候補の曖昧さエラーを作る。診断はFBXメッシュ順を保つ。
+fn ambiguous_tie_error(file: &FbxFile<'_>, matched: &[(ObjectId, Vec<&str>)]) -> VrmError {
+    let mut details: Vec<String> = Vec::with_capacity(matched.len());
+    for (id, names) in matched {
+        let name = file
+            .mesh(*id)
+            .map(|mesh| mesh.name.as_str())
+            .unwrap_or("(不明)");
+        details.push(format!(
+            "{name} [object: {}]（一致数{}: {}）",
+            id.value(),
+            names.len(),
+            names.join(", ")
+        ));
+    }
+    // 名前が重複する候補を潰さないため、重複排除はしない。
+    VrmError::new(
+        VrmErrorKind::AmbiguousExpressionTarget,
+        format!(
+            "表情ターゲットを含むメッシュが複数ある: {}",
+            details.join(", ")
+        ),
+    )
+}
+
+/// 候補の一致ターゲットに非ゼロの位置差分があるかを返す。
+///
+/// 一致ターゲットだけを調べ、全チャンネルは展開しない。束ねが指す名前の
+/// 重複・単一フレーム条件・初期値・重み率の検査を先に行い、不正・非対応・
+/// デコード失敗は「空」扱いにせず既存の対応エラーを返す。全一致ターゲットを
+/// 検査し、途中で返さない。非ゼロの有無はフラグで持ち、エラーは即座に返す。
+/// 非ゼロ判定は検証済みの有限な元差分で成分が `0.0` と異なるかであり、
+/// `-0.0` はゼロ、許容誤差は使わない。非有限の差分は後段と同じく構造破損として失敗する。
+fn candidate_has_nonzero_matched_target(
+    file: &FbxFile<'_>,
+    mesh_channels: &[(ObjectId, Vec<crate::fbx::BlendShapeChannel>)],
+    geometry: ObjectId,
+    matched: &[&str],
+) -> Result<bool, VrmError> {
+    let channels = mesh_channels
+        .iter()
+        .find(|(id, _)| *id == geometry)
+        .map(|(_, channels)| channels)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    // 全一致ターゲットを検査する。非ゼロの有無はフラグで持ち、途中で返さない。
+    // 不正の検出を優先し、エラーは即座に返す。
+    let mut found_nonzero = false;
+    for want in matched {
+        let same_name: Vec<&crate::fbx::BlendShapeChannel> = channels
+            .iter()
+            .filter(|channel| channel.name.as_str() == *want)
+            .collect();
+        // 束ねが指す名前の重複は解決先が定まらないため失敗させる。
+        // 候補の数え方は異なる名前の数のため、同名が複数あっても加点しない。
+        let [channel] = same_name.as_slice() else {
+            return Err(VrmError::new(
+                VrmErrorKind::AmbiguousExpressionTarget,
+                format!("同じ表情ターゲット名が重複する: {want}"),
+            )
+            .with_object(geometry));
+        };
+        if channel.shapes.len() != 1 {
+            return Err(VrmError::new(
+                VrmErrorKind::UnsupportedBlendShape,
+                format!(
+                    "単一フレームでないチャンネルがある: {want}（形状数{}）",
+                    channel.shapes.len()
+                ),
+            )
+            .with_object(channel.id));
+        }
+        match channel.deform_percent {
+            Some(value) if value.is_finite() && value.abs() <= FULL_WEIGHT_TOLERANCE => {}
+            _ => {
+                return Err(VrmError::new(
+                    VrmErrorKind::UnsupportedBlendShape,
+                    format!("初期値がゼロでないチャンネルがある: {want}"),
+                )
+                .with_object(channel.id));
+            }
+        }
+        if channel.has_full_weights {
+            let weights = file
+                .blend_channel_weights(channel.id)
+                .map_err(wrap_fbx_error)?;
+            let all_full = weights
+                .iter()
+                .all(|v| v.is_finite() && (*v - 100.0).abs() <= FULL_WEIGHT_TOLERANCE);
+            if !all_full {
+                return Err(VrmError::new(
+                    VrmErrorKind::UnsupportedBlendShape,
+                    format!("重み率が全100でないチャンネルがある: {want}"),
+                )
+                .with_object(channel.id));
+            }
+        }
+        let data = file
+            .shape_data(channel.shapes[0].shape)
+            .map_err(wrap_fbx_error)?;
+        // 判定用の形状データは使い終わったら解放する。採用候補の検査は
+        // 後段で改めて読み直すため、ここでは保持しない。
+        for delta in &data.position_deltas {
+            if !delta.iter().all(|v| v.is_finite()) {
+                return Err(
+                    VrmError::new(VrmErrorKind::InvalidStructure, "有限でない差分がある")
+                        .with_object(channel.id),
+                );
+            }
+            if delta.iter().any(|v| *v != 0.0) {
+                found_nonzero = true;
+            }
+        }
+    }
+    Ok(found_nonzero)
+}
+
 fn resolve_expressions(
     file: &FbxFile<'_>,
     options: &VrmOptions,
-) -> Result<Option<ResolvedPlan>, VrmError> {
+) -> Result<(Option<ResolvedPlan>, Vec<String>), VrmError> {
     let Some(profile) = options.expressions.as_ref() else {
-        return Ok(None);
+        return Ok((None, Vec::new()));
     };
-    // 要求順を保ちつつ重複ターゲットは1つにまとめる。式の束ねは後段で同じ索引を指す。
+    // 要求順を保ちつつ重複ターゲットは1つにまとめる。欠落警告はこの順序で1件ずつ出す。
     let mut wanted: Vec<&str> = Vec::with_capacity(profile.bindings.len());
     for binding in &profile.bindings {
         if !wanted.contains(&binding.target.as_str()) {
@@ -627,59 +903,44 @@ fn resolve_expressions(
         }
     }
     if wanted.is_empty() {
-        return Ok(None);
+        return Ok((None, Vec::new()));
     }
-    // 全メッシュのチャンネル名を調べ、要求をすべて含むメッシュを集める。
+    // 全メッシュのチャンネル名を調べ、異なる名前の一致数を数える。
     // メッシュ名はジオメトリ名であり、モデル名（`Body` など）とは限らない。
     // チャンネル列は所有データを保ち、名前集合だけを借用する。
+    // 同名チャンネルが複数あっても加点しない（集合で数える）。
     let mesh_channels: Vec<(ObjectId, Vec<crate::fbx::BlendShapeChannel>)> = file
         .meshes()
         .iter()
         .map(|mesh| (mesh.id, file.blend_shape_channels(mesh.id)))
         .collect();
-    let mut candidates: Vec<ObjectId> = Vec::new();
-    let mut all_names: HashSet<&str> = HashSet::new();
+    let mut counts: Vec<(ObjectId, usize)> = Vec::with_capacity(mesh_channels.len());
     for (id, channels) in &mesh_channels {
         let names: HashSet<&str> = channels.iter().map(|c| c.name.as_str()).collect();
-        all_names.extend(names.iter().copied());
-        if wanted.iter().all(|want| names.contains(want)) {
-            candidates.push(*id);
-        }
+        let count = wanted.iter().filter(|want| names.contains(**want)).count();
+        counts.push((*id, count));
     }
-    let geometry = match candidates.as_slice() {
-        [] => {
-            let missing: Vec<&str> = wanted
-                .iter()
-                .copied()
-                .filter(|want| !all_names.contains(want))
-                .collect();
-            if missing.is_empty() {
-                return Err(VrmError::new(
-                    VrmErrorKind::MissingExpressionTarget,
-                    "1つのメッシュに全要求ターゲットが含まれない",
-                ));
-            }
-            return Err(VrmError::new(
-                VrmErrorKind::MissingExpressionTarget,
-                format!("表情ターゲットが見つからない: {}", missing.join(", ")),
-            ));
-        }
-        [single] => *single,
-        _ => {
-            let mut names: Vec<String> = candidates
-                .iter()
-                .filter_map(|id| file.mesh(*id).map(|mesh| mesh.name.clone()))
-                .collect();
-            names.sort();
-            names.dedup();
-            return Err(VrmError::new(
-                VrmErrorKind::AmbiguousExpressionTarget,
-                format!(
-                    "表情ターゲットを含むメッシュが複数ある: {}",
-                    names.join(", ")
-                ),
-            ));
-        }
+    let max_count = counts.iter().map(|(_, count)| *count).max().unwrap_or(0);
+    if max_count == 0 {
+        // 一致が無い場合は表情を作らず、全要求を要求順に警告する。
+        // 追加の集約警告は重ねない。
+        let warnings = wanted
+            .iter()
+            .map(|want| format!("表情ターゲットを適用しない: {want}（一致するメッシュが無いため）"))
+            .collect();
+        return Ok((None, warnings));
+    }
+    let best: Vec<ObjectId> = counts
+        .iter()
+        .filter(|(_, count)| *count == max_count)
+        .map(|(id, _)| *id)
+        .collect();
+    // 決定的な診断のため、FBXのメッシュ順（`mesh_channels` の順序）を保つ。
+    // `counts` 自体がその順序のため、ここで並べ替えない。
+    // 正の最大一致数で同率の場合は限定解消を試み、解消できなければ失敗する。
+    let (geometry, selection_warnings) = match best.as_slice() {
+        [single] => (*single, Vec::new()),
+        _ => resolve_expression_tie(file, options, &mesh_channels, &wanted, &best)?,
     };
     // 対象メッシュに所有モデルが無い場合は後段で飛ばされ、束ねが宙に浮くため失敗する。
     let owned = file
@@ -693,6 +954,39 @@ fn resolve_expressions(
         )
         .with_object(geometry));
     }
+    let adopted_names: HashSet<&str> = mesh_channels
+        .iter()
+        .find(|(id, _)| *id == geometry)
+        .map(|(_, channels)| channels.iter().map(|c| c.name.as_str()).collect())
+        .unwrap_or_default();
+    // 採用メッシュの識別情報は欠落警告に含める。
+    let adopted_label = {
+        let name = file
+            .mesh(geometry)
+            .map(|mesh| mesh.name.as_str())
+            .unwrap_or("(不明)");
+        format!("{name} [object: {}]", geometry.value())
+    };
+    // 採用メッシュに存在するターゲットの束ねだけを元の順序で残す。
+    // 欠落判定は採用メッシュ内であり、他メッシュにあるだけなら未適用として警告する。
+    let bindings: Vec<VrmExpressionBinding> = profile
+        .bindings
+        .iter()
+        .filter(|binding| adopted_names.contains(binding.target.as_str()))
+        .cloned()
+        .collect();
+    // 警告順は選択警告の後に欠落警告（要求順）を置く。
+    let mut warnings: Vec<String> = selection_warnings;
+    warnings.extend(
+        wanted
+            .iter()
+            .filter(|want| !adopted_names.contains(**want))
+            .map(|want| {
+                format!(
+                    "表情ターゲットを適用しない: {want}（採用メッシュ {adopted_label} に無いため）"
+                )
+            }),
+    );
     // 対象メッシュのチャンネルをFBX順に絞る。残すのは束ねが指す名前・`vrc.` 始まり
     // （大文字小文字を無視）・MMD名（NFKC比較）のいずれかに当てはまる場合だけであり、
     // 参照実装の `PruneBlendShapes` と同値である。束ねが指す名前の重複だけを失敗させる。
@@ -702,7 +996,10 @@ fn resolve_expressions(
         .map(|(_, channels)| channels)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let bound: HashSet<&str> = wanted.iter().copied().collect();
+    let bound: HashSet<&str> = bindings
+        .iter()
+        .map(|binding| binding.target.as_str())
+        .collect();
     let mut kept: Vec<&crate::fbx::BlendShapeChannel> = Vec::new();
     for channel in channels {
         if !(bound.contains(channel.name.as_str())
@@ -723,17 +1020,6 @@ fn resolve_expressions(
             .with_object(geometry));
         }
         kept.push(channel);
-    }
-    // 選定で含むことを確認した束ね参照は、絞り込み後にも残る。
-    for want in &wanted {
-        if !kept.iter().any(|channel| channel.name.as_str() == *want) {
-            // 選定と絞り込みは同じ名前集合で判定するため、ここには到達しない。
-            return Err(VrmError::new(
-                VrmErrorKind::MissingExpressionTarget,
-                format!("表情ターゲットが見つからない: {want}"),
-            )
-            .with_object(geometry));
-        }
     }
     if kept.len() > options.max_morph_targets {
         return Err(VrmError::new(
@@ -806,11 +1092,14 @@ fn resolve_expressions(
             data,
         });
     }
-    Ok(Some(ResolvedPlan {
-        geometry,
-        channels: resolved,
-        bindings: profile.bindings.clone(),
-    }))
+    Ok((
+        Some(ResolvedPlan {
+            geometry,
+            channels: resolved,
+            bindings,
+        }),
+        warnings,
+    ))
 }
 
 /// 読み取り層の失敗を中間モデル層の失敗へ写す。
@@ -1610,6 +1899,9 @@ fn build_meshes(
         bind_pose_models: 0,
         bind_cluster_models: 0,
         bind_rest_models: 0,
+        // 表情の欠落警告は解決時に確定し、呼び出し側で `from_fbx` が引き継ぐ。
+        // 件数は適用できた束ねの数と一致する。
+        warnings: Vec::new(),
     };
     Ok((meshes, report, expression_mesh))
 }

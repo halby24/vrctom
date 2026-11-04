@@ -5,12 +5,14 @@
 //! 引数不正の2は[`clap`]のエラーを可視エスケープして返す。
 
 use std::fs::File;
+use std::io::Read as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use vrctom::conversion::{ConversionError, build_model, export_model};
 use vrctom::fbx::{FbxFile, FbxOptions};
+use vrctom::unity::{AssetMeta, HumanBoneMapping, MAX_META_BYTES};
 use vrctom::unitypackage::{UnpackOptions, unpack_to};
 #[cfg(not(target_arch = "wasm32"))]
 use vrctom::vrm::load_renderer_materials;
@@ -60,7 +62,7 @@ enum Command {
         /// `Assets` を含むUnityプロジェクトのルート。省略時はFBXの祖先から探す。
         #[arg(long, value_name = "DIR")]
         assets: Option<PathBuf>,
-        /// 表情の選択指定。`vrc` はVRChat向けの8件（あいうえお・瞬き・視線上下）を使う。
+        /// 表情の選択指定。`vrc` はVRChat向けの8種類の対応から見つかったものを生成する。
         #[arg(long, value_name = "PROFILE")]
         expressions: Option<ExpressionProfile>,
         /// 検証用: Unity採取の物理sidecar（JSON）。比較のための入力であり、通常は使わない。
@@ -109,10 +111,10 @@ enum Command {
     },
 }
 
-/// 表情の選択指定。現在はVRChat向けの8件だけを受け付ける。
+/// 表情の選択指定。現在はVRChat向けの8種類の対応だけを受け付ける。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ExpressionProfile {
-    /// VRChat向けの8件（あいうえお・瞬き・視線上下）。
+    /// VRChat向けの8種類の対応から見つかったものを生成する。
     Vrc,
 }
 
@@ -499,17 +501,29 @@ fn export(
             report.bind_cluster_models, report.bind_rest_models
         );
     }
+    emit_model_warnings(&report);
     // 物理適用時はhumanoid検出を解決より先に行い、明示指定で引き継ぐ。
     // 解決で追加する補助ノードはFBXの骨と同名のノードを含むことがあり、
     // 書き出し時の名前基準の検出が重複で失敗するためである。
-    // 検出できない場合は従来どおり書き出し時に失敗させる。
-    let mut explicit_humanoid = None;
-    if (physics.is_some() || (!no_physics && prefab.is_some()))
-        && let Ok(detected) = HumanoidBones::detect(&model)
+    // 入力FBXの隣の `.fbx.meta` があれば対応表を優先し、無ければ名前推測になる。
+    // 物理・Prefabを使わない `--renderers` だけの経路でも書き出しで同じ対応を使う。
+    // 検出の失敗は握り潰さず、そのまま終了コード1で返す。
+    let mappings = match load_humanoid_mappings(&input) {
+        Ok(mappings) => mappings,
+        Err(code) => return code,
+    };
+    let (detected, humanoid_warnings) = match HumanoidBones::detect_with_mapping(&model, &mappings)
     {
-        explicit_humanoid = Some(detected);
-        // 検出できない場合は従来どおり書き出し時に失敗させる。
+        Ok(resolved) => resolved,
+        Err(error) => {
+            diagnose_stage("humanoidの対応付けに失敗した", &error);
+            return 1;
+        }
+    };
+    for warning in &humanoid_warnings {
+        eprintln!("humanoidの警告: {}", escape_diag(warning));
     }
+    let explicit_humanoid = detected;
     // 物理sidecarの指定時は、解決とコンパイルが通ってから代入する。
     // 失敗時はモデルを部分更新しない。
     let mut spring_summary: Option<String> = None;
@@ -532,7 +546,7 @@ fn export(
                 return 1;
             }
         };
-        match apply_physics_sidecar(&mut model, &sidecar, &bytes, explicit_humanoid.as_ref()) {
+        match apply_physics_sidecar(&mut model, &sidecar, &bytes, &explicit_humanoid) {
             Ok(summary) => {
                 spring_summary = Some(summary);
             }
@@ -550,7 +564,7 @@ fn export(
             prefab_path,
             &input,
             assets_root.as_deref(),
-            explicit_humanoid.as_ref(),
+            &explicit_humanoid,
         ) {
             Ok(summary) => {
                 spring_summary = Some(summary);
@@ -609,9 +623,7 @@ fn export(
     let mut material_count = 0usize;
     // 物理適用時に検出したhumanoidは明示指定で引き継ぐ。
     // 補助ノードの同名ノードを避け、解決前の対応付けを保つ。
-    if let Some(humanoid) = explicit_humanoid {
-        export_options = export_options.with_humanoid(humanoid);
-    }
+    export_options = export_options.with_humanoid(explicit_humanoid);
     if let Some((assigned_materials, _)) = assignment_out {
         material_count = assigned_materials.entries().len();
         export_options = export_options.with_materials(assigned_materials);
@@ -695,7 +707,7 @@ fn export(
 ///
 /// 中間モデルを先に作ってバインド代替の報告を残し、材質は所有権ごと
 /// 書き出し設定へ移してから書き出す。表示は診断順序（FBX・中間モデルの
-/// 失敗を先に返し、成功時はバインド代替・材質警告の順に出す）を保つ。
+/// 失敗を先に返し、成功時はバインド代替・humanoid警告・材質警告の順に出す）を保つ。
 /// 明示の材質失敗は書き出し失敗より先に返す。
 /// 終了コード・要約・警告の意味は既存どおりである。
 // 引数はCLI配線の束ねであり、分割より呼び出し側の見通しを優先するため許す。
@@ -736,6 +748,7 @@ fn export_simple(
             built.report.bind_cluster_models, built.report.bind_rest_models
         );
     }
+    emit_model_warnings(&built.report);
     // 明示の材質失敗は書き出し失敗より先に返す。
     // 従来は材質読み取りが書き出しより先のためである。
     if let Some(Err(load_error)) = &loaded
@@ -760,6 +773,29 @@ fn export_simple(
         Some(Err(error)) => Some(Err(error)),
         None => None,
     };
+    // 入力FBXの隣の `.fbx.meta` があれば対応表を優先し、無ければ名前推測になる。
+    // 空の対応表では `detect` と同じ結果になる。`with_humanoid` は完全な明示指定で
+    // 自動補完しないため、ここで解決した対応をそのまま渡す。
+    let mappings = match load_humanoid_mappings(input) {
+        Ok(mappings) => mappings,
+        Err(code) => {
+            emit_material_outcome_ref(&material_outcome, explicit_assets);
+            return code;
+        }
+    };
+    match HumanoidBones::detect_with_mapping(&built.model, &mappings) {
+        Ok((humanoid, warnings)) => {
+            for warning in &warnings {
+                eprintln!("humanoidの警告: {}", escape_diag(warning));
+            }
+            export_options = export_options.with_humanoid(humanoid);
+        }
+        Err(error) => {
+            emit_material_outcome_ref(&material_outcome, explicit_assets);
+            diagnose_stage("humanoidの対応付けに失敗した", &error);
+            return 1;
+        }
+    }
     let vrm_bytes = match export_model(&built.model, &export_options) {
         Ok(vrm_bytes) => vrm_bytes,
         Err(error) => {
@@ -807,6 +843,16 @@ fn export_simple(
     0
 }
 
+/// 中間モデル生成の警告表示。
+///
+/// 通常経路と特殊経路の両方から呼び出す。書き出しより前に出し、
+/// 後段で失敗してもモデル警告は残る。
+fn emit_model_warnings(report: &vrctom::vrm::VrmReport) {
+    for warning in &report.warnings {
+        eprintln!("中間モデルの警告: {}", escape_diag(warning));
+    }
+}
+
 /// 材質読み取り結果の警告表示。
 ///
 /// 成功時の警告と自動検出の失敗警告を出す。明示指定の失敗は呼び出し側が
@@ -828,6 +874,56 @@ fn emit_material_outcome_ref(
             );
         }
         Some(Err(_)) | None => {}
+    }
+}
+
+/// 入力FBXの隣の `.fbx.meta` からhumanoid対応表を読む。
+///
+/// メタのパスは入力パスへ文字列 `.meta` を追加して求める。`with_extension` は
+/// 使わない（`.fbx` の拡張子を保ったまま隣のファイルを指定するためである）。
+/// `display()` 経由の文字列組み立ては区切りや非UTF-8の扱いを変え得るため、
+/// OS文字列へ直接追加する。メタが無い場合だけ空の対応表として名前推測に任せ、
+/// 権限不足などの読み取り失敗・上限超過・形状不良は診断を出して終了コード1で返す。
+fn load_humanoid_mappings(input: &Path) -> Result<Vec<HumanBoneMapping>, i32> {
+    let mut meta_os = input.as_os_str().to_owned();
+    meta_os.push(".meta");
+    let meta_path = PathBuf::from(meta_os);
+    let meta_label = escape_diag(&format!("{meta_path:?}"));
+    // 上限+1バイトまでの制限付き読み取りにし、超過は読み取り層の上限エラーへつなぐ。
+    // 全体を読み切ってから拒否しない。`NotFound` だけ空対応表にして名前推測に任せる。
+    let file = match File::open(&meta_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            eprintln!(
+                "humanoidの対応表を読めない: {meta_label}: {}",
+                escape_diag(&error.to_string())
+            );
+            return Err(1);
+        }
+    };
+    let mut bytes = Vec::new();
+    if let Err(error) = file.take(MAX_META_BYTES + 1).read_to_end(&mut bytes) {
+        eprintln!(
+            "humanoidの対応表を読めない: {meta_label}: {}",
+            escape_diag(&error.to_string())
+        );
+        return Err(1);
+    }
+    // 超過時は切り詰めで上限+1バイトになり、読み取り層が上限超過で拒否する。
+    let meta = match AssetMeta::parse(&bytes) {
+        Ok(meta) => meta,
+        Err(error) => {
+            diagnose_stage(&format!("humanoidの対応表を読めない: {meta_label}"), &error);
+            return Err(1);
+        }
+    };
+    match meta.human_bone_mappings() {
+        Ok(mappings) => Ok(mappings),
+        Err(error) => {
+            diagnose_stage(&format!("humanoidの対応表を読めない: {meta_label}"), &error);
+            Err(1)
+        }
     }
 }
 
@@ -863,7 +959,7 @@ fn derive_physics_from_prefab(
     prefab_path: &std::path::Path,
     input: &std::path::Path,
     assets_root: Option<&std::path::Path>,
-    humanoid: Option<&HumanoidBones>,
+    humanoid: &HumanoidBones,
 ) -> Result<String, i32> {
     use vrctom::unity::{ParseOptions, SerializedFile};
     use vrctom::vrm::derive_physics_sidecar;
@@ -1007,7 +1103,7 @@ fn apply_physics_sidecar(
     model: &mut VrmModel,
     sidecar: &PhysicsSidecar,
     fbx_bytes: &[u8],
-    humanoid: Option<&HumanoidBones>,
+    humanoid: &HumanoidBones,
 ) -> Result<String, i32> {
     let resolution = match model.resolve_physics_sidecar(sidecar, fbx_bytes) {
         Ok(resolution) => {
@@ -1035,9 +1131,10 @@ fn apply_physics_sidecar(
     // humanoidのrest姿勢はsidecarのT-poseを優先する。無い骨は
     // ノードの姿勢のまま残す。参照実装もリグ構築直後にT-poseを当ててから
     // 物理を解決するため、視線の測定とスプリングの生成より前に適用する。
+    // 書き出しに使う解決済み対応を渡し、不一致は適用前に失敗させる。
     // 失敗時はモデルを部分更新せず打ち切る。
     let (tpose_applied, tpose_skipped) =
-        match apply_humanoid_t_pose(sidecar, model, &resolution, sidecar.humanoid.as_ref()) {
+        match apply_humanoid_t_pose(sidecar, model, &resolution, humanoid) {
             Ok(report) => {
                 for skipped in &report.skipped {
                     eprintln!(
@@ -1058,19 +1155,15 @@ fn apply_physics_sidecar(
     // 測定も既定もここで確定する。モデルは変更しないため、
     // 失敗時は部分更新なく打ち切る。humanoidは解決より前に検出したものを
     // 使い、補助ノード（同名ノードを含む）の影響を受けない。
-    let look_at = match (sidecar.look_at.as_ref(), humanoid) {
-        (Some(_), Some(detected)) => match resolve_look_at(sidecar, model, &resolution, detected) {
+    let look_at = match sidecar.look_at.as_ref() {
+        Some(_) => match resolve_look_at(sidecar, model, &resolution, humanoid) {
             Ok(look_at) => look_at,
             Err(error) => {
                 diagnose_stage("視線の解決に失敗した", &error);
                 return Err(1);
             }
         },
-        (Some(_), None) => {
-            eprintln!("視線の解決に失敗した: humanoidを検出できない");
-            return Err(1);
-        }
-        (None, _) => None,
+        None => None,
     };
     match compile_springs(sidecar, model, &resolution, &SpringCompileOptions::new()) {
         Ok(compiled) => {
@@ -1577,5 +1670,62 @@ mod tests {
             assert!(!escaped.contains(raw), "生の不可視文字が残らない");
         }
         assert_eq!(super::escape_diag(&escaped), escaped);
+    }
+
+    /// 指定バイト数の `.fbx.meta` を作る。YAML注釈で埋めて大きさを調整する。
+    ///
+    /// 上限ちょうど・上限+1の境界を確かめるために使う。
+    /// 内容は空の対応表（`human: []`）であり、読み取り自体は成功する。
+    fn 上限サイズのmetaを作る(作業: &std::path::Path, 全体: usize) {
+        let 頭 = b"fileFormatVersion: 2\nguid: 0123456789abcdef0123456789abcdef\nModelImporter:\n  animationType: 3\n  humanDescription:\n    human: []\n";
+        assert!(全体 > 頭.len() + 4, "注釈を足せる大きさである");
+        let mut 本文 = 頭.to_vec();
+        本文.extend_from_slice(b"# ");
+        本文.extend(std::iter::repeat_n(b'x', 全体 - 本文.len() - 1));
+        本文.push(b'\n');
+        assert_eq!(本文.len(), 全体, "指定の大きさになる");
+        std::fs::write(作業.join("入力.fbx.meta"), 本文).expect("metaは書ける");
+        std::fs::write(作業.join("入力.fbx"), b"fake-fbx").expect("fbxは書ける");
+    }
+
+    #[test]
+    fn 上限ちょうどのmetaは読み取れる() {
+        // 上限ちょうどは制限付き読み取りで通り、空の対応表になる。
+        let 作業 = tempfile::TempDir::new().expect("作業場所は作れる");
+        上限サイズのmetaを作る(作業.path(), super::MAX_META_BYTES as usize);
+        let 対応 = super::load_humanoid_mappings(&作業.path().join("入力.fbx"))
+            .expect("上限ちょうどは通る");
+        assert!(対応.is_empty(), "空の対応表である");
+    }
+
+    #[test]
+    fn 上限を超えたmetaは読み取れない() {
+        // 上限+1は読み取り層の上限超過で失敗する。出力は作らない。
+        let 作業 = tempfile::TempDir::new().expect("作業場所は作れる");
+        上限サイズのmetaを作る(作業.path(), super::MAX_META_BYTES as usize + 1);
+        let 結果 = super::load_humanoid_mappings(&作業.path().join("入力.fbx"));
+        assert!(結果.is_err(), "上限超過は失敗する");
+    }
+
+    #[test]
+    fn 存在しないmetaは空の対応表になる() {
+        // `.fbx.meta` が無い場合は名前推測に任せるため空になる。
+        let 作業 = tempfile::TempDir::new().expect("作業場所は作れる");
+        let 入力 = 作業.path().join("入力.fbx");
+        std::fs::write(&入力, b"fake-fbx").expect("fbxは書ける");
+        let 対応 = super::load_humanoid_mappings(&入力).expect("meta無しは空になる");
+        assert!(対応.is_empty(), "空の対応表である");
+    }
+
+    #[test]
+    fn 読み取れないmetaは空に読み替えない() {
+        // `NotFound` 以外の読み取り失敗は空対応表への読み替えをせず失敗する。
+        // ディレクトリを開いた読み取りは失敗するため、権限に依存せず確かめられる。
+        let 作業 = tempfile::TempDir::new().expect("作業場所は作れる");
+        let 入力 = 作業.path().join("入力.fbx");
+        std::fs::write(&入力, b"fake-fbx").expect("fbxは書ける");
+        std::fs::create_dir(作業.path().join("入力.fbx.meta")).expect("meta位置に場所を作る");
+        let 結果 = super::load_humanoid_mappings(&入力);
+        assert!(結果.is_err(), "読み取り失敗は空にしない");
     }
 }

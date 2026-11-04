@@ -12,6 +12,7 @@ use serde::Deserialize;
 
 use super::VrmModel;
 use super::error::{VrmError, VrmErrorKind};
+use super::humanoid::{HumanoidBones, unity_bone_to_vrm};
 use super::matrix;
 
 /// sidecar JSONの書式名。
@@ -5027,17 +5028,31 @@ const HUMANOID_IDENTITY_DELTA_RAD: f64 = 1e-12;
 /// T-poseを当ててから物理を解決するため）。適用は全件の検証が通ってから
 /// 一括で行い、部分更新はしない。同じVRMノードに2件の骨が対応する場合は失敗する。
 ///
+/// 書き出しに使う解決済み [`HumanoidBones`]（`resolved_humanoid`）と
+/// sidecar自身の `humanoid.bones`（Unity骨名＋`n:N`）が食い違う場合は
+/// 適用前に失敗する。比較は文字列ではなく同じ中間モデル上のノード索引で行い、
+/// sidecar側はUnity骨名を共通表と完全一致で照合し（正規化しない）、
+/// 解決済み対応の索引と比べる。sidecarの骨名は Unity の `HumanBodyBones` 名
+/// （空白なし）を前提とするため、空白付きの表記は比較対象外として
+/// 従来の適用・スキップに落とす。
+/// sidecarの `nodeId` は [`PhysicsResolution::node_map`] で索引に直す。
+/// VRMに対応先が無い骨（`Jaw`）・sidecarにしか無い骨・解決済み対応に無い骨・
+/// 未知のsidecar骨名は比較対象外とし、従来の適用・スキップを維持する。
+/// sidecarノード未解決・モデルノード不存在も比較不能として従来のスキップにする。
+/// 恒等回転の骨でも不一致なら失敗する。
+///
 /// # Errors
 ///
 /// T-poseや参照姿勢の回転の非有限値やゼロ・
-/// 同じノードへの重複の場合に返す。この場合モデルは変更しない。
+/// 同じノードへの重複・解決済み対応との不一致の場合に返す。
+/// この場合モデルは変更しない。
 pub fn apply_humanoid_t_pose(
     sidecar: &PhysicsSidecar,
     model: &mut VrmModel,
     resolution: &PhysicsResolution,
-    humanoid: Option<&SidecarHumanoid>,
+    resolved_humanoid: &HumanoidBones,
 ) -> Result<HumanoidPoseReport, VrmError> {
-    let Some(humanoid) = humanoid else {
+    let Some(humanoid) = sidecar.humanoid.as_ref() else {
         return Ok(HumanoidPoseReport::default());
     };
     let sidecar_at: HashMap<&str, &SidecarNode> = sidecar
@@ -5046,11 +5061,41 @@ pub fn apply_humanoid_t_pose(
         .map(|node| (node.id.as_str(), node))
         .collect();
     // 先に全件を検証し、適用計画だけを作る。失敗時は部分更新しない。
+    // 対応の不一致もここで検出し、回転の変更より前に返す。
     // 差分δはUnity空間の参照姿勢から求め、VRM空間へ鏡像して正規化する。
     let mut planned: Vec<(String, usize, [f64; 4], f64)> = Vec::with_capacity(humanoid.bones.len());
     let mut report = HumanoidPoseReport::default();
     let mut seen_nodes: HashSet<usize> = HashSet::new();
     for bone in &humanoid.bones {
+        // 書き出し用の解決済み対応とsidecarの対応が食い違う場合は失敗する。
+        // 比較不能（対応先なし・未解決）は不一致扱いにせず従来の扱いへ落とす。
+        // `tPose` の有無より先に比べ、欠落と矛盾を区別する。
+        // sidecarの骨名は共通表と完全一致で照合し、正規化しない。
+        // 空白付きの表記は比較対象外として従来の適用・スキップに落とす。
+        if let Some(Some(vrm_bone)) = unity_bone_to_vrm(bone.bone.as_str())
+            && let (Some(resolved), Some(sidecar_index)) = (
+                resolved_humanoid.get(vrm_bone),
+                resolution.node_map.get(bone.node_id.as_str()).copied(),
+            )
+            && model.nodes.get(resolved).is_some()
+            && let Some(sidecar_node) = model.nodes.get(sidecar_index)
+            && resolved != sidecar_index
+        {
+            let resolved_node = &model.nodes[resolved];
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidPhysicsSidecar,
+                format!(
+                    "humanoidの対応が一致しない: Unity骨={} / VRM骨={}; sidecar humanoid.bones: nodeId={} -> node[{}] \"{}\"; VRM出力用の解決済みhumanoid: node[{}] \"{}\"",
+                    bone.bone,
+                    vrm_bone.name(),
+                    bone.node_id,
+                    sidecar_index,
+                    sidecar_node.name,
+                    resolved,
+                    resolved_node.name,
+                ),
+            ));
+        }
         let Some(t_pose) = bone.t_pose.as_ref() else {
             report.skipped.push(SkippedHumanoidBone {
                 bone: bone.bone.clone(),

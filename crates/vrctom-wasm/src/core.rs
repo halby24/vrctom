@@ -5,11 +5,13 @@
 //! テストできる。JS境界の薄い写しは [`crate::WebPackage`] を参照。
 
 use serde::{Deserialize, Serialize};
-use vrctom::conversion::{ConversionError, convert_fbx};
+use vrctom::conversion::{ConversionError, build_model, export_model};
 use vrctom::fbx::FbxOptions;
-use vrctom::unity::{AssetIndex, IndexOptions};
+use vrctom::unity::{AssetIndex, HumanBoneMapping, IndexOptions};
 use vrctom::unitypackage::{EntryKind, MemoryPackage, UnpackOptions, unpack_in_memory};
-use vrctom::vrm::{MaterialOptions, VrmExportOptions, VrmExpressionProfile, VrmMeta, VrmOptions};
+use vrctom::vrm::{
+    HumanoidBones, MaterialOptions, VrmExportOptions, VrmExpressionProfile, VrmMeta, VrmOptions,
+};
 
 /// Web向けの資源上限。
 ///
@@ -333,6 +335,10 @@ impl Package {
     }
 
     /// 上限を指定して変換する。テストで小さな上限を使うための入口である。
+    ///
+    /// 順序は中間モデルの生成→humanoid対応の解決→VRM書き出しである。
+    /// FBX解析は [`build_model`](vrctom::conversion::build_model) の一度だけであり、
+    /// humanoid対応は索引の `.fbx.meta` から引いた対応表と名前推測で決める。
     fn convert_with_limits(
         &self,
         fbx_path: &str,
@@ -370,27 +376,37 @@ impl Package {
             vrm_options = vrm_options.with_expressions(VrmExpressionProfile::vrchat());
         }
         let meta = VrmMeta::new(options.name(&relative), options.authors());
-        let mut export_options =
-            VrmExportOptions::new(meta).with_max_output_bytes(limits.max_output_bytes);
+        let built = build_model(&fbx_bytes, &FbxOptions::default(), &vrm_options)
+            .map_err(|error| conversion_error(&error, fbx_path))?;
+        // `.fbx.meta` の対応表を索引から引き、名前推測で不足分を補う。
+        // 対応表が空の場合も同じ経路を通すため、名前推測だけの既存挙動と同じ結果になる。
+        let mappings = self.humanoid_mappings(&relative, fbx_path)?;
+        let (humanoid, mapping_warnings) =
+            HumanoidBones::detect_with_mapping(&built.model, &mappings).map_err(|error| {
+                CoreError::new(Stage::Export, format!("VRMの書き出しに失敗した: {error}"))
+                    .with_path(fbx_path.to_owned())
+            })?;
+        // 順序は材質警告・灰色出力警告の後にモデル警告、最後に対応表由来の警告を置く。
+        // 既存の `Report.warnings` に統合し、JSONスキーマは変えない。
+        warnings.extend(built.report.warnings.iter().cloned());
+        warnings.extend(mapping_warnings);
+        let mut export_options = VrmExportOptions::new(meta)
+            .with_max_output_bytes(limits.max_output_bytes)
+            .with_humanoid(humanoid);
         if let Some(materials) = materials {
             export_options = export_options.with_materials(materials);
         }
-        let (vrm, model_report) = convert_fbx(
-            &fbx_bytes,
-            &FbxOptions::default(),
-            &vrm_options,
-            &export_options,
-        )
-        .map_err(|error| conversion_error(&error, fbx_path))?;
+        let vrm = export_model(&built.model, &export_options)
+            .map_err(|error| conversion_error(&error, fbx_path))?;
         let report = Report {
             fbx: fbx_path.to_owned(),
             bytes: vrm.len() as u64,
-            nodes: model_report.node_count,
-            meshes: model_report.mesh_count,
-            skins: model_report.skin_count,
+            nodes: built.report.node_count,
+            meshes: built.report.mesh_count,
+            skins: built.report.skin_count,
             materials: material_count,
             images: image_count,
-            expressions: model_report.expression_count,
+            expressions: built.report.expression_count,
             warnings,
         };
         let report_json = serde_json::to_string(&report).map_err(|error| {
@@ -439,6 +455,31 @@ impl Package {
             .with_path(fbx_path.to_owned()));
         }
         Ok(stored.to_vec())
+    }
+
+    /// 対象FBXの `.fbx.meta` からhumanoid対応表を索引で引く。
+    ///
+    /// 索引の記録は `.meta` を正としており、FBXの記録の `meta` が
+    /// `.fbx.meta` の読み取り結果そのものであるため、再読取や走査はしない。
+    /// FBX本体が索引に無い場合は整合性エラーとして失敗する。
+    /// 対応表の読み取りや形状不良も索引の不整合として扱う。
+    /// 空の対応表は名前推測に委ねるため、そのまま返す。
+    fn humanoid_mappings(
+        &self,
+        relative: &str,
+        fbx_path: &str,
+    ) -> Result<Vec<HumanBoneMapping>, CoreError> {
+        let record = self.index.get_by_path(relative).ok_or_else(|| {
+            CoreError::new(Stage::Package, format!("索引にFBXが無い: {fbx_path}"))
+                .with_path(fbx_path.to_owned())
+        })?;
+        record.meta.human_bone_mappings().map_err(|error| {
+            CoreError::new(
+                Stage::Package,
+                format!("humanoid対応表の読み取りに失敗した: {error}"),
+            )
+            .with_path(fbx_path.to_owned())
+        })
     }
 }
 
@@ -1004,5 +1045,764 @@ mod tests {
             assert!(report[key].is_number(), "{key}は数値である");
         }
         assert!(report["warnings"].is_array(), "warningsは配列である");
+    }
+
+    /// 論理プロパティ列。件数は組み立て時に数える。
+    ///
+    /// 共有変換入口の契約テストと同じ組み立て方であり、FBX読み取り層が
+    /// 受け付ける最小のバイナリを作る。
+    #[derive(Default)]
+    struct Props {
+        buf: Vec<u8>,
+        count: u32,
+    }
+
+    impl Props {
+        fn prop(&mut self, code: u8, body: &[u8]) {
+            self.buf.push(code);
+            self.buf.extend_from_slice(body);
+            self.count += 1;
+        }
+
+        fn l(&mut self, v: i64) {
+            self.prop(b'L', &v.to_le_bytes());
+        }
+
+        fn s(&mut self, v: &[u8]) {
+            let mut body = (v.len() as u32).to_le_bytes().to_vec();
+            body.extend_from_slice(v);
+            self.prop(b'S', &body);
+        }
+
+        /// 配列プロパティを書く。圧縮は使わずrawだけにする。
+        fn array(&mut self, code: u8, count: u32, payload: &[u8]) {
+            let mut body = count.to_le_bytes().to_vec();
+            body.extend_from_slice(&0u32.to_le_bytes());
+            body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            body.extend_from_slice(payload);
+            self.prop(code, &body);
+        }
+
+        /// `f64` 列をrawの `d` 配列として書く。
+        fn d_raw(&mut self, values: &[f64]) {
+            let mut payload = Vec::with_capacity(values.len() * 8);
+            for v in values {
+                payload.extend_from_slice(&v.to_le_bytes());
+            }
+            self.array(b'd', values.len() as u32, &payload);
+        }
+
+        /// `i32` 列をrawの `i` 配列として書く。
+        fn i_raw(&mut self, values: &[i32]) {
+            let mut payload = Vec::with_capacity(values.len() * 4);
+            for v in values {
+                payload.extend_from_slice(&v.to_le_bytes());
+            }
+            self.array(b'i', values.len() as u32, &payload);
+        }
+    }
+
+    /// 論理ノード。シリアライズ時に絶対オフセットを確定させる。
+    struct TNode {
+        name: Vec<u8>,
+        props: Props,
+        children: Vec<TNode>,
+    }
+
+    impl TNode {
+        fn leaf(name: &[u8], props: Props) -> Self {
+            Self {
+                name: name.to_vec(),
+                props,
+                children: Vec::new(),
+            }
+        }
+
+        fn branch(name: &[u8], props: Props, children: Vec<TNode>) -> Self {
+            Self {
+                name: name.to_vec(),
+                props,
+                children,
+            }
+        }
+    }
+
+    /// 論理ノードを絶対オフセット付きで書き出す。
+    fn ser(node: &TNode, buf: &mut Vec<u8>) {
+        let start = buf.len();
+        buf.extend_from_slice(&[0u8; 13]);
+        buf.extend_from_slice(&node.name);
+        buf.extend_from_slice(&node.props.buf);
+        for child in &node.children {
+            ser(child, buf);
+        }
+        if !node.children.is_empty() {
+            // 子列の終端であり、親範囲の一部である。
+            buf.extend_from_slice(&[0u8; 13]);
+        }
+        let end = buf.len() as u32;
+        buf[start..start + 4].copy_from_slice(&end.to_le_bytes());
+        buf[start + 4..start + 8].copy_from_slice(&node.props.count.to_le_bytes());
+        buf[start + 8..start + 12].copy_from_slice(&(node.props.buf.len() as u32).to_le_bytes());
+        buf[start + 12] = node.name.len() as u8;
+    }
+
+    /// 直下ノード列からバイナリFBXを組み立てる。
+    fn 合成file(top: Vec<TNode>) -> Vec<u8> {
+        let mut buf = b"Kaydara FBX Binary  \x00\x1a\x00".to_vec();
+        buf.extend_from_slice(&7400u32.to_le_bytes());
+        for node in &top {
+            ser(node, &mut buf);
+        }
+        // トップレベルの終端以降はフッタであり、読まない。
+        buf.extend_from_slice(&[0u8; 13]);
+        buf
+    }
+
+    /// `Model` ノードを組み立てる。
+    fn 合成model(id: i64, name: &str, subtype: &str) -> TNode {
+        let mut props = Props::default();
+        props.l(id);
+        props.s(format!("{name}\x00\x01Model").as_bytes());
+        props.s(subtype.as_bytes());
+        TNode::branch(b"Model", props, Vec::new())
+    }
+
+    /// `Geometry`（Mesh）ノードを組み立てる。
+    fn 合成geometry(id: i64, name: &str, children: Vec<TNode>) -> TNode {
+        let mut props = Props::default();
+        props.l(id);
+        props.s(format!("{name}\x00\x01Geometry").as_bytes());
+        props.s(b"Mesh");
+        TNode::branch(b"Geometry", props, children)
+    }
+
+    /// `Vertices` ノードを組み立てる。
+    fn 合成vertices(values: &[f64]) -> TNode {
+        let mut props = Props::default();
+        props.d_raw(values);
+        TNode::leaf(b"Vertices", props)
+    }
+
+    /// `PolygonVertexIndex` ノードを組み立てる。
+    fn 合成pvi(values: &[i32]) -> TNode {
+        let mut props = Props::default();
+        props.i_raw(values);
+        TNode::leaf(b"PolygonVertexIndex", props)
+    }
+
+    /// `Connections` の `OO` 接続（子→親）を組み立てる。
+    fn 合成conn(child: i64, parent: i64) -> TNode {
+        let mut props = Props::default();
+        props.s(b"OO");
+        props.l(child);
+        props.l(parent);
+        TNode::leaf(b"C", props)
+    }
+
+    /// `PoseNode` を組み立てる。行列は16値の `d` 配列である。
+    fn 合成pose_node(model: i64, matrix: &[f64; 16]) -> TNode {
+        let mut matrix_props = Props::default();
+        matrix_props.d_raw(matrix);
+        let mut node_props = Props::default();
+        node_props.l(model);
+        TNode::branch(
+            b"PoseNode",
+            Props::default(),
+            vec![
+                TNode::leaf(b"Node", node_props),
+                TNode::leaf(b"Matrix", matrix_props),
+            ],
+        )
+    }
+
+    /// 平行移動だけが異なる行優先のバインド行列を組み立てる。
+    fn 合成bind_matrix(x: f64, y: f64, z: f64) -> [f64; 16] {
+        [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0, //
+            x, y, z, 1.0, //
+        ]
+    }
+
+    /// 必須15骨の（id、名前、親id）列。手の名前だけ呼び出し側で変える。
+    ///
+    /// 親子関係は書き出し層の許容を満たす。末尾はメッシュ所有モデルである。
+    fn 必須骨列(
+        左手: &'static str,
+        右手: &'static str,
+    ) -> Vec<(i64, &'static str, Option<i64>)> {
+        vec![
+            (1, "Hips", None),
+            (2, "Spine", Some(1)),
+            (3, "Head", Some(2)),
+            (4, "LeftUpperArm", Some(2)),
+            (5, "LeftLowerArm", Some(4)),
+            (6, 左手, Some(5)),
+            (7, "RightUpperArm", Some(2)),
+            (8, "RightLowerArm", Some(7)),
+            (9, 右手, Some(8)),
+            (10, "LeftUpperLeg", Some(1)),
+            (11, "LeftLowerLeg", Some(10)),
+            (12, "LeftFoot", Some(11)),
+            (13, "RightUpperLeg", Some(1)),
+            (14, "RightLowerLeg", Some(13)),
+            (15, "RightFoot", Some(14)),
+            (16, "Owner", Some(1)),
+        ]
+    }
+
+    /// 必須骨と三角形1枚を持つFBXを組み立てる。手の名前だけ変えられる。
+    fn 手別名fbxを組み立てる(左手: &'static str, 右手: &'static str) -> Vec<u8> {
+        let 列 = 必須骨列(左手, 右手);
+        let mut objs: Vec<TNode> = 列
+            .iter()
+            .map(|(id, name, _)| {
+                let subtype = if *name == "Owner" { "Mesh" } else { "LimbNode" };
+                合成model(*id, name, subtype)
+            })
+            .collect();
+        objs.push(合成geometry(
+            100,
+            "Tri",
+            vec![
+                合成vertices(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+                // `!2 == -3` が終端を表す。
+                合成pvi(&[0, 1, -3]),
+            ],
+        ));
+        let mut pose_props = Props::default();
+        pose_props.l(200);
+        pose_props.s(b"Bind\x00\x01Pose");
+        pose_props.s(b"BindPose");
+        let binds: Vec<TNode> = 列
+            .iter()
+            .map(|(id, _, _)| 合成pose_node(*id, &合成bind_matrix(0.0, 0.0, 0.0)))
+            .collect();
+        objs.push(TNode::branch(b"Pose", pose_props, binds));
+        let mut conns: Vec<TNode> = 列
+            .iter()
+            .filter_map(|(id, _, parent)| parent.map(|parent| 合成conn(*id, parent)))
+            .collect();
+        conns.push(合成conn(100, 16));
+        conns.push(合成conn(1, 0));
+        合成file(vec![
+            TNode::branch(b"Objects", Props::default(), objs),
+            TNode::branch(b"Connections", Props::default(), conns),
+        ])
+    }
+
+    /// humanoid対応表を持つ `.fbx.meta` を組み立てる。
+    fn 対応表付きmeta(項目ら: &[(&str, &str)]) -> Vec<u8> {
+        let mut 本文 = String::from("  humanDescription:\n    serializedVersion: 3\n    human:\n");
+        for (ノード名, 骨名) in 項目ら {
+            本文.push_str(&format!(
+                "    - boneName: {ノード名}\n      humanName: {骨名}\n"
+            ));
+        }
+        本文.push_str("  animationType: 3\n");
+        file_meta(1, "ModelImporter", &本文)
+    }
+
+    /// 合成FBX1件だけを持つパッケージを作る。
+    fn 合成fbxパッケージ(fbx実体: Vec<u8>, meta実体: Vec<u8>) -> Vec<u8> {
+        package_bytes(&[
+            Member::Pathname {
+                guid: guid(1),
+                content: b"Assets/Model.fbx".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(1),
+                content: fbx実体,
+            },
+            Member::Meta {
+                guid: guid(1),
+                content: meta実体,
+            },
+        ])
+    }
+
+    /// 変換成功時のGLBマジックとレポートの基本形を確かめる。
+    fn 成功の基本形を確かめる(converted: &ConvertedPackage) {
+        assert!(converted.vrm.len() > 4, "VRMバイト列はマジックより長い");
+        assert_eq!(&converted.vrm[..4], b"glTF", "GLBマジックがある");
+        let report: serde_json::Value =
+            serde_json::from_str(&converted.report_json).expect("レポートはJSONである");
+        assert_eq!(report["fbx"], serde_json::json!("Assets/Model.fbx"));
+        assert_eq!(
+            report["bytes"],
+            serde_json::json!(converted.vrm.len() as u64),
+            "bytesはVRMバイト列の大きさである",
+        );
+    }
+
+    #[test]
+    fn 対応表が無いと別名の手首では書き出し段階で失敗する() {
+        // Wol系の再現：手首骨が `Wrist.L`/`Wrist.R` で対応表が無い場合は、
+        // 名前推測で手が見つからず書き出しで失敗する。
+        let fbx = 手別名fbxを組み立てる("Wrist.L", "Wrist.R");
+        let bytes = 合成fbxパッケージ(
+            fbx,
+            file_meta(1, "ModelImporter", "  externalObjects: {}\n"),
+        );
+        let package = Package::open(&bytes).expect("合成パッケージは開ける");
+        let error = package
+            .convert("Assets/Model.fbx", "{}")
+            .expect_err("別名の手首は名前推測で失敗する");
+        assert_eq!(error.stage(), Stage::Export);
+        assert_eq!(error.stage().as_str(), "export");
+        assert!(
+            error.message().contains("VRMの書き出しに失敗した"),
+            "書き出し段階の見出しを持つ: {}",
+            error.message(),
+        );
+        assert_eq!(error.path(), Some("Assets/Model.fbx"));
+    }
+
+    #[test]
+    fn メタの対応表で別名の手首を対応付けて変換できる() {
+        // 対応表（`Wrist.L→LeftHand` 等）があれば、名前推測で失敗する
+        // 命名でも変換が成功する。
+        let fbx = 手別名fbxを組み立てる("Wrist.L", "Wrist.R");
+        let meta = 対応表付きmeta(&[("Wrist.L", "LeftHand"), ("Wrist.R", "RightHand")]);
+        let package = Package::open(&合成fbxパッケージ(fbx, meta)).expect("合成パッケージは開ける");
+        let converted = package
+            .convert("Assets/Model.fbx", "{}")
+            .expect("対応表があれば変換できる");
+        成功の基本形を確かめる(&converted);
+        let report: serde_json::Value =
+            serde_json::from_str(&converted.report_json).expect("レポートはJSONである");
+        // 材質の置換表が無いため既存の材質警告が残り、対応表の警告は無い。
+        assert_eq!(
+            report["warnings"],
+            serde_json::json!([
+                "FBXに材質の置換表がないため材質を読まない",
+                "材質を読めなかったため灰色で出力する",
+            ]),
+        );
+    }
+
+    #[test]
+    fn 対応表が空なら名前推測で変換できる() {
+        // 標準名のFBX＋対応表なしmetaは、空の対応表で同じ経路を通っても
+        // 従来どおり名前推測で変換できる。
+        let fbx = 手別名fbxを組み立てる("LeftHand", "RightHand");
+        let bytes = 合成fbxパッケージ(
+            fbx,
+            file_meta(1, "ModelImporter", "  externalObjects: {}\n"),
+        );
+        let package = Package::open(&bytes).expect("合成パッケージは開ける");
+        let converted = package
+            .convert("Assets/Model.fbx", "{}")
+            .expect("標準名は名前推測で変換できる");
+        成功の基本形を確かめる(&converted);
+        let report: serde_json::Value =
+            serde_json::from_str(&converted.report_json).expect("レポートはJSONである");
+        assert_eq!(
+            report["warnings"],
+            serde_json::json!([
+                "FBXに材質の置換表がないため材質を読まない",
+                "材質を読めなかったため灰色で出力する",
+            ]),
+        );
+    }
+
+    #[test]
+    fn 壊れた対応表はpackage段階で失敗する() {
+        // `human` がシーケンスでない場合は、パッケージの整合性として失敗する。
+        let fbx = 手別名fbxを組み立てる("LeftHand", "RightHand");
+        let meta = file_meta(1, "ModelImporter", "  humanDescription:\n    human: {}\n");
+        let package =
+            Package::open(&合成fbxパッケージ(fbx, meta)).expect("meta自体は読めるため開ける");
+        let error = package
+            .convert("Assets/Model.fbx", "{}")
+            .expect_err("壊れた対応表は失敗する");
+        assert_eq!(error.stage(), Stage::Package);
+        assert_eq!(error.stage().as_str(), "package");
+        assert_eq!(error.path(), Some("Assets/Model.fbx"));
+    }
+
+    #[test]
+    fn 対応先ノードが無い場合はexport段階で失敗する() {
+        // 対応表の指すノードがモデルに無い場合は、書き出し段階で失敗する。
+        let fbx = 手別名fbxを組み立てる("LeftHand", "RightHand");
+        let meta = 対応表付きmeta(&[("Ghost", "LeftHand")]);
+        let package = Package::open(&合成fbxパッケージ(fbx, meta)).expect("合成パッケージは開ける");
+        let error = package
+            .convert("Assets/Model.fbx", "{}")
+            .expect_err("対応先の欠落は失敗する");
+        assert_eq!(error.stage(), Stage::Export);
+        assert_eq!(error.stage().as_str(), "export");
+        assert!(
+            error.message().contains("VRMの書き出しに失敗した"),
+            "書き出し段階の見出しを持つ: {}",
+            error.message(),
+        );
+        assert_eq!(error.path(), Some("Assets/Model.fbx"));
+    }
+
+    #[test]
+    fn 未知human名の警告は材質警告の後ろに追加される() {
+        // 未知の `humanName` は省いて警告し、材質警告の並びを保ったまま
+        // 後ろに追加する。文言は対応表の解決結果そのままである。
+        let fbx = 手別名fbxを組み立てる("LeftHand", "RightHand");
+        let meta = 対応表付きmeta(&[("Hips", "MysteryBone")]);
+        let package = Package::open(&合成fbxパッケージ(fbx, meta)).expect("合成パッケージは開ける");
+        let converted = package
+            .convert("Assets/Model.fbx", "{}")
+            .expect("未知の対応は省いて変換できる");
+        成功の基本形を確かめる(&converted);
+        let report: serde_json::Value =
+            serde_json::from_str(&converted.report_json).expect("レポートはJSONである");
+        assert_eq!(
+            report["warnings"],
+            serde_json::json!([
+                "FBXに材質の置換表がないため材質を読まない",
+                "材質を読めなかったため灰色で出力する",
+                "未知のhumanNameのため対応を省く: MysteryBone",
+            ]),
+        );
+    }
+
+    /// 倍精度浮動小数点のプロパティを書く。`DeformPercent` に使う。
+    impl Props {
+        fn 合成d(&mut self, v: f64) {
+            self.prop(b'D', &v.to_le_bytes());
+        }
+    }
+
+    /// ブレンドシェイプの `Shape` ジオメトリを組み立てる。
+    fn 合成shape(id: i64, 名前: &[u8]) -> TNode {
+        let mut index_props = Props::default();
+        index_props.i_raw(&[0]);
+        let mut delta_props = Props::default();
+        delta_props.d_raw(&[0.5, 0.0, 0.0]);
+        let mut props = Props::default();
+        props.l(id);
+        props.s(名前);
+        props.s(b"Shape");
+        TNode::branch(
+            b"Geometry",
+            props,
+            vec![
+                TNode::leaf(b"Indexes", index_props),
+                TNode::leaf(b"Vertices", delta_props),
+            ],
+        )
+    }
+
+    /// ブレンドシェイプチャンネルを組み立てる。初期値はゼロである。
+    fn 合成channel(id: i64, 名前: &[u8]) -> TNode {
+        let mut deform_props = Props::default();
+        deform_props.合成d(0.0);
+        let mut props = Props::default();
+        props.l(id);
+        props.s(名前);
+        props.s(b"BlendShapeChannel");
+        TNode::branch(
+            b"Deformer",
+            props,
+            vec![TNode::leaf(b"DeformPercent", deform_props)],
+        )
+    }
+
+    /// 必須骨と表情チャンネルを持つFBXを組み立てる。標準名のため対応表なしで書き出せる。
+    fn 表情付きfbxを組み立てる(チャンネル名ら: &[&str]) -> Vec<u8> {
+        let 列 = 必須骨列("LeftHand", "RightHand");
+        let mut objs: Vec<TNode> = 列
+            .iter()
+            .map(|(id, name, _)| {
+                let subtype = if *name == "Owner" { "Mesh" } else { "LimbNode" };
+                合成model(*id, name, subtype)
+            })
+            .collect();
+        objs.push(合成geometry(
+            100,
+            "Tri",
+            vec![
+                合成vertices(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+                合成pvi(&[0, 1, -3]),
+            ],
+        ));
+        objs.push(TNode::branch(
+            b"Deformer",
+            {
+                let mut props = Props::default();
+                props.l(3000);
+                props.s(b"Blend\x00\x01Deformer");
+                props.s(b"BlendShape");
+                props
+            },
+            vec![],
+        ));
+        let mut 追加接続 = Vec::new();
+        for (offset, 名前) in チャンネル名ら.iter().enumerate() {
+            let shape_id = 1000 + offset as i64;
+            let channel_id = 2000 + offset as i64;
+            let mut channel_full = 名前.as_bytes().to_vec();
+            channel_full.extend_from_slice(b"\x00\x01SubDeformer");
+            let mut shape_full = format!("{名前}-shape").into_bytes();
+            shape_full.extend_from_slice(b"\x00\x01Shape");
+            objs.push(合成shape(shape_id, &shape_full));
+            objs.push(合成channel(channel_id, &channel_full));
+            追加接続.push(合成conn(shape_id, channel_id));
+            追加接続.push(合成conn(channel_id, 3000));
+        }
+        追加接続.push(合成conn(3000, 100));
+        let mut pose_props = Props::default();
+        pose_props.l(200);
+        pose_props.s(b"Bind\x00\x01Pose");
+        pose_props.s(b"BindPose");
+        let binds: Vec<TNode> = 列
+            .iter()
+            .map(|(id, _, _)| 合成pose_node(*id, &合成bind_matrix(0.0, 0.0, 0.0)))
+            .collect();
+        objs.push(TNode::branch(b"Pose", pose_props, binds));
+        let mut conns: Vec<TNode> = 列
+            .iter()
+            .filter_map(|(id, _, parent)| parent.map(|parent| 合成conn(*id, parent)))
+            .collect();
+        conns.push(合成conn(100, 16));
+        conns.push(合成conn(1, 0));
+        conns.extend(追加接続);
+        合成file(vec![
+            TNode::branch(b"Objects", Props::default(), objs),
+            TNode::branch(b"Connections", Props::default(), conns),
+        ])
+    }
+
+    #[test]
+    fn 部分一致は存在する式だけを作り欠落を警告する() {
+        // `vrc.v_aa`・`vrc.v_ih` だけがある場合は2式を作り、残り6件を警告する。
+        // JSONスキーマは変えず、既存の文字列配列契約のままである。
+        let fbx = 表情付きfbxを組み立てる(&["vrc.v_aa", "vrc.v_ih"]);
+        let bytes = 合成fbxパッケージ(
+            fbx,
+            file_meta(1, "ModelImporter", "  externalObjects: {}\n"),
+        );
+        let package = Package::open(&bytes).expect("合成パッケージは開ける");
+        let converted = package
+            .convert("Assets/Model.fbx", r#"{"expressions":"vrc"}"#)
+            .expect("部分一致は成功する");
+        成功の基本形を確かめる(&converted);
+        let report: serde_json::Value =
+            serde_json::from_str(&converted.report_json).expect("レポートはJSONである");
+        assert_eq!(report["expressions"], serde_json::json!(2));
+        let warnings = report["warnings"].as_array().expect("warningsは配列である");
+        assert_eq!(warnings.len(), 2 + 6, "材質2件＋欠落6件である");
+        assert_eq!(
+            warnings[0],
+            serde_json::json!("FBXに材質の置換表がないため材質を読まない")
+        );
+        assert_eq!(
+            warnings[1],
+            serde_json::json!("材質を読めなかったため灰色で出力する")
+        );
+        for (警告, 欠落) in warnings[2..].iter().zip([
+            "vrc.v_ou",
+            "vrc.v_e",
+            "vrc.v_oh",
+            "vrc.blink",
+            "vrc.looking_up",
+            "vrc.looking_down",
+        ]) {
+            assert!(
+                警告.as_str().unwrap_or("").contains(欠落),
+                "欠落名を含む: {警告}"
+            );
+        }
+    }
+
+    #[test]
+    fn 一致0件は成功し式なしで全要求を警告する() {
+        // 要求のどれにも一致しない場合は式なしで成功し、8件すべてを警告する。
+        let fbx = 表情付きfbxを組み立てる(&["t1"]);
+        let bytes = 合成fbxパッケージ(
+            fbx,
+            file_meta(1, "ModelImporter", "  externalObjects: {}\n"),
+        );
+        let package = Package::open(&bytes).expect("合成パッケージは開ける");
+        let converted = package
+            .convert("Assets/Model.fbx", r#"{"expressions":"vrc"}"#)
+            .expect("0件一致は成功する");
+        成功の基本形を確かめる(&converted);
+        let report: serde_json::Value =
+            serde_json::from_str(&converted.report_json).expect("レポートはJSONである");
+        assert_eq!(report["expressions"], serde_json::json!(0));
+        let warnings = report["warnings"].as_array().expect("warningsは配列である");
+        assert_eq!(warnings.len(), 2 + 8, "材質2件＋欠落8件である");
+    }
+
+    #[test]
+    fn 警告の順序は材質の後ろにモデル警告とhumanoid警告を置く() {
+        // 順序は既存の材質警告・灰色出力警告 → モデル生成警告 → humanoid対応付け警告である。
+        let fbx = 表情付きfbxを組み立てる(&["vrc.v_aa"]);
+        let meta = 対応表付きmeta(&[("Hips", "MysteryBone")]);
+        let package = Package::open(&合成fbxパッケージ(fbx, meta)).expect("合成パッケージは開ける");
+        let converted = package
+            .convert("Assets/Model.fbx", r#"{"expressions":"vrc"}"#)
+            .expect("警告があっても変換できる");
+        成功の基本形を確かめる(&converted);
+        let report: serde_json::Value =
+            serde_json::from_str(&converted.report_json).expect("レポートはJSONである");
+        let warnings: Vec<&str> = report["warnings"]
+            .as_array()
+            .expect("warningsは配列である")
+            .iter()
+            .map(|警告| 警告.as_str().expect("警告は文字列である"))
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            2 + 7 + 1,
+            "材質2件＋欠落7件＋対応表1件である"
+        );
+        assert_eq!(warnings[0], "FBXに材質の置換表がないため材質を読まない");
+        assert_eq!(warnings[1], "材質を読めなかったため灰色で出力する");
+        assert!(
+            warnings[2..9]
+                .iter()
+                .all(|警告| 警告.contains("表情ターゲットを適用しない")),
+            "3件目からはモデル生成警告である: {warnings:?}"
+        );
+        assert_eq!(warnings[9], "未知のhumanNameのため対応を省く: MysteryBone");
+    }
+
+    /// 同率2メッシュの表情FBXを組み立てる。先頭と後続の差分を変えられる。
+    /// チャンネル名はVRCの要求名に含まれるものを使い、同率の限定解消を起こす。
+    fn 同率表情fbxを組み立てる(
+        先頭差分: [f64; 3], 後続差分: [f64; 3]
+    ) -> Vec<u8> {
+        let 列 = 必須骨列("LeftHand", "RightHand");
+        let mut objs: Vec<TNode> = 列
+            .iter()
+            .map(|(id, name, _)| {
+                let subtype = if *name == "Owner" { "Mesh" } else { "LimbNode" };
+                合成model(*id, name, subtype)
+            })
+            .collect();
+        objs.push(合成geometry(
+            100,
+            "Tri",
+            vec![
+                合成vertices(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+                合成pvi(&[0, 1, -3]),
+            ],
+        ));
+        objs.push(合成geometry(
+            101,
+            "Second",
+            vec![
+                合成vertices(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+                合成pvi(&[0, 1, -3]),
+            ],
+        ));
+        objs.push(合成model(17, "Owner2", "Mesh"));
+        for (blend_id, 幾何名, 差分, 基数) in [
+            (3000i64, 100i64, 先頭差分, 0i64),
+            (3001i64, 101i64, 後続差分, 100i64),
+        ] {
+            objs.push(TNode::branch(
+                b"Deformer",
+                {
+                    let mut props = Props::default();
+                    props.l(blend_id);
+                    props.s(format!("Blend{blend_id}\x00\x01Deformer").as_bytes());
+                    props.s(b"BlendShape");
+                    props
+                },
+                vec![],
+            ));
+            let shape_id = 1000 + 基数;
+            let channel_id = 2000 + 基数;
+            let mut channel_full = b"vrc.v_aa".to_vec();
+            channel_full.extend_from_slice(b"\x00\x01SubDeformer");
+            let mut shape_full = b"vrc.v_aa-shape".to_vec();
+            shape_full.extend_from_slice(b"\x00\x01Shape");
+            let mut index_props = Props::default();
+            index_props.i_raw(&[0]);
+            let mut delta_props = Props::default();
+            delta_props.d_raw(&差分);
+            let mut shape_props = Props::default();
+            shape_props.l(shape_id);
+            shape_props.s(&shape_full);
+            shape_props.s(b"Shape");
+            objs.push(TNode::branch(
+                b"Geometry",
+                shape_props,
+                vec![
+                    TNode::leaf(b"Indexes", index_props),
+                    TNode::leaf(b"Vertices", delta_props),
+                ],
+            ));
+            objs.push(合成channel(channel_id, &channel_full));
+            let _ = 幾何名;
+        }
+        let mut pose_props = Props::default();
+        pose_props.l(200);
+        pose_props.s(b"Bind\x00\x01Pose");
+        pose_props.s(b"BindPose");
+        let mut binds: Vec<TNode> = 列
+            .iter()
+            .map(|(id, _, _)| 合成pose_node(*id, &合成bind_matrix(0.0, 0.0, 0.0)))
+            .collect();
+        binds.push(合成pose_node(17, &合成bind_matrix(0.0, 0.0, 0.0)));
+        objs.push(TNode::branch(b"Pose", pose_props, binds));
+        let mut conns: Vec<TNode> = 列
+            .iter()
+            .filter_map(|(id, _, parent)| parent.map(|parent| 合成conn(*id, parent)))
+            .collect();
+        conns.push(合成conn(100, 16));
+        conns.push(合成conn(1, 0));
+        conns.push(合成conn(17, 1));
+        conns.push(合成conn(101, 17));
+        for (blend_id, 幾何, 基数) in [(3000i64, 100i64, 0i64), (3001i64, 101i64, 100i64)] {
+            conns.push(合成conn(1000 + 基数, 2000 + 基数));
+            conns.push(合成conn(2000 + 基数, blend_id));
+            conns.push(合成conn(blend_id, 幾何));
+        }
+        合成file(vec![
+            TNode::branch(b"Objects", Props::default(), objs),
+            TNode::branch(b"Connections", Props::default(), conns),
+        ])
+    }
+
+    #[test]
+    fn 同率で唯一非ゼロなら警告一覧に選択警告が載る() {
+        // 後続メッシュの一致ターゲットがすべてゼロなら先頭を採用する。
+        // 順序は材質警告・灰色出力警告 → 選択警告 → 欠落警告である。
+        let fbx = 同率表情fbxを組み立てる([0.5, 0.0, 0.0], [0.0, 0.0, 0.0]);
+        let bytes = 合成fbxパッケージ(
+            fbx,
+            file_meta(1, "ModelImporter", "  externalObjects: {}\n"),
+        );
+        let package = Package::open(&bytes).expect("合成パッケージは開ける");
+        let converted = package
+            .convert("Assets/Model.fbx", r#"{"expressions":"vrc"}"#)
+            .expect("限定解消は成功する");
+        成功の基本形を確かめる(&converted);
+        let report: serde_json::Value =
+            serde_json::from_str(&converted.report_json).expect("レポートはJSONである");
+        assert_eq!(report["expressions"], serde_json::json!(1));
+        let warnings: Vec<&str> = report["warnings"]
+            .as_array()
+            .expect("warningsは配列である")
+            .iter()
+            .map(|警告| 警告.as_str().expect("警告は文字列である"))
+            .collect();
+        assert_eq!(warnings.len(), 2 + 1 + 7, "材質2件＋選択1件＋欠落7件である");
+        assert_eq!(warnings[0], "FBXに材質の置換表がないため材質を読まない");
+        assert_eq!(warnings[1], "材質を読めなかったため灰色で出力する");
+        assert!(
+            warnings[2].contains("同率候補から"),
+            "3件目は選択警告である: {}",
+            warnings[2]
+        );
+        assert!(
+            warnings[3..]
+                .iter()
+                .all(|警告| 警告.contains("表情ターゲットを適用しない")),
+            "4件目からは欠落警告である: {warnings:?}"
+        );
     }
 }

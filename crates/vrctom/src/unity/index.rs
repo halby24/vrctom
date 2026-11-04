@@ -7,10 +7,16 @@
 
 use std::collections::HashMap;
 
-use super::{AssetKind, AssetMeta, FileId, Guid, ObjectRef, UnityError, UnityErrorKind, classify};
+use super::{
+    AssetKind, AssetMeta, FileId, Guid, ObjectRef, UnityError, UnityErrorKind, classify,
+    meta::MAX_META_BYTES,
+};
 
 /// meta 1件の既定上限（バイト）。
-const DEFAULT_MAX_META_BYTES: u64 = 4 * 1024 * 1024;
+///
+/// 値は [`MAX_META_BYTES`](super::meta::MAX_META_BYTES) と同じであり、
+/// 二重管理しない。
+const DEFAULT_MAX_META_BYTES: u64 = MAX_META_BYTES;
 /// meta合計の既定上限（バイト）。
 const DEFAULT_MAX_META_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 /// アセット数の既定上限。

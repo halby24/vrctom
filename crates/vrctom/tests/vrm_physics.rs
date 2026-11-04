@@ -8,9 +8,10 @@
 use std::collections::HashMap;
 
 use vrctom::fbx::{FbxFile, FbxOptions};
+use vrctom::unity::HumanBoneMapping;
 use vrctom::vrm::{
-    HumanoidBones, HumanoidPoseReport, PhysicsLimits, PhysicsResolution, PhysicsSidecar,
-    SkippedHumanoidReason, SpringCompileOptions, VrmErrorKind, VrmExportOptions,
+    HumanoidBone, HumanoidBones, HumanoidPoseReport, PhysicsLimits, PhysicsResolution,
+    PhysicsSidecar, SkippedHumanoidReason, SpringCompileOptions, VrmErrorKind, VrmExportOptions,
     VrmExpressionProfile, VrmMeta, VrmModel, VrmNode, VrmOptions, VrmSpringBones,
     apply_humanoid_t_pose, compile_springs, resolve_look_at,
 };
@@ -909,9 +910,11 @@ fn tポーズは差分デルタを右から掛けてローカル回転だけ変�
     let 解決 = モデル
         .resolve_physics_sidecar(&sidecar, fbxバイト列)
         .expect("単一ノードは解決できる");
-    let 報告: HumanoidPoseReport =
-        apply_humanoid_t_pose(&sidecar, &mut モデル, &解決, sidecar.humanoid.as_ref())
-            .expect("tポーズは適用できる");
+    // sidecarの `Hips -> n:0` と一致する解決済み対応を渡す。
+    let mut 解決済み = HumanoidBones::new();
+    解決済み.set(HumanoidBone::Hips, 0);
+    let 報告: HumanoidPoseReport = apply_humanoid_t_pose(&sidecar, &mut モデル, &解決, &解決済み)
+        .expect("tポーズは適用できる");
     assert_eq!(報告.applied.len(), 1, "1骨を上書きする");
     assert_eq!(報告.applied[0].bone, "Hips");
     assert_eq!(報告.applied[0].node, 0);
@@ -959,9 +962,11 @@ fn 差分が無い骨は回転を変えない() {
     let 解決 = モデル
         .resolve_physics_sidecar(&sidecar, fbxバイト列)
         .expect("単一ノードは解決できる");
-    let 報告: HumanoidPoseReport =
-        apply_humanoid_t_pose(&sidecar, &mut モデル, &解決, sidecar.humanoid.as_ref())
-            .expect("tポーズは適用できる");
+    // 恒等差分でも対応が一致すれば適用し、変化記録には残らない。
+    let mut 解決済み = HumanoidBones::new();
+    解決済み.set(HumanoidBone::Hips, 0);
+    let 報告: HumanoidPoseReport = apply_humanoid_t_pose(&sidecar, &mut モデル, &解決, &解決済み)
+        .expect("tポーズは適用できる");
     assert_eq!(報告.applied.len(), 1, "上書き自体は行う");
     assert!(報告.changed.is_empty(), "変化記録は無い");
     for (i, (実, 想)) in モデルローカル
@@ -1015,9 +1020,11 @@ fn 未解決とtポーズ無しは記録して飛ばす() {
     let 解決 = モデル
         .resolve_physics_sidecar(&sidecar, fbxバイト列)
         .expect("単一ノードは解決できる");
-    let 報告: HumanoidPoseReport =
-        apply_humanoid_t_pose(&sidecar, &mut モデル, &解決, sidecar.humanoid.as_ref())
-            .expect("T-pose無し骨は飛ばす");
+    // `Spine -> n:0` と一致する解決済み対応を渡し、欠落のスキップを確かめる。
+    let mut 解決済み = HumanoidBones::new();
+    解決済み.set(HumanoidBone::Spine, 0);
+    let 報告: HumanoidPoseReport = apply_humanoid_t_pose(&sidecar, &mut モデル, &解決, &解決済み)
+        .expect("T-pose無し骨は飛ばす");
     assert!(報告.applied.is_empty(), "上書きは無い");
     assert_eq!(報告.skipped.len(), 1, "1骨を飛ばす");
     assert_eq!(報告.skipped[0].bone, "Spine");
@@ -1047,7 +1054,11 @@ fn 重複ノードのtポーズは失敗して部分更新しない() {
     let 解決 = モデル
         .resolve_physics_sidecar(&sidecar, fbxバイト列)
         .expect("単一ノードは解決できる");
-    let エラー = apply_humanoid_t_pose(&sidecar, &mut モデル, &解決, sidecar.humanoid.as_ref())
+    // 両骨ともsidecarと一致する解決済み対応を渡し、重複の失敗を確かめる。
+    let mut 解決済み = HumanoidBones::new();
+    解決済み.set(HumanoidBone::Hips, 0);
+    解決済み.set(HumanoidBone::Spine, 0);
+    let エラー = apply_humanoid_t_pose(&sidecar, &mut モデル, &解決, &解決済み)
         .expect_err("重複ノードは失敗する");
     assert_eq!(エラー.kind(), VrmErrorKind::InvalidPhysicsSidecar);
     assert_eq!(モデル.nodes[0].local, 単位行列(), "部分更新しない");
@@ -1066,9 +1077,10 @@ fn humanoid無しの旧sidecarでは何もしない() {
     let 解決 = モデル
         .resolve_physics_sidecar(&sidecar, fbxバイト列)
         .expect("単一ノードは解決できる");
-    let 報告: HumanoidPoseReport =
-        apply_humanoid_t_pose(&sidecar, &mut モデル, &解決, sidecar.humanoid.as_ref())
-            .expect("humanoid無しでも成功する");
+    // 旧sidecarにはhumanoid記録が無く、解決済み対応は使わない。
+    let 解決済み = HumanoidBones::new();
+    let 報告: HumanoidPoseReport = apply_humanoid_t_pose(&sidecar, &mut モデル, &解決, &解決済み)
+        .expect("humanoid無しでも成功する");
     assert!(報告.applied.is_empty(), "上書きは無い");
     assert!(報告.skipped.is_empty(), "飛ばしは無い");
     assert_eq!(モデル.nodes[0].local, 単位行列(), "モデルは変わらない");
@@ -1272,8 +1284,23 @@ fn 実fixtureのtポーズはunity出力と一致する() {
     let 解決 = モデル
         .resolve_physics_sidecar(&sidecar, &fbxバイト列)
         .expect("実fixtureの参照は解決できる");
+    // sidecar自身から対応表を組み立て、解決済み対応を作る。
+    // 比較が通ることを前提に、T-pose適用の件数・角度を確かめる。
+    let 対応表: Vec<HumanBoneMapping> = humanoid記録
+        .bones
+        .iter()
+        .filter_map(|骨| {
+            let 索引 = *解決.node_map.get(骨.node_id.as_str())?;
+            Some(HumanBoneMapping {
+                human_name: 骨.bone.clone(),
+                bone_name: モデル.nodes.get(索引)?.name.clone(),
+            })
+        })
+        .collect();
+    let (解決済み, _) = HumanoidBones::detect_with_mapping(&モデル, &対応表)
+        .expect("実fixtureの対応表は解決できる");
     // CLIと同じ順序であり、視線の測定とスプリングの生成より前に適用する。
-    let 報告 = apply_humanoid_t_pose(&sidecar, &mut モデル, &解決, Some(humanoid記録))
+    let 報告 = apply_humanoid_t_pose(&sidecar, &mut モデル, &解決, &解決済み)
         .expect("実fixtureのT-poseは適用できる");
     assert_eq!(報告.applied.len(), 53, "53骨を上書きする");
     assert!(報告.skipped.is_empty(), "飛ばしは無い");
@@ -1663,4 +1690,342 @@ fn 実fixtureのtポーズはunity出力と一致する() {
     assert_eq!(モデル.node_constraints.len(), 8);
     assert_eq!(対象名数, 57);
     assert_eq!(meta数, 12);
+}
+
+/// 不一致検証用の3ノード対応を作る。モデル名とsidecar名を合わせる。
+///
+/// 階層は `Hips -> {OldWrist, NewWrist}` であり、参照ローカルは
+/// モデル姿勢のX反転（Unity左手系）に合わせる。T-poseは恒等であり、
+/// 一致する骨は行列を変えない。
+fn 三ノードの対応を作る(fbxバイト列: &[u8]) -> (VrmModel, String) {
+    let 名前 = ["Hips", "OldWrist", "NewWrist"];
+    let 親 = [None, Some(0), Some(0)];
+    let 位置 = [[0.0, 1.0, 0.0], [0.2, 1.0, 0.0], [0.4, 1.0, 0.0]];
+    let ローカル: Vec<[f64; 16]> = 位置.iter().map(|位置| 平行移動行列(*位置)).collect();
+    let モデル = 合成モデルを作る(&名前, &親, &ローカル);
+    let 参照 = |位置: [f64; 3]| [-位置[0], 位置[1], 位置[2]];
+    let ノード = vec![
+        ノードjson(
+            "n:0",
+            None,
+            "Hips",
+            &["Milfy", "Hips"],
+            Some(出所json("milfy", &["Hips"])),
+            参照(位置[0]),
+        ),
+        ノードjson(
+            "n:1",
+            Some("n:0"),
+            "OldWrist",
+            &["Milfy", "Hips", "OldWrist"],
+            Some(出所json("milfy", &["Hips", "OldWrist"])),
+            参照(位置[1]),
+        ),
+        ノードjson(
+            "n:2",
+            Some("n:0"),
+            "NewWrist",
+            &["Milfy", "Hips", "NewWrist"],
+            Some(出所json("milfy", &["Hips", "NewWrist"])),
+            参照(位置[2]),
+        ),
+    ];
+    let 文 = sidecar_json(
+        fbxバイト列,
+        ノード,
+        vec![ボーンjson("pb:0", "n:0", "n:0", &[], &[])],
+        Vec::new(),
+    );
+    (モデル, 文)
+}
+
+/// 解決済み対応と食い違うT-poseは失敗し、モデルを変えない。
+///
+/// 正常骨（Hips）を先に、不一致骨（LeftHand）を後に置く。
+/// 先頭の正常骨は非恒等回転にし、逐次適用する退行でも検出できるようにする。
+/// 恒等回転でも不一致なら失敗し、全ノードのローカル行列が変わらない。
+#[test]
+fn 解決済み対応と食い違うtポーズは失敗して何も変えない() {
+    // メタ解決では `LeftHand -> NewWrist`（node[2]）だが、
+    // 古いsidecarは `LeftHand -> n:1`（node[1] `OldWrist`）を指す。
+    // HipsのT-poseはY軸90度であり、適用が走れば行列が変わる配置である。
+    let fbxバイト列 = b"fake-fbx";
+    let (mut モデル, 文) = 三ノードの対応を作る(fbxバイト列);
+    let 適用前: Vec<[f64; 16]> = モデル.nodes.iter().map(|ノード| ノード.local).collect();
+    let 九十度 = std::f64::consts::FRAC_1_SQRT_2;
+    let humanoid = serde_json::json!({
+        "isHuman": true,
+        "bones": [
+            humanoid骨json("Hips", "n:0", Some([0.0, 九十度, 0.0, 九十度])),
+            humanoid骨json("LeftHand", "n:1", Some([0.0, 0.0, 0.0, 1.0])),
+        ],
+    });
+    let sidecar = PhysicsSidecar::from_json(
+        &humanoid付きsidecar_json(&文, humanoid),
+        &PhysicsLimits::new(),
+    )
+    .expect("不一致自体は検証を通る");
+    let 解決 = モデル
+        .resolve_physics_sidecar(&sidecar, fbxバイト列)
+        .expect("3ノードは解決できる");
+    let mut 解決済み = HumanoidBones::new();
+    解決済み.set(HumanoidBone::Hips, 0);
+    解決済み.set(HumanoidBone::LeftHand, 2);
+    let エラー = apply_humanoid_t_pose(&sidecar, &mut モデル, &解決, &解決済み)
+        .expect_err("不一致は失敗する");
+    assert_eq!(エラー.kind(), VrmErrorKind::InvalidPhysicsSidecar);
+    let 文面 = format!("{エラー}");
+    for 断片 in [
+        "humanoidの対応が一致しない",
+        "LeftHand",
+        "leftHand",
+        "n:1",
+        "node[1]",
+        "OldWrist",
+        "node[2]",
+        "NewWrist",
+    ] {
+        assert!(文面.contains(断片), "診断に {断片} が入る: {文面}");
+    }
+    for (索引, (前, 後)) in 適用前
+        .iter()
+        .zip(モデル.nodes.iter().map(|ノード| &ノード.local))
+        .enumerate()
+    {
+        assert_eq!(前, 後, "node[{索引}] は変わらない");
+    }
+}
+
+/// tポーズが無くても対応の不一致は失敗する。欠落と矛盾は区別する。
+#[test]
+fn tポーズ無しでも対応の不一致は失敗する() {
+    // `tPose` が無くても、両側の対応が解決できて食い違えば失敗する。
+    // HipsのT-poseはY軸90度であり、適用が走れば行列が変わる配置である。
+    let fbxバイト列 = b"fake-fbx";
+    let (mut モデル, 文) = 三ノードの対応を作る(fbxバイト列);
+    let 適用前: Vec<[f64; 16]> = モデル.nodes.iter().map(|ノード| ノード.local).collect();
+    let 九十度 = std::f64::consts::FRAC_1_SQRT_2;
+    let humanoid = serde_json::json!({
+        "isHuman": true,
+        "bones": [
+            humanoid骨json("Hips", "n:0", Some([0.0, 九十度, 0.0, 九十度])),
+            humanoid骨json("LeftHand", "n:1", None),
+        ],
+    });
+    let sidecar = PhysicsSidecar::from_json(
+        &humanoid付きsidecar_json(&文, humanoid),
+        &PhysicsLimits::new(),
+    )
+    .expect("tポーズ無しは検証を通る");
+    let 解決 = モデル
+        .resolve_physics_sidecar(&sidecar, fbxバイト列)
+        .expect("3ノードは解決できる");
+    let mut 解決済み = HumanoidBones::new();
+    解決済み.set(HumanoidBone::Hips, 0);
+    解決済み.set(HumanoidBone::LeftHand, 2);
+    let エラー = apply_humanoid_t_pose(&sidecar, &mut モデル, &解決, &解決済み)
+        .expect_err("欠落があっても矛盾は失敗する");
+    assert_eq!(エラー.kind(), VrmErrorKind::InvalidPhysicsSidecar);
+    assert!(
+        format!("{エラー}").contains("humanoidの対応が一致しない"),
+        "矛盾の診断になる"
+    );
+    for (索引, (前, 後)) in 適用前
+        .iter()
+        .zip(モデル.nodes.iter().map(|ノード| &ノード.local))
+        .enumerate()
+    {
+        assert_eq!(前, 後, "node[{索引}] は変わらない");
+    }
+}
+
+/// 対応が一致すればtポーズ無しは従来どおり飛ばす。
+#[test]
+fn 対応が一致すればtポーズ無しは飛ばす() {
+    // 両側の対応が同じ索引なら、`tPose` の無い骨は欠落として飛ばす。
+    let fbxバイト列 = b"fake-fbx";
+    let (mut モデル, 文) = 三ノードの対応を作る(fbxバイト列);
+    let humanoid = serde_json::json!({
+        "isHuman": true,
+        "bones": [
+            humanoid骨json("Hips", "n:0", Some([0.0, 0.0, 0.0, 1.0])),
+            humanoid骨json("LeftHand", "n:2", None),
+        ],
+    });
+    let sidecar = PhysicsSidecar::from_json(
+        &humanoid付きsidecar_json(&文, humanoid),
+        &PhysicsLimits::new(),
+    )
+    .expect("tポーズ無しは検証を通る");
+    let 解決 = モデル
+        .resolve_physics_sidecar(&sidecar, fbxバイト列)
+        .expect("3ノードは解決できる");
+    let mut 解決済み = HumanoidBones::new();
+    解決済み.set(HumanoidBone::Hips, 0);
+    解決済み.set(HumanoidBone::LeftHand, 2);
+    let 報告 = apply_humanoid_t_pose(&sidecar, &mut モデル, &解決, &解決済み)
+        .expect("一致すれば飛ばして成功する");
+    assert_eq!(報告.applied.len(), 1, "Hipsだけ上書きする");
+    assert_eq!(報告.skipped.len(), 1, "LeftHandだけ飛ばす");
+    assert_eq!(報告.skipped[0].bone, "LeftHand");
+    assert_eq!(報告.skipped[0].reason, SkippedHumanoidReason::MissingTPose);
+}
+
+/// Jawは比較対象外であり、従来どおり適用する。
+#[test]
+fn jawは比較対象外で従来どおり適用する() {
+    // `Jaw` はVRMに対応先が無いため、索引が違っても比較しない。
+    let fbxバイト列 = b"fake-fbx";
+    let (mut モデル, 文) = 三ノードの対応を作る(fbxバイト列);
+    let humanoid = serde_json::json!({
+        "isHuman": true,
+        "bones": [
+            humanoid骨json("Hips", "n:0", Some([0.0, 0.0, 0.0, 1.0])),
+            humanoid骨json("Jaw", "n:1", Some([0.0, 0.0, 0.0, 1.0])),
+        ],
+    });
+    let sidecar = PhysicsSidecar::from_json(
+        &humanoid付きsidecar_json(&文, humanoid),
+        &PhysicsLimits::new(),
+    )
+    .expect("Jawは検証を通る");
+    let 解決 = モデル
+        .resolve_physics_sidecar(&sidecar, fbxバイト列)
+        .expect("3ノードは解決できる");
+    let mut 解決済み = HumanoidBones::new();
+    解決済み.set(HumanoidBone::Hips, 0);
+    解決済み.set(HumanoidBone::LeftHand, 2);
+    let 報告 = apply_humanoid_t_pose(&sidecar, &mut モデル, &解決, &解決済み)
+        .expect("Jawは比較せず成功する");
+    assert_eq!(報告.applied.len(), 2, "HipsとJawを上書きする");
+    assert!(報告.skipped.is_empty(), "飛ばしは無い");
+}
+
+/// 解決済み対応に無い骨は比較対象外であり、書き出し対応に追加しない。
+#[test]
+fn 解決済み対応に無い骨は比較せず適用する() {
+    // sidecarにしか無い `LeftHand` は比較せず、従来どおり適用する。
+    let fbxバイト列 = b"fake-fbx";
+    let (mut モデル, 文) = 三ノードの対応を作る(fbxバイト列);
+    let humanoid = serde_json::json!({
+        "isHuman": true,
+        "bones": [
+            humanoid骨json("Hips", "n:0", Some([0.0, 0.0, 0.0, 1.0])),
+            humanoid骨json("LeftHand", "n:1", Some([0.0, 0.0, 0.0, 1.0])),
+        ],
+    });
+    let sidecar = PhysicsSidecar::from_json(
+        &humanoid付きsidecar_json(&文, humanoid),
+        &PhysicsLimits::new(),
+    )
+    .expect("任意骨は検証を通る");
+    let 解決 = モデル
+        .resolve_physics_sidecar(&sidecar, fbxバイト列)
+        .expect("3ノードは解決できる");
+    let mut 解決済み = HumanoidBones::new();
+    解決済み.set(HumanoidBone::Hips, 0);
+    let 報告 = apply_humanoid_t_pose(&sidecar, &mut モデル, &解決, &解決済み)
+        .expect("片側だけの骨は比較せず成功する");
+    assert_eq!(報告.applied.len(), 2, "2骨を上書きする");
+    assert!(解決済み.get(HumanoidBone::LeftHand).is_none());
+}
+
+/// 親指は共通表の変換先で比べる。
+#[test]
+fn 親指は共通表の変換先で比べる() {
+    // sidecarの `LeftThumbProximal` はVRMの中手骨に当たる。
+    // 解決済みの中手骨と食い違えば失敗し、診断はVRM骨名で出す。
+    let fbxバイト列 = b"fake-fbx";
+    let (mut モデル, 文) = 三ノードの対応を作る(fbxバイト列);
+    let humanoid = serde_json::json!({
+        "isHuman": true,
+        "bones": [
+            humanoid骨json("Hips", "n:0", Some([0.0, 0.0, 0.0, 1.0])),
+            humanoid骨json("LeftThumbProximal", "n:1", Some([0.0, 0.0, 0.0, 1.0])),
+        ],
+    });
+    let sidecar = PhysicsSidecar::from_json(
+        &humanoid付きsidecar_json(&文, humanoid),
+        &PhysicsLimits::new(),
+    )
+    .expect("親指は検証を通る");
+    let 解決 = モデル
+        .resolve_physics_sidecar(&sidecar, fbxバイト列)
+        .expect("3ノードは解決できる");
+    let mut 解決済み = HumanoidBones::new();
+    解決済み.set(HumanoidBone::Hips, 0);
+    解決済み.set(HumanoidBone::LeftThumbMetacarpal, 2);
+    let エラー = apply_humanoid_t_pose(&sidecar, &mut モデル, &解決, &解決済み)
+        .expect_err("親指の不一致は失敗する");
+    assert_eq!(エラー.kind(), VrmErrorKind::InvalidPhysicsSidecar);
+    let 文面 = format!("{エラー}");
+    assert!(
+        文面.contains("LeftThumbProximal"),
+        "Unity骨名が出る: {文面}"
+    );
+    assert!(
+        文面.contains("leftThumbMetacarpal"),
+        "変換先のVRM骨名が出る: {文面}"
+    );
+}
+
+/// 未知のsidecar骨名は比較せず、従来どおり適用する。
+#[test]
+fn 未知のsidecar骨名は比較せず適用する() {
+    // 共通表に無い骨名は新たな拒否をせず、従来どおり適用する。
+    let fbxバイト列 = b"fake-fbx";
+    let (mut モデル, 文) = 三ノードの対応を作る(fbxバイト列);
+    let humanoid = serde_json::json!({
+        "isHuman": true,
+        "bones": [
+            humanoid骨json("Hips", "n:0", Some([0.0, 0.0, 0.0, 1.0])),
+            humanoid骨json("UnknownBone", "n:1", Some([0.0, 0.0, 0.0, 1.0])),
+        ],
+    });
+    let sidecar = PhysicsSidecar::from_json(
+        &humanoid付きsidecar_json(&文, humanoid),
+        &PhysicsLimits::new(),
+    )
+    .expect("未知骨名は検証を通る");
+    let 解決 = モデル
+        .resolve_physics_sidecar(&sidecar, fbxバイト列)
+        .expect("3ノードは解決できる");
+    let mut 解決済み = HumanoidBones::new();
+    解決済み.set(HumanoidBone::Hips, 0);
+    解決済み.set(HumanoidBone::LeftHand, 2);
+    let 報告 = apply_humanoid_t_pose(&sidecar, &mut モデル, &解決, &解決済み)
+        .expect("未知骨名は比較せず成功する");
+    assert_eq!(報告.applied.len(), 2, "2骨を上書きする");
+}
+
+/// 空白付きのsidecar骨名は比較せず、従来どおり適用する。
+#[test]
+fn 空白付きのsidecar骨名は比較せず適用する() {
+    // sidecarの骨名は共通表と完全一致で照合し、正規化しない。
+    // `"Left Hand"` は正規化すれば `LeftHand` になるが、
+    // 共通表に無いため比較対象外として従来どおり適用する。
+    let fbxバイト列 = b"fake-fbx";
+    let (mut モデル, 文) = 三ノードの対応を作る(fbxバイト列);
+    let humanoid = serde_json::json!({
+        "isHuman": true,
+        "bones": [
+            humanoid骨json("Hips", "n:0", Some([0.0, 0.0, 0.0, 1.0])),
+            humanoid骨json("Left Hand", "n:1", Some([0.0, 0.0, 0.0, 1.0])),
+        ],
+    });
+    let sidecar = PhysicsSidecar::from_json(
+        &humanoid付きsidecar_json(&文, humanoid),
+        &PhysicsLimits::new(),
+    )
+    .expect("空白付き骨名は検証を通る");
+    let 解決 = モデル
+        .resolve_physics_sidecar(&sidecar, fbxバイト列)
+        .expect("3ノードは解決できる");
+    let mut 解決済み = HumanoidBones::new();
+    解決済み.set(HumanoidBone::Hips, 0);
+    解決済み.set(HumanoidBone::LeftHand, 2);
+    let 報告 = apply_humanoid_t_pose(&sidecar, &mut モデル, &解決, &解決済み)
+        .expect("空白付き骨名は比較せず成功する");
+    assert_eq!(報告.applied.len(), 2, "2骨を上書きする");
+    assert!(報告.skipped.is_empty(), "飛ばしは無い");
 }

@@ -22,7 +22,8 @@
 //!
 //! 画像のデコード・再エンコードは取り込み上限の縮小の範囲で行い、
 //! テクスチャのベイク、lilToon以外のシェーダの解釈は行わない。
-//! MIMEは先頭バイトで判定し、PNGとJPEGだけを受け付ける。
+//! 形式は先頭バイトで判定し、PNG・JPEGとPSDの保存済み合成画像を受け付ける。
+//! PSDはRaw・RLEの8bit RGB・Grayscaleだけを復号し、復号後にPNGへ符号化する。
 
 use crate::escape_diag;
 
@@ -36,9 +37,11 @@ use super::bake::{
     AlphaMaskInput, BakeChannel, BakeImage, BakeInput, BakeSize, BakeSt, BaseColorJob, EmissionJob,
     EmissionMask, NormalJob, NpotScale, RepackJob, ShadeJob, bake_base_color, bake_channel_repack,
     bake_emission, bake_normal, bake_output_size, bake_shade, downscale_bake_image,
-    encode_color_png, encode_data_png, encode_rgba_png, image_dimensions, import_fitted_size,
-    load_bake_image, matcap_disc_average, shade_layer_weights,
+    downscale_bake_image_owned, encode_color_png, encode_data_png, encode_rgba_png,
+    encode_rgba_png_limited, image_dimensions, import_fitted_size, load_bake_image,
+    matcap_disc_average, shade_layer_weights,
 };
+use super::psd::{PsdError, decode_psd, is_psd, psd_dimensions};
 
 use crate::unity::{
     AssetIndex, AssetKind, AssetSource, Guid, ParseOptions, SerializedFile, TypedObject,
@@ -1571,12 +1574,18 @@ impl<'a> LoadContext<'a> {
                 .with_source(error));
             }
         };
-        let Some(mime) = sniff_mime(&bytes) else {
+        let Some(source) = sniff_source(&bytes) else {
             self.warn(format!(
                 "未対応の画像形式のため省く: {slot}: {property}: {path}"
             ));
             return Ok(None);
         };
+        // PSDは保存済みcompositeを復号してPNGへ符号化し直す。
+        // PNG・JPEGの素通し経路は変えない。
+        if source == SourceImageFormat::Psd {
+            return self.resolve_psd_texture(slot, property, &path, &record.meta, guid, bytes);
+        }
+        let mime = mime_of(source).expect("PSD以外は埋め込みMIMEを持つ");
         // 焼き・縮小の要否にかかわらず、埋め込む画像の寸法をヘッダから検査する。
         // 画素データの確保は行わない。上限超過は失敗して対象パスを付け、
         // ヘッダを読めない画像は未検査のまま埋め込まず警告して省く。
@@ -1607,15 +1616,36 @@ impl<'a> LoadContext<'a> {
                 return Err(error.with_path(path.clone()));
             }
         };
+        let sampler = sampler_of(&record.meta);
+        Ok(Some(self.push_direct_image(
+            slot, property, &path, guid, bytes, mime, sampler,
+        )?))
+    }
+
+    /// 直載せ画像を画像列へ載せ、索引を返す。
+    ///
+    /// 合計上限の超過は失敗として返し、対象パスを付ける。
+    /// 名前はアセットパスのファイルstem、サンプラは呼び出し側が `.meta` から作る。
+    // 引数は画像登録にそのまま使うため束ねない。
+    #[allow(clippy::too_many_arguments)]
+    fn push_direct_image(
+        &mut self,
+        slot: &str,
+        property: &str,
+        path: &str,
+        guid: Guid,
+        bytes: Vec<u8>,
+        mime: VrmImageMime,
+        sampler: VrmSampler,
+    ) -> Result<usize, MaterialError> {
         let total = self.total_image_bytes.saturating_add(bytes.len() as u64);
         if total > self.options.max_total_image_bytes {
             return Err(MaterialError::new(
                 MaterialErrorKind::LimitExceeded,
                 format!("画像の合計が上限を超えた: {slot}: {property}"),
             )
-            .with_path(path));
+            .with_path(path.to_owned()));
         }
-        let sampler = sampler_of(&record.meta);
         let name = path
             .rsplit('/')
             .next()
@@ -1630,7 +1660,137 @@ impl<'a> LoadContext<'a> {
         });
         self.image_at.insert(guid, index);
         self.total_image_bytes = total;
-        Ok(Some(index))
+        Ok(index)
+    }
+
+    /// PSDの失敗を振り分ける。
+    ///
+    /// 警告扱い（対象外・破損・composite不在）は文面を残して `None` を返し、
+    /// 画素上限の超過だけ対象パス付きで失敗として返す。入出力失敗は
+    /// 呼び出し側の読み取りが既に分類しているため、ここには来ない。
+    fn split_psd<T>(
+        &mut self,
+        result: Result<T, PsdError>,
+        slot: &str,
+        property: &str,
+        path: &str,
+    ) -> Result<Option<T>, MaterialError> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(PsdError::Skip { reason, detail }) => {
+                self.warn(format!("{reason}: {slot}: {property}: {path}: {detail}"));
+                Ok(None)
+            }
+            Err(PsdError::Limit(error)) => Err(error.with_path(path.to_owned())),
+        }
+    }
+
+    /// PSDテクスチャ1件を直載せして画像索引を返す。
+    ///
+    /// 入力判別後の流れは `元寸法の上限検査（ヘッダ）→compositeのRGBA8復号→
+    /// 共通の `.meta` 解像度合わせ→PNG符号化（縮小後の1回だけ）→
+    /// 合計出力バイト上限・サンプラ・画像登録` であり、焼きは行わない。
+    /// PSD用PNG出力は残り合計予算に対して制限付きで書き、超過を
+    /// [`MaterialErrorKind::LimitExceeded`] にする。
+    /// 対象外・破損・composite不在は警告して `None` を返す。
+    /// 画像の読み込み失敗・上限の超過だけは失敗として返す。
+    /// 同じGUIDの画像は1件だけ読み、索引を共有する。
+    fn resolve_psd_texture(
+        &mut self,
+        slot: &str,
+        property: &str,
+        path: &str,
+        meta: &crate::unity::AssetMeta,
+        guid: Guid,
+        bytes: Vec<u8>,
+    ) -> Result<Option<usize>, MaterialError> {
+        // 元寸法の上限検査はヘッダで行う。画素データの確保は起きない。
+        let Some((width, height)) = self.split_psd(
+            psd_dimensions(&bytes, self.options.max_image_pixels),
+            slot,
+            property,
+            path,
+        )?
+        else {
+            return Ok(None);
+        };
+        if let Err(error) = self.check_image_pixels(width, height, &format!("{slot}: {property}")) {
+            return Err(error.with_path(path.to_owned()));
+        }
+        // 保存済みcompositeをRGBA8へ復号する。レイヤー合成へ落ちない。
+        let Some(decoded) = self.split_psd(
+            decode_psd(&bytes, self.options.max_image_pixels),
+            slot,
+            property,
+            path,
+        )?
+        else {
+            return Ok(None);
+        };
+        // 復号済み画像へ共通の `.meta` 解像度合わせを適用する。
+        // PNG・JPEGの素通し経路とは別に、復号済み画素から直接載せる。
+        let image = BakeImage::from_rgba8(
+            decoded.width(),
+            decoded.height(),
+            decoded.into_pixels(),
+            srgb_of(meta),
+            sampler_of(meta),
+        )
+        .map_err(|error| error.with_path(path.to_owned()))?;
+        if let Err(error) = self.check_image_pixels(
+            image.width(),
+            image.height(),
+            &format!("{slot}: {property}"),
+        ) {
+            return Err(error.with_path(path.to_owned()));
+        }
+        let (max_size, npot, unknown_npot) = import_limit_of(meta);
+        if unknown_npot {
+            self.warn(format!(
+                "NPOT指定が読めないためそのままの寸法で扱う: {slot}: {property}"
+            ));
+        }
+        let (fitted_w, fitted_h) =
+            import_fitted_size(image.width(), image.height(), max_size, npot);
+        // `.meta` 適用後の寸法も確保前に上限検査する。
+        if let Err(error) =
+            self.check_image_pixels(fitted_w, fitted_h, &format!("{slot}: {property}"))
+        {
+            return Err(error.with_path(path.to_owned()));
+        }
+        let linear = !is_color_property(property);
+        // 等倍時は所有権を移して複製しない。縮小時だけ画素を作り直す。
+        let small = downscale_bake_image_owned(image, fitted_w, fitted_h, linear);
+        let remaining = self
+            .options
+            .max_total_image_bytes
+            .saturating_sub(self.total_image_bytes);
+        let bytes = encode_rgba_png_limited(
+            small.pixels(),
+            BakeSize {
+                width: fitted_w,
+                height: fitted_h,
+            },
+            remaining,
+            &format!("{slot}: {property}"),
+        )
+        .map_err(|error| {
+            if error.path().is_none() {
+                error.with_path(path.to_owned())
+            } else {
+                error
+            }
+        })?;
+        let sampler = sampler_of(meta);
+        Ok(Some(self.push_direct_image(
+            slot,
+            property,
+            path,
+            guid,
+            bytes,
+            VrmImageMime::Png,
+            sampler,
+        )?))
     }
 
     /// 直載せ画像を取り込み後の寸法に縮小する。
@@ -1769,11 +1929,10 @@ impl<'a> LoadContext<'a> {
                     )?;
                     let (fitted_w, fitted_h) =
                         import_fitted_size(image.width(), image.height(), max_size, npot);
-                    let shrunk = if (fitted_w, fitted_h) == (image.width(), image.height()) {
-                        Rc::new(image)
-                    } else {
-                        Rc::new(downscale_bake_image(&image, fitted_w, fitted_h, linear))
-                    };
+                    // 等倍時は所有権を移して複製しない。
+                    let shrunk = Rc::new(downscale_bake_image_owned(
+                        image, fitted_w, fitted_h, linear,
+                    ));
                     // 縮小後の実寸で保持量の予算に入れる。超えたら古い保持を
                     // 捨てて再復号する。失敗にしない。
                     self.admit_bake_cache(shrunk.width(), shrunk.height());
@@ -1790,6 +1949,100 @@ impl<'a> LoadContext<'a> {
                     return Ok(None);
                 }
             };
+        self.baked_inputs.insert(key, Some(Rc::clone(&image)));
+        Ok(Some(BakeInput {
+            image,
+            st,
+            channel,
+            invert,
+        }))
+    }
+
+    /// PSDの保存済みcompositeから焼きの入力を作る。
+    ///
+    /// 復号済みRGBA8から直接載せ、中間PNGを作らない。以降の流れ
+    /// （取り込み解像度合わせ・保持量の予算・用途区分ごとの共有）は
+    /// PNG・JPEGの入力と同じである。復号失敗は警告して `None` を返し、
+    /// 同じGUIDの再復号を避けるため共有表に覚える。
+    /// 画素上限の超過と対象パス付きの失敗はそのまま返す。
+    // 引数は `BakeInput` の組み立てにそのまま使うため束ねない。
+    #[allow(clippy::too_many_arguments)]
+    fn bake_psd_input(
+        &mut self,
+        slot: &str,
+        property: &str,
+        path: &str,
+        guid: Option<Guid>,
+        bytes: Vec<u8>,
+        srgb: bool,
+        sampler: VrmSampler,
+        st: BakeSt,
+        channel: BakeChannel,
+        invert: bool,
+        max_size: Option<u32>,
+        npot: NpotScale,
+    ) -> Result<Option<BakeInput>, MaterialError> {
+        let Some(guid) = guid else {
+            self.warn(format!(
+                "テクスチャの参照先が解決できないため省く: {slot}: {property}"
+            ));
+            return Ok(None);
+        };
+        // 色は符号化済み空間で、データ（マスク・法線）は線形空間で縮小する。
+        // 同じGUIDでも用途区分が違えば別の版として持つ。
+        let linear = !is_color_property(property);
+        let key = (guid.clone(), linear);
+        if let Some(cached) = self.baked_inputs.get(&key) {
+            return Ok(cached.clone().map(|image| BakeInput {
+                image,
+                st,
+                channel,
+                invert,
+            }));
+        }
+        let image = match decode_psd(&bytes, self.options.max_image_pixels) {
+            Ok(decoded) => {
+                let image = BakeImage::from_rgba8(
+                    decoded.width(),
+                    decoded.height(),
+                    decoded.into_pixels(),
+                    srgb,
+                    sampler,
+                )
+                .map_err(|error| error.with_path(path.to_owned()))?;
+                // 焼きの入力も取り込み後の寸法にし、焼きの出力は縮小後の
+                // 入力に従う。1枚の画素上限の超過は失敗として返す。
+                self.check_image_pixels(
+                    image.width(),
+                    image.height(),
+                    &format!("{slot}: {property}"),
+                )
+                .map_err(|error| error.with_path(path.to_owned()))?;
+                let (fitted_w, fitted_h) =
+                    import_fitted_size(image.width(), image.height(), max_size, npot);
+                // `.meta` 適用後の寸法も確保前に上限検査する。
+                self.check_image_pixels(fitted_w, fitted_h, &format!("{slot}: {property}"))
+                    .map_err(|error| error.with_path(path.to_owned()))?;
+                // 等倍時は所有権を移して複製しない。
+                let shrunk = Rc::new(downscale_bake_image_owned(
+                    image, fitted_w, fitted_h, linear,
+                ));
+                // 縮小後の実寸で保持量の予算に入れる。超えたら古い保持を
+                // 捨てて再復号する。失敗にしない。
+                self.admit_bake_cache(shrunk.width(), shrunk.height());
+                shrunk
+            }
+            Err(PsdError::Skip { reason, detail }) => {
+                self.warn(format!(
+                    "焼き用に復号できないため直載せする: {slot}: {property}: {reason}: {detail}"
+                ));
+                self.baked_inputs.insert(key, None);
+                return Ok(None);
+            }
+            Err(PsdError::Limit(error)) => {
+                return Err(error.with_path(path.to_owned()));
+            }
+        };
         self.baked_inputs.insert(key, Some(Rc::clone(&image)));
         Ok(Some(BakeInput {
             image,
@@ -1870,12 +2123,37 @@ impl<'a> LoadContext<'a> {
                 .with_source(error));
             }
         };
-        let Some(mime) = sniff_mime(&bytes) else {
+        let Some(source) = sniff_source(&bytes) else {
             self.warn(format!(
                 "未対応の画像形式のため省く: {slot}: {property}: {path}"
             ));
             return Ok(None);
         };
+        // PSDは保存済みcompositeを復号し、RGBA8から直接焼き入力にする。
+        // 中間PNGを作らない。PNG・JPEGの復号経路は変えない。
+        if source == SourceImageFormat::Psd {
+            let srgb = srgb_of(&record.meta);
+            let sampler = sampler_of(&record.meta);
+            let (max_size, npot, unknown_npot) = import_limit_of(&record.meta);
+            if unknown_npot {
+                self.warn(format!(
+                    "NPOT指定が読めないためそのままの寸法で扱う: {slot}: {property}"
+                ));
+            }
+            return self
+                .bake_psd_input(
+                    slot, property, &path, guid, bytes, srgb, sampler, st, channel, invert,
+                    max_size, npot,
+                )
+                .map_err(|error| {
+                    if error.path().is_none() {
+                        error.with_path(path.clone())
+                    } else {
+                        error
+                    }
+                });
+        }
+        let mime = mime_of(source).expect("PSD以外は埋め込みMIMEを持つ");
         let srgb = srgb_of(&record.meta);
         let sampler = sampler_of(&record.meta);
         let (max_size, npot, unknown_npot) = import_limit_of(&record.meta);
@@ -3189,14 +3467,41 @@ fn has_texture(material: &crate::unity::Material, name: &str) -> bool {
     texture(material, name).is_some_and(|environment| !environment.texture.is_null())
 }
 
-/// 先頭バイトからMIMEを求める。PNGとJPEGだけを受け付ける。
-fn sniff_mime(bytes: &[u8]) -> Option<VrmImageMime> {
+/// 先頭バイトから入力形式を求める。
+///
+/// PNG・JPEGとPSDの保存済み合成画像だけを受け付ける。
+/// PSDは復号してPNGへ符号化し直すため、埋め込みのMIMEはPNGになる。
+/// 埋め込みの [`VrmImageMime`] と [`VrmImage`] はPNG・JPEGのまま保ち、
+/// 生RGBAを公開型に足さない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceImageFormat {
+    /// PNG。
+    Png,
+    /// JPEG。
+    Jpeg,
+    /// PSD（保存済みcompositeを復号して使う）。
+    Psd,
+}
+
+/// 先頭バイトから入力形式を求める。PNG・JPEG・PSDだけを受け付ける。
+fn sniff_source(bytes: &[u8]) -> Option<SourceImageFormat> {
     if bytes.starts_with(&PNG_MAGIC) {
-        Some(VrmImageMime::Png)
+        Some(SourceImageFormat::Png)
     } else if bytes.starts_with(&JPEG_MAGIC) {
-        Some(VrmImageMime::Jpeg)
+        Some(SourceImageFormat::Jpeg)
+    } else if is_psd(bytes) {
+        Some(SourceImageFormat::Psd)
     } else {
         None
+    }
+}
+
+/// 入力形式から埋め込みMIMEを求める。PSDは復号後にPNGになるため持たない。
+fn mime_of(source: SourceImageFormat) -> Option<VrmImageMime> {
+    match source {
+        SourceImageFormat::Png => Some(VrmImageMime::Png),
+        SourceImageFormat::Jpeg => Some(VrmImageMime::Jpeg),
+        SourceImageFormat::Psd => None,
     }
 }
 

@@ -4,10 +4,11 @@
 //! 呼び出し側は [`HumanoidBones`] を明示指定して名前推測を使わないこともできる。
 //! 親子・拡大率の検証は書き出し時に行い、ここでは対応付けだけを担う。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use super::VrmModel;
 use super::export::VrmExportError;
+use crate::unity::HumanBoneMapping;
 
 /// VRM humanoidの骨。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -492,6 +493,131 @@ enum Side {
     Right,
 }
 
+/// Unityのhumanoid骨名からVRMの骨への変換表。
+///
+/// Unity名（`HumanBodyBones`、空白なし）の順序は物理sidecarの既存出力
+/// （`build_humanoid_json` の旧 `ORDER`）と同じであり、順序・内容を変えない。
+/// 親指はUnityとVRMで意味がずれるため、必ず変換する
+/// （`ThumbProximal`→中手骨・`ThumbIntermediate`→基節骨・`ThumbDistal`→末節骨）。
+/// `Jaw` はUnity名として保持するがVRMの [`HumanoidBone`] には無いため
+/// 対応先を `None` とし、通常の書き出しでは警告して省く。
+/// 物理sidecarは `Jaw` を含む全名を扱える。
+pub(crate) const UNITY_HUMANOID_BONE_TABLE: &[(&str, Option<HumanoidBone>)] = &[
+    ("Hips", Some(HumanoidBone::Hips)),
+    ("LeftUpperLeg", Some(HumanoidBone::LeftUpperLeg)),
+    ("RightUpperLeg", Some(HumanoidBone::RightUpperLeg)),
+    ("LeftLowerLeg", Some(HumanoidBone::LeftLowerLeg)),
+    ("RightLowerLeg", Some(HumanoidBone::RightLowerLeg)),
+    ("LeftFoot", Some(HumanoidBone::LeftFoot)),
+    ("RightFoot", Some(HumanoidBone::RightFoot)),
+    ("Spine", Some(HumanoidBone::Spine)),
+    ("Chest", Some(HumanoidBone::Chest)),
+    ("UpperChest", Some(HumanoidBone::UpperChest)),
+    ("Neck", Some(HumanoidBone::Neck)),
+    ("Head", Some(HumanoidBone::Head)),
+    ("LeftShoulder", Some(HumanoidBone::LeftShoulder)),
+    ("RightShoulder", Some(HumanoidBone::RightShoulder)),
+    ("LeftUpperArm", Some(HumanoidBone::LeftUpperArm)),
+    ("RightUpperArm", Some(HumanoidBone::RightUpperArm)),
+    ("LeftLowerArm", Some(HumanoidBone::LeftLowerArm)),
+    ("RightLowerArm", Some(HumanoidBone::RightLowerArm)),
+    ("LeftHand", Some(HumanoidBone::LeftHand)),
+    ("RightHand", Some(HumanoidBone::RightHand)),
+    ("LeftToes", Some(HumanoidBone::LeftToes)),
+    ("RightToes", Some(HumanoidBone::RightToes)),
+    ("LeftEye", Some(HumanoidBone::LeftEye)),
+    ("RightEye", Some(HumanoidBone::RightEye)),
+    ("Jaw", None),
+    ("LeftThumbProximal", Some(HumanoidBone::LeftThumbMetacarpal)),
+    (
+        "LeftThumbIntermediate",
+        Some(HumanoidBone::LeftThumbProximal),
+    ),
+    ("LeftThumbDistal", Some(HumanoidBone::LeftThumbDistal)),
+    ("LeftIndexProximal", Some(HumanoidBone::LeftIndexProximal)),
+    (
+        "LeftIndexIntermediate",
+        Some(HumanoidBone::LeftIndexIntermediate),
+    ),
+    ("LeftIndexDistal", Some(HumanoidBone::LeftIndexDistal)),
+    ("LeftMiddleProximal", Some(HumanoidBone::LeftMiddleProximal)),
+    (
+        "LeftMiddleIntermediate",
+        Some(HumanoidBone::LeftMiddleIntermediate),
+    ),
+    ("LeftMiddleDistal", Some(HumanoidBone::LeftMiddleDistal)),
+    ("LeftRingProximal", Some(HumanoidBone::LeftRingProximal)),
+    (
+        "LeftRingIntermediate",
+        Some(HumanoidBone::LeftRingIntermediate),
+    ),
+    ("LeftRingDistal", Some(HumanoidBone::LeftRingDistal)),
+    ("LeftLittleProximal", Some(HumanoidBone::LeftLittleProximal)),
+    (
+        "LeftLittleIntermediate",
+        Some(HumanoidBone::LeftLittleIntermediate),
+    ),
+    ("LeftLittleDistal", Some(HumanoidBone::LeftLittleDistal)),
+    (
+        "RightThumbProximal",
+        Some(HumanoidBone::RightThumbMetacarpal),
+    ),
+    (
+        "RightThumbIntermediate",
+        Some(HumanoidBone::RightThumbProximal),
+    ),
+    ("RightThumbDistal", Some(HumanoidBone::RightThumbDistal)),
+    ("RightIndexProximal", Some(HumanoidBone::RightIndexProximal)),
+    (
+        "RightIndexIntermediate",
+        Some(HumanoidBone::RightIndexIntermediate),
+    ),
+    ("RightIndexDistal", Some(HumanoidBone::RightIndexDistal)),
+    (
+        "RightMiddleProximal",
+        Some(HumanoidBone::RightMiddleProximal),
+    ),
+    (
+        "RightMiddleIntermediate",
+        Some(HumanoidBone::RightMiddleIntermediate),
+    ),
+    ("RightMiddleDistal", Some(HumanoidBone::RightMiddleDistal)),
+    ("RightRingProximal", Some(HumanoidBone::RightRingProximal)),
+    (
+        "RightRingIntermediate",
+        Some(HumanoidBone::RightRingIntermediate),
+    ),
+    ("RightRingDistal", Some(HumanoidBone::RightRingDistal)),
+    (
+        "RightLittleProximal",
+        Some(HumanoidBone::RightLittleProximal),
+    ),
+    (
+        "RightLittleIntermediate",
+        Some(HumanoidBone::RightLittleIntermediate),
+    ),
+    ("RightLittleDistal", Some(HumanoidBone::RightLittleDistal)),
+];
+
+/// Unityの骨名を照合用に正規化する。ASCII空白だけを除去する。
+///
+/// `Left Shoulder` のような表記を `LeftShoulder` に寄せる。
+/// ノード名（`boneName`）には使わない。完全一致で突き合わせる。
+pub(crate) fn normalize_unity_bone_name(name: &str) -> String {
+    name.chars().filter(|c| !c.is_ascii_whitespace()).collect()
+}
+
+/// 正規化済みのUnity骨名からVRMの骨を求める。
+///
+/// 外側の `None` は未知・未対応のUnity名、
+/// 内側の `None` はVRMに対応が無い既知名（`Jaw`）である。
+pub(crate) fn unity_bone_to_vrm(normalized: &str) -> Option<Option<HumanoidBone>> {
+    UNITY_HUMANOID_BONE_TABLE
+        .iter()
+        .find(|(name, _)| *name == normalized)
+        .map(|(_, bone)| *bone)
+}
+
 /// 骨とノード索引の対応付け。
 ///
 /// フィールドは非公開で、`set` で上書きできる。`detect` は名前から作る。
@@ -543,12 +669,144 @@ impl HumanoidBones {
     ///
     /// 同じ骨に複数ノードが一致した場合・必須骨が無い場合に返す。
     pub fn detect(model: &VrmModel) -> Result<Self, VrmExportError> {
-        let mut bones = Self::new();
-        let mut exact_matched = vec![false; model.nodes.len()];
+        Ok(Self::resolve(model, &[])?.0)
+    }
+
+    /// Unityの対応表とノード名から対応付ける。
+    ///
+    /// 対応表（[`.fbx.meta` の `humanDescription.human`](crate::unity::AssetMeta::human_bone_mappings) を
+    /// 想定）は利用者の明示指定（[`VrmExportOptions::with_humanoid`](super::export::VrmExportOptions::with_humanoid)）より弱く、
+    /// 名前推測より強い。手順はメタの解決・確定、メタ確定骨のロック、
+    /// メタ使用済みノードの除外、未充足骨の正確名補完、
+    /// さらに未充足骨の別名補完、必須骨の存在検査の順である。
+    ///
+    /// `humanName` はASCII空白を除去して既知のUnity骨名に照合する。
+    /// `boneName` はモデルのノード名と完全一致で突き合わせ、
+    /// 大文字小文字の折り畳み・部分一致・区切り除去はしない。
+    /// 同一対応の反復は重複排除して許容する。
+    /// 同一Unity骨に異なる `boneName`・同一ノードを別の骨への割当て・
+    /// 対応先ノードの欠落や重複は先勝ち・後勝ちにせず失敗する。
+    /// 未知・未対応の `humanName` とVRMに対応が無い既知名（`Jaw`）は
+    /// 警告して省く。空の対応表は [`detect`](Self::detect) と同じ名前推測になる。
+    ///
+    /// 戻り値は対応付けと警告文の組である。警告の順序は対応表の順序に従う。
+    /// `skeleton`（T-pose）は使わない。通常の書き出しのrest姿勢は変えない。
+    ///
+    /// # Errors
+    ///
+    /// 対応先ノードの欠落や重複・同じ骨や同じノードへの複数対応付け・
+    /// 名前推測の重複・必須骨の欠落の場合に返す。
+    pub fn detect_with_mapping(
+        model: &VrmModel,
+        mappings: &[HumanBoneMapping],
+    ) -> Result<(Self, Vec<String>), VrmExportError> {
+        Self::resolve(model, mappings)
+    }
+
+    /// 対応表と名前推測で対応付ける共通処理。
+    ///
+    /// 空の対応表では名前推測だけになり、[`detect`](Self::detect) と同じ結果になる。
+    /// ロック済みの骨に対する名前候補は複数あっても無視し、
+    /// メタの確定を名前の曖昧さで失敗させない。
+    /// 未充足の同一骨に同順位の候補が複数ある場合は推測せず失敗する。
+    fn resolve(
+        model: &VrmModel,
+        mappings: &[HumanBoneMapping],
+    ) -> Result<(Self, Vec<String>), VrmExportError> {
+        let mut warnings = Vec::new();
+        let mut warned: BTreeSet<String> = BTreeSet::new();
+        // ノード名から索引を引く。完全一致で突き合わせる。
+        let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
         for (index, node) in model.nodes.iter().enumerate() {
+            by_name.entry(node.name.as_str()).or_default().push(index);
+        }
+        let mut bones = Self::new();
+        let mut used: BTreeSet<usize> = BTreeSet::new();
+        // メタの有効な対応を解決・確定する。
+        for mapping in mappings {
+            let normalized = normalize_unity_bone_name(&mapping.human_name);
+            let Some(mapped) = unity_bone_to_vrm(&normalized) else {
+                // 未知・未対応の `humanName` は警告して無視する。
+                if warned.insert(format!("unknown:{normalized}")) {
+                    warnings.push(format!(
+                        "未知のhumanNameのため対応を省く: {}",
+                        mapping.human_name
+                    ));
+                }
+                continue;
+            };
+            let Some(bone) = mapped else {
+                // VRMに対応が無い既知名（`Jaw`）は警告して省く。
+                if warned.insert(format!("unsupported:{normalized}")) {
+                    warnings.push(format!(
+                        "VRMのhumanoidに対応が無いため省く: {}",
+                        mapping.human_name
+                    ));
+                }
+                continue;
+            };
+            let candidates = by_name
+                .get(mapping.bone_name.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let &[node] = candidates else {
+                if candidates.is_empty() {
+                    return Err(VrmExportError::missing_bone(
+                        bone,
+                        format!(
+                            "metaの対応先ノードが無い: {} -> {}",
+                            mapping.human_name, mapping.bone_name
+                        ),
+                    ));
+                }
+                return Err(VrmExportError::duplicate_bone(
+                    bone,
+                    candidates[0],
+                    format!("metaの対応先ノードが重複する: {}", mapping.bone_name),
+                ));
+            };
+            if let Some(existing) = bones.get(bone) {
+                // 同一対応の反復は重複排除して許容する。
+                if existing == node {
+                    continue;
+                }
+                return Err(VrmExportError::duplicate_bone(
+                    bone,
+                    node,
+                    format!(
+                        "metaで同じ骨に複数のノードが対応する: {}",
+                        mapping.human_name
+                    ),
+                ));
+            }
+            if used.contains(&node) {
+                return Err(VrmExportError::duplicate_bone(
+                    bone,
+                    node,
+                    format!(
+                        "metaで同じノードに複数の骨が対応する: {}",
+                        mapping.bone_name
+                    ),
+                ));
+            }
+            bones.set(bone, node);
+            used.insert(node);
+        }
+        // メタで確定した骨をロックし、メタで使用済みのノードを名前検出から除外する。
+        let locked: BTreeSet<HumanoidBone> = bones.iter().map(|(bone, _)| bone).collect();
+        // 未充足の骨だけ正確名で補完する。
+        let mut consumed = used;
+        for (index, node) in model.nodes.iter().enumerate() {
+            if consumed.contains(&index) {
+                continue;
+            }
             let Some(bone) = match_bone(&node.name) else {
                 continue;
             };
+            if locked.contains(&bone) {
+                consumed.insert(index);
+                continue;
+            }
             if bones.get(bone).is_some() {
                 return Err(VrmExportError::duplicate_bone(
                     bone,
@@ -557,16 +815,20 @@ impl HumanoidBones {
                 ));
             }
             bones.set(bone, index);
-            exact_matched[index] = true;
+            consumed.insert(index);
         }
+        // さらに未充足の骨だけ別名で補完する。
         let mut alias_filled: BTreeSet<HumanoidBone> = BTreeSet::new();
         for (index, node) in model.nodes.iter().enumerate() {
-            if exact_matched[index] {
+            if consumed.contains(&index) {
                 continue;
             }
             let Some(bone) = match_alias_bone(&node.name) else {
                 continue;
             };
+            if locked.contains(&bone) {
+                continue;
+            }
             if bones.get(bone).is_some() {
                 if alias_filled.contains(&bone) {
                     return Err(VrmExportError::duplicate_bone(
@@ -586,7 +848,7 @@ impl HumanoidBones {
                 return Err(VrmExportError::missing_bone(bone, "必須のhumanoid骨が無い"));
             }
         }
-        Ok(bones)
+        Ok((bones, warnings))
     }
 }
 
@@ -938,6 +1200,105 @@ mod tests {
                 骨.name()
             );
         }
+    }
+
+    #[test]
+    fn 共通表は55件で物理sidecarの順序を保つ() {
+        // 旧 `ORDER`（LastBone除く）と同じ順序・件数である。
+        assert_eq!(UNITY_HUMANOID_BONE_TABLE.len(), 55, "共通表は55件である");
+        let 名前: Vec<&str> = UNITY_HUMANOID_BONE_TABLE
+            .iter()
+            .map(|(名前, _)| *名前)
+            .collect();
+        assert_eq!(
+            名前,
+            vec![
+                "Hips",
+                "LeftUpperLeg",
+                "RightUpperLeg",
+                "LeftLowerLeg",
+                "RightLowerLeg",
+                "LeftFoot",
+                "RightFoot",
+                "Spine",
+                "Chest",
+                "UpperChest",
+                "Neck",
+                "Head",
+                "LeftShoulder",
+                "RightShoulder",
+                "LeftUpperArm",
+                "RightUpperArm",
+                "LeftLowerArm",
+                "RightLowerArm",
+                "LeftHand",
+                "RightHand",
+                "LeftToes",
+                "RightToes",
+                "LeftEye",
+                "RightEye",
+                "Jaw",
+                "LeftThumbProximal",
+                "LeftThumbIntermediate",
+                "LeftThumbDistal",
+                "LeftIndexProximal",
+                "LeftIndexIntermediate",
+                "LeftIndexDistal",
+                "LeftMiddleProximal",
+                "LeftMiddleIntermediate",
+                "LeftMiddleDistal",
+                "LeftRingProximal",
+                "LeftRingIntermediate",
+                "LeftRingDistal",
+                "LeftLittleProximal",
+                "LeftLittleIntermediate",
+                "LeftLittleDistal",
+                "RightThumbProximal",
+                "RightThumbIntermediate",
+                "RightThumbDistal",
+                "RightIndexProximal",
+                "RightIndexIntermediate",
+                "RightIndexDistal",
+                "RightMiddleProximal",
+                "RightMiddleIntermediate",
+                "RightMiddleDistal",
+                "RightRingProximal",
+                "RightRingIntermediate",
+                "RightRingDistal",
+                "RightLittleProximal",
+                "RightLittleIntermediate",
+                "RightLittleDistal",
+            ],
+            "共通表の順序は既存出力と同じである"
+        );
+    }
+
+    #[test]
+    fn 共通表は親指を変換し顎に対応が無い() {
+        // 親指はUnityとVRMで意味がずれるため変換する。
+        assert_eq!(
+            unity_bone_to_vrm("LeftThumbProximal"),
+            Some(Some(HumanoidBone::LeftThumbMetacarpal))
+        );
+        assert_eq!(
+            unity_bone_to_vrm("LeftThumbIntermediate"),
+            Some(Some(HumanoidBone::LeftThumbProximal))
+        );
+        assert_eq!(
+            unity_bone_to_vrm("RightThumbProximal"),
+            Some(Some(HumanoidBone::RightThumbMetacarpal))
+        );
+        // 顎はUnity名として保持するがVRMの列挙子は無い。
+        assert_eq!(unity_bone_to_vrm("Jaw"), Some(None));
+        // 未知の名前は対応付けない。
+        assert_eq!(unity_bone_to_vrm("LastBone"), None);
+        assert_eq!(unity_bone_to_vrm("FooBone"), None);
+        // 照合はASCII空白だけを除去する。ノード名の空白は保つ対象外である。
+        assert_eq!(
+            normalize_unity_bone_name("Left Thumb Proximal"),
+            "LeftThumbProximal"
+        );
+        assert_eq!(normalize_unity_bone_name("LeftShoulder"), "LeftShoulder");
     }
 
     #[test]
