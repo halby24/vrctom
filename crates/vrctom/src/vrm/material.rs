@@ -35,11 +35,11 @@ use std::rc::Rc;
 
 use super::bake::{
     AlphaMaskInput, BakeChannel, BakeImage, BakeInput, BakeSize, BakeSt, BaseColorJob, EmissionJob,
-    EmissionMask, NormalJob, NpotScale, RepackJob, ShadeJob, bake_base_color, bake_channel_repack,
-    bake_emission, bake_normal, bake_output_size, bake_shade, downscale_bake_image,
-    downscale_bake_image_owned, encode_color_png, encode_data_png, encode_rgba_png,
-    encode_rgba_png_limited, image_dimensions, import_fitted_size, load_bake_image,
-    matcap_disc_average, shade_layer_weights,
+    EmissionMask, NormalJob, NpotScale, RepackJob, RimMultiplyJob, ShadeJob, bake_base_color,
+    bake_channel_repack, bake_emission, bake_normal, bake_output_size, bake_rim_multiply,
+    bake_shade, downscale_bake_image, downscale_bake_image_owned, encode_color_png,
+    encode_data_png, encode_rgba_png, encode_rgba_png_limited, image_dimensions,
+    import_fitted_size, load_bake_image, matcap_disc_average, shade_layer_weights,
 };
 use super::psd::{PsdError, decode_psd, is_psd, psd_dimensions};
 
@@ -379,8 +379,9 @@ pub struct VrmMtoonParameters {
     pub matcap_image: Option<usize>,
     /// リム乗算テクスチャの画像索引。無い場合は `None` である。
     ///
-    /// リム光とMatCapに掛かる共通の倍率であり、単一の素朴なマスクだけを
-    /// 直載せする（`RimMultiplyComposite` の焼きは対象外）。
+    /// リム光とMatCapに掛かる共通の倍率であり、単一の素朴なマスクだけは
+    /// 直載せし、それ以外（リム色テクスチャ・アルベドtint・1超の明るさ）は
+    /// `RimMultiplyComposite` の焼きで載せる。
     pub rim_multiply_image: Option<usize>,
     /// アウトライン幅の方式。
     pub outline_width_mode: VrmOutlineWidthMode,
@@ -1213,7 +1214,7 @@ impl<'a> LoadContext<'a> {
         capability: ShaderCapability,
     ) -> Result<VrmMaterial, MaterialError> {
         let base = color(material, "_Color").unwrap_or([1.0, 1.0, 1.0, 1.0]);
-        let base_rgb = [
+        let mut base_rgb = [
             srgb_to_linear(base[0]),
             srgb_to_linear(base[1]),
             srgb_to_linear(base[2]),
@@ -1282,56 +1283,106 @@ impl<'a> LoadContext<'a> {
         // MToonの影側は `shadeColorFactor × shadeMultiplyTexture` のため、
         // 焼かない場合は影色テクスチャの有無で従来の近似へ落とす。
         // 焼く場合は係数を白にし、参照実装と同じく報告は省く。
-        let (shade_color_factor, shading_shift_factor, shading_toony_factor, shade_multiply_image) =
-            if !use_shadow {
-                // 影を使わない場合、陰影は基準色と同じにし、境界は見せない。
-                (base_rgb, 0.0, 0.9, base_color_image)
-            } else {
-                self.map_shade(
-                    material,
-                    slot,
-                    &base,
-                    base_color_image,
-                    baked_albedo.clone(),
-                    &main_st,
-                )?
-            };
-
-        // 参照実装の `ReadMatcap` のうち一段の写像に対応する。MToonの枠は
-        // ひとつだけであり、MatCapは `_UseMatCap` が真で `_MatCapTex` の
-        // 割り当てがある場合だけ有効になる。重みは
-        // `_MatCapColor.rgb × (_MatCapBlend × saturate(_MatCapColor.a))`
-        // （参照実装の `MatcapWeight`）であり、無効時は `[0, 0, 0]` とする。
-        // どのMatCapを枠に入れるかの判定は `SlotMatcapPrefix` と対応する。
-        // Normal・Multiply混合の減光（`Covers`）は近似せず警告する。
-        let matcap_slot = matcap_slot(material);
-        let (matcap_factor, matcap_image) = match matcap_slot {
-            MatcapSlot::First => {
-                let weight = matcap_weight(material, "_MatCap");
-                (weight, self.resolve_texture(material, slot, "_MatCapTex")?)
-            }
-            MatcapSlot::Second => {
-                let weight = matcap_weight(material, "_MatCap2nd");
-                (
-                    weight,
-                    self.resolve_texture(material, slot, "_MatCap2ndTex")?,
-                )
-            }
-            MatcapSlot::None => ([0.0, 0.0, 0.0], None),
+        let (
+            mut shade_color_factor,
+            shading_shift_factor,
+            shading_toony_factor,
+            shade_multiply_image,
+        ) = if !use_shadow {
+            // 影を使わない場合、陰影は基準色と同じにし、境界は見せない。
+            (base_rgb, 0.0, 0.9, base_color_image)
+        } else {
+            self.map_shade(
+                material,
+                slot,
+                &base,
+                base_color_image,
+                baked_albedo.clone(),
+                &main_st,
+            )?
         };
-        if matcap_image.is_some() {
-            let prefix = match matcap_slot {
-                MatcapSlot::First => "_MatCap",
-                MatcapSlot::Second => "_MatCap2nd",
-                MatcapSlot::None => "",
+
+        // 参照実装の `MapRimAndMatcap` のうち枠の判定に対応する。MToonの枠は
+        // ひとつだけであり、どのMatCapを入れるかは `SlotMatcapPrefix` と対応する。
+        // 乗算（`BlendMode == 3`）でマスク越しの場合はMToonの加算MatCapで
+        // 表せないため枠から外す。減光（`Covers`）は下の色を暗くして足し戻す。
+        let use_rim = number(material, "_UseRim").unwrap_or(0.0) != 0.0;
+        let matcap_slot = matcap_slot(material);
+        let matcap_prefix = match matcap_slot {
+            MatcapSlot::First => Some("_MatCap"),
+            MatcapSlot::Second => Some("_MatCap2nd"),
+            MatcapSlot::None => None,
+        };
+        let matcap_blend_mode = matcap_prefix
+            .map(|prefix| number(material, &format!("{prefix}BlendMode")).unwrap_or(1.0) as i64)
+            .unwrap_or(1);
+        let multiplies = matcap_blend_mode == 3;
+        let rim_textured = use_rim && has_texture(material, "_RimColorTex");
+        let covers = matcap_prefix
+            .map(|prefix| matcap_covers(material, prefix))
+            .unwrap_or(0.0);
+        let has_mask = matcap_prefix
+            .map(|prefix| has_texture(material, &format!("{prefix}BlendMask")))
+            .unwrap_or(false);
+        // 参照実装の `matcapExported`
+        // （本体があり、乗算でなければ出すか、減光で足し戻せる場合だけ出す）と対応する。
+        // 覆う量があり、マスクが無く、リムにテクスチャが無い場合だけ
+        // 下の色を暗くして足し戻す。候補に無いMatCapは解決も埋め込みもしない。
+        let darkens_candidate = covers > 0.0 && !has_mask && !rim_textured;
+        let matcap_candidate = matcap_prefix.is_some() && (!multiplies || darkens_candidate);
+        if multiplies && matcap_prefix.is_some() && !matcap_candidate {
+            let reason = if has_mask {
+                "マスク付きの減光は再現できない"
+            } else if rim_textured {
+                "リムの色テクスチャを共有するため、下の色を均一に暗くして足し戻せない"
+            } else if covers == 0.0 {
+                "強度が0で色を変えない"
+            } else {
+                "MToonの加算MatCapでは減光を表せない"
             };
-            if !prefix.is_empty() && matcap_covers(material, prefix) > 0.0 {
-                self.warn(format!("MatCapの減光は写像しない: {slot}"));
+            let remedy = if has_mask {
+                "マスクを外すかAddへ"
+            } else if rim_textured {
+                "リムの色テクスチャを外すかAddへ"
+            } else {
+                "Addへ"
+            };
+            self.warn(format!(
+                "MatCapの乗算はMToonの加算MatCapでは表せず、{reason}ため書き出さない。{remedy}: {slot}"
+            ));
+        }
+        // MatCap本体は書き出し候補の場合だけ解決し、使わない画像を埋め込まない。
+        // 解決できなければ減光も書き出しもしない（係数は `[0, 0, 0]`）。
+        let matcap_image = if matcap_candidate {
+            match matcap_prefix {
+                Some("_MatCap") => self.resolve_texture(material, slot, "_MatCapTex")?,
+                Some(_) => self.resolve_texture(material, slot, "_MatCap2ndTex")?,
+                None => None,
             }
+        } else {
+            None
+        };
+        let darkens = darkens_candidate && matcap_image.is_some();
+        let matcap_exported = matcap_candidate && matcap_image.is_some();
+        if matcap_exported && !multiplies && matcap_blend_mode != 1 && !darkens {
+            let kind = if matcap_blend_mode == 0 {
+                "Normal"
+            } else {
+                "Screen"
+            };
+            self.warn(format!("{kind} MatCapは加算として書き出す: {slot}"));
+        }
+        if matcap_slot == MatcapSlot::Second
+            && has_matcap(material, "_MatCap")
+            && matcap_contributes(material, "_MatCap")
+        {
+            self.warn(format!(
+                "Firstは乗算マスクのため書き出さず、MatCap2ndを枠に入れる: {slot}"
+            ));
         }
 
         let (emissive_factor, emissive_image) =
-            self.map_emission(material, slot, &main_st, &base, baked_albedo)?;
+            self.map_emission(material, slot, &main_st, &base, baked_albedo.clone())?;
 
         // 参照実装の `ReadOutline` と対応する。Outline系の変種は
         // `_UseOutline` に関係なく描画し、Multi系のときだけ
@@ -1376,15 +1427,9 @@ impl<'a> LoadContext<'a> {
         // 参照実装の `ReadRim` のうち直接値に対応する。リムが無効な場合は
         // 既定（色 `[0, 0, 0]`・フレネル5・持ち上げ0・混合1）を書く。
         // 有効な場合は色・フレネル・混合を入れ、境界・ぼかしの合わせ込み
-        // （参照実装の `RimFit`）と色テクスチャ・マスクは次の段として警告する。
-        // リム倍率テクスチャは、単一の素朴なMatCapマスクだけを直載せする
-        // （参照実装の `BindRimMultiply` の直接載せと対応）。
-        let use_rim = number(material, "_UseRim").unwrap_or(0.0) != 0.0;
-        let (
-            parametric_rim_color_factor,
-            parametric_rim_fresnel_power_factor,
-            rim_lighting_mix_factor,
-        ) = if use_rim {
+        // （参照実装の `RimFit`）は次の段として警告する。
+        // 色テクスチャとMatCapマスクはリム倍率テクスチャへ焼く。
+        let (rim_color, rim_lighting_mix, parametric_rim_fresnel_power_factor) = if use_rim {
             // 参照実装の代替値は線形で宣言されている。
             let rim = linear_color_or(material, "_RimColor", [0.66, 0.5, 0.48]);
             let alpha = color(material, "_RimColor").map_or(1.0, |rim| rim[3]);
@@ -1395,15 +1440,15 @@ impl<'a> LoadContext<'a> {
                 clamp01(alpha)
             } as f32;
             self.warn(format!(
-                "リムライトの境界・ぼかしの合わせ込みは近似し、色テクスチャ・マスクは写像しない: {slot}"
+                "リムライトの境界・ぼかしの合わせ込みは近似する: {slot}"
             ));
             (
                 [rim[0] * weight, rim[1] * weight, rim[2] * weight],
-                number(material, "_RimFresnelPower").unwrap_or(3.5).max(0.0) as f32,
                 clamp01(number(material, "_RimEnableLighting").unwrap_or(1.0)) as f32,
+                number(material, "_RimFresnelPower").unwrap_or(3.5).max(0.0) as f32,
             )
         } else {
-            ([0.0, 0.0, 0.0], 5.0, 1.0)
+            ([0.0, 0.0, 0.0], 1.0, 5.0)
         };
 
         // 参照実装の `ReadBase` のUVアニメと `MapUvAnimation` に対応する。
@@ -1427,10 +1472,80 @@ impl<'a> LoadContext<'a> {
 
         self.warn_unsupported_features(material, slot);
 
-        // リム倍率テクスチャは単一の素朴なMatCapマスクだけを直載せする。
-        // 参照実装の `BindRimMultiply` の直接載せと対応し、焼きが必要な
-        // 場合は対象外として警告する。
-        let rim_multiply_image = self.map_rim_multiply(material, slot, use_rim, matcap_image);
+        // 参照実装の `PlanRimMultiply` と対応する。リム光とMatCapの
+        // 係数・共有テクスチャ・tint・明るさを決め、減光は下の色へ戻す。
+        let plan = self.plan_rim_multiply(
+            material,
+            slot,
+            use_rim,
+            rim_color,
+            rim_lighting_mix,
+            matcap_prefix,
+            matcap_exported,
+            &base_rgb,
+            base_color_image,
+            &main_st,
+        )?;
+        // 焼きのtintへ渡すアルベド色は減光前の線形基準色である。
+        // 参照実装の `AlbedoColor` と対応するが、vrctomの基準色ベイクは
+        // `base_tint` を白にして `_Color` を含めないため、焼き済み経路でも
+        // 線形の `_Color` を渡す。
+        let albedo_base_rgb = base_rgb;
+        if darkens && plan.matcap.is_some() {
+            // 参照実装の `MapMatcapDarkening` と対応する。下の色を
+            // `1 - Covers` に暗くし、MatCapで足し戻す。MToonのMatCapを
+            // 描くアプリではUnityと同じに見え、無視するアプリでは暗く見える。
+            let kept = 1.0 - covers;
+            base_rgb = [base_rgb[0] * kept, base_rgb[1] * kept, base_rgb[2] * kept];
+            shade_color_factor = [
+                shade_color_factor[0] * kept,
+                shade_color_factor[1] * kept,
+                shade_color_factor[2] * kept,
+            ];
+            let taken = covers * 100.0;
+            let left = kept * 100.0;
+            let kind = if multiplies { "Multiply" } else { "Normal" };
+            let times = if multiplies {
+                "MatCapは基準色を掛けて足し戻される。"
+            } else {
+                ""
+            };
+            self.warn(format!(
+                "MToonのMatCapは加算のみなので、下の色を{taken:.0}%取る{kind} MatCapは基準色と影色を{left:.0}%に暗くし、MatCapで足し戻す。{times}MToonのMatCapを描くVRMアプリではUnityと同じに見え、無視するアプリでは暗く見える: {slot}"
+            ));
+        }
+        let parametric_rim_color_factor = match &plan.rim {
+            Some(rim) => self.clamp_rim_factor(slot, "リム色", rim.factor),
+            None => [0.0, 0.0, 0.0],
+        };
+        let matcap_factor = self.clamp_rim_factor(slot, "MatCap色", plan.matcap_factor);
+        // 参照実装の `MapRimAndMatcap` の混合係数と対応する。最初の
+        // シェア（リムがあればリム、無ければMatCap）の値を使い、
+        // 複数で違う場合は近似として警告する。
+        let first_mix = plan
+            .rim
+            .as_ref()
+            .or(plan.matcap.as_ref())
+            .map(|share| share.lighting_mix)
+            .unwrap_or(1.0);
+        let rim_lighting_mix_factor = clamp01(f64::from(first_mix)) as f32;
+        let mixes_differ = [&plan.rim, &plan.matcap]
+            .into_iter()
+            .flatten()
+            .any(|share| (share.lighting_mix - first_mix).abs() > 1e-3);
+        if mixes_differ {
+            self.warn(format!(
+                "MToonはリムとMatCapにひとつの光照混合係数を使うため、最初の値を使う: {slot}"
+            ));
+        }
+        let rim_multiply_image = self.bind_rim_multiply(
+            material,
+            slot,
+            &plan,
+            baked_albedo,
+            albedo_base_rgb,
+            base[3] as f32,
+        )?;
 
         Ok(VrmMaterial {
             name: material.name.clone(),
@@ -2770,52 +2885,459 @@ impl<'a> LoadContext<'a> {
         Ok(Some(MatcapFold { color, mask }))
     }
 
-    /// リム倍率テクスチャを写像する（`BindRimMultiply` の直接載せと対応）。
+    /// リム倍率テクスチャ1件の読み先を作る（`AtMainUvTiled` と対応）。
     ///
-    /// 単一の素朴なマスクだけを直載せし、焼きが必要な場合や
-    /// リム有効時は対象外として警告して省く。
-    fn map_rim_multiply(
+    /// 主変換の後に個別変換を合成し、GUID・`_ST`・チャンネル・反転で
+    /// 同一性を比べられるように持つ。読めない場合は警告して `None` を返す。
+    fn rim_factor_input(
+        &mut self,
+        material: &crate::unity::Material,
+        slot: &str,
+        main_st: &BakeSt,
+        property: &str,
+    ) -> Result<Option<RimFactor>, MaterialError> {
+        let own = bake_st_of(texture(material, property));
+        let composed = compose_st(main_st, &own);
+        let Some(input) = self.bake_input_of(material, slot, property, BakeChannel::Rgb, false)?
+        else {
+            return Ok(None);
+        };
+        let plain = !input.invert;
+        let texture_id = texture(material, property)
+            .and_then(|environment| environment.texture.guid.clone())
+            .map(|guid| guid.as_str().to_owned());
+        Ok(Some(RimFactor {
+            input: BakeInput {
+                st: composed,
+                ..input
+            },
+            property: property.to_owned(),
+            texture_id,
+            plain,
+        }))
+    }
+
+    /// 共有1要素の係数とtintを決める（`ShareOf` と対応）。
+    ///
+    /// tintが定数なら係数へ折り込み、非定数で基準色テクスチャが無い場合は
+    /// 基準色での値を係数へ折り込む。基準色テクスチャがある場合だけ
+    /// tintを残し、係数には最大値を掛ける。
+    // 引数は共有要素の組み立てにそのまま使うため束ねない。
+    #[allow(clippy::too_many_arguments)]
+    fn share_of(
+        name: &'static str,
+        color: [f32; 3],
+        textures: Vec<RimFactor>,
+        tint: AlbedoTint,
+        lighting_mix: f32,
+        masks_only: bool,
+        base_rgb: [f32; 3],
+        has_base_texture: bool,
+    ) -> RimShare {
+        if tint.is_constant() {
+            return RimShare {
+                name,
+                textures,
+                tint: None,
+                factor: [
+                    color[0] * tint.constant,
+                    color[1] * tint.constant,
+                    color[2] * tint.constant,
+                ],
+                lighting_mix,
+                masks_only,
+            };
+        }
+        if !has_base_texture {
+            let tinted = tint.at_color(base_rgb);
+            return RimShare {
+                name,
+                textures,
+                tint: None,
+                factor: [
+                    color[0] * tinted[0],
+                    color[1] * tinted[1],
+                    color[2] * tinted[2],
+                ],
+                lighting_mix,
+                masks_only,
+            };
+        }
+        let peak = tint.peak();
+        RimShare {
+            name,
+            textures,
+            tint: Some(tint),
+            factor: [color[0] * peak, color[1] * peak, color[2] * peak],
+            lighting_mix,
+            masks_only,
+        }
+    }
+
+    /// リム光とMatCapのリム倍率の計画を作る（`PlanRimMultiply` と対応）。
+    ///
+    /// lilToonではリム光（tint無し）とMatCap（`_MatCapMainStrength` の
+    /// アルベドtint）の2要素だけを扱う。参照実装の反転リム・減光・
+    /// テクスチャ上限の切り捨ては対象外であり、3件を超える構成は無い。
+    // 引数は計画の組み立てにそのまま使うため束ねない。
+    #[allow(clippy::too_many_arguments)]
+    fn plan_rim_multiply(
         &mut self,
         material: &crate::unity::Material,
         slot: &str,
         use_rim: bool,
-        matcap_image: Option<usize>,
-    ) -> Option<usize> {
-        matcap_image?;
-        let prefix = match matcap_slot(material) {
-            MatcapSlot::First => "_MatCap",
-            MatcapSlot::Second => "_MatCap2nd",
-            MatcapSlot::None => return None,
+        rim_color: [f32; 3],
+        rim_lighting_mix: f32,
+        matcap_prefix: Option<&str>,
+        matcap_exported: bool,
+        base_rgb: &[f32; 3],
+        base_color_image: Option<usize>,
+        main_st: &BakeSt,
+    ) -> Result<RimMultiplyPlan, MaterialError> {
+        let rim = if use_rim {
+            let textures = match self.rim_factor_input(material, slot, main_st, "_RimColorTex")? {
+                Some(input) => vec![input],
+                None => Vec::new(),
+            };
+            Some(Self::share_of(
+                "リム光",
+                rim_color,
+                textures,
+                AlbedoTint::none(),
+                rim_lighting_mix,
+                false,
+                *base_rgb,
+                base_color_image.is_some(),
+            ))
+        } else {
+            None
         };
-        if use_rim {
-            self.warn(format!(
-                "リム倍率テクスチャの焼き込みは未対応のため省く: {slot}"
-            ));
-            return None;
-        }
-        if mode_of(material, &format!("{prefix}MainStrength")) != 0.0 {
-            self.warn(format!(
-                "リム倍率テクスチャの焼き込みは未対応のため省く: {slot}"
-            ));
-            return None;
-        }
-        if !has_texture(material, &format!("{prefix}BlendMask")) {
-            return None;
-        }
-        let weight = matcap_weight(material, prefix);
-        if weight[0] > 1.0 || weight[1] > 1.0 || weight[2] > 1.0 {
-            self.warn(format!(
-                "リム倍率テクスチャの焼き込みは未対応のため省く: {slot}"
-            ));
-            return None;
-        }
-        match self.resolve_texture(material, slot, &format!("{prefix}BlendMask")) {
-            Ok(image) => image,
-            Err(_) => {
-                self.warn(format!("リム倍率テクスチャを読めないため省く: {slot}"));
-                None
+        let matcap = match (matcap_prefix, matcap_exported) {
+            (Some(prefix), true) => {
+                let textures = match self.rim_factor_input(
+                    material,
+                    slot,
+                    main_st,
+                    &format!("{prefix}BlendMask"),
+                )? {
+                    Some(input) => vec![input],
+                    None => Vec::new(),
+                };
+                let multiplies =
+                    number(material, &format!("{prefix}BlendMode")).unwrap_or(1.0) as i64 == 3;
+                let mix = clamp01(number(material, &format!("{prefix}MainStrength")).unwrap_or(0.0))
+                    as f32;
+                // 乗算は下の色を掛けて足し戻し、加算系は混ぜ具合だけを見る。
+                let tint = AlbedoTint {
+                    mix,
+                    constant: if multiplies { 0.0 } else { 1.0 },
+                    albedo: if multiplies { 1.0 } else { 0.0 },
+                };
+                Some(Self::share_of(
+                    "MatCap",
+                    matcap_weight(material, prefix),
+                    textures,
+                    tint,
+                    if multiplies {
+                        1.0
+                    } else {
+                        clamp01(number(material, &format!("{prefix}EnableLighting")).unwrap_or(1.0))
+                            as f32
+                    },
+                    true,
+                    *base_rgb,
+                    base_color_image.is_some(),
+                ))
+            }
+            _ => None,
+        };
+        // lilToonでは反転リムが無いため `matcap_factor` はMatCap層だけである
+        // （参照実装の `ComposeMatcap` と対応）。
+        let matcap_factor = matcap
+            .as_ref()
+            .map_or([0.0, 0.0, 0.0], |share| share.factor);
+        let mut plan = RimMultiplyPlan {
+            rim,
+            matcap,
+            textures: Vec::new(),
+            tint: None,
+            tinted: Vec::new(),
+            gain: 1.0,
+            matcap_factor,
+        };
+        self.share_tint(slot, &mut plan);
+        self.report_shared_textures(slot, &plan);
+        for share in [&plan.rim, &plan.matcap].into_iter().flatten() {
+            for texture in &share.textures {
+                if !plan.textures.iter().any(|known| texture.same_as(known)) {
+                    plan.textures.push(texture.clone());
+                }
             }
         }
+        self.move_brightness_into_texture(slot, &mut plan);
+        Ok(plan)
+    }
+
+    /// 共有tintの持ち主を決める（`ShareTint` と対応）。
+    ///
+    /// lilToonではtintはMatCapだけが持つ。単独ならそのまま運び、
+    /// リムと両立する場合はMatCapを所有者にし、リムにも同じtintが
+    /// 掛かる近似として警告する。参照実装の `TintRatio` はtint無しの
+    /// 追従では100%になるため、係数は変えない。
+    fn share_tint(&mut self, slot: &str, plan: &mut RimMultiplyPlan) {
+        let rim_tint = plan.rim.as_ref().and_then(|share| share.tint);
+        let matcap_tint = plan.matcap.as_ref().and_then(|share| share.tint);
+        match (rim_tint, matcap_tint) {
+            (Some(rim), Some(matcap)) if rim.same_shape(matcap) => {
+                // 同じ変わり方をするtintはそのまま運ぶ。
+                plan.tint = Some(matcap);
+                plan.tinted = vec!["リム光", "MatCap"];
+            }
+            (Some(_), Some(_)) => {
+                // lilToonの読み取りでは起きない組み合わせであり、先勝ちにしない。
+                // 両方にtintがある場合はMatCapを所有者にする。
+                plan.tint = matcap_tint;
+                plan.tinted = vec!["MatCap"];
+                self.warn(format!(
+                    "MToonはリムとMatCapをひとつのテクスチャで乗算するため、リムとMatCapに同じアルベドtint（Main Color Power）が掛かる近似になる: {slot}"
+                ));
+            }
+            (None, Some(_)) => {
+                plan.tint = matcap_tint;
+                plan.tinted = vec!["MatCap"];
+                if plan.rim.is_some() {
+                    self.warn(format!(
+                        "MToonはリムとMatCapをひとつのテクスチャで乗算するため、リムにもMatCapのアルベドtint（Main Color Power）が掛かる近似になる: {slot}"
+                    ));
+                }
+            }
+            (Some(_), None) => {
+                plan.tint = rim_tint;
+                plan.tinted = vec!["リム光"];
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// 片方だけが持つテクスチャを報告する（`ReportSharedTextures` と対応）。
+    ///
+    /// MToonはリムとMatCapを1枚で乗算するため、相手にも掛かる旨を警告する。
+    fn report_shared_textures(&mut self, slot: &str, plan: &RimMultiplyPlan) {
+        let shares: Vec<&RimShare> = [&plan.rim, &plan.matcap].into_iter().flatten().collect();
+        if shares.len() < 2 {
+            return;
+        }
+        let mut parts = Vec::new();
+        for (index, owner) in shares.iter().enumerate() {
+            let own: Vec<&RimFactor> = owner
+                .textures
+                .iter()
+                .filter(|texture| {
+                    !shares[..index]
+                        .iter()
+                        .any(|earlier| earlier.textures.iter().any(|known| texture.same_as(known)))
+                })
+                .collect();
+            for (other_index, other) in shares.iter().enumerate() {
+                if other_index == index {
+                    continue;
+                }
+                let foreign: Vec<&RimFactor> = own
+                    .iter()
+                    .copied()
+                    .filter(|texture| !other.textures.iter().any(|known| texture.same_as(known)))
+                    .collect();
+                if foreign.is_empty() {
+                    continue;
+                }
+                let kinds: Vec<&str> = foreign
+                    .iter()
+                    .map(|texture| texture.kind(owner.masks_only))
+                    .collect();
+                let kinds = kinds.join("と");
+                parts.push(format!("{}にも{}の{kinds}が掛かる", other.name, owner.name));
+            }
+        }
+        if parts.is_empty() {
+            return;
+        }
+        self.warn(format!(
+            "MToonはリム光とMatCapを1枚のテクスチャで乗算するため、{}: {slot}",
+            parts.join("、")
+        ));
+    }
+
+    /// 1超の明るさをテクスチャへ移す（`MoveBrightnessIntoTexture` と対応）。
+    ///
+    /// 両方がある場合は丸めた係数が相手も暗くするため何もしない。
+    /// 片方だけの場合は最大値で割り、テクスチャ側で掛け直す。
+    fn move_brightness_into_texture(&mut self, slot: &str, plan: &mut RimMultiplyPlan) {
+        if !plan.per_texel() {
+            return;
+        }
+        if plan.rim.is_some() && plan.matcap.is_some() {
+            return;
+        }
+        let peak = if let Some(rim) = &plan.rim {
+            rim.factor[0].max(rim.factor[1]).max(rim.factor[2])
+        } else {
+            plan.matcap_factor[0]
+                .max(plan.matcap_factor[1])
+                .max(plan.matcap_factor[2])
+        };
+        if peak <= 1.0 {
+            return;
+        }
+        plan.gain = peak;
+        if let Some(rim) = plan.rim.as_mut() {
+            rim.factor = [
+                rim.factor[0] / peak,
+                rim.factor[1] / peak,
+                rim.factor[2] / peak,
+            ];
+            self.warn(format!(
+                "リム光の明るさが1を超えるためテクスチャへ移して上限で切る: {slot}"
+            ));
+        } else {
+            plan.matcap_factor = [
+                plan.matcap_factor[0] / peak,
+                plan.matcap_factor[1] / peak,
+                plan.matcap_factor[2] / peak,
+            ];
+            self.warn(format!(
+                "MatCapの明るさが1を超えるためテクスチャへ移して上限で切る: {slot}"
+            ));
+        }
+    }
+
+    /// 色係数を0〜1へ丸める（`ClampColor` と対応）。
+    ///
+    /// 範囲外の場合は警告する。
+    fn clamp_rim_factor(&mut self, slot: &str, field: &str, factor: [f32; 3]) -> [f32; 3] {
+        let clamped = [
+            factor[0].clamp(0.0, 1.0),
+            factor[1].clamp(0.0, 1.0),
+            factor[2].clamp(0.0, 1.0),
+        ];
+        if clamped != factor {
+            self.warn(format!("{field}が0〜1の範囲外のため丸める: {slot}"));
+        }
+        clamped
+    }
+
+    /// リム倍率テクスチャを結び付ける（`BindRimMultiply` と対応）。
+    ///
+    /// 画素ごとの内容が無い場合は `None`、単位変換の単一の素朴なマスクだけの
+    /// 場合は直載せし、それ以外は `RimMultiplyComposite` を焼く。
+    /// 焼く場合はアルベドtintと1超の明るさを報告する。
+    // 引数は焼きの組み立てにそのまま使うため束ねない。
+    #[allow(clippy::too_many_arguments)]
+    fn bind_rim_multiply(
+        &mut self,
+        material: &crate::unity::Material,
+        slot: &str,
+        plan: &RimMultiplyPlan,
+        baked_albedo: Option<Rc<BakeImage>>,
+        albedo_base_rgb: [f32; 3],
+        base_alpha: f32,
+    ) -> Result<Option<usize>, MaterialError> {
+        if !plan.per_texel() {
+            return Ok(None);
+        }
+        let gain = plan.gain / plan.tint.map_or(1.0, |tint| tint.peak());
+        if plan.tint.is_none()
+            && (gain - 1.0).abs() < 1e-6
+            && plan.textures.len() == 1
+            && plan.textures[0].plain
+            && plan.textures[0].input.st.is_identity()
+        {
+            // 単一の素朴なマスクはそのまま載せる。
+            // チャンネル違いは `ChannelRepack` でRGBへ広げるが、
+            // lilToonのマスクはRGBのため通常は通らない。
+            let property = plan.textures[0].property.clone();
+            if plan.textures[0].input.channel == BakeChannel::Rgb {
+                return self.resolve_texture(material, slot, &property);
+            }
+            let source = plan.textures[0].input.clone();
+            let output_id = format!("bake:{slot}:RimMultiply");
+            let size = bake_output_size(
+                &[(
+                    source.image.width(),
+                    source.image.height(),
+                    source.st.scale[0].abs(),
+                    source.st.scale[1].abs(),
+                )],
+                &output_id,
+            )?;
+            let pixels = bake_channel_repack(&RepackJob {
+                source,
+                target: [1.0, 1.0, 0.0, 0.0],
+                size,
+            });
+            let bytes = encode_color_png(&pixels, size);
+            return Ok(Some(self.push_baked_image(slot, "RimMultiply", bytes)?));
+        }
+        // 焼く場合のアルベドは焼いた基準色があればそれを使い、
+        // なければ主テクスチャをそのまま読む（参照実装の `AlbedoInput` と対応）。
+        // アルベド色はどちらの場合も減光前の線形基準色である。vrctomの
+        // 基準色ベイクは `_Color` を含めないため、焼き済みでも白にしない。
+        let albedo_color = [
+            albedo_base_rgb[0],
+            albedo_base_rgb[1],
+            albedo_base_rgb[2],
+            base_alpha,
+        ];
+        let albedo = match baked_albedo {
+            Some(image) => Some(BakeInput {
+                image,
+                st: BakeSt::identity(),
+                channel: BakeChannel::Rgb,
+                invert: false,
+            }),
+            None => self.bake_input_of(material, slot, "_MainTex", BakeChannel::Rgb, false)?,
+        };
+        let mut extents = Vec::new();
+        for texture in &plan.textures {
+            extents.push((
+                texture.input.image.width(),
+                texture.input.image.height(),
+                texture.input.st.scale[0].abs(),
+                texture.input.st.scale[1].abs(),
+            ));
+        }
+        if plan.tint.is_some()
+            && let Some(albedo) = &albedo
+        {
+            extents.push((
+                albedo.image.width(),
+                albedo.image.height(),
+                albedo.st.scale[0].abs(),
+                albedo.st.scale[1].abs(),
+            ));
+        }
+        let output_id = format!("bake:{slot}:RimMultiply");
+        let size = bake_output_size(&extents, &output_id)?;
+        let mut inputs = plan.textures.iter();
+        let pixels = bake_rim_multiply(&RimMultiplyJob {
+            source: inputs.next().map(|texture| texture.input.clone()),
+            mask: inputs.next().map(|texture| texture.input.clone()),
+            scale: inputs.next().map(|texture| texture.input.clone()),
+            albedo,
+            albedo_color,
+            tint: plan.tint,
+            gain,
+            target: [1.0, 1.0, 0.0, 0.0],
+            size,
+        });
+        let bytes = encode_color_png(&pixels, size);
+        let image = self.push_baked_image(slot, "RimMultiply", bytes)?;
+        if plan.tint.is_some() {
+            let owners = plan.tinted.join("と");
+            self.warn(format!(
+                "{owners}のアルベドtint（Main Color Power）をリム倍率テクスチャへ焼く: {slot}"
+            ));
+        }
+        Ok(Some(image))
     }
 
     /// アウトライン幅マスクをGへ載せ替える（`MapOutline` と対応）。
@@ -2936,6 +3458,164 @@ struct MatcapFold {
     mask: Option<BakeInput>,
 }
 
+/// リム光やMatCapが混ぜ先のアルベドで変わる度合い（`AlbedoTint` と対応）。
+///
+/// 式は `lerp(1, albedo, mix) * (constant + albedo係数 * albedo)` であり、
+/// lilToonではtintはMatCapの `_MatCapMainStrength` だけが持つ。
+/// リムはtintを持たない。`None`相当は呼び出し側で `Option` の無しとして扱う。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct AlbedoTint {
+    /// 基準色の混ざり具合（0〜1）。
+    pub(crate) mix: f32,
+    /// アルベドに依らない持ち分。
+    pub(crate) constant: f32,
+    /// アルベドに比例する持ち分。
+    pub(crate) albedo: f32,
+}
+
+impl AlbedoTint {
+    /// tint無し（定数1）。
+    fn none() -> Self {
+        Self {
+            mix: 0.0,
+            constant: 1.0,
+            albedo: 0.0,
+        }
+    }
+
+    /// アルベドに依らず一定かどうか。
+    pub(crate) fn is_constant(self) -> bool {
+        self.mix == 0.0 && self.albedo == 0.0
+    }
+
+    /// アルベド1成分に対する倍率。
+    pub(crate) fn at(self, albedo: f32) -> f32 {
+        (1.0 - self.mix + self.mix * albedo) * (self.constant + self.albedo * albedo)
+    }
+
+    /// アルベドRGBに対する倍率。
+    pub(crate) fn at_color(self, albedo: [f32; 3]) -> [f32; 3] {
+        [self.at(albedo[0]), self.at(albedo[1]), self.at(albedo[2])]
+    }
+
+    /// アルベド0〜1での最大倍率。
+    ///
+    /// 式はアルベドの二次式であり、頂点が0〜1に入る場合はそこも見る。
+    pub(crate) fn peak(self) -> f32 {
+        let mut peak = self.at(0.0).max(self.at(1.0));
+        let curvature = self.mix * self.albedo;
+        if curvature != 0.0 {
+            let vertex =
+                -((1.0 - self.mix) * self.albedo + self.mix * self.constant) / (2.0 * curvature);
+            if vertex > 0.0 && vertex < 1.0 {
+                peak = peak.max(self.at(vertex));
+            }
+        }
+        peak.max(0.0)
+    }
+
+    /// 両方のtintがアルベドで同じ変わり方をするかどうか。
+    ///
+    /// 正規化（最大値で割る）後の `mix`・`constant`・`albedo` が
+    /// 許容差以内で一致する場合に真になる。定数同士は同じ形とみなす。
+    pub(crate) fn same_shape(self, other: Self) -> bool {
+        const TOLERANCE: f32 = 1e-4;
+        if self.is_constant() || other.is_constant() {
+            return self.is_constant() && other.is_constant();
+        }
+        let peak = self.peak();
+        let other_peak = other.peak();
+        if peak <= 0.0 || other_peak <= 0.0 {
+            return peak <= 0.0 && other_peak <= 0.0;
+        }
+        (self.mix - other.mix).abs() <= TOLERANCE
+            && (self.constant / peak - other.constant / other_peak).abs() <= TOLERANCE
+            && (self.albedo / peak - other.albedo / other_peak).abs() <= TOLERANCE
+    }
+}
+
+/// リム倍率に掛かるテクスチャ1件（`RimFactorTexture` と対応）。
+///
+/// lilToonではリム色テクスチャとMatCapのマスクだけがあり、
+/// アルファ掛け（Poiyomiの発光マップのアルファ）は使わない。
+/// `invert` は常に偽、`channel` は `Rgb` の場合がほとんどである。
+#[derive(Debug, Clone)]
+struct RimFactor {
+    /// 読み先。`_ST` は主変換との合成済みである。
+    input: BakeInput,
+    /// 由来のプロパティ（`_RimColorTex`・`{prefix}BlendMask`）。
+    property: String,
+    /// 由来テクスチャのGUID文字列。同一性の判定に使う。
+    texture_id: Option<String>,
+    /// 反転なしでMToonがそのまま読めるかどうか（`IsPlain` と対応）。
+    /// vrctomにアルファ掛けは無いため、反転の有無だけで決める。
+    plain: bool,
+}
+
+impl RimFactor {
+    /// 同じ読み先かどうか（GUID・`_ST`・チャンネル・反転で比べる）。
+    fn same_as(&self, other: &Self) -> bool {
+        self.texture_id == other.texture_id
+            && self.input.st == other.input.st
+            && self.input.channel == other.input.channel
+            && self.input.invert == other.input.invert
+    }
+
+    /// 警告文での呼び名。MatCap由来はマスク、リム由来はテクスチャと呼ぶ。
+    fn kind(&self, masks_only: bool) -> &'static str {
+        if masks_only || self.input.channel != BakeChannel::Rgb {
+            "マスク"
+        } else {
+            "テクスチャ"
+        }
+    }
+}
+
+/// リム倍率を分け合う1要素（リム光かMatCap、`RimShare` と対応）。
+///
+/// 反転リム（Poiyomiの後ろ向きリム）・減光はlilToonに無いため持たない。
+#[derive(Debug, Clone)]
+struct RimShare {
+    /// 警告文での呼び名（「リム光」・「MatCap」）。
+    name: &'static str,
+    /// 掛かるテクスチャ列。
+    textures: Vec<RimFactor>,
+    /// 画素ごとに変わるアルベドtint。定数は係数へ折り込むため持たない。
+    tint: Option<AlbedoTint>,
+    /// MToonの色係数（線形）。tintの最大値と合わせ込み・丸めの後で持つ。
+    factor: [f32; 3],
+    /// 光照混合係数。
+    lighting_mix: f32,
+    /// 由来がすべてマスクかどうか。警告文の呼び名に使う。
+    masks_only: bool,
+}
+
+/// リム光とMatCapが分け合うリム倍率の計画（`RimMultiplyPlan` と対応）。
+#[derive(Debug, Clone)]
+struct RimMultiplyPlan {
+    /// リム光。無効時は `None` である。
+    rim: Option<RimShare>,
+    /// MatCap。書き出さない場合は `None` である。
+    matcap: Option<RimShare>,
+    /// 共有テクスチャ列（3件まで）。
+    textures: Vec<RimFactor>,
+    /// テクスチャが運ぶアルベドtint。無い場合は掛けない。
+    tint: Option<AlbedoTint>,
+    /// tintをそのまま運ぶ要素名列。
+    tinted: Vec<&'static str>,
+    /// 色係数に入らない明るさ。テクスチャ側で掛ける。
+    gain: f32,
+    /// MToonのMatCap係数（MatCap層の持ち分）。
+    matcap_factor: [f32; 3],
+}
+
+impl RimMultiplyPlan {
+    /// 画素ごとに変わる内容（テクスチャかtint）があるかどうか。
+    fn per_texel(&self) -> bool {
+        !self.textures.is_empty() || self.tint.is_some()
+    }
+}
+
 /// 陰影の2層目以降1層分（`ShadeLayer` と対応）。
 struct ShadeExtraLayer {
     /// 境界・ぼかし。
@@ -2997,11 +3677,6 @@ fn emission_linear(material: &crate::unity::Material) -> ([f32; 3], bool) {
         }
     }
     (factor, clamped)
-}
-
-/// 浮動小数点プロパティを読む。整数も受け付ける。無ければ `default` である。
-fn mode_of(material: &crate::unity::Material, name: &str) -> f64 {
-    number(material, name).unwrap_or(0.0)
 }
 
 /// MatCapが下の色をどれだけ取るか（`Matcap.Covers` と対応）。
@@ -3123,6 +3798,7 @@ fn is_color_property(property: &str) -> bool {
             | "_EmissionMap"
             | "_MatCapTex"
             | "_MatCap2ndTex"
+            | "_RimColorTex"
     )
 }
 

@@ -3363,3 +3363,1089 @@ fn 小さい保持予算でもpsdの焼き出力は同じになる() {
     let (_退, 退避) = 配置(1);
     assert_eq!(通常, 退避, "退避しても出力は同じになる");
 }
+
+/// MatCapマスクだけ・リム無効・MainStrength 0はマスクを直載せし焼かない。
+#[test]
+fn マスクだけなら直載せし焼かない() {
+    // MatCap本体とマスクと主テクスチャを別のGUIDにし、直載せ先を名前で確かめる。
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    let main = guid(0x22);
+    let 本体 = guid(0x23);
+    let mask = guid(0x24);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    let mut 浮動 = 基本浮動小数();
+    for (名, 値) in &mut 浮動 {
+        if *名 == "_UseMatCap" {
+            *値 = 1.0;
+        }
+    }
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[
+            ("_MainTex", 参照::割当(&main)),
+            ("_MatCapTex", 参照::割当(&本体)),
+            ("_MatCapBlendMask", 参照::割当(&mask)),
+        ],
+        &浮動,
+        &基本色(),
+    );
+    テクスチャを書く(&root, "Assets/Textures/Main.png", &main, PNG_1X1);
+    テクスチャを書く(&root, "Assets/Textures/MatCap.png", &本体, PNG_1X1);
+    テクスチャを書く(&root, "Assets/Textures/Mask.png", &mask, PNG_1X1);
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let 所有 = materials.expect("ある");
+    let mtoon = 所有.get("Body").expect("ある").mtoon.clone().expect("ある");
+    // 焼き画像は増えず、マスク画像をそのまま指す。
+    assert_eq!(所有.images().len(), 3, "直載せ3枚で焼きは無い");
+    assert!(
+        所有
+            .images()
+            .iter()
+            .all(|image| !image.name.starts_with("bake:")),
+        "焼き画像は無い"
+    );
+    let 索引 = mtoon.rim_multiply_image.expect("マスクを載せる");
+    assert_eq!(所有.images()[索引].name, "Mask");
+    assert_eq!(mtoon.matcap_factor, [1.0, 1.0, 1.0]);
+    assert!(
+        !report.warnings().iter().any(|警告| 警告.contains("焼")),
+        "焼きの警告は無い: {:?}",
+        report.warnings()
+    );
+}
+
+/// MatCapマスク＋MainStrength 1はアルベドtintを焼き、係数は最大値になる。
+#[test]
+fn 主強度のtintは焼いて係数は最大値になる() {
+    // 主テクスチャの模様と白マスクの積が焼き出力になる。
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    let main = guid(0x22);
+    let 本体 = guid(0x23);
+    let mask = guid(0x24);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    let mut 浮動 = 基本浮動小数();
+    for (名, 値) in &mut 浮動 {
+        if *名 == "_UseMatCap" {
+            *値 = 1.0;
+        }
+    }
+    浮動.push(("_MatCapMainStrength", 1.0));
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[
+            ("_MainTex", 参照::割当(&main)),
+            ("_MatCapTex", 参照::割当(&本体)),
+            ("_MatCapBlendMask", 参照::割当(&mask)),
+        ],
+        &浮動,
+        &基本色(),
+    );
+    let 主 = 模様pngを作る(2, 2);
+    テクスチャを書く(&root, "Assets/Textures/Main.png", &main, &主);
+    テクスチャを書く(&root, "Assets/Textures/MatCap.png", &本体, PNG_1X1);
+    テクスチャを書く(
+        &root,
+        "Assets/Textures/Mask.png",
+        &mask,
+        &単色pngを作る(2, 2, [0xFF, 0xFF, 0xFF, 0xFF]),
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let 所有 = materials.expect("ある");
+    let mtoon = 所有.get("Body").expect("ある").mtoon.clone().expect("ある");
+    // tintの最大値は1のため、係数は重みのままになる。
+    assert_eq!(mtoon.matcap_factor, [1.0, 1.0, 1.0]);
+    let 索引 = mtoon.rim_multiply_image.expect("焼いて載せる");
+    assert_eq!(所有.images()[索引].name, "bake:Body:RimMultiply");
+    // 白マスク×主テクスチャの線形値であり、符号化の往復以内で一致する。
+    let (幅, 高さ, 復号) = pngを復号する(&所有.images()[索引].data);
+    assert_eq!((幅, 高さ), (2, 2));
+    let (_, _, 主画素) = pngを復号する(&主);
+    for (実測, 目標) in 復号.chunks_exact(4).zip(主画素.chunks_exact(4)) {
+        for (実測, 目標) in 実測.iter().zip(目標.iter()) {
+            assert!(
+                (i16::from(*実測) - i16::from(*目標)).abs() <= 2,
+                "画素が合う: {復号:?} と {主画素:?}"
+            );
+        }
+    }
+    assert!(
+        report
+            .warnings()
+            .iter()
+            .any(|警告| 警告.contains("アルベドtint")),
+        "tintの警告がある: {:?}",
+        report.warnings()
+    );
+}
+
+/// MatCapマスク＋リム有効（色テクスチャなし）は直載せし共有を警告する。
+#[test]
+fn リム有効でもマスクは直載せし共有を警告する() {
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    let main = guid(0x22);
+    let 本体 = guid(0x23);
+    let mask = guid(0x24);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    let mut 浮動 = 基本浮動小数();
+    for (名, 値) in &mut 浮動 {
+        if *名 == "_UseMatCap" {
+            *値 = 1.0;
+        }
+    }
+    浮動.push(("_UseRim", 1.0));
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[
+            ("_MainTex", 参照::割当(&main)),
+            ("_MatCapTex", 参照::割当(&本体)),
+            ("_MatCapBlendMask", 参照::割当(&mask)),
+        ],
+        &浮動,
+        &基本色(),
+    );
+    テクスチャを書く(&root, "Assets/Textures/Main.png", &main, PNG_1X1);
+    テクスチャを書く(&root, "Assets/Textures/MatCap.png", &本体, PNG_1X1);
+    テクスチャを書く(&root, "Assets/Textures/Mask.png", &mask, PNG_1X1);
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let 所有 = materials.expect("ある");
+    let mtoon = 所有.get("Body").expect("ある").mtoon.clone().expect("ある");
+    // リムにテクスチャが無いため、マスクのまま載る。
+    let 索引 = mtoon.rim_multiply_image.expect("マスクを載せる");
+    assert_eq!(所有.images()[索引].name, "Mask");
+    // リム色は既定（線形の代替値）のまま係数になる。
+    assert!((mtoon.parametric_rim_color_factor[0] - 0.66).abs() < 1e-6);
+    assert!((mtoon.parametric_rim_color_factor[1] - 0.5).abs() < 1e-6);
+    assert!((mtoon.parametric_rim_color_factor[2] - 0.48).abs() < 1e-6);
+    assert!(
+        report
+            .warnings()
+            .iter()
+            .any(|警告| 警告.contains("リム光にもMatCapのマスクが掛かる")),
+        "共有の警告がある: {:?}",
+        report.warnings()
+    );
+}
+
+/// MatCapマスク＋リム色テクスチャは2枚を1枚に焼き共有を警告する。
+#[test]
+fn リム色とマスクは積で1枚に焼く() {
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    let main = guid(0x22);
+    let 本体 = guid(0x23);
+    let mask = guid(0x24);
+    let rim = guid(0x25);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    let mut 浮動 = 基本浮動小数();
+    for (名, 値) in &mut 浮動 {
+        if *名 == "_UseMatCap" {
+            *値 = 1.0;
+        }
+    }
+    浮動.push(("_UseRim", 1.0));
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[
+            ("_MainTex", 参照::割当(&main)),
+            ("_MatCapTex", 参照::割当(&本体)),
+            ("_MatCapBlendMask", 参照::割当(&mask)),
+            ("_RimColorTex", 参照::割当(&rim)),
+        ],
+        &浮動,
+        &基本色(),
+    );
+    テクスチャを書く(&root, "Assets/Textures/Main.png", &main, PNG_1X1);
+    テクスチャを書く(&root, "Assets/Textures/MatCap.png", &本体, PNG_1X1);
+    // どちらも128の灰色（線形で約0.216）のため、積は約0.047（符号化で約61）になる。
+    テクスチャを書く(
+        &root,
+        "Assets/Textures/Mask.png",
+        &mask,
+        &単色pngを作る(2, 2, [0x80, 0x80, 0x80, 0xFF]),
+    );
+    テクスチャを書く(
+        &root,
+        "Assets/Textures/Rim.png",
+        &rim,
+        &単色pngを作る(2, 2, [0x80, 0x80, 0x80, 0xFF]),
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let 所有 = materials.expect("ある");
+    let mtoon = 所有.get("Body").expect("ある").mtoon.clone().expect("ある");
+    let 索引 = mtoon.rim_multiply_image.expect("焼いて載せる");
+    assert_eq!(所有.images()[索引].name, "bake:Body:RimMultiply");
+    let (幅, 高さ, 復号) = pngを復号する(&所有.images()[索引].data);
+    assert_eq!((幅, 高さ), (2, 2));
+    assert!(
+        復号
+            .chunks_exact(4)
+            .all(|画素| (i16::from(画素[0]) - 61).abs() <= 3
+                && (i16::from(画素[1]) - 61).abs() <= 3
+                && (i16::from(画素[2]) - 61).abs() <= 3),
+        "積になる: {復号:?}"
+    );
+    let 警告 = report.warnings().join("\n");
+    assert!(
+        警告.contains("MatCapにもリム光のテクスチャが掛かる"),
+        "共有の警告がある: {警告}"
+    );
+    assert!(
+        警告.contains("リム光にもMatCapのマスクが掛かる"),
+        "共有の警告がある: {警告}"
+    );
+}
+
+/// 乗算＋マスクのMatCapは書き出さず係数もゼロになる。
+#[test]
+fn 乗算マスクのmatcapは書き出さない() {
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    let main = guid(0x22);
+    let 本体 = guid(0x23);
+    let mask = guid(0x24);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    let mut 浮動 = 基本浮動小数();
+    for (名, 値) in &mut 浮動 {
+        if *名 == "_UseMatCap" {
+            *値 = 1.0;
+        }
+    }
+    浮動.push(("_MatCapBlendMode", 3.0));
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[
+            ("_MainTex", 参照::割当(&main)),
+            ("_MatCapTex", 参照::割当(&本体)),
+            ("_MatCapBlendMask", 参照::割当(&mask)),
+        ],
+        &浮動,
+        &基本色(),
+    );
+    テクスチャを書く(&root, "Assets/Textures/Main.png", &main, PNG_1X1);
+    テクスチャを書く(&root, "Assets/Textures/MatCap.png", &本体, PNG_1X1);
+    テクスチャを書く(&root, "Assets/Textures/Mask.png", &mask, PNG_1X1);
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let 所有 = materials.expect("ある");
+    let mtoon = 所有.get("Body").expect("ある").mtoon.clone().expect("ある");
+    assert_eq!(mtoon.matcap_image, None);
+    assert_eq!(mtoon.matcap_factor, [0.0, 0.0, 0.0]);
+    assert_eq!(mtoon.rim_multiply_image, None);
+    assert!(
+        report.warnings().iter().any(|警告| 警告.contains("乗算")),
+        "乗算の警告がある: {:?}",
+        report.warnings()
+    );
+}
+
+/// マスクなしNormalの減光は基準色と影色を暗くして足し戻す。
+#[test]
+fn マスクなしnormalの減光は下の色を暗くする() {
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    let main = guid(0x22);
+    let 本体 = guid(0x23);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    let mut 浮動 = 基本浮動小数();
+    for (名, 値) in &mut 浮動 {
+        if *名 == "_UseMatCap" {
+            *値 = 1.0;
+        }
+    }
+    浮動.push(("_MatCapBlendMode", 0.0));
+    浮動.push(("_MatCapBlend", 0.5));
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[
+            ("_MainTex", 参照::割当(&main)),
+            ("_MatCapTex", 参照::割当(&本体)),
+        ],
+        &浮動,
+        &基本色(),
+    );
+    テクスチャを書く(&root, "Assets/Textures/Main.png", &main, PNG_1X1);
+    テクスチャを書く(&root, "Assets/Textures/MatCap.png", &本体, PNG_1X1);
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let 所有 = materials.expect("ある");
+    let 材質 = 所有.get("Body").expect("ある");
+    let mtoon = 材質.mtoon.clone().expect("ある");
+    // 白の半分が下に残り、MatCap係数も重みのままになる。
+    assert_eq!(材質.base_color_factor, [0.5, 0.5, 0.5, 1.0]);
+    assert_eq!(mtoon.matcap_factor, [0.5, 0.5, 0.5]);
+    // 影色の既定値（線形で約0.638・0.538・0.692）の半分になる。
+    assert!(
+        (mtoon.shade_color_factor[0] - 0.319).abs() < 0.005,
+        "{:?}",
+        mtoon.shade_color_factor
+    );
+    assert!(
+        (mtoon.shade_color_factor[1] - 0.269).abs() < 0.005,
+        "{:?}",
+        mtoon.shade_color_factor
+    );
+    assert!(
+        (mtoon.shade_color_factor[2] - 0.346).abs() < 0.005,
+        "{:?}",
+        mtoon.shade_color_factor
+    );
+    assert!(
+        report.warnings().iter().any(|警告| 警告.contains("暗くし")),
+        "減光の警告がある: {:?}",
+        report.warnings()
+    );
+}
+
+/// 重み1超のマスクは明るさをテクスチャへ移して係数を丸める。
+#[test]
+fn 重み1超のマスクは明るさを移して焼く() {
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    let main = guid(0x22);
+    let 本体 = guid(0x23);
+    let mask = guid(0x24);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    let mut 浮動 = 基本浮動小数();
+    for (名, 値) in &mut 浮動 {
+        if *名 == "_UseMatCap" {
+            *値 = 1.0;
+        }
+    }
+    浮動.push(("_MatCapBlend", 2.0));
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[
+            ("_MainTex", 参照::割当(&main)),
+            ("_MatCapTex", 参照::割当(&本体)),
+            ("_MatCapBlendMask", 参照::割当(&mask)),
+        ],
+        &浮動,
+        &基本色(),
+    );
+    テクスチャを書く(
+        &root,
+        "Assets/Textures/Main.png",
+        &main,
+        &単色pngを作る(1, 1, [0xFF, 0xFF, 0xFF, 0xFF]),
+    );
+    テクスチャを書く(
+        &root,
+        "Assets/Textures/MatCap.png",
+        &本体,
+        &単色pngを作る(1, 1, [0xFF, 0xFF, 0xFF, 0xFF]),
+    );
+    テクスチャを書く(
+        &root,
+        "Assets/Textures/Mask.png",
+        &mask,
+        &単色pngを作る(1, 1, [0xFF, 0xFF, 0xFF, 0xFF]),
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let 所有 = materials.expect("ある");
+    let mtoon = 所有.get("Body").expect("ある").mtoon.clone().expect("ある");
+    // 明るさ2は係数に入らず、1に丸めた係数と上限で切った焼きになる。
+    assert_eq!(mtoon.matcap_factor, [1.0, 1.0, 1.0]);
+    let 索引 = mtoon.rim_multiply_image.expect("焼いて載せる");
+    assert_eq!(所有.images()[索引].name, "bake:Body:RimMultiply");
+    let (幅, 高さ, 復号) = pngを復号する(&所有.images()[索引].data);
+    assert_eq!((幅, 高さ), (1, 1));
+    assert_eq!(復号, vec![0xFF, 0xFF, 0xFF, 0xFF]);
+    assert!(
+        report
+            .warnings()
+            .iter()
+            .any(|警告| 警告.contains("上限で切る")),
+        "明るさの警告がある: {:?}",
+        report.warnings()
+    );
+}
+
+/// 同じ入力のリム倍率焼きは同じ画像索引を共有する。
+#[test]
+fn 同じ入力の焼きは画像索引を共有する() {
+    // 2スロットで同じGUID・同じ値を参照し、内容ハッシュで1枚にまとめる。
+    let (_guard, root) = 作業域を作る();
+    let a = guid(0x11);
+    let b = guid(0x12);
+    let main = guid(0x22);
+    let 本体 = guid(0x23);
+    let mask = guid(0x24);
+    fbxメタを書く(&root, &guid(0x99), &[("A", Some(&a)), ("B", Some(&b))]);
+    for mat in [&a, &b] {
+        let mut 浮動 = 基本浮動小数();
+        for (名, 値) in &mut 浮動 {
+            if *名 == "_UseMatCap" {
+                *値 = 1.0;
+            }
+        }
+        浮動.push(("_MatCapMainStrength", 1.0));
+        マテリアルを書く(
+            &root,
+            &format!("Assets/Materials/{mat}.mat"),
+            mat,
+            mat,
+            Some(SHADER_OPAQUE),
+            &[
+                ("_MainTex", 参照::割当(&main)),
+                ("_MatCapTex", 参照::割当(&本体)),
+                ("_MatCapBlendMask", 参照::割当(&mask)),
+            ],
+            &浮動,
+            &基本色(),
+        );
+        メタを書く(
+            &root,
+            &format!("Assets/Materials/{mat}.mat"),
+            mat,
+            "NativeFormatImporter",
+            "  externalObjects: {}\n  userData: \n",
+        );
+    }
+    テクスチャを書く(
+        &root,
+        "Assets/Textures/Main.png",
+        &main,
+        &単色pngを作る(1, 1, [0xFF, 0xFF, 0xFF, 0xFF]),
+    );
+    テクスチャを書く(&root, "Assets/Textures/MatCap.png", &本体, PNG_1X1);
+    テクスチャを書く(
+        &root,
+        "Assets/Textures/Mask.png",
+        &mask,
+        &単色pngを作る(1, 1, [0xFF, 0xFF, 0xFF, 0xFF]),
+    );
+    let (materials, _) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let 所有 = materials.expect("ある");
+    let 甲 = 所有.get("A").expect("ある").mtoon.clone().expect("ある");
+    let 乙 = 所有.get("B").expect("ある").mtoon.clone().expect("ある");
+    let 甲焼き = 甲.rim_multiply_image.expect("焼いて載せる");
+    let 乙焼き = 乙.rim_multiply_image.expect("焼いて載せる");
+    assert_eq!(甲焼き, 乙焼き, "同じ内容は同じ索引になる");
+    assert_eq!(
+        所有
+            .images()
+            .iter()
+            .filter(|image| image.name.starts_with("bake:"))
+            .count(),
+        1,
+        "焼き画像は1枚だけ増える"
+    );
+}
+
+/// 本体画像が無いMatCapは減光も書き出しもしない。
+#[test]
+fn 本体が無いmatcapは減光も書き出しもしない() {
+    // `_MatCapTex` は割り当てるが資産を書かない。索引に無いため省く。
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    let main = guid(0x22);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    let mut 浮動 = 基本浮動小数();
+    for (名, 値) in &mut 浮動 {
+        if *名 == "_UseMatCap" {
+            *値 = 1.0;
+        }
+    }
+    浮動.push(("_MatCapBlendMode", 0.0));
+    浮動.push(("_MatCapBlend", 0.5));
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[
+            ("_MainTex", 参照::割当(&main)),
+            ("_MatCapTex", 参照::割当(&guid(0x30))),
+        ],
+        &浮動,
+        &基本色(),
+    );
+    テクスチャを書く(&root, "Assets/Textures/Main.png", &main, PNG_1X1);
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let 所有 = materials.expect("ある");
+    let 材質 = 所有.get("Body").expect("ある");
+    let mtoon = 材質.mtoon.clone().expect("ある");
+    // 本体が無いため下の色は暗くならず、MatCapも載らない。
+    assert_eq!(材質.base_color_factor, [1.0, 1.0, 1.0, 1.0]);
+    assert!(
+        (mtoon.shade_color_factor[0] - 0.638).abs() < 0.005,
+        "{:?}",
+        mtoon.shade_color_factor
+    );
+    assert!(
+        (mtoon.shade_color_factor[1] - 0.538).abs() < 0.005,
+        "{:?}",
+        mtoon.shade_color_factor
+    );
+    assert!(
+        (mtoon.shade_color_factor[2] - 0.692).abs() < 0.005,
+        "{:?}",
+        mtoon.shade_color_factor
+    );
+    assert_eq!(mtoon.matcap_image, None);
+    assert_eq!(mtoon.matcap_factor, [0.0, 0.0, 0.0]);
+    assert_eq!(mtoon.rim_multiply_image, None);
+    let 警告 = report.warnings().join("\n");
+    assert!(!警告.contains("暗くし"), "減光しない: {警告}");
+}
+
+/// 本体が無いAddではマスクだけをリム倍率に載せない。
+#[test]
+fn 本体が無いaddではマスクだけを載せない() {
+    // 本体は欠落、マスクだけある。Addでもマスク単独では載せない。
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    let main = guid(0x22);
+    let mask = guid(0x24);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    let mut 浮動 = 基本浮動小数();
+    for (名, 値) in &mut 浮動 {
+        if *名 == "_UseMatCap" {
+            *値 = 1.0;
+        }
+    }
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[
+            ("_MainTex", 参照::割当(&main)),
+            ("_MatCapTex", 参照::割当(&guid(0x30))),
+            ("_MatCapBlendMask", 参照::割当(&mask)),
+        ],
+        &浮動,
+        &基本色(),
+    );
+    テクスチャを書く(&root, "Assets/Textures/Main.png", &main, PNG_1X1);
+    テクスチャを書く(
+        &root,
+        "Assets/Textures/Mask.png",
+        &mask,
+        &単色pngを作る(1, 1, [0xFF, 0xFF, 0xFF, 0xFF]),
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let 所有 = materials.expect("ある");
+    let mtoon = 所有.get("Body").expect("ある").mtoon.clone().expect("ある");
+    assert_eq!(mtoon.matcap_image, None);
+    assert_eq!(mtoon.matcap_factor, [0.0, 0.0, 0.0]);
+    assert_eq!(mtoon.rim_multiply_image, None);
+    let 警告 = report.warnings().join("\n");
+    assert!(
+        !警告.contains("1枚のテクスチャで乗算"),
+        "共有しない: {警告}"
+    );
+}
+
+/// tintのアルベド色は線形の基準色になる。
+#[test]
+fn tintのアルベド色は線形基準色になる() {
+    // `_Color` 0.5（線形で約0.214）に白マスクを掛け、符号化で約128になる。
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    let main = guid(0x22);
+    let 本体 = guid(0x23);
+    let mask = guid(0x24);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    let mut 浮動 = 基本浮動小数();
+    for (名, 値) in &mut 浮動 {
+        if *名 == "_UseMatCap" {
+            *値 = 1.0;
+        }
+    }
+    浮動.push(("_MatCapMainStrength", 1.0));
+    let mut 色 = 基本色();
+    for (名, 値) in &mut 色 {
+        if *名 == "_Color" {
+            *値 = [0.5, 0.5, 0.5, 1.0];
+        }
+    }
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[
+            ("_MainTex", 参照::割当(&main)),
+            ("_MatCapTex", 参照::割当(&本体)),
+            ("_MatCapBlendMask", 参照::割当(&mask)),
+        ],
+        &浮動,
+        &色,
+    );
+    テクスチャを書く(
+        &root,
+        "Assets/Textures/Main.png",
+        &main,
+        &単色pngを作る(1, 1, [0xFF, 0xFF, 0xFF, 0xFF]),
+    );
+    テクスチャを書く(&root, "Assets/Textures/MatCap.png", &本体, PNG_1X1);
+    テクスチャを書く(
+        &root,
+        "Assets/Textures/Mask.png",
+        &mask,
+        &単色pngを作る(1, 1, [0xFF, 0xFF, 0xFF, 0xFF]),
+    );
+    let (materials, _) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let 所有 = materials.expect("ある");
+    let mtoon = 所有.get("Body").expect("ある").mtoon.clone().expect("ある");
+    let 索引 = mtoon.rim_multiply_image.expect("焼いて載せる");
+    let (_, _, 復号) = pngを復号する(&所有.images()[索引].data);
+    assert!(
+        復号
+            .chunks_exact(4)
+            .all(|画素| (i16::from(画素[0]) - 128).abs() <= 2
+                && (i16::from(画素[1]) - 128).abs() <= 2
+                && (i16::from(画素[2]) - 128).abs() <= 2),
+        "線形基準色で焼く: {復号:?}"
+    );
+}
+
+/// 焼いた基準色でもtintのアルベド色は線形基準色になる。
+#[test]
+fn 焼いた基準色でもtintは線形基準色になる() {
+    // アルファマスクで基準色を焼く経路でも、白ベイクに線形の `_Color` を掛ける。
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    let main = guid(0x22);
+    let 本体 = guid(0x23);
+    let mask = guid(0x24);
+    let alpha = guid(0x25);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    let mut 浮動 = 基本浮動小数();
+    for (名, 値) in &mut 浮動 {
+        if *名 == "_UseMatCap" {
+            *値 = 1.0;
+        }
+    }
+    浮動.push(("_MatCapMainStrength", 1.0));
+    浮動.push(("_AlphaMaskMode", 1.0));
+    let mut 色 = 基本色();
+    for (名, 値) in &mut 色 {
+        if *名 == "_Color" {
+            *値 = [0.5, 0.5, 0.5, 1.0];
+        }
+    }
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[
+            ("_MainTex", 参照::割当(&main)),
+            ("_MatCapTex", 参照::割当(&本体)),
+            ("_MatCapBlendMask", 参照::割当(&mask)),
+            ("_AlphaMask", 参照::割当(&alpha)),
+        ],
+        &浮動,
+        &色,
+    );
+    テクスチャを書く(
+        &root,
+        "Assets/Textures/Main.png",
+        &main,
+        &単色pngを作る(1, 1, [0xFF, 0xFF, 0xFF, 0xFF]),
+    );
+    テクスチャを書く(&root, "Assets/Textures/MatCap.png", &本体, PNG_1X1);
+    テクスチャを書く(
+        &root,
+        "Assets/Textures/Mask.png",
+        &mask,
+        &単色pngを作る(1, 1, [0xFF, 0xFF, 0xFF, 0xFF]),
+    );
+    テクスチャを書く(
+        &root,
+        "Assets/Textures/Alpha.png",
+        &alpha,
+        &単色pngを作る(1, 1, [0xFF, 0xFF, 0xFF, 0xFF]),
+    );
+    let (materials, _) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let 所有 = materials.expect("ある");
+    let 材質 = 所有.get("Body").expect("ある");
+    // 基準色は焼かれている。
+    assert!(材質.base_color_image.is_some());
+    let mtoon = 材質.mtoon.clone().expect("ある");
+    let 索引 = mtoon.rim_multiply_image.expect("焼いて載せる");
+    let (_, _, 復号) = pngを復号する(&所有.images()[索引].data);
+    assert!(
+        復号
+            .chunks_exact(4)
+            .all(|画素| (i16::from(画素[0]) - 128).abs() <= 2
+                && (i16::from(画素[1]) - 128).abs() <= 2
+                && (i16::from(画素[2]) - 128).abs() <= 2),
+        "焼いた基準色でも線形基準色で焼く: {復号:?}"
+    );
+}
+
+/// 非単位変換の単一マスクは直載せせず焼いて変換を反映する。
+#[test]
+fn 非単位変換のマスクは焼いて反映する() {
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    let main = guid(0x22);
+    let 本体 = guid(0x23);
+    let mask = guid(0x24);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    let mut 浮動 = 基本浮動小数();
+    for (名, 値) in &mut 浮動 {
+        if *名 == "_UseMatCap" {
+            *値 = 1.0;
+        }
+    }
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[
+            ("_MainTex", 参照::割当(&main)),
+            ("_MatCapTex", 参照::割当(&本体)),
+            ("_MatCapBlendMask", 参照::割当(&mask)),
+        ],
+        &浮動,
+        &基本色(),
+    );
+    // マスクのオフセットを x=0.5 にずらす。
+    let 場所 = root.join("Assets/Materials/Body.mat");
+    let 本文 = fs::read_to_string(&場所).expect("matは読める");
+    let 標的 = format!(
+        "    - _MatCapBlendMask:\n        m_Texture: {{fileID: 2800000, guid: {mask}, type: 3}}\n        m_Scale: {{x: 1, y: 1}}\n        m_Offset: {{x: 0, y: 0}}"
+    );
+    assert!(本文.contains(&標的), "書式が合う");
+    fs::write(
+        &場所,
+        本文
+            .replace(&標的, &標的.replace("{x: 0, y: 0}", "{x: 0.5, y: 0}"))
+            .as_bytes(),
+    )
+    .expect("matは書ける");
+    テクスチャを書く(&root, "Assets/Textures/Main.png", &main, PNG_1X1);
+    テクスチャを書く(&root, "Assets/Textures/MatCap.png", &本体, PNG_1X1);
+    // 点補間・繰り返しの2x2模様。x=0.5 のずれで列が入れ替わる。
+    資産を書く(&root, "Assets/Textures/Mask.png", &模様pngを作る(2, 2));
+    メタを書く(
+        &root,
+        "Assets/Textures/Mask.png",
+        &mask,
+        "TextureImporter",
+        "  externalObjects: {}\n  textureSettings:\n    filterMode: 0\n    wrapU: 0\n    wrapV: 0\n  mipmaps:\n    enableMipMap: 1\n",
+    );
+    let (materials, _) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let 所有 = materials.expect("ある");
+    let mtoon = 所有.get("Body").expect("ある").mtoon.clone().expect("ある");
+    let 索引 = mtoon.rim_multiply_image.expect("焼いて載せる");
+    assert_eq!(所有.images()[索引].name, "bake:Body:RimMultiply");
+    let (幅, 高さ, 復号) = pngを復号する(&所有.images()[索引].data);
+    assert_eq!((幅, 高さ), (2, 2));
+    // 列が入れ替わる（Rは64・0、Gは行のまま、Bは128）。
+    let 期待 = [
+        64u8, 0, 128, 255, 0, 0, 128, 255, 64, 64, 128, 255, 0, 64, 128, 255,
+    ];
+    for (実測, 目標) in 復号.iter().zip(期待.iter()) {
+        assert!(
+            (i16::from(*実測) - i16::from(*目標)).abs() <= 2,
+            "ずらしが反映される: {復号:?}"
+        );
+    }
+}
+
+/// リム色テクスチャの縮小は色として平均する。
+#[test]
+fn リム色テクスチャの縮小は色として平均する() {
+    // 2x1 の [0, 128] を上限1で縮める。符号化済み平均は64、線形平均は約92になる。
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    let main = guid(0x22);
+    let 本体 = guid(0x23);
+    let mask = guid(0x24);
+    let rim = guid(0x25);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    let mut 浮動 = 基本浮動小数();
+    for (名, 値) in &mut 浮動 {
+        if *名 == "_UseMatCap" {
+            *値 = 1.0;
+        }
+    }
+    浮動.push(("_UseRim", 1.0));
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[
+            ("_MainTex", 参照::割当(&main)),
+            ("_MatCapTex", 参照::割当(&本体)),
+            ("_MatCapBlendMask", 参照::割当(&mask)),
+            ("_RimColorTex", 参照::割当(&rim)),
+        ],
+        &浮動,
+        &基本色(),
+    );
+    テクスチャを書く(
+        &root,
+        "Assets/Textures/Main.png",
+        &main,
+        &単色pngを作る(1, 1, [0xFF, 0xFF, 0xFF, 0xFF]),
+    );
+    テクスチャを書く(&root, "Assets/Textures/MatCap.png", &本体, PNG_1X1);
+    テクスチャを書く(
+        &root,
+        "Assets/Textures/Mask.png",
+        &mask,
+        &単色pngを作る(1, 1, [0xFF, 0xFF, 0xFF, 0xFF]),
+    );
+    // 2x1 の R=G=B=[0, 128] を上限1で縮小する。
+    let mut raw = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut raw, 2, 1);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("PNGは書ける");
+        writer
+            .write_image_data(&[0, 0, 0, 0xFF, 0x80, 0x80, 0x80, 0xFF])
+            .expect("画素は書ける");
+        drop(writer);
+    }
+    縮小指定テクスチャを書く(&root, "Assets/Textures/Rim.png", &rim, &raw, 1);
+    let (materials, _) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let 所有 = materials.expect("ある");
+    let mtoon = 所有.get("Body").expect("ある").mtoon.clone().expect("ある");
+    let 索引 = mtoon.rim_multiply_image.expect("焼いて載せる");
+    let (幅, 高さ, 復号) = pngを復号する(&所有.images()[索引].data);
+    assert_eq!((幅, 高さ), (1, 1));
+    assert!(
+        復号
+            .chunks_exact(4)
+            .all(|画素| (i16::from(画素[0]) - 64).abs() <= 2
+                && (i16::from(画素[1]) - 64).abs() <= 2
+                && (i16::from(画素[2]) - 64).abs() <= 2),
+        "色として縮小する: {復号:?}"
+    );
+}
+
+/// 乗算＋マスクなし＋リム色ありは本体を解決せず書き出さない。
+#[test]
+fn リム色ありの乗算は本体を埋め込まず書き出さない() {
+    // 減光で足し戻せないため候補から外し、本体資産があっても埋め込まない。
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    let main = guid(0x22);
+    let rim = guid(0x25);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    let mut 浮動 = 基本浮動小数();
+    for (名, 値) in &mut 浮動 {
+        if *名 == "_UseMatCap" {
+            *値 = 1.0;
+        }
+    }
+    浮動.push(("_MatCapBlendMode", 3.0));
+    浮動.push(("_UseRim", 1.0));
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[
+            ("_MainTex", 参照::割当(&main)),
+            ("_MatCapTex", 参照::割当(&guid(0x30))),
+            ("_RimColorTex", 参照::割当(&rim)),
+        ],
+        &浮動,
+        &基本色(),
+    );
+    テクスチャを書く(&root, "Assets/Textures/Main.png", &main, PNG_1X1);
+    // 本体資産があっても候補から外すため解決・埋め込みしない。
+    テクスチャを書く(&root, "Assets/Textures/MatCap.png", &guid(0x30), PNG_1X1);
+    テクスチャを書く(
+        &root,
+        "Assets/Textures/Rim.png",
+        &rim,
+        &単色pngを作る(1, 1, [0xFF, 0xFF, 0xFF, 0xFF]),
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("本体が無くても省略して続ける");
+    let 所有 = materials.expect("ある");
+    let mtoon = 所有.get("Body").expect("ある").mtoon.clone().expect("ある");
+    assert_eq!(mtoon.matcap_image, None);
+    assert_eq!(mtoon.matcap_factor, [0.0, 0.0, 0.0]);
+    assert!(
+        !所有.images().iter().any(|image| image.name == "MatCap"),
+        "本体を埋め込まない: {:?}",
+        所有
+            .images()
+            .iter()
+            .map(|image| &image.name)
+            .collect::<Vec<_>>()
+    );
+    let 警告 = report.warnings().join("\n");
+    assert!(
+        警告.contains("リムの色テクスチャを共有するため"),
+        "原因の警告がある: {警告}"
+    );
+}
+
+/// 強度0の乗算MatCapはリム倍率に載らず係数もゼロになる。
+#[test]
+fn 強度0の乗算はリムを暗くしない() {
+    // `covers == 0` のため候補から外れ、Multiplyのtintでリムを暗くしない。
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    let main = guid(0x22);
+    let 本体 = guid(0x23);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    let mut 浮動 = 基本浮動小数();
+    for (名, 値) in &mut 浮動 {
+        if *名 == "_UseMatCap" {
+            *値 = 1.0;
+        }
+    }
+    浮動.push(("_MatCapBlendMode", 3.0));
+    浮動.push(("_MatCapBlend", 0.0));
+    浮動.push(("_UseRim", 1.0));
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(SHADER_OPAQUE),
+        &[
+            ("_MainTex", 参照::割当(&main)),
+            ("_MatCapTex", 参照::割当(&本体)),
+        ],
+        &浮動,
+        &基本色(),
+    );
+    テクスチャを書く(
+        &root,
+        "Assets/Textures/Main.png",
+        &main,
+        &単色pngを作る(1, 1, [0xFF, 0xFF, 0xFF, 0xFF]),
+    );
+    テクスチャを書く(&root, "Assets/Textures/MatCap.png", &本体, PNG_1X1);
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let 所有 = materials.expect("ある");
+    let mtoon = 所有.get("Body").expect("ある").mtoon.clone().expect("ある");
+    assert_eq!(mtoon.matcap_image, None);
+    assert_eq!(mtoon.matcap_factor, [0.0, 0.0, 0.0]);
+    assert_eq!(mtoon.rim_multiply_image, None);
+    let 警告 = report.warnings().join("\n");
+    assert!(
+        警告.contains("強度が0で色を変えない"),
+        "原因の警告がある: {警告}"
+    );
+}

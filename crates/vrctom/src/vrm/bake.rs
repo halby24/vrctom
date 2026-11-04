@@ -2,8 +2,8 @@
 //!
 //! Unityの `.mat` と参照実装（`SoulFlameBake.shader` の各パス・
 //! `BakeJobBuilder` の組み方・`BakeExecutor.Bind` の渡し方）に沿い、
-//! 基準色・陰影・発光の合成とチャンネル詰め替え・法線合成をCPUで行う。
-//! Matcap合成・リム乗算合成・デカールは扱わない。
+//! 基準色・陰影・発光・リム乗算の合成とチャンネル詰め替え・法線合成をCPUで行う。
+//! Matcap合成・デカールは扱わない。
 //!
 //! ```mermaid
 //! flowchart LR
@@ -27,7 +27,7 @@
 use std::rc::Rc;
 
 use super::material::{
-    MaterialError, MaterialErrorKind, VrmFilter, VrmImageMime, VrmSampler, VrmWrap,
+    AlbedoTint, MaterialError, MaterialErrorKind, VrmFilter, VrmImageMime, VrmSampler, VrmWrap,
 };
 
 /// 焼きが1辺に持てる最大テクセル数。
@@ -1792,6 +1792,77 @@ pub fn bake_normal(job: &NormalJob) -> Vec<[f32; 4]> {
                 normal[0] * 0.5 + 0.5,
                 normal[1] * 0.5 + 0.5,
                 normal[2] * 0.5 + 0.5,
+                1.0,
+            ]);
+        }
+    }
+    out
+}
+
+/// リム乗算合成の入力（`RimMultiplyComposite` パスと対応）。
+#[derive(Debug, Clone)]
+pub struct RimMultiplyJob {
+    /// 1枚目の倍率テクスチャ。無い場合は1から始める。
+    pub source: Option<BakeInput>,
+    /// 2枚目の倍率テクスチャ。無い場合は掛けない。
+    pub mask: Option<BakeInput>,
+    /// 3枚目の倍率テクスチャ。無い場合は掛けない。
+    pub scale: Option<BakeInput>,
+    /// アルベド（焼いた基準色か主テクスチャ）。無い場合は白である。
+    pub albedo: Option<BakeInput>,
+    /// アルベドに掛ける色（線形・アルファ付き）。
+    pub albedo_color: [f32; 4],
+    /// アルベドtint。無い場合は掛けない。
+    pub tint: Option<AlbedoTint>,
+    /// 0〜1へ丸める前に掛ける倍率。色係数に入らない明るさを運ぶ。
+    pub gain: f32,
+    /// 出力の `_Target`（今回は単位）。
+    pub target: [f64; 4],
+    /// 出力寸法。
+    pub size: BakeSize,
+}
+
+/// リム乗算テクスチャを合成する（`Frag` の `RimMultiplyComposite` 節と対応）。
+///
+/// 各入力を [`tap_masked`] でRGBへ直し（スカラーは3成分へ広げる）、
+/// 積にアルベドtint（`lerp(1, albedo, mix) * (constant + albedo係数 * albedo)`）を掛け、
+/// `gain` を掛けて0〜1へ丸める。`AlbedoTint::None` は参照実装の呼び出し側で
+/// 渡さない（tint無しと対応）のと同じく、ここでも `None` で扱う。
+pub fn bake_rim_multiply(job: &RimMultiplyJob) -> Vec<[f32; 4]> {
+    let mut out = Vec::with_capacity(job.size.width as usize * job.size.height as usize);
+    for oy in 0..job.size.height {
+        for ox in 0..job.size.width {
+            let uv = [
+                (f64::from(ox) + 0.5) / f64::from(job.size.width),
+                (f64::from(oy) + 0.5) / f64::from(job.size.height),
+            ];
+            let uv0 = mesh_uv(uv, job.target);
+            let mut tinted = [1.0f32; 3];
+            for input in [&job.source, &job.mask, &job.scale].into_iter().flatten() {
+                let factor = tap_masked(input, uv0);
+                tinted[0] *= factor[0];
+                tinted[1] *= factor[1];
+                tinted[2] *= factor[2];
+            }
+            if let Some(tint) = &job.tint {
+                let albedo = match &job.albedo {
+                    Some(input) => tap_color(input, uv0),
+                    None => [1.0, 1.0, 1.0, 1.0],
+                };
+                let albedo = [
+                    albedo[0] * job.albedo_color[0],
+                    albedo[1] * job.albedo_color[1],
+                    albedo[2] * job.albedo_color[2],
+                ];
+                let mixed = tint.at_color(albedo);
+                tinted[0] *= mixed[0];
+                tinted[1] *= mixed[1];
+                tinted[2] *= mixed[2];
+            }
+            out.push([
+                (tinted[0] * job.gain).clamp(0.0, 1.0),
+                (tinted[1] * job.gain).clamp(0.0, 1.0),
+                (tinted[2] * job.gain).clamp(0.0, 1.0),
                 1.0,
             ]);
         }
