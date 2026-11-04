@@ -51,10 +51,60 @@ VRCプロファイル（`VrmExpressionProfile::vrchat`）はSoulFlame出力の�
 | `lookUp` | `vrc.looking_up` |
 | `lookDown` | `vrc.looking_down` |
 
-CLIでは `vrctom export ... --expressions vrc` でこの8種類の対応から見つかったものを生成する。未指定は表情を作らない。
+CLIでは `vrctom export ... --expressions vrc` でこの8種類の対応から見つかったものを生成する。`--prefab` なしで `--expressions` 未指定の場合は表情を作らない。`--prefab` 指定時はdescriptor由来の既定生成になる（`--no-expressions` で止める）。
 8種類は束ねの指定であり、見つかる分だけを適用して欠落は警告に残す。
 出力するターゲットは後述の絞り込みで残った互換形状すべてになる（Milfy実測では57件）。
 カスタムプロファイルも同じ部分適用の規則であり、VRC専用の分岐は無い。
+
+## descriptorからの既定生成
+
+`--prefab` 指定時はPrefab内の `VRCAvatarDescriptor` から既定の対応を作る。
+識別は `lipSync` 欄に加え、`VisemeBlendShapes`・`VisemeSkinnedMesh`・
+`customEyeLookSettings` のいずれかを伴う `MonoBehaviour` 文書であり、
+別スクリプトの同名欄を誤認しない。参照実装（SoulFlame VRM Exporter 0.6.9）が
+descriptorから既定生成する表情と同じにする。対象は口とまぶたの束ねの生成までであり、
+ベースライン焼き込み・複数メッシュ束ね・法線デルタ・
+カスタム式・override・ARKitは対象外である。
+
+- 対応表：SDKのviseme順は `sil, PP, FF, TH, DD, kk, CH, SS, nn, RR, aa, E, ih, oh, ou` であり、
+  VRM式への対応は `aa=10, ih=12, ou=14, ee=11("E"), oh=13`（SDK索引）である。
+  式の順序は `aa, ih, ou, ee, oh, blink, lookUp, lookDown` になる。
+- 口の分岐：LipSync=3（VisemeBlendShape）はviseme名から `aa/ih/ou/ee/oh` の5件、
+  LipSync=2（JawFlapBlendShape）は `MouthOpenBlendShapeName` から `aa` の1件を作る。
+  不足分（短い列・空名・メッシュに無い名）はその式だけ警告して落とし、残りを作る。
+  LipSync=1（JawFlapBone）・4（VisemeParameterOnly）・0（Default）は候補を作らず理由を警告する。
+- まぶたの分岐：`eyelidType=2`（Blendshapes）かつ `enableEyeLook` が有効の場合だけ `blink`（索引0）を作る。
+  `lookUp`・`lookDown`（索引1・2）はさらにhumanoidとして左右Eyeが解決できる場合だけ作る。
+  目条件はdescriptorの `leftEye`・`rightEye` ではなく、`.fbx.meta` の対応表と共有するhumanoid解決で判定する。
+  `eyelidType` が0（None）・1（Bones）の場合やeyeLook無効時は作らず警告する。
+- `eyelidsBlendshapes` は16進バイト列（リトルエンディアンi32×3）を文書の生本文から読む。
+  読むのは `customEyeLookSettings` ブロックの直接の子だけであり、
+  コメント・block scalarの内容・別mapping・ネスト先の同名キーは拾わない。
+  引用符付きキー（`"customEyeLookSettings"` など）もキーとして扱う。
+  YAMLの数値解決では先頭ゼロが落ち桁が変わるため、生本文を優先し、
+  無い・空・曖昧・フロー形式の場合だけ `Value::Sequence`・`String`・bignumの順に読む
+  （フロー形式では先頭ゼロを保証しない）。
+  `-1` は未設定としてその式だけ落とし、範囲外・空名も同じく落として警告する。
+- renderer解決：FBXの `models()` から取り込みID表（メッシュID・描画設定ID）を作り、
+  Prefab内のstripped文書と直接記述の `SkinnedMeshRenderer` を張る。
+  出所を検証し、stripped文書はclassID 137（SkinnedMeshRenderer）であり、
+  対応元GUIDが入力FBXと一致し、所属の `m_PrefabInstance` が外部GUIDを持たない
+  ローカル参照で入力FBXへの文書と一致する場合だけ使う。直接記述はメッシュ参照の
+  GUIDが入力FBXと一致する場合だけ使う。同じfileIDが異なるメッシュに解決する曖昧さは
+  部分成功にせず失敗する。使用する側の参照にGUIDがある（外部参照）・参照先が
+  Prefabに無い（dangling）・文書はあるが入力FBXのrendererに解決できない場合も
+  警告続行にせず失敗する。null・欠落だけ警告してその側の式なしで続ける。
+  FBXのチャンネル順をUnity側のブレンドシェイプ索引と同一視する前提であり、
+  `eyelidsBlendshapes` の索引はこの順序で名前を引く。
+  visemeとeyelidの両方に実在候補があり別メッシュの場合は今回の範囲外として
+  失敗する（部分成功にしない）。実在候補が無い側の別メッシュは失敗にしない。
+  片方だけならそのメッシュを使う。
+- 重みはすべて100（VRM束ねは1.0）、overrideはnone、`isBinary` は偽である。
+- descriptorが無い場合は理由を警告して式なしで続行する。
+  参照の形状不良・曖昧参照・外部参照・dangling・上限超過は失敗にする。
+- 適用先メッシュの決定はヒントとして `VrmOptions::with_expression_mesh` で渡し、
+  最大一致による選択をせず、単一フレーム検査など既存の解決規則は変えない。
+  束ねに入れるのはメッシュに実在する名前だけであり、欠落警告は解決時に出す。
 
 ## メッシュ解決
 
@@ -149,8 +199,10 @@ CLIでは `vrctom export ... --expressions vrc` でこの8種類の対応から�
 
 - ARKit名は残さない。参照実装は顔追跡を書くプリセットのときだけ残すが、
   ここでは顔追跡を書かないため対象外である。
-- descriptorが名指しするviseme・まぶた形状名は残さない。sidecarにその指定は無く、
-  Milfyでは `vrc.` とMMD名だけで57件すべてを説明できる。
+- descriptor経路では束ねが参照するdescriptor名（viseme名・まぶた形状名）は残る。
+  絞り込みの保持条件に束ね参照が含まれるためである。
+  束ねないviseme名は `vrc.`・MMD規則で残るか落ちる。
+  参照実装はdescriptor名をすべて残すが、今回は束ね参照以外は未対応である。
 
 Milfy実測ではFBXの667チャンネルが57件に絞られる。
 
@@ -280,7 +332,8 @@ Unity空間へ戻してから適用する。鏡像は群同型のため、往復
 
 - カスタム式は作らない。プリセット18種以外の式名は書き出し時に失敗する。
 - 材質・テクスチャへの束ねは作らない。
-- ARKit名・descriptor指定名の形状は残さない。顔追跡を書かないためである。
+- ARKit名は残さない。顔追跡を書かないためである。descriptor経路で束ねが参照する
+  descriptor名は残るが、束ねないdescriptor名をすべて残すことはしない。
 - 視線との連動（`overrideLookAt`）やまぶたの視線追従は扱わない。
   上書き指定は `none` のまま置く。
 - 法線モーフ（NORMAL）は出力しない。

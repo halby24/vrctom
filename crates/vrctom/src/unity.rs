@@ -49,6 +49,7 @@ pub use objects::{
 pub(crate) use reference::read_guid;
 pub use reference::{FileId, Guid, ObjectRef};
 pub use source::AssetSource;
+pub(crate) use yaml::bignum_digits;
 pub use yaml::{Document, ParseOptions, SerializedFile};
 
 #[cfg(not(target_arch = "wasm32"))]

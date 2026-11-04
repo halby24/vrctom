@@ -194,6 +194,23 @@ UVはFBXとUnityの左下原点からglTFの左上原点へ合わせるため、
   無指定時は「FBXの置換表経路であり、Prefabの割当・有効状態は未反映」と
   1行残す.
 
+## CLI入力（`--prefab` による表情の既定生成）
+
+`vrctom export --prefab <prefab>` を指定した場合は、Prefabの `VRCAvatarDescriptor` から
+表情を既定生成する（Unityを回さない）。`--no-expressions` を付けると止める。
+
+- `--expressions vrc` は `--prefab` があってもdescriptorより優先し、従来どおり固定対応を使う。
+- `--expressions descriptor` はdescriptor由来の既定生成を明示し、`--prefab` が必須である
+ （`requires_if` で受け付け時に検査する）。
+- `--expressions` と `--no-expressions` は同時に指定できない（`conflicts_with`）。
+- descriptor経路では入力FBXの隣の `.fbx.meta` からGUIDを読み、PrefabInstanceの特定と
+  renderer参照の出所検証に使う。GUIDが無い場合は明確に失敗する。
+  humanoid対応表は後段の検出と共有し、二重に読まない。
+- descriptor由来の警告は `表情の警告:` で標準エラーに出し（要約より前）、
+  束ねが非空の場合だけ `表情: VRCAvatarDescriptor から{n}件` を出す。
+- 要約の `書き出しが完了した` には `表情{n}件` を含める。
+- 対応の作り方・分岐・失敗条件は [`VRM表情`](VRM表情.md) の「descriptorからの既定生成」に譲る。
+
 ## CLI入力（`--prefab` による物理導出）
 
 `vrctom export --prefab <prefab>` を `--physics` 無しで指定した場合は、

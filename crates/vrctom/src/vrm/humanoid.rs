@@ -703,6 +703,24 @@ impl HumanoidBones {
         Self::resolve(model, mappings)
     }
 
+    /// ノード名列と対応表から対応付ける。
+    ///
+    /// [`detect_with_mapping`](Self::detect_with_mapping) と同じ規則であり、
+    /// モデル構築前に左右Eyeの有無だけを判定するために使う。
+    /// 名前列は [`VrmModel::nodes`] の順序と同じ `name` の列を想定する。
+    /// 挙動・警告・エラーは [`detect_with_mapping`](Self::detect_with_mapping) と変えない。
+    ///
+    /// # Errors
+    ///
+    /// 対応先ノードの欠落や重複・同じ骨や同じノードへの複数対応付け・
+    /// 名前推測の重複・必須骨の欠落の場合に返す。
+    pub fn detect_with_mapping_names(
+        names: &[&str],
+        mappings: &[HumanBoneMapping],
+    ) -> Result<(Self, Vec<String>), VrmExportError> {
+        Self::resolve_names(names, mappings)
+    }
+
     /// 対応表と名前推測で対応付ける共通処理。
     ///
     /// 空の対応表では名前推測だけになり、[`detect`](Self::detect) と同じ結果になる。
@@ -713,12 +731,26 @@ impl HumanoidBones {
         model: &VrmModel,
         mappings: &[HumanBoneMapping],
     ) -> Result<(Self, Vec<String>), VrmExportError> {
+        let names: Vec<&str> = model.nodes.iter().map(|node| node.name.as_str()).collect();
+        Self::resolve_names(&names, mappings)
+    }
+
+    /// 対応表と名前推測で対応付ける名前列版の共通処理。
+    ///
+    /// 空の対応表では名前推測だけになり、[`detect`](Self::detect) と同じ結果になる。
+    /// ロック済みの骨に対する名前候補は複数あっても無視し、
+    /// メタの確定を名前の曖昧さで失敗させない。
+    /// 未充足の同一骨に同順位の候補が複数ある場合は推測せず失敗する。
+    fn resolve_names(
+        names: &[&str],
+        mappings: &[HumanBoneMapping],
+    ) -> Result<(Self, Vec<String>), VrmExportError> {
         let mut warnings = Vec::new();
         let mut warned: BTreeSet<String> = BTreeSet::new();
         // ノード名から索引を引く。完全一致で突き合わせる。
         let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
-        for (index, node) in model.nodes.iter().enumerate() {
-            by_name.entry(node.name.as_str()).or_default().push(index);
+        for (index, name) in names.iter().enumerate() {
+            by_name.entry(*name).or_default().push(index);
         }
         let mut bones = Self::new();
         let mut used: BTreeSet<usize> = BTreeSet::new();
@@ -796,11 +828,11 @@ impl HumanoidBones {
         let locked: BTreeSet<HumanoidBone> = bones.iter().map(|(bone, _)| bone).collect();
         // 未充足の骨だけ正確名で補完する。
         let mut consumed = used;
-        for (index, node) in model.nodes.iter().enumerate() {
+        for (index, name) in names.iter().enumerate() {
             if consumed.contains(&index) {
                 continue;
             }
-            let Some(bone) = match_bone(&node.name) else {
+            let Some(bone) = match_bone(name) else {
                 continue;
             };
             if locked.contains(&bone) {
@@ -819,11 +851,11 @@ impl HumanoidBones {
         }
         // さらに未充足の骨だけ別名で補完する。
         let mut alias_filled: BTreeSet<HumanoidBone> = BTreeSet::new();
-        for (index, node) in model.nodes.iter().enumerate() {
+        for (index, name) in names.iter().enumerate() {
             if consumed.contains(&index) {
                 continue;
             }
-            let Some(bone) = match_alias_bone(&node.name) else {
+            let Some(bone) = match_alias_bone(name) else {
                 continue;
             };
             if locked.contains(&bone) {

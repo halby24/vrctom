@@ -17,6 +17,7 @@
 //! ```
 
 pub(crate) mod bake;
+mod descriptor;
 mod error;
 mod export;
 mod humanoid;
@@ -30,6 +31,7 @@ pub mod prefab;
 pub(crate) mod psd;
 pub mod renderers;
 
+pub use descriptor::{DescriptorExpressionPlan, expressions_from_avatar_descriptor};
 pub use error::{VrmError, VrmErrorKind};
 pub use export::{
     VrmAvatarPermission, VrmCommercialUsage, VrmCreditNotation, VrmExportError, VrmExportErrorKind,
@@ -308,6 +310,7 @@ pub struct VrmOptions {
     max_morph_targets: usize,
     max_morph_bytes: usize,
     expressions: Option<VrmExpressionProfile>,
+    expression_mesh: Option<ObjectId>,
 }
 
 /// モーフターゲットとプリセット式の選択指定。
@@ -317,6 +320,8 @@ pub struct VrmOptions {
 /// ソース（FBXのブレンドシェイプ）由来のためである。
 /// 要求は部分適用であり、見つかる分だけを生成して欠落は警告に残す。
 /// カスタムの対応付けも同じ規則であり、VRC専用の分岐は無い。
+/// 固定の `vrc` 対応のほか、Prefabの `VRCAvatarDescriptor` から作る
+/// 対応（[`expressions_from_avatar_descriptor`])もこの型で表す。
 #[derive(Debug, Clone)]
 pub struct VrmExpressionProfile {
     /// 式とターゲットの対応付け。`bindings` の順序がターゲットと式の順序になる。
@@ -370,6 +375,7 @@ impl VrmOptions {
             max_morph_targets: DEFAULT_MAX_MORPH_TARGETS,
             max_morph_bytes: DEFAULT_MAX_MORPH_BYTES,
             expressions: None,
+            expression_mesh: None,
         }
     }
 
@@ -406,6 +412,16 @@ impl VrmOptions {
     /// 表情の選択指定を付ける。付けない場合は従来どおり表情を作らない。
     pub fn with_expressions(mut self, profile: VrmExpressionProfile) -> Self {
         self.expressions = Some(profile);
+        self
+    }
+
+    /// 表情対象のメッシュを直接指定する。
+    ///
+    /// [`expressions_from_avatar_descriptor`] が求めた適用先メッシュを
+    /// 最大一致による選択なしに使うためのヒントである。指定時は
+    /// 解決の選択を行わず、このメッシュで束ねを絞る。
+    pub fn with_expression_mesh(mut self, mesh: ObjectId) -> Self {
+        self.expression_mesh = Some(mesh);
         self
     }
 }
@@ -914,6 +930,26 @@ fn resolve_expressions(
         .iter()
         .map(|mesh| (mesh.id, file.blend_shape_channels(mesh.id)))
         .collect();
+    // ヒント指定時は最大一致による選択をせず、そのメッシュを採用する。
+    // FBXのメッシュ一覧に無い場合は構造破損として失敗する。
+    if let Some(hint) = options.expression_mesh {
+        if file.mesh(hint).is_none() {
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidStructure,
+                "表情対象のヒントメッシュがFBXにない",
+            )
+            .with_object(hint));
+        }
+        return resolve_with_geometry(
+            file,
+            options,
+            profile,
+            &wanted,
+            &mesh_channels,
+            hint,
+            Vec::new(),
+        );
+    }
     let mut counts: Vec<(ObjectId, usize)> = Vec::with_capacity(mesh_channels.len());
     for (id, channels) in &mesh_channels {
         let names: HashSet<&str> = channels.iter().map(|c| c.name.as_str()).collect();
@@ -942,6 +978,33 @@ fn resolve_expressions(
         [single] => (*single, Vec::new()),
         _ => resolve_expression_tie(file, options, &mesh_channels, &wanted, &best)?,
     };
+    resolve_with_geometry(
+        file,
+        options,
+        profile,
+        &wanted,
+        &mesh_channels,
+        geometry,
+        selection_warnings,
+    )
+}
+
+/// 採用メッシュを確定済みとして束ねとチャンネルを解決する共通処理。
+///
+/// 所有モデルの有無・束ねの絞り・欠落警告・重複検査・上限検査・
+/// 単一フレーム条件の検査は既存の選択なし経路と同じである。
+/// ヒント使用時も要求ターゲットが採用メッシュに無い場合は同じ警告を出し、
+/// 束ねを落とす。最終的に束ねが0件なら `(None, warnings)` を返す。
+#[allow(clippy::too_many_arguments)]
+fn resolve_with_geometry(
+    file: &FbxFile<'_>,
+    options: &VrmOptions,
+    profile: &VrmExpressionProfile,
+    wanted: &[&str],
+    mesh_channels: &[(ObjectId, Vec<crate::fbx::BlendShapeChannel>)],
+    geometry: ObjectId,
+    selection_warnings: Vec<String>,
+) -> Result<(Option<ResolvedPlan>, Vec<String>), VrmError> {
     // 対象メッシュに所有モデルが無い場合は後段で飛ばされ、束ねが宙に浮くため失敗する。
     let owned = file
         .models()
@@ -987,6 +1050,9 @@ fn resolve_expressions(
                 )
             }),
     );
+    if bindings.is_empty() {
+        return Ok((None, warnings));
+    }
     // 対象メッシュのチャンネルをFBX順に絞る。残すのは束ねが指す名前・`vrc.` 始まり
     // （大文字小文字を無視）・MMD名（NFKC比較）のいずれかに当てはまる場合だけであり、
     // 参照実装の `PruneBlendShapes` と同値である。束ねが指す名前の重複だけを失敗させる。

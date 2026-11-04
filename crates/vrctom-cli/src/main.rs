@@ -12,17 +12,17 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 use vrctom::conversion::{ConversionError, build_model, export_model};
 use vrctom::fbx::{FbxFile, FbxOptions};
-use vrctom::unity::{AssetMeta, HumanBoneMapping, MAX_META_BYTES};
+use vrctom::unity::{AssetMeta, HumanBoneMapping, MAX_META_BYTES, ParseOptions, SerializedFile};
 use vrctom::unitypackage::{UnpackOptions, unpack_to};
 #[cfg(not(target_arch = "wasm32"))]
 use vrctom::vrm::load_renderer_materials;
 use vrctom::vrm::{
-    HumanoidBones, MaterialError, MaterialOptions, MaterialReport, PhysicsLimits, PhysicsSidecar,
-    RendererApplyReport, RendererLimits, RendererMeshView, RendererSidecar, SpringCompileOptions,
-    VrmAvatarPermission, VrmCommercialUsage, VrmCreditNotation, VrmExportOptions,
-    VrmExpressionProfile, VrmMaterials, VrmMeta, VrmModel, VrmModification, VrmOptions,
-    apply_humanoid_t_pose, apply_renderer_plan, compile_springs, plan_renderer_assignment,
-    resolve_look_at,
+    HumanoidBone, HumanoidBones, MaterialError, MaterialOptions, MaterialReport, PhysicsLimits,
+    PhysicsSidecar, RendererApplyReport, RendererLimits, RendererMeshView, RendererSidecar,
+    SpringCompileOptions, VrmAvatarPermission, VrmCommercialUsage, VrmCreditNotation,
+    VrmExportOptions, VrmExpressionProfile, VrmMaterials, VrmMeta, VrmModel, VrmModification,
+    VrmOptions, apply_humanoid_t_pose, apply_renderer_plan, compile_springs,
+    expressions_from_avatar_descriptor, plan_renderer_assignment, resolve_look_at,
 };
 
 #[derive(Debug, Parser)]
@@ -63,7 +63,9 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         assets: Option<PathBuf>,
         /// 表情の選択指定。`vrc` はVRChat向けの8種類の対応から見つかったものを生成する。
-        #[arg(long, value_name = "PROFILE")]
+        /// `descriptor` はPrefabの `VRCAvatarDescriptor` から既定生成する。
+        /// `--prefab` 指定時は `--no-expressions` が無い限り `descriptor` と同じになる。
+        #[arg(long, value_name = "PROFILE", requires_if("descriptor", "prefab"))]
         expressions: Option<ExpressionProfile>,
         /// 検証用: Unity採取の物理sidecar（JSON）。比較のための入力であり、通常は使わない。
         /// 既定では `--prefab` から物理を導出する。
@@ -81,6 +83,10 @@ enum Command {
         /// 物理を載せない。`--prefab` 指定時の導出を止める。
         #[arg(long, conflicts_with_all = ["physics", "physics_from_prefab"])]
         no_physics: bool,
+        /// 表情を作らない。`--prefab` 指定時のdescriptor由来の既定生成を止める。
+        /// `--expressions` とは同時に指定できない。
+        #[arg(long, conflicts_with = "expressions")]
+        no_expressions: bool,
         /// アバターの人格権の扱い。既定は `only-author`。
         #[arg(long, value_enum, value_name = "PERMISSION")]
         avatar_permission: Option<AvatarPermissionArg>,
@@ -111,11 +117,13 @@ enum Command {
     },
 }
 
-/// 表情の選択指定。現在はVRChat向けの8種類の対応だけを受け付ける。
+/// 表情の選択指定。`vrc` は固定対応、`descriptor` はPrefab由来の既定生成である。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ExpressionProfile {
     /// VRChat向けの8種類の対応から見つかったものを生成する。
     Vrc,
+    /// Prefabの `VRCAvatarDescriptor` から既定生成する。`--prefab` が必須である。
+    Descriptor,
 }
 
 /// アバター権限のCLI指定。VRM 1.0の3値をそのまま表す。
@@ -238,6 +246,7 @@ fn main() {
             prefab,
             physics_from_prefab: _,
             no_physics,
+            no_expressions,
             avatar_permission,
             commercial_usage,
             credit_notation,
@@ -258,6 +267,7 @@ fn main() {
             renderers,
             prefab,
             no_physics,
+            no_expressions,
             ExportMetaArgs {
                 avatar_permission,
                 commercial_usage,
@@ -414,6 +424,7 @@ fn export(
     renderers: Option<PathBuf>,
     prefab: Option<PathBuf>,
     no_physics: bool,
+    no_expressions: bool,
     meta_args: ExportMetaArgs,
 ) -> i32 {
     // 既定出力先は入力の拡張子を `vrm` に変えたパスとする。
@@ -456,6 +467,10 @@ fn export(
     if expressions == Some(ExpressionProfile::Vrc) {
         vrm_options = vrm_options.with_expressions(VrmExpressionProfile::vrchat());
     }
+    // descriptor由来の表情は `--expressions vrc` より弱い。`vrc` 指定時は
+    // `--prefab` があっても従来どおり固定対応を優先する。
+    let use_descriptor_expressions = expressions == Some(ExpressionProfile::Descriptor)
+        || (expressions.is_none() && prefab.is_some() && !no_expressions);
     // 材質配置の解決は物理導出（Prefabからのsidecar生成）でも使うため、物理より先に確定させる。
     // 指定時はその配置、省略時はFBXの祖先の `Assets` から求める。
     // いずれも出力を持たない純粋な算出であり、診断順序に影響しない。
@@ -487,6 +502,91 @@ fn export(
             return 1;
         }
     };
+    // descriptor由来の表情はFBX解析後・中間モデル生成前に解決する。
+    // `.fbx.meta` の対応表は後段のhumanoid検出と共有し、二重に読まない。
+    let mut early_mappings: Option<Vec<HumanBoneMapping>> = None;
+    if use_descriptor_expressions {
+        let Some(prefab_path) = prefab.as_ref() else {
+            eprintln!("--expressions descriptor には --prefab が必須である");
+            return 2;
+        };
+        let prefab_label = format!("{prefab_path:?}");
+        let prefab_bytes = match std::fs::read(prefab_path) {
+            Ok(prefab_bytes) => prefab_bytes,
+            Err(error) => {
+                eprintln!(
+                    "Prefabを読み込めない: {}: {}",
+                    escape_diag(&prefab_label),
+                    escape_diag(&error.to_string())
+                );
+                return 1;
+            }
+        };
+        let prefab_file = match SerializedFile::parse(&prefab_bytes, &ParseOptions::new()) {
+            Ok(prefab_file) => prefab_file,
+            Err(error) => {
+                diagnose_stage("Prefabの解析に失敗した", &error);
+                return 1;
+            }
+        };
+        let fbx_meta = match load_fbx_meta(&input) {
+            Ok(fbx_meta) => fbx_meta,
+            Err(code) => return code,
+        };
+        // Prefab表情にはFBXのGUIDが必要である。無い場合は後段でも失敗するため、
+        // ここで明確に止める。全ゼロは未設定とみなす。
+        if fbx_meta.guid.chars().all(|c| c == '0') {
+            let mut meta_os = input.as_os_str().to_owned();
+            meta_os.push(".meta");
+            eprintln!(
+                "Prefab表情にはFBXのGUIDが必要である: {}",
+                escape_diag(&format!("{:?}", PathBuf::from(meta_os)))
+            );
+            return 1;
+        }
+        let mappings = fbx_meta.mappings;
+        // 目条件はdescriptorの左右Eyeではなく、humanoidとして左右Eyeが
+        // 解決できることで判定する。モデル構築前に名前列で確かめる。
+        // 検出自体に失敗した場合は偽にし、後段の通常検出がエラーを出す。
+        let names: Vec<&str> = file
+            .models()
+            .iter()
+            .map(|model| model.name.as_str())
+            .collect();
+        let humanoid_eyes = match HumanoidBones::detect_with_mapping_names(&names, &mappings) {
+            Ok((bones, _)) => {
+                bones.get(HumanoidBone::LeftEye).is_some()
+                    && bones.get(HumanoidBone::RightEye).is_some()
+            }
+            Err(_) => false,
+        };
+        match expressions_from_avatar_descriptor(
+            &prefab_file,
+            &prefab_label,
+            &file,
+            &fbx_meta.guid,
+            humanoid_eyes,
+        ) {
+            Ok(plan) => {
+                for warning in &plan.warnings {
+                    eprintln!("表情の警告: {}", escape_diag(warning));
+                }
+                if !plan.profile.bindings.is_empty() {
+                    let count = plan.profile.bindings.len();
+                    vrm_options = vrm_options.with_expressions(plan.profile);
+                    if let Some(mesh) = plan.mesh {
+                        vrm_options = vrm_options.with_expression_mesh(mesh);
+                    }
+                    eprintln!("表情: VRCAvatarDescriptor から{count}件");
+                }
+            }
+            Err(error) => {
+                diagnose_stage("表情の解決に失敗した", &error);
+                return 1;
+            }
+        }
+        early_mappings = Some(mappings);
+    }
     let (mut model, report) = match VrmModel::from_fbx(&file, &vrm_options) {
         Ok(built) => built,
         Err(error) => {
@@ -508,9 +608,13 @@ fn export(
     // 入力FBXの隣の `.fbx.meta` があれば対応表を優先し、無ければ名前推測になる。
     // 物理・Prefabを使わない `--renderers` だけの経路でも書き出しで同じ対応を使う。
     // 検出の失敗は握り潰さず、そのまま終了コード1で返す。
-    let mappings = match load_humanoid_mappings(&input) {
-        Ok(mappings) => mappings,
-        Err(code) => return code,
+    // descriptor経路では対応表を既に読んでいるため再利用する。
+    let mappings = match early_mappings {
+        Some(mappings) => mappings,
+        None => match load_humanoid_mappings(&input) {
+            Ok(mappings) => mappings,
+            Err(code) => return code,
+        },
     };
     let (detected, humanoid_warnings) = match HumanoidBones::detect_with_mapping(&model, &mappings)
     {
@@ -686,11 +790,12 @@ fn export(
         return 1;
     }
     eprintln!(
-        "書き出しが完了した: ノード{}件 メッシュ{}件 スキン{}件 材質{}件 {}バイト: {}",
+        "書き出しが完了した: ノード{}件 メッシュ{}件 スキン{}件 材質{}件 表情{}件 {}バイト: {}",
         report.node_count,
         model.meshes.len(),
         report.skin_count,
         material_count,
+        model.expressions.preset.len(),
         vrm_bytes.len(),
         escape_diag(&format!("{destination:?}"))
     );
@@ -831,11 +936,12 @@ fn export_simple(
         return 1;
     }
     eprintln!(
-        "書き出しが完了した: ノード{}件 メッシュ{}件 スキン{}件 材質{}件 {}バイト: {}",
+        "書き出しが完了した: ノード{}件 メッシュ{}件 スキン{}件 材質{}件 表情{}件 {}バイト: {}",
         built.report.node_count,
         built.report.mesh_count,
         built.report.skin_count,
         material_count,
+        built.model.expressions.preset.len(),
         vrm_bytes.len(),
         escape_diag(&format!("{destination:?}"))
     );
@@ -877,23 +983,40 @@ fn emit_material_outcome_ref(
     }
 }
 
-/// 入力FBXの隣の `.fbx.meta` からhumanoid対応表を読む。
+/// 入力FBXの隣の `.fbx.meta` から読んだ情報。
+///
+/// GUIDはPrefab内の参照の出所検証に、対応表はhumanoid解決に使う。
+/// いずれも同じ読み取りで求め、二重に読まない。
+struct FbxMetaInfo {
+    /// FBXアセットのGUID（小文字hex）。
+    guid: String,
+    /// humanoid対応表。メタが無い場合は空である。
+    mappings: Vec<HumanBoneMapping>,
+}
+
+/// 入力FBXの隣の `.fbx.meta` からGUIDとhumanoid対応表を読む。
 ///
 /// メタのパスは入力パスへ文字列 `.meta` を追加して求める。`with_extension` は
 /// 使わない（`.fbx` の拡張子を保ったまま隣のファイルを指定するためである）。
 /// `display()` 経由の文字列組み立ては区切りや非UTF-8の扱いを変え得るため、
-/// OS文字列へ直接追加する。メタが無い場合だけ空の対応表として名前推測に任せ、
-/// 権限不足などの読み取り失敗・上限超過・形状不良は診断を出して終了コード1で返す。
-fn load_humanoid_mappings(input: &Path) -> Result<Vec<HumanBoneMapping>, i32> {
+/// OS文字列へ直接追加する。メタが無い場合だけGUIDを空・対応表を空として
+/// 名前推測に任せ、権限不足などの読み取り失敗・上限超過・形状不良は
+/// 診断を出して終了コード1で返す。
+fn load_fbx_meta(input: &Path) -> Result<FbxMetaInfo, i32> {
     let mut meta_os = input.as_os_str().to_owned();
     meta_os.push(".meta");
     let meta_path = PathBuf::from(meta_os);
     let meta_label = escape_diag(&format!("{meta_path:?}"));
     // 上限+1バイトまでの制限付き読み取りにし、超過は読み取り層の上限エラーへつなぐ。
-    // 全体を読み切ってから拒否しない。`NotFound` だけ空対応表にして名前推測に任せる。
+    // 全体を読み切ってから拒否しない。`NotFound` だけ空にして名前推測に任せる。
     let file = match File::open(&meta_path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FbxMetaInfo {
+                guid: String::new(),
+                mappings: Vec::new(),
+            });
+        }
         Err(error) => {
             eprintln!(
                 "humanoidの対応表を読めない: {meta_label}: {}",
@@ -918,13 +1041,22 @@ fn load_humanoid_mappings(input: &Path) -> Result<Vec<HumanBoneMapping>, i32> {
             return Err(1);
         }
     };
+    let guid = meta.guid().as_str().to_owned();
     match meta.human_bone_mappings() {
-        Ok(mappings) => Ok(mappings),
+        Ok(mappings) => Ok(FbxMetaInfo { guid, mappings }),
         Err(error) => {
             diagnose_stage(&format!("humanoidの対応表を読めない: {meta_label}"), &error);
             Err(1)
         }
     }
+}
+
+/// 入力FBXの隣の `.fbx.meta` からhumanoid対応表を読む。
+///
+/// GUIDが要らない経路のための取り出し口であり、読み取りは [`load_fbx_meta`] と同じである。
+/// メタが無い場合だけ空の対応表として名前推測に任せる。
+fn load_humanoid_mappings(input: &Path) -> Result<Vec<HumanBoneMapping>, i32> {
+    load_fbx_meta(input).map(|info| info.mappings)
 }
 
 /// 共有変換入口の失敗を既存の段階文面で診断に出す。

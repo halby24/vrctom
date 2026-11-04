@@ -363,6 +363,7 @@ fn parse_body(
         class_name: class_name.to_owned(),
         stripped,
         raw: Value::Mapping(body_mapping.clone()),
+        body: body.to_owned(),
     })
 }
 
@@ -371,6 +372,9 @@ fn parse_body(
 /// ヘッダ情報とクラス本体の汎用データを保持する。
 /// 型付き読み取りは [`Document::decode`] で行い、未知クラスでも
 /// 元データはこの文書に残る。
+/// 本文の原文も保持する。`eyelidsBlendshapes` のような16進配列は
+/// YAMLの数値解決で桁落ち・先頭ゼロ落ちするため、生本文から読む必要があり、
+/// そのためのメモリ増を受け入れる。
 #[derive(Debug, Clone)]
 pub struct Document {
     file_id: FileId,
@@ -378,6 +382,7 @@ pub struct Document {
     class_name: String,
     stripped: bool,
     raw: Value,
+    body: String,
 }
 
 impl Document {
@@ -421,6 +426,14 @@ impl Document {
     /// 既知クラスとclassIDの不一致や必須欄の欠落・形状違いの場合にエラーを返す。
     pub fn decode(&self) -> Result<super::TypedObject, UnityError> {
         super::objects::decode_document(self)
+    }
+
+    /// 文書本文の原文を返す。
+    ///
+    /// `eyelidsBlendshapes` のような16進配列はYAMLの数値解決で桁落ち・
+    /// 先頭ゼロ落ちするため、生本文から読む必要がある。
+    pub(crate) fn body_text(&self) -> &str {
+        &self.body
     }
 }
 
