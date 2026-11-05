@@ -16,7 +16,7 @@ wasm-pack build crates/vrctom-wasm \
   --release \
   --out-dir pkg \
   --out-name vrctom_wasm \
-  --scope halby24 \
+  --scope halby \
   --no-gitignore \
   -- --locked
 

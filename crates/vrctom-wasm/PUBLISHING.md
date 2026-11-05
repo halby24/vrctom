@@ -1,12 +1,12 @@
 # npm 公開手順
 
-`@halby24/vrctom-wasm` を npm へ公開するための保守者向け手順です。
+`@halby/vrctom-wasm` を npm へ公開するための保守者向け手順です。
 利用者向けの説明は [README.md](README.md) にあります。
 
 ## 前提
 
 - `mise install` で `wasm-pack` 0.15.1 が入っていること
-- npm の `@halby24` スコープを所有していること
+- npm の `@halby` スコープを所有していること
 - 初回公開（0.1.0）だけは `NPM_TOKEN`（Automation Token）が必要であること
 - 2回目以降は npm の Trusted Publishing（OIDC）を使う
 
@@ -59,12 +59,12 @@ git push origin v0.1.0
 
 ## Trusted Publishing への移行（0.1.1 以降）
 
-0.1.0 の公開後、npmjs.com の `@halby24/vrctom-wasm` → Settings →
+0.1.0 の公開後、npmjs.com の `@halby/vrctom-wasm` → Settings →
 Trusted Publisher に GitHub Actions を登録します。
 
 | 項目 | 値 |
 |---|---|
-| Organization or user | `halby24` |
+| Organization or user（GitHub） | `halby24` |
 | Repository | `vrctom` |
 | Workflow filename | `npm.yml` |
 | Environment name | 空欄 |
@@ -142,4 +142,6 @@ npm publish ./crates/vrctom-wasm/pkg --access public
 - `wasm-pack` の版は `mise.toml` と `.github/workflows/npm.yml` で固定しています。
   更新するときは両方を揃えてください。
 - `wasm-bindgen` の版は `Cargo.lock` に従い、wasm-pack が用意します。
-- npm の `@halby24` スコープは初回公開前に取得が必要です。
+- npm の `@halby` スコープは `halby` アカウントのスコープです。
+  別のアカウントで公開する場合は、そのアカウントのスコープに合わせて
+  `web/scripts/build-wasm.sh` の `--scope` を変更してください。

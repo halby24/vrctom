@@ -109,7 +109,7 @@ mise経由なら `mise run web-dev`・`mise run web-build`・`mise run wasm`（W
 
 ## npmパッケージ
 
-Wasmバインディングは `@halby24/vrctom-wasm` として公開するための成果物を
+Wasmバインディングは `@halby/vrctom-wasm` として公開するための成果物を
 `crates/vrctom-wasm/pkg/` に作る。利用者向けの説明は
 [`crates/vrctom-wasm/README.md`](crates/vrctom-wasm/README.md)、
 保守者向けの公開手順は [`crates/vrctom-wasm/PUBLISHING.md`](crates/vrctom-wasm/PUBLISHING.md) にある。

@@ -1,4 +1,4 @@
-# @halby24/vrctom-wasm を npm へ公開する。
+# @halby/vrctom-wasm を npm へ公開する。
 #
 # v* タグの push で本公開する。手動実行は既定で --dry-run であり、
 # dry_run を false にした場合だけ本公開する。

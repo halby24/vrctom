@@ -1,4 +1,4 @@
-# @halby24/vrctom-wasm
+# @halby/vrctom-wasm
 
 `.unitypackage`（またはその中の FBX）をブラウザ内で VRM 1.0 に変換する Wasm パッケージです。
 入力ファイルをサーバへ送らず、変換はすべてブラウザ内で完結します。
@@ -6,7 +6,7 @@
 ## インストール
 
 ```sh
-npm install @halby24/vrctom-wasm
+npm install @halby/vrctom-wasm
 ```
 
 このパッケージは ESM 専用です（`require()` では読み込めません）。
@@ -14,7 +14,7 @@ npm install @halby24/vrctom-wasm
 ## 使い方
 
 ```ts
-import init, { WebPackage } from "@halby24/vrctom-wasm";
+import init, { WebPackage } from "@halby/vrctom-wasm";
 
 // 最初に一度だけ初期化する。二度目以降は完了済みの Promise が返る。
 await init();
