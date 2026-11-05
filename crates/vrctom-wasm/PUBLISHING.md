@@ -7,7 +7,8 @@
 
 - `mise install` で `wasm-pack` 0.15.1 が入っていること
 - npm の `@halby24` スコープを所有していること
-- リポジトリの Secrets に `NPM_TOKEN`（Automation Token）があること
+- 初回公開（0.1.0）だけは `NPM_TOKEN`（Automation Token）が必要であること
+- 2回目以降は npm の Trusted Publishing（OIDC）を使う
 
 ## ローカルで作る
 
@@ -40,7 +41,69 @@ version = "0.1.1"
 `crates/vrctom-wasm/Cargo.toml` は `version.workspace = true` のため、
 個別の版は編集しません。`package.json` の版は wasm-pack が Cargo から作ります。
 
-## 公開する
+## 初回公開（0.1.0）
+
+Trusted Publishing は既存のパッケージにしか設定できません。
+そのため 0.1.0 だけは `NPM_TOKEN` で公開します。
+
+1. リポジトリの Secrets に `NPM_TOKEN` を登録する。
+2. workspace の版が `0.1.0` であることを確認する。
+3. タグを push する。
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+`.github/workflows/npm.yml` がテスト・ビルド・公開を行います。
+
+## Trusted Publishing への移行（0.1.1 以降）
+
+0.1.0 の公開後、npmjs.com の `@halby24/vrctom-wasm` → Settings →
+Trusted Publisher に GitHub Actions を登録します。
+
+| 項目 | 値 |
+|---|---|
+| Organization or user | `halby24` |
+| Repository | `vrctom` |
+| Workflow filename | `npm.yml` |
+| Environment name | 空欄 |
+| Allowed actions | `npm publish` |
+
+要件は次のとおりです。
+
+- GitHub-hosted runner で実行すること
+- workflow に `id-token: write` があること
+- npm CLI 11.5.1 以上、Node 22.14 以上であること
+- `package.json` の `repository.url` がリポジトリと一致すること
+
+登録した Trusted Publisher は、2日以内に最初の公開を成功させないと失効します。
+0.1.1 を出す直前に登録してください。
+
+移行時は workflow から token を外します。
+
+```diff
+       - name: npmへ公開する
+-        env:
+-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+         run: |
+-          args="--access public --provenance"
++          args="--access public"
+           if [ "${{ inputs.dry_run }}" = "true" ]; then
+             args="$args --dry-run"
+           fi
+           npm publish ./crates/vrctom-wasm/pkg $args
+```
+
+`--provenance` は Trusted Publishing では自動で付くため不要です。
+
+0.1.1 を公開して OIDC が通ることを確認したら、次を行います。
+
+1. リポジトリの `NPM_TOKEN` を削除する
+2. npm の Settings → Publishing access を
+   「Require 2FA and disallow tokens」に変更する
+
+## 通常の公開（Trusted Publishing 移行後）
 
 ```sh
 git tag v0.1.1
@@ -52,7 +115,7 @@ git push origin v0.1.1
 1. Rust のテスト
 2. `web/scripts/build-wasm.sh` による wasm のビルド
 3. タグと `pkg/package.json` の版の一致確認
-4. `npm publish --access public --provenance`
+4. `npm publish --access public`
 
 手動で確認したい場合は Actions から `npm` を実行します。
 `dry_run` が既定で true のため、そのままでは公開されません。
@@ -61,6 +124,7 @@ git push origin v0.1.1
 ## ローカルから公開する場合
 
 CI を介さずに公開することもできます。
+初回は `npm login` してから実行します。
 
 ```sh
 mise run wasm

@@ -2,7 +2,10 @@
 #
 # v* タグの push で本公開する。手動実行は既定で --dry-run であり、
 # dry_run を false にした場合だけ本公開する。
-# リポジトリの Secrets に NPM_TOKEN（npm の Automation Token）が必要である。
+#
+# 0.1.0 は Trusted Publishing を設定できないため NPM_TOKEN で公開する。
+# 0.1.1 以降は OIDC へ移行し、NODE_AUTH_TOKEN と NPM_TOKEN を外す。
+# 手順は crates/vrctom-wasm/PUBLISHING.md を参照。
 name: npm
 
 on:
@@ -55,6 +58,7 @@ jobs:
             echo "タグ $GITHUB_REF_NAME と package.json の $version が一致しない" >&2
             exit 1
           fi
+      # 0.1.0 の初回公開だけ NPM_TOKEN を使う。OIDC 移行時にこの env を削除する。
       - name: npmへ公開する
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
