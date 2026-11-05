@@ -3,6 +3,8 @@
 # Rustはバージョンだけここで固定し、targets/componentsはrustup側の機構に委譲する
 rust = { version = "1.96.0", targets = ["wasm32-unknown-unknown"], components = ["rustfmt", "clippy"] }
 "cargo:cargo-nextest" = "latest"
+# npm向けのWasmパッケージを作る。wasm-bindgenとwasm-optはwasm-packが用意する。
+"cargo:wasm-pack" = "0.15.1"
 node = "lts"
 pnpm = "latest"
 

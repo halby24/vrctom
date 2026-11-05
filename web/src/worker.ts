@@ -94,7 +94,7 @@ async function handleOpen(id: number, bytes: ArrayBuffer): Promise<void> {
     currentPackage = null;
     const opened = new WebPackage(new Uint8Array(bytes));
     currentPackage = opened;
-    const raw: unknown = JSON.parse(opened.fbx_candidates());
+    const raw: unknown = JSON.parse(opened.fbxCandidates());
     post({ type: "opened", id, candidates: parseFbxCandidates(raw) });
   } catch (error) {
     currentPackage = null;
@@ -126,7 +126,7 @@ async function handleConvert(id: number, request: ConvertRequest): Promise<void>
     const converted = currentPackage.convert(request.fbxPath, optionsJson);
     try {
       // 所有権ごと取り出し、全体を占める裏側の領域は複写せず転送する。
-      const source: Uint8Array = converted.take_vrm();
+      const source: Uint8Array = converted.takeVrm();
       const backing: ArrayBufferLike = source.buffer;
       const vrm: ArrayBuffer =
         backing instanceof ArrayBuffer && source.byteOffset === 0 && backing.byteLength === source.byteLength

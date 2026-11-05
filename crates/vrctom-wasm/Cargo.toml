@@ -2,6 +2,14 @@
 name = "vrctom-wasm"
 version.workspace = true
 edition.workspace = true
+description = ".unitypackage / FBX を VRM 1.0 に変換するブラウザ向け Wasm バインディング"
+license = "MIT"
+repository = "https://github.com/halby24/vrctom"
+homepage = "https://github.com/halby24/vrctom"
+documentation = "https://github.com/halby24/vrctom"
+readme = "README.md"
+keywords = ["vrm", "vrchat", "unity", "fbx", "wasm"]
+categories = ["wasm", "graphics"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]

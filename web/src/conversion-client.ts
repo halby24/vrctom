@@ -109,7 +109,7 @@ function isCount(value: unknown): value is number {
 /**
  * FBX候補のJSON値を検証して返す。
  *
- * @param value - `fbx_candidates()`のJSONを解釈した値。
+ * @param value - `fbxCandidates()`のJSONを解釈した値。
  * @returns 検証済みの候補列。
  * @throws `ConversionError` — 配列や各項目の形が崩れている場合。
  */

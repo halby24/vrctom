@@ -100,9 +100,11 @@ Web専用の簡易写像は作らない。
 
 フロントは `web/` に置く Vite・TypeScript・three.js構成とし、
 VRMの表示にはthree-vrmを使う。
-wasm-bindgenはweb向けに出し、Workerはモジュールとして読み込む。
+wasm-packでweb向けのnpmパッケージを作り、Workerはモジュールとして読み込む。
+同じ成果物を `@halby24/vrctom-wasm` として公開できる形にし、
+Webアプリはそのglueをそのまま使う。
 生成物と配信物はコミットせず、CIでwasmの構築からフロントの型検査と
-ビルドまでを通してPagesへ渡す。
+ビルドまでを通してPagesへ渡す。npm公開はタグを契機に別のworkflowで行う。
 配信の土台の詳細はここでは決めず、構成の方針だけを保つ。
 
 ## 制限と公開判断

@@ -34,10 +34,10 @@ jobs:
           toolchain: 1.96.0
           target: wasm32-unknown-unknown
           components: clippy, rustfmt
-      - name: wasm-bindgenを入れる
+      - name: wasm-packを入れる
         uses: taiki-e/install-action@v2
         with:
-          tool: wasm-bindgen@0.2.129
+          tool: wasm-pack@0.15.1
       - name: フォーマットを確認する
         run: cargo fmt --all --check
       - name: Clippyで検査する

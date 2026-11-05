@@ -1,0 +1,66 @@
+# @halby24/vrctom-wasm を npm へ公開する。
+#
+# v* タグの push で本公開する。手動実行は既定で --dry-run であり、
+# dry_run を false にした場合だけ本公開する。
+# リポジトリの Secrets に NPM_TOKEN（npm の Automation Token）が必要である。
+name: npm
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "npm publish を --dry-run で確認する"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: リポジトリを取得する
+        uses: actions/checkout@v4
+      - name: Rustツールチェーンを入れる
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: 1.96.0
+          target: wasm32-unknown-unknown
+      - name: wasm-packを入れる
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.15.1
+      - name: Nodeを入れる
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: テストを実行する
+        run: cargo test --workspace
+      - name: Wasmパッケージをビルドする
+        run: sh web/scripts/build-wasm.sh
+      - name: パッケージの中身を確認する
+        run: npm pack ./crates/vrctom-wasm/pkg --dry-run
+      - name: タグとパッケージ版の一致を確かめる
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(node -p "require('./crates/vrctom-wasm/pkg/package.json').version")
+          tag=${GITHUB_REF_NAME#v}
+          if [ "$version" != "$tag" ]; then
+            echo "タグ $GITHUB_REF_NAME と package.json の $version が一致しない" >&2
+            exit 1
+          fi
+      - name: npmへ公開する
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          args="--access public --provenance"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            args="$args --dry-run"
+          fi
+          npm publish ./crates/vrctom-wasm/pkg $args

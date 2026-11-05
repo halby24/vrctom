@@ -6,7 +6,7 @@
 
 - mise
 - Rust 1.96（`wasm32-unknown-unknown` ターゲット、`rustfmt`・`clippy` を含む）
-- wasm-bindgen 0.2.129（`Cargo.lock` と合わせる）
+- wasm-pack 0.15.1（`wasm-bindgen` は `Cargo.lock` に合わせて用意される）
 - Node 24
 - pnpm 12
 
@@ -40,7 +40,9 @@ pnpm --dir web preview
 mise run wasm
 ```
 
-`web/scripts/build-wasm.sh` がリリースビルドした `vrctom-wasm` に `wasm-bindgen` をかけて `web/src/wasm` に glue を出す。`web/src/wasm` と `web/dist` は生成物のためコミットしない。
+`web/scripts/build-wasm.sh` が wasm-pack で `crates/vrctom-wasm/pkg/` に npm 公開用の成果物を作り、同じ glue を `web/src/wasm` へ同期する。`crates/vrctom-wasm/pkg`・`web/src/wasm`・`web/dist` は生成物のためコミットしない。
+
+npm パッケージとしての公開手順は [`crates/vrctom-wasm/PUBLISHING.md`](../crates/vrctom-wasm/PUBLISHING.md) を参照。
 
 ## GitHub Pages の初回設定
 

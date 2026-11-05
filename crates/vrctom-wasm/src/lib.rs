@@ -26,6 +26,7 @@ impl WebPackage {
     }
 
     /// FBX候補のJSON文字列を返す。パス昇順である。
+    #[wasm_bindgen(js_name = fbxCandidates)]
     pub fn fbx_candidates(&self) -> Result<String, JsValue> {
         Ok(self.package.candidates_json())
     }
@@ -62,6 +63,7 @@ impl Converted {
     /// 複製せず所有権ごと渡すため、大きなVRMではこちらを使う。
     /// 呼び出し後は空になる。Worker側の移行先であり、
     /// 従来の `vrm` 取得子は互換のため残す。
+    #[wasm_bindgen(js_name = takeVrm)]
     pub fn take_vrm(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.vrm)
     }
