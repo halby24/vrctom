@@ -4,7 +4,7 @@ members = ["crates/vrctom", "crates/vrctom-cli", "crates/vrctom-wasm"]
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0"
+version = "0.1.1"
 
 [workspace.dependencies]
 vrctom = { path = "crates/vrctom" }
