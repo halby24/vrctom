@@ -3,8 +3,8 @@
 # v* タグの push で本公開する。手動実行は既定で --dry-run であり、
 # dry_run を false にした場合だけ本公開する。
 #
-# 0.1.0 は Trusted Publishing を設定できないため NPM_TOKEN で公開する。
-# 0.1.1 以降は OIDC へ移行し、NODE_AUTH_TOKEN と NPM_TOKEN を外す。
+# 0.1.0 は NPM_TOKEN で公開済みである。0.1.1 以降は Trusted Publishing（OIDC）
+# で公開する。npmjs.com で npm.yml を Trusted Publisher に登録しておくこと。
 # 手順は crates/vrctom-wasm/PUBLISHING.md を参照。
 name: npm
 
@@ -58,12 +58,10 @@ jobs:
             echo "タグ $GITHUB_REF_NAME と package.json の $version が一致しない" >&2
             exit 1
           fi
-      # 0.1.0 の初回公開だけ NPM_TOKEN を使う。OIDC 移行時にこの env を削除する。
+      # OIDC では provenance が自動で付くため、--provenance は指定しない。
       - name: npmへ公開する
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          args="--access public --provenance"
+          args="--access public"
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             args="$args --dry-run"
           fi

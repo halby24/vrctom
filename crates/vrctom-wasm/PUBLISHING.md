@@ -7,8 +7,8 @@
 
 - `mise install` で `wasm-pack` 0.15.1 が入っていること
 - npm の `@halby` スコープを所有していること
-- 初回公開（0.1.0）だけは `NPM_TOKEN`（Automation Token）が必要であること
-- 2回目以降は npm の Trusted Publishing（OIDC）を使う
+- 0.1.0 は `NPM_TOKEN`（Automation Token）で公開済みであること
+- 0.1.1 以降は npm の Trusted Publishing（OIDC）を使う
 
 ## ローカルで作る
 
@@ -41,10 +41,12 @@ version = "0.1.1"
 `crates/vrctom-wasm/Cargo.toml` は `version.workspace = true` のため、
 個別の版は編集しません。`package.json` の版は wasm-pack が Cargo から作ります。
 
-## 初回公開（0.1.0）
+## 初回公開（0.1.0、完了済み）
 
 Trusted Publishing は既存のパッケージにしか設定できません。
-そのため 0.1.0 だけは `NPM_TOKEN` で公開します。
+そのため 0.1.0 だけは `NPM_TOKEN` で公開しました。
+
+以下は別名で作り直す場合の再現手順として残します。
 
 1. リポジトリの Secrets に `NPM_TOKEN` を登録する。
 2. workspace の版が `0.1.0` であることを確認する。
@@ -80,22 +82,9 @@ Trusted Publisher に GitHub Actions を登録します。
 登録した Trusted Publisher は、2日以内に最初の公開を成功させないと失効します。
 0.1.1 を出す直前に登録してください。
 
-移行時は workflow から token を外します。
-
-```diff
-       - name: npmへ公開する
--        env:
--          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-         run: |
--          args="--access public --provenance"
-+          args="--access public"
-           if [ "${{ inputs.dry_run }}" = "true" ]; then
-             args="$args --dry-run"
-           fi
-           npm publish ./crates/vrctom-wasm/pkg $args
-```
-
-`--provenance` は Trusted Publishing では自動で付くため不要です。
+`.github/workflows/npm.yml` は OIDC 用に移行済みです。
+`NODE_AUTH_TOKEN` と `--provenance` は外してあります。
+`--provenance` は Trusted Publishing では自動で付きます。
 
 0.1.1 を公開して OIDC が通ることを確認したら、次を行います。
 
@@ -116,6 +105,11 @@ git push origin v0.1.1
 2. `web/scripts/build-wasm.sh` による wasm のビルド
 3. タグと `pkg/package.json` の版の一致確認
 4. `npm publish --access public`
+
+公開直後はレジストリの複製が追いつかず、`npm view` や `npm install` が
+数分間 404 を返すことがあります。パッケージページ、
+`https://registry.npmjs.org/<name>/<version>`、tarball が先に見える場合は
+公開自体は成功しています。数分待ってから再確認してください。
 
 手動で確認したい場合は Actions から `npm` を実行します。
 `dry_run` が既定で true のため、そのままでは公開されません。
