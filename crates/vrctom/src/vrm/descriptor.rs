@@ -21,7 +21,6 @@ use std::collections::{HashMap, HashSet};
 
 use yaml_serde::Value;
 
-use super::prefab_hierarchy_paths;
 use super::{VrmError, VrmErrorKind, VrmExpressionBinding, VrmExpressionProfile};
 use crate::fbx::{FbxFile, ObjectId};
 use crate::unity::{
@@ -72,56 +71,8 @@ pub fn expressions_from_avatar_descriptor(
         });
     };
     // FBXのモデル列から取り込みID表を作る。prefab内の参照解決に使う。
-    let nodes = prefab_hierarchy_paths(fbx)?;
-    let mut mesh_ids: HashMap<FileId, ObjectId> = HashMap::new();
-    for model in fbx.models() {
-        let Some(geometry) = model.mesh else {
-            continue;
-        };
-        let fid = mesh_file_id(&model.name);
-        match mesh_ids.get(&fid) {
-            Some(&existing) if existing != geometry => {
-                return Err(VrmError::new(
-                    VrmErrorKind::InvalidPrefab,
-                    format!(
-                        "参照FBXのメッシュIDが重複するため先勝ちにしない: {}（{}）",
-                        crate::escape_diag(&model.name),
-                        crate::escape_diag(prefab_label),
-                    ),
-                ));
-            }
-            Some(_) => {}
-            None => {
-                mesh_ids.insert(fid, geometry);
-            }
-        }
-    }
-    let mut renderer_ids: HashMap<FileId, ObjectId> = HashMap::new();
-    for (index, model) in fbx.models().iter().enumerate() {
-        let Some(geometry) = model.mesh else {
-            continue;
-        };
-        let Some(node) = nodes.get(index) else {
-            continue;
-        };
-        let fid = skinned_mesh_renderer_file_id(&node.path);
-        match renderer_ids.get(&fid) {
-            Some(&existing) if existing != geometry => {
-                return Err(VrmError::new(
-                    VrmErrorKind::InvalidPrefab,
-                    format!(
-                        "参照FBXの描画設定IDが重複するため先勝ちにしない: {}（{}）",
-                        crate::escape_diag(&model.name),
-                        crate::escape_diag(prefab_label),
-                    ),
-                ));
-            }
-            Some(_) => {}
-            None => {
-                renderer_ids.insert(fid, geometry);
-            }
-        }
-    }
+    // ID表の構築はベースライン解決と共有し、二重実装にしない。
+    let (mesh_ids, renderer_ids) = fbx_renderer_ids(fbx, prefab_label)?;
     // Prefab内の文書ID集合。dangling（存在しない参照先）の検出に使う。
     let doc_ids: HashSet<FileId> = prefab.documents().iter().map(|doc| doc.file_id()).collect();
     // 入力FBXへのPrefabInstanceを特定する。複数は先勝ちにしない。
@@ -397,6 +348,7 @@ fn read_ref(value: &Value, role: &str, prefab_label: &str) -> Result<Option<Obje
 }
 
 /// 入力FBXへのPrefabInstance文書を特定する。無い場合は `None` を返す。
+/// ベースライン解決と共有するため `pub(crate)` で公開する。
 ///
 /// `m_SourcePrefab.guid` が `fbx_guid` と一致するものを探す。
 /// 複数ある場合は先勝ちにせず失敗する。
@@ -404,7 +356,7 @@ fn read_ref(value: &Value, role: &str, prefab_label: &str) -> Result<Option<Obje
 /// # Errors
 ///
 /// 一致する文書が複数ある場合・文書の読み取りに失敗した場合に返す。
-fn find_fbx_instance(
+pub(crate) fn find_fbx_instance(
     prefab: &SerializedFile,
     prefab_label: &str,
     fbx_guid: &str,
@@ -451,68 +403,152 @@ fn find_fbx_instance(
     Ok(found)
 }
 
-/// rendererのfileIDからメッシュへの対応表を作る。出所を検証する。
+/// FBXの取り込みID表（メッシュID・描画設定ID）を作る。
+/// ベースライン解決と共有し、二重実装にしない。
 ///
-/// 取り込みIDは対応元の内部照合にだけ使い、最終表には検証済みの文書IDだけを張る。
-/// stripped文書はclassID 137（SkinnedMeshRenderer）であり、対応元のGUIDが
-/// `fbx_guid` と一致し、所属のPrefabInstanceが外部GUIDを持たないローカル参照で
-/// 特定した文書と一致する場合だけ使う。直接記述の描画設定はメッシュ参照の
-/// GUIDが `fbx_guid` と一致する場合だけ使う。一致しない文書は入れない。
-/// 同じfileIDが異なるメッシュに解決したら曖昧として失敗する。
+/// 同名・同IDで異なるメッシュに解決したら先勝ちにせず失敗する。
+/// 階層パスの構築は [`prefab_hierarchy_paths`](super::prefab_hierarchy_paths) を使う。
 ///
 /// # Errors
 ///
-/// 文書の読み取りに失敗した場合・参照が曖昧な場合に返す。
-fn build_renderer_meshes(
+/// 階層パスを作れない場合・IDが重複する場合に返す。
+// 取り込みID表2種の組であり、呼び出し側は両方を使うため分けない。
+#[allow(clippy::type_complexity)]
+pub(crate) fn fbx_renderer_ids(
+    fbx: &FbxFile<'_>,
+    prefab_label: &str,
+) -> Result<(HashMap<FileId, ObjectId>, HashMap<FileId, ObjectId>), VrmError> {
+    // 取り込みIDの算出規則はPrefab割当経路と同じであり、旧方式は扱わない。
+    // ラベルは重複診断にだけ使い、IDの算出結果は変えない。
+    let nodes = super::prefab_hierarchy_paths(fbx)?;
+    let mut mesh_ids: HashMap<FileId, ObjectId> = HashMap::new();
+    for model in fbx.models() {
+        let Some(geometry) = model.mesh else {
+            continue;
+        };
+        let fid = mesh_file_id(&model.name);
+        match mesh_ids.get(&fid) {
+            Some(&existing) if existing != geometry => {
+                return Err(VrmError::new(
+                    VrmErrorKind::InvalidPrefab,
+                    format!(
+                        "参照FBXのメッシュIDが重複するため先勝ちにしない: {}（{}）",
+                        crate::escape_diag(&model.name),
+                        crate::escape_diag(prefab_label),
+                    ),
+                ));
+            }
+            Some(_) => {}
+            None => {
+                mesh_ids.insert(fid, geometry);
+            }
+        }
+    }
+    let mut renderer_ids: HashMap<FileId, ObjectId> = HashMap::new();
+    for (index, model) in fbx.models().iter().enumerate() {
+        let Some(geometry) = model.mesh else {
+            continue;
+        };
+        let Some(node) = nodes.get(index) else {
+            continue;
+        };
+        let fid = skinned_mesh_renderer_file_id(&node.path);
+        match renderer_ids.get(&fid) {
+            Some(&existing) if existing != geometry => {
+                return Err(VrmError::new(
+                    VrmErrorKind::InvalidPrefab,
+                    format!(
+                        "参照FBXの描画設定IDが重複するため先勝ちにしない: {}（{}）",
+                        crate::escape_diag(&model.name),
+                        crate::escape_diag(prefab_label),
+                    ),
+                ));
+            }
+            Some(_) => {}
+            None => {
+                renderer_ids.insert(fid, geometry);
+            }
+        }
+    }
+    Ok((mesh_ids, renderer_ids))
+}
+
+/// 検証済みの描画設定文書1件。
+/// ベースライン解決で重みの出所と対応元を共有するための形である。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RendererDoc {
+    /// Prefab内の検証済み文書ID。
+    pub doc_id: FileId,
+    /// 対応元の取り込み描画設定ID。直接記述の場合は `None` である。
+    pub source_id: Option<FileId>,
+    /// 解決済みのメッシュGeometry。
+    pub geometry: ObjectId,
+}
+
+/// 検証済みの描画設定文書列と、出所検証で除外した対応元。
+/// ベースライン解決は重みの受け入れ可否の判定に両方を使う。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RendererDocSet {
+    /// 検証済みの描画設定文書列。
+    pub docs: Vec<RendererDoc>,
+    /// 検証で除外したstripped描画設定の対応元（取り込み描画設定ID）。
+    /// 対応元GUIDが入力FBXと一致し既知の取り込みIDを指すのに、
+    /// クラス（classID 137）または所属（特定instanceとの一致・外部GUID無し）の
+    /// 検証に落ちたものだけを集める。
+    /// 不明な取り込みID・別資産・strippedでない文書は含めない。
+    pub tainted_sources: HashSet<FileId>,
+}
+
+/// 検証済みの描画設定文書列を作る。出所を検証する。
+/// [`build_renderer_meshes`] と同じ走査であり、最終表への格納だけが違う。
+/// ベースライン解決は重みの出所としてこの列を使い、descriptorは最終表へ写す。
+///
+/// 取り込みIDは対応元の内部照合にだけ使い、直接記述の取り込みIDそのものは
+/// 文書IDではないため含めない。stripped文書はclassID 137であり、対応元のGUIDが
+/// `fbx_guid` と一致し、所属のPrefabInstanceが外部GUIDを持たないローカル参照で
+/// 特定した文書と一致する場合だけ使う。一致しない文書は入れない。
+/// 対応元が入力FBXの既知の取り込みIDを指すのに、クラスまたは所属の検証に落ちた
+/// stripped文書は、出所の矛盾として対応元を `tainted_sources` に残す。
+/// 改変の受け入れ可否に使う。
+///
+/// # Errors
+///
+/// 文書の読み取りに失敗した場合に返す。
+pub(crate) fn renderer_docs(
     prefab: &SerializedFile,
     prefab_label: &str,
     mesh_ids: &HashMap<FileId, ObjectId>,
     renderer_ids: &HashMap<FileId, ObjectId>,
     fbx_guid: &str,
     instance: Option<FileId>,
-) -> Result<HashMap<FileId, ObjectId>, VrmError> {
-    // 検証済みのPrefab文書IDだけを最終表に入れる。取り込みIDそのものは
-    // 文書IDではないため、descriptor参照が取り込みIDを直接指した場合は
-    // 後段の doc_ids 検査でdanglingとして失敗する。
-    let mut renderer_meshes: HashMap<FileId, ObjectId> = HashMap::new();
-    let mut insert_renderer = |file_id: FileId, geometry: ObjectId| -> Result<(), VrmError> {
-        match renderer_meshes.get(&file_id) {
-            Some(&existing) if existing != geometry => Err(VrmError::new(
-                VrmErrorKind::InvalidPrefab,
-                format!(
-                    "renderer参照が曖昧なため先勝ちにしない: fileID {file_id}（{}）",
-                    crate::escape_diag(prefab_label),
-                ),
-            )),
-            Some(_) => Ok(()),
-            None => {
-                renderer_meshes.insert(file_id, geometry);
-                Ok(())
-            }
-        }
-    };
+) -> Result<RendererDocSet, VrmError> {
+    let mut out = Vec::new();
+    let mut tainted_sources: HashSet<FileId> = HashSet::new();
     for doc in prefab.documents() {
         if doc.stripped() {
             // 直接記述方式ではstripped文書は対応付けに使わない。
-            // 参照側が指した場合は解決不能として失敗させる。
             let Some(instance_id) = instance else {
                 continue;
             };
-            // stripped文書はSkinnedMeshRenderer（classID 137）だけを対象にする。
-            // TypedObject::Stripped はクラスを表さないため、Transform等を
-            // 描画設定として受理しないよう文書側で確かめる。
-            if doc.class_id() != 137 {
-                continue;
-            }
-            let typed = doc.decode().map_err(|error| {
-                VrmError::new(
-                    VrmErrorKind::InvalidPrefab,
-                    format!(
-                        "Prefabの文書を読めない（{}）: {error}",
-                        crate::escape_diag(prefab_label),
-                    ),
-                )
-            })?;
+            // 描画設定でないstripped文書は対応付けに使わない。
+            // ただし対応元リンクが読め、入力FBXの既知の取り込みIDを指す場合は、
+            // 出所の矛盾として対応元を残す。読み取り失敗は従来どおり無視する。
+            let is_renderer = doc.class_id() == 137;
+            let typed = match doc.decode() {
+                Ok(typed) => typed,
+                Err(error) => {
+                    if is_renderer {
+                        return Err(VrmError::new(
+                            VrmErrorKind::InvalidPrefab,
+                            format!(
+                                "Prefabの文書を読めない（{}）: {error}",
+                                crate::escape_diag(prefab_label),
+                            ),
+                        ));
+                    }
+                    continue;
+                }
+            };
             let TypedObject::Stripped(link) = typed else {
                 continue;
             };
@@ -527,6 +563,15 @@ fn build_renderer_meshes(
             if !guid_matches {
                 continue;
             }
+            // 既知の取り込みIDを指す場合だけ、所属の検証結果が意味を持つ。
+            // 不明な取り込みID・別資産は矛盾の判定対象にしない。
+            let known = renderer_ids.contains_key(&link.corresponding_source.file_id);
+            if !is_renderer {
+                if known {
+                    tainted_sources.insert(link.corresponding_source.file_id);
+                }
+                continue;
+            }
             // 所属のPrefabInstanceが特定した文書と一致する場合だけ使う。
             // 外部GUID付きの参照は別アセットを指し得るため受理しない。
             let owner = link
@@ -534,13 +579,25 @@ fn build_renderer_meshes(
                 .get("m_PrefabInstance")
                 .and_then(|value| ObjectRef::decode_body(value).ok());
             let Some(owner) = owner else {
+                // 所属が読めない文書は検証できないため、既知の対応元を矛盾として残す。
+                if known {
+                    tainted_sources.insert(link.corresponding_source.file_id);
+                }
                 continue;
             };
             if owner.guid.is_some() || owner.file_id != instance_id {
+                // 所属が特定instanceと一致しない文書は、その対応元への改変と矛盾する。
+                if known {
+                    tainted_sources.insert(link.corresponding_source.file_id);
+                }
                 continue;
             }
             if let Some(&geometry) = renderer_ids.get(&link.corresponding_source.file_id) {
-                insert_renderer(doc.file_id(), geometry)?;
+                out.push(RendererDoc {
+                    doc_id: doc.file_id(),
+                    source_id: Some(link.corresponding_source.file_id),
+                    geometry,
+                });
             }
             continue;
         }
@@ -566,7 +623,66 @@ fn build_renderer_meshes(
                 continue;
             }
             if let Some(&geometry) = mesh_ids.get(&renderer.mesh.file_id) {
-                insert_renderer(doc.file_id(), geometry)?;
+                out.push(RendererDoc {
+                    doc_id: doc.file_id(),
+                    source_id: None,
+                    geometry,
+                });
+            }
+        }
+    }
+    Ok(RendererDocSet {
+        docs: out,
+        tainted_sources,
+    })
+}
+
+/// rendererのfileIDからメッシュへの対応表を作る。出所を検証する。
+///
+/// 取り込みIDは対応元の内部照合にだけ使い、最終表には検証済みの文書IDだけを張る。
+/// stripped文書はclassID 137（SkinnedMeshRenderer）であり、対応元のGUIDが
+/// `fbx_guid` と一致し、所属のPrefabInstanceが外部GUIDを持たないローカル参照で
+/// 特定した文書と一致する場合だけ使う。直接記述の描画設定はメッシュ参照の
+/// GUIDが `fbx_guid` と一致する場合だけ使う。一致しない文書は入れない。
+/// 同じfileIDが異なるメッシュに解決したら曖昧として失敗する。
+///
+/// # Errors
+///
+/// 文書の読み取りに失敗した場合・参照が曖昧な場合に返す。
+fn build_renderer_meshes(
+    prefab: &SerializedFile,
+    prefab_label: &str,
+    mesh_ids: &HashMap<FileId, ObjectId>,
+    renderer_ids: &HashMap<FileId, ObjectId>,
+    fbx_guid: &str,
+    instance: Option<FileId>,
+) -> Result<HashMap<FileId, ObjectId>, VrmError> {
+    // 検証済み文書列は [`renderer_docs`] と共有し、最終表への格納だけをここで行う。
+    // 取り込みIDそのものは文書IDではないため、最終表には検証済み文書IDだけを入れる。
+    let docs = renderer_docs(
+        prefab,
+        prefab_label,
+        mesh_ids,
+        renderer_ids,
+        fbx_guid,
+        instance,
+    )?;
+    let mut renderer_meshes: HashMap<FileId, ObjectId> = HashMap::new();
+    for doc in &docs.docs {
+        match renderer_meshes.get(&doc.doc_id) {
+            Some(&existing) if existing != doc.geometry => {
+                return Err(VrmError::new(
+                    VrmErrorKind::InvalidPrefab,
+                    format!(
+                        "renderer参照が曖昧なため先勝ちにしない: fileID {}（{}）",
+                        doc.doc_id,
+                        crate::escape_diag(prefab_label),
+                    ),
+                ));
+            }
+            Some(_) => {}
+            None => {
+                renderer_meshes.insert(doc.doc_id, doc.geometry);
             }
         }
     }

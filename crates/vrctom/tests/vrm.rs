@@ -4,8 +4,14 @@
 //! 失敗条件を固定する。実fixtureを使う検証は `VRCTOM_FBX_FIXTURE` が指す
 //! ファイルだけを読み、未設定なら跳ばす。
 
+use std::collections::HashMap;
+
 use vrctom::fbx::{FbxFile, FbxOptions, ObjectId};
-use vrctom::vrm::{VrmErrorKind, VrmExpressionProfile, VrmModel, VrmOptions};
+use vrctom::unity::{ParseOptions, SerializedFile, mesh_file_id, skinned_mesh_renderer_file_id};
+use vrctom::vrm::{
+    BaselineChannel, BaselineWeights, VrmErrorKind, VrmExpressionProfile, VrmModel, VrmOptions,
+    prefab_baseline_weights,
+};
 
 // テスト名は日本語で書く（テストは仕様・契約であるため）。
 
@@ -3133,4 +3139,918 @@ fn 継ぎ目で複製された頂点すべてに差分が配られる() {
         }
     }
     assert_eq!(seam_vertices, 2, "角0はUV違いで2頂点になる");
+}
+
+/// 基準姿勢の重み1件を作る。キーはジオメトリID、値はチャンネルIDとUnity重みである。
+fn 基準姿勢(geometry: i64, channel: i64, weight: f64) -> BaselineWeights {
+    BaselineWeights {
+        meshes: HashMap::from([(
+            ObjectId::new(geometry),
+            vec![BaselineChannel {
+                channel: ObjectId::new(channel),
+                weight,
+            }],
+        )]),
+    }
+}
+
+#[test]
+fn 基準姿勢50はベースへ半分焼き込みターゲットを半分にする() {
+    // チャンネルt1（ID2000）の差分 [0.5,0,0] を重み50で焼き込む。
+    // ベースには (50/100)*差分を足し、ターゲットには (1-50/100) を掛ける。
+    let bytes = 表情最小ファイル(
+        &[("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None)],
+        vec![],
+        vec![],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("表情付きは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let options = VrmOptions::new()
+        .with_expressions(profile)
+        .with_baseline_weights(基準姿勢(10, 2000, 50.0));
+    let (model, report) = VrmModel::from_fbx(&parsed, &options).expect("焼き込みは変換できる");
+    // 所有モデルの平行移動 (1,2,3) でベイクした頂点へ半分を足す。
+    assert_eq!(model.meshes[0].vertices.positions[0], [1.25, 2.0, 3.0]);
+    assert_eq!(model.meshes[0].vertices.positions[1], [2.0, 2.0, 3.0]);
+    // ターゲットは半分に縮む。
+    assert_eq!(model.meshes[0].targets.len(), 1);
+    assert_eq!(model.meshes[0].targets[0].positions[0], [0.25, 0.0, 0.0]);
+    assert_eq!(model.meshes[0].targets[0].positions[1], [0.0, 0.0, 0.0]);
+    // 束ねは残り、件数は一致する。
+    assert_eq!(model.expressions.preset.len(), 1);
+    assert_eq!(report.expression_count, 1);
+    assert_eq!(report.baseline_meshes, 1);
+    assert_eq!(report.baseline_shapes, 1);
+    assert!(report.warnings.is_empty(), "欠落も基準姿勢警告も無い");
+}
+
+#[test]
+fn 基準姿勢なしは報告ゼロで従来どおりになる() {
+    // 同じ入力を基準姿勢なしで変換し、焼き込みが無いことを確かめる。
+    let bytes = 表情最小ファイル(
+        &[("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None)],
+        vec![],
+        vec![],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("表情付きは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let options = VrmOptions::new().with_expressions(profile);
+    let (model, report) = VrmModel::from_fbx(&parsed, &options).expect("要求なしでも変換できる");
+    assert_eq!(model.meshes[0].vertices.positions[0], [1.0, 2.0, 3.0]);
+    assert_eq!(model.meshes[0].targets[0].positions[0], [0.5, 0.0, 0.0]);
+    assert_eq!(report.baseline_meshes, 0);
+    assert_eq!(report.baseline_shapes, 0);
+}
+
+#[test]
+fn 空の基準姿勢は結果を変えない() {
+    // 空の適用値は焼き込みなしと同じであり、既存のvrc経路を変えない。
+    let bytes = 表情最小ファイル(
+        &[("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None)],
+        vec![],
+        vec![],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("表情付きは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let plain = VrmOptions::new().with_expressions(profile.clone());
+    let (plain_model, plain_report) =
+        VrmModel::from_fbx(&parsed, &plain).expect("基準姿勢なしは変換できる");
+    let with_empty = VrmOptions::new()
+        .with_expressions(profile)
+        .with_baseline_weights(BaselineWeights::default());
+    let (empty_model, empty_report) =
+        VrmModel::from_fbx(&parsed, &with_empty).expect("空の基準姿勢は変換できる");
+    assert_eq!(
+        empty_model.meshes[0].vertices.positions,
+        plain_model.meshes[0].vertices.positions
+    );
+    assert_eq!(
+        empty_model.meshes[0].targets[0].positions,
+        plain_model.meshes[0].targets[0].positions
+    );
+    assert_eq!(empty_report.baseline_meshes, 0);
+    assert_eq!(empty_report.baseline_shapes, 0);
+    assert_eq!(empty_report, plain_report);
+}
+
+#[test]
+fn 基準姿勢100は束ねを落として警告しターゲットをゼロにする() {
+    // ベースにはフルポーズが入り、ターゲットはゼロ差分になる。
+    // 束ねはVRMランタイムが戻す分と二重になるため落として警告する。
+    let bytes = 表情最小ファイル(
+        &[("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None)],
+        vec![],
+        vec![],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("表情付きは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let options = VrmOptions::new()
+        .with_expressions(profile)
+        .with_baseline_weights(基準姿勢(10, 2000, 100.0));
+    let (model, report) = VrmModel::from_fbx(&parsed, &options).expect("100でも変換できる");
+    assert_eq!(model.meshes[0].vertices.positions[0], [1.5, 2.0, 3.0]);
+    // 全束ねが落ちたら式なしであり、選択も無いためターゲット自体を作らない。
+    assert!(model.meshes[0].targets.is_empty());
+    // 束ねは落ち、警告1件と件数が一致する。
+    assert!(model.expressions.preset.is_empty());
+    assert_eq!(report.expression_count, 0);
+    assert_eq!(report.baseline_meshes, 1);
+    assert_eq!(report.baseline_shapes, 1);
+    assert_eq!(report.warnings.len(), 1);
+    assert!(
+        report.warnings[0].contains("t1")
+            && report.warnings[0].contains("基準姿勢で既に最大のため"),
+        "束ね落としの理由が分かる: {}",
+        report.warnings[0]
+    );
+}
+
+#[test]
+fn 基準姿勢100の束ねだけを落としても索引は維持する() {
+    // t1へ100・t2へ0を焼き、t1の束ねだけを落とす。残ったt2の索引は従来どおり1である。
+    // 落としたt1のターゲットは残ってゼロ差分になる。
+    let bytes = 表情最小ファイル(
+        &[
+            ("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None),
+            (
+                "t2",
+                "t2-shape",
+                &[1],
+                &[0.0, 0.5, 0.0],
+                Some(0.0),
+                Some(&[100.0]),
+            ),
+        ],
+        vec![],
+        vec![],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("表情付きは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1"), 束ね("blink", "t2")],
+    };
+    // t2の重みは無し（ゼロ）のため、ベースもターゲットも変わらない。
+    let weights = 基準姿勢(10, 2000, 100.0);
+    let options = VrmOptions::new()
+        .with_expressions(profile)
+        .with_baseline_weights(weights);
+    let (model, report) = VrmModel::from_fbx(&parsed, &options).expect("部分落としは変換できる");
+    // ベースにはt1のフルが入り、t2は変わらない。
+    assert_eq!(model.meshes[0].vertices.positions[0], [1.5, 2.0, 3.0]);
+    assert_eq!(model.meshes[0].vertices.positions[1], [2.0, 2.0, 3.0]);
+    // チャンネル列は維持し、t1のターゲットはゼロ差分になる。
+    assert_eq!(model.meshes[0].targets.len(), 2);
+    assert!(
+        model.meshes[0].targets[0]
+            .positions
+            .iter()
+            .all(|delta| *delta == [0.0, 0.0, 0.0]),
+        "100のターゲットはゼロ差分になる"
+    );
+    assert_eq!(model.meshes[0].targets[1].positions[1], [0.0, 0.5, 0.0]);
+    // 束ねはblinkだけ残り、索引は解決順のまま1を指す。
+    assert_eq!(model.expressions.preset.len(), 1);
+    assert_eq!(model.expressions.preset[0].name, "blink");
+    assert_eq!(model.expressions.preset[0].morph_target_binds[0].target, 1);
+    assert_eq!(report.expression_count, 1);
+    assert_eq!(report.warnings.len(), 1);
+    assert!(
+        report.warnings[0].contains("t1")
+            && report.warnings[0].contains("基準姿勢で既に最大のため"),
+        "束ね落としの理由が分かる: {}",
+        report.warnings[0]
+    );
+}
+
+#[test]
+fn 複数チャンネルは累積し刈り込み落ちもベースへ寄与する() {
+    // t1は束ね参照、otherは束ねなし・vrc/MMD名でもないため刈り込まれる。
+    // ベースには両方の非ゼロ分を累積し、ターゲットはt1だけが半分になる。
+    let bytes = 表情最小ファイル(
+        &[
+            ("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None),
+            (
+                "other",
+                "other-shape",
+                &[1],
+                &[0.0, 0.5, 0.0],
+                Some(0.0),
+                None,
+            ),
+        ],
+        vec![],
+        vec![],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("表情付きは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let mut weights = 基準姿勢(10, 2000, 50.0);
+    weights
+        .meshes
+        .get_mut(&ObjectId::new(10))
+        .expect("t1の重みがある")
+        .push(BaselineChannel {
+            channel: ObjectId::new(2001),
+            weight: 100.0,
+        });
+    let options = VrmOptions::new()
+        .with_expressions(profile)
+        .with_baseline_weights(weights);
+    let (model, report) = VrmModel::from_fbx(&parsed, &options).expect("複数でも変換できる");
+    // t1は半分、otherはフルでベースへ累積する。
+    assert_eq!(model.meshes[0].vertices.positions[0], [1.25, 2.0, 3.0]);
+    assert_eq!(model.meshes[0].vertices.positions[1], [2.0, 2.5, 3.0]);
+    // 刈り込まれたotherのターゲットは無く、t1だけが残って半分になる。
+    assert_eq!(model.meshes[0].targets.len(), 1);
+    assert_eq!(model.meshes[0].targets[0].name, "t1");
+    assert_eq!(model.meshes[0].targets[0].positions[0], [0.25, 0.0, 0.0]);
+    // 束ねはt1だけ残り、焼き込みは2件数える。
+    assert_eq!(model.expressions.preset.len(), 1);
+    assert_eq!(report.baseline_meshes, 1);
+    assert_eq!(report.baseline_shapes, 2);
+}
+
+#[test]
+fn 継ぎ目の複製すべてに同じ基準姿勢が焼き込まれる() {
+    // 角0はUV違いで2頂点になる。四角形のチャンネルIDは30である。
+    let bytes = 表情四角形ファイル();
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("四角形は読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let options = VrmOptions::new()
+        .with_expressions(profile)
+        .with_baseline_weights(基準姿勢(10, 30, 50.0));
+    let (model, _) = VrmModel::from_fbx(&parsed, &options).expect("焼き込み四角形は変換できる");
+    let mesh = &model.meshes[0];
+    assert_eq!(mesh.vertices.positions.len(), 4);
+    let mut seam_vertices = 0;
+    for (position, delta) in mesh
+        .vertices
+        .positions
+        .iter()
+        .zip(&mesh.targets[0].positions)
+    {
+        if position == &[1.25, 2.0, 3.0] {
+            seam_vertices += 1;
+            assert_eq!(
+                *delta,
+                [0.25, 0.0, 0.0],
+                "継ぎ目の複製にも同じ焼き込みが要る"
+            );
+        }
+    }
+    assert_eq!(seam_vertices, 2, "角0の複製2頂点に焼き込む");
+}
+
+/// 所有モデルのバインド行列を指定できる表情最小ファイル。
+/// `表情最小ファイル` と同じ組み立てであり、所有者（ID2）の行列だけ変える。
+/// 同IDのバインドを2件にすると読み取りで失敗するため、置き換えで渡す。
+fn 表情可変バインドファイル(owner_bind: [f64; 16]) -> Vec<u8> {
+    let mut objs = vec![
+        model(1, b"Root\x00\x01Model", "Null"),
+        model(2, b"Owner\x00\x01Model", "Mesh"),
+        triangle_geometry(10, b"Tri\x00\x01Geometry", vec![]),
+    ];
+    let mut conns = vec![conn(2, 1), conn(10, 2), conn(1, 0)];
+    objs.push(束ねノード(3000, b"Blend\x00\x01Deformer"));
+    let mut channel_full = b"t1".to_vec();
+    channel_full.extend_from_slice(b"\x00\x01SubDeformer");
+    let mut shape_full = b"t1-shape".to_vec();
+    shape_full.extend_from_slice(b"\x00\x01Shape");
+    objs.push(形状(1000, &shape_full, &[0], &[0.5, 0.0, 0.0]));
+    objs.push(伝達子(2000, &channel_full, Some(0.0), None));
+    conns.push(conn(1000, 2000));
+    conns.push(conn(2000, 3000));
+    conns.push(conn(3000, 10));
+    objs.push(bind_pose(
+        100,
+        &[(1, bind_matrix(0.0, 0.0, 0.0)), (2, owner_bind)],
+    ));
+    assemble(None, objs, conns)
+}
+
+#[test]
+fn 非一様拡大でも線形変換どおりに焼き込まれる() {
+    // X軸2倍のバインドでは差分 [0.5,0,0] が [1.0,0,0] になり、半分で [0.5,0,0] 足す。
+    let scaled = [
+        2.0, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 1.0, 0.0, //
+        1.0, 2.0, 3.0, 1.0, //
+    ];
+    let bytes = 表情可変バインドファイル(scaled);
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("拡大付きは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let options = VrmOptions::new()
+        .with_expressions(profile)
+        .with_baseline_weights(基準姿勢(10, 2000, 50.0));
+    let (model, _) = VrmModel::from_fbx(&parsed, &options).expect("拡大付きは変換できる");
+    assert_eq!(model.meshes[0].vertices.positions[0], [1.5, 2.0, 3.0]);
+    assert_eq!(model.meshes[0].targets[0].positions[0], [0.5, 0.0, 0.0]);
+}
+
+#[test]
+fn 鏡像でも符号を反転して焼き込まれる() {
+    // X軸-1倍のバインドでは巻き方向が反転し、差分 [0.5,0,0] が [-0.5,0,0] になる。
+    let mirrored = [
+        -1.0, 0.0, 0.0, 0.0, //
+        0.0, 1.0, 0.0, 0.0, //
+        0.0, 0.0, 1.0, 0.0, //
+        1.0, 2.0, 3.0, 1.0, //
+    ];
+    let bytes = 表情可変バインドファイル(mirrored);
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("鏡像付きは読める");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let options = VrmOptions::new()
+        .with_expressions(profile)
+        .with_baseline_weights(基準姿勢(10, 2000, 50.0));
+    let (model, report) = VrmModel::from_fbx(&parsed, &options).expect("鏡像付きは変換できる");
+    assert_eq!(model.meshes[0].vertices.positions[0], [0.75, 2.0, 3.0]);
+    assert_eq!(model.meshes[0].targets[0].positions[0], [-0.25, 0.0, 0.0]);
+    assert_eq!(report.mirrored_meshes, 1);
+}
+
+#[test]
+fn 範囲外の基準姿勢の重みは失敗する() {
+    for weight in [150.0, -1.0, f64::NAN] {
+        let bytes = 表情最小ファイル(
+            &[("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None)],
+            vec![],
+            vec![],
+            &[],
+        );
+        let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("表情付きは読める");
+        let options = VrmOptions::new().with_baseline_weights(基準姿勢(10, 2000, weight));
+        let 結果 = VrmModel::from_fbx(&parsed, &options);
+        assert!(
+            matches!(
+                結果,
+                Err(ref error) if error.kind() == VrmErrorKind::InvalidStructure
+            ),
+            "重み{weight}は構造破損で失敗する"
+        );
+    }
+}
+
+#[test]
+fn 無いチャンネルの基準姿勢は失敗する() {
+    let bytes = 表情最小ファイル(
+        &[("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None)],
+        vec![],
+        vec![],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("表情付きは読める");
+    let options = VrmOptions::new().with_baseline_weights(基準姿勢(10, 9999, 50.0));
+    let 結果 = VrmModel::from_fbx(&parsed, &options);
+    assert!(
+        matches!(
+            結果,
+            Err(ref error) if error.kind() == VrmErrorKind::InvalidStructure
+        ),
+        "メッシュに無いチャンネルは失敗する"
+    );
+}
+
+#[test]
+fn 単一フレームでない基準姿勢は失敗する() {
+    // t1に形状を2件付ける。表情のkept検査を避けるため束ねは付けない。
+    let bytes = 表情最小ファイル(
+        &[("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None)],
+        vec![形状(
+            1100,
+            b"t1-extra\x00\x01Shape",
+            &[1],
+            &[0.0, 0.5, 0.0],
+        )],
+        vec![conn(1100, 2000)],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("2形状は読める");
+    let options = VrmOptions::new().with_baseline_weights(基準姿勢(10, 2000, 50.0));
+    let 結果 = VrmModel::from_fbx(&parsed, &options);
+    assert!(
+        matches!(
+            結果,
+            Err(ref error) if error.kind() == VrmErrorKind::UnsupportedBlendShape
+        ),
+        "複数フレームの基準姿勢は未対応で失敗する"
+    );
+}
+
+#[test]
+fn 重み率が全100でない基準姿勢は失敗する() {
+    // FullWeights が [50] のチャンネルへ非ゼロの基準姿勢を焼くと失敗する。
+    let bytes = 表情最小ファイル(
+        &[(
+            "t1",
+            "t1-shape",
+            &[0],
+            &[0.5, 0.0, 0.0],
+            Some(0.0),
+            Some(&[50.0]),
+        )],
+        vec![],
+        vec![],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("重み率付きは読める");
+    let options = VrmOptions::new().with_baseline_weights(基準姿勢(10, 2000, 50.0));
+    let 結果 = VrmModel::from_fbx(&parsed, &options);
+    assert!(
+        matches!(
+            結果,
+            Err(ref error) if error.kind() == VrmErrorKind::UnsupportedBlendShape
+        ),
+        "全100でない重み率の基準姿勢は未対応で失敗する"
+    );
+}
+
+/// 試験用のFBX GUID。小文字hexである。
+const 基準姿勢試験GUID: &str = "9ef94258554e06b4ab03fbe9fc914c5c";
+
+/// 直接記述の描画設定文書を作る。重み列はYAMLの数値列になる。
+fn 直接基準姿勢文書(文書id: i64, 網guid: Option<&str>, 重み: &str) -> Vec<u8> {
+    直接基準姿勢の網文書(文書id, mesh_file_id("Owner"), 網guid, 重み)
+}
+
+/// 直接記述の描画設定文書の部品を作る。メッシュ参照のfileIDを指定できる。
+fn 直接基準姿勢の網文書(
+    文書id: i64,
+    網fid: i64,
+    網guid: Option<&str>,
+    重み: &str,
+) -> Vec<u8> {
+    let 網 = match 網guid {
+        Some(guid) => format!("{{fileID: {網fid}, guid: {guid}, type: 3}}"),
+        None => format!("{{fileID: {網fid}}}"),
+    };
+    format!(
+        "--- !u!137 &{文書id}\n\
+         SkinnedMeshRenderer:\n\
+         \x20 m_ObjectHideFlags: 0\n\
+         \x20 m_CorrespondingSourceObject: {{fileID: 0}}\n\
+         \x20 m_PrefabInstance: {{fileID: 0}}\n\
+         \x20 m_PrefabAsset: {{fileID: 0}}\n\
+         \x20 m_GameObject: {{fileID: 1}}\n\
+         \x20 m_Enabled: 1\n\
+         \x20 m_Mesh: {網}\n\
+         \x20 m_BlendShapeWeights: [{重み}]\n\
+         \x20 m_Materials: []\n\
+         \x20 m_Bones: []\n\
+         \x20 m_RootBone: {{fileID: 0}}\n"
+    )
+    .into_bytes()
+}
+
+/// 部品列から試験Prefabを読む。
+fn 基準姿勢試験prefabを読む(部品ら: &[Vec<u8>]) -> SerializedFile {
+    let mut 本文 = b"%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n".to_vec();
+    for 部品 in 部品ら {
+        本文.extend_from_slice(部品);
+    }
+    SerializedFile::parse(&本文, &ParseOptions::new()).expect("試験prefabは読める")
+}
+
+/// 表情2チャンネルの試験FBXを読む。チャンネルIDは2000・2001、形状は1000・1001である。
+fn 基準姿勢試験fbxを読む() -> FbxFile<'static> {
+    // 返却値の借用を保つため、バイト列を漏らして静的化する。
+    let bytes = 表情最小ファイル(
+        &[
+            ("t1", "t1-shape", &[0], &[0.5, 0.0, 0.0], Some(0.0), None),
+            ("t2", "t2-shape", &[1], &[0.0, 0.5, 0.0], Some(0.0), None),
+        ],
+        vec![],
+        vec![],
+        &[],
+    );
+    let bytes: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+    FbxFile::parse(bytes, &FbxOptions::new()).expect("試験FBXは読める")
+}
+
+#[test]
+fn 直接記述の重みから基準姿勢を解決して焼き込める() {
+    // FBXチャンネル順をUnity索引と同一視し、t1（索引0）へ50を焼き込む。
+    let fbx = 基準姿勢試験fbxを読む();
+    let prefab = 基準姿勢試験prefabを読む(&[直接基準姿勢文書(
+        600,
+        Some(基準姿勢試験GUID),
+        "50, 0",
+    )]);
+    let weights =
+        prefab_baseline_weights(&prefab, "試験", &fbx, 基準姿勢試験GUID).expect("解決できる");
+    assert_eq!(weights.meshes.len(), 1);
+    let channels = &weights.meshes[&ObjectId::new(10)];
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0].channel, ObjectId::new(2000));
+    assert_eq!(channels[0].weight, 50.0);
+    // 解決した適用値で変換し、ベースへ半分焼き込む。
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let options = VrmOptions::new()
+        .with_expressions(profile)
+        .with_baseline_weights(weights);
+    let (model, report) = VrmModel::from_fbx(&fbx, &options).expect("焼き込みは変換できる");
+    assert_eq!(model.meshes[0].vertices.positions[0], [1.25, 2.0, 3.0]);
+    assert_eq!(model.meshes[0].targets[0].positions[0], [0.25, 0.0, 0.0]);
+    assert_eq!(report.baseline_meshes, 1);
+    assert_eq!(report.baseline_shapes, 1);
+}
+
+#[test]
+fn 短い重み配列は足りない索引をゼロとして扱う() {
+    // 要素1件の配列では索引1（t2）をゼロとみなし、t1だけ残る。
+    let fbx = 基準姿勢試験fbxを読む();
+    let prefab =
+        基準姿勢試験prefabを読む(&[直接基準姿勢文書(600, Some(基準姿勢試験GUID), "50")]);
+    let weights =
+        prefab_baseline_weights(&prefab, "試験", &fbx, 基準姿勢試験GUID).expect("解決できる");
+    let channels = &weights.meshes[&ObjectId::new(10)];
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0].channel, ObjectId::new(2000));
+}
+
+#[test]
+fn 別資産の描画設定は基準姿勢に使わない() {
+    // GUID不一致の文書は出所が検証できないため使わず、空になる。
+    let fbx = 基準姿勢試験fbxを読む();
+    let prefab = 基準姿勢試験prefabを読む(&[直接基準姿勢文書(
+        600,
+        Some("7464d0b6ac9485e4c9b53c7a0f61a372"),
+        "50, 50",
+    )]);
+    let weights =
+        prefab_baseline_weights(&prefab, "試験", &fbx, 基準姿勢試験GUID).expect("解決できる");
+    assert!(weights.meshes.is_empty(), "別資産は使わない");
+}
+
+#[test]
+fn 範囲外の非ゼロ重みは解決時に失敗する() {
+    // チャンネル2件に対し索引2へ非ゼロを置くと失敗する。
+    let fbx = 基準姿勢試験fbxを読む();
+    let prefab = 基準姿勢試験prefabを読む(&[直接基準姿勢文書(
+        600,
+        Some(基準姿勢試験GUID),
+        "0, 0, 50",
+    )]);
+    let 結果 = prefab_baseline_weights(&prefab, "試験", &fbx, 基準姿勢試験GUID);
+    assert!(
+        matches!(
+            結果,
+            Err(ref error) if error.kind() == VrmErrorKind::InvalidPrefab
+        ),
+        "範囲外の非ゼロ重みは失敗する"
+    );
+}
+
+#[test]
+fn 同じ重みの複数描画設定は通し違う重みは先勝ちにしない() {
+    // 同じジオメトリの2文書が同じ実効値なら通り、違えば失敗する。
+    let fbx = 基準姿勢試験fbxを読む();
+    let 同じ = 基準姿勢試験prefabを読む(&[
+        直接基準姿勢文書(600, Some(基準姿勢試験GUID), "50, 0"),
+        直接基準姿勢文書(601, Some(基準姿勢試験GUID), "50"),
+    ]);
+    prefab_baseline_weights(&同じ, "試験", &fbx, 基準姿勢試験GUID).expect("一致は通る");
+    let 違い = 基準姿勢試験prefabを読む(&[
+        直接基準姿勢文書(600, Some(基準姿勢試験GUID), "50, 0"),
+        直接基準姿勢文書(601, Some(基準姿勢試験GUID), "25, 0"),
+    ]);
+    let 結果 = prefab_baseline_weights(&違い, "試験", &fbx, 基準姿勢試験GUID);
+    assert!(
+        matches!(
+            結果,
+            Err(ref error) if error.kind() == VrmErrorKind::InvalidPrefab
+        ),
+        "不一致の重みは先勝ちにしない"
+    );
+}
+
+#[test]
+fn 改変内容の大きさと成分から重みを復元できる() {
+    // stripped文書とPrefabInstanceの改変で、t1（索引0）へ25を焼き込む。
+    let fbx = 基準姿勢試験fbxを読む();
+    let 描画fid = skinned_mesh_renderer_file_id("Root/Owner");
+    let guid = 基準姿勢試験GUID;
+    let 本文 = format!(
+        "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n\
+         --- !u!1001 &100\n\
+         PrefabInstance:\n\
+         \x20 m_ObjectHideFlags: 0\n\
+         \x20 m_Modification:\n\
+         \x20\x20\x20 m_Modifications:\n\
+         \x20\x20\x20 - target: {{fileID: {描画fid}, guid: {guid}, type: 3}}\n\
+         \x20\x20\x20   propertyPath: m_BlendShapeWeights.Array.size\n\
+         \x20\x20\x20   value: 2\n\
+         \x20\x20\x20   objectReference: {{fileID: 0}}\n\
+         \x20\x20\x20 - target: {{fileID: {描画fid}, guid: {guid}, type: 3}}\n\
+         \x20\x20\x20   propertyPath: m_BlendShapeWeights.Array.data[0]\n\
+         \x20\x20\x20   value: 25\n\
+         \x20\x20\x20   objectReference: {{fileID: 0}}\n\
+         \x20 m_SourcePrefab: {{fileID: 100100000, guid: {guid}, type: 3}}\n\
+         --- !u!137 &500 stripped\n\
+         SkinnedMeshRenderer:\n\
+         \x20 m_CorrespondingSourceObject: {{fileID: {描画fid}, guid: {guid}, type: 3}}\n\
+         \x20 m_PrefabInstance: {{fileID: 100}}\n\
+         \x20 m_PrefabAsset: {{fileID: 0}}\n"
+    );
+    let prefab =
+        SerializedFile::parse(本文.as_bytes(), &ParseOptions::new()).expect("改変付きは読める");
+    let weights = prefab_baseline_weights(&prefab, "試験", &fbx, guid).expect("改変から解決できる");
+    let channels = &weights.meshes[&ObjectId::new(10)];
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0].channel, ObjectId::new(2000));
+    assert_eq!(channels[0].weight, 25.0);
+    // 解決した適用値で変換し、ベースへ1/4焼き込む。
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "t1")],
+    };
+    let options = VrmOptions::new()
+        .with_expressions(profile)
+        .with_baseline_weights(weights);
+    let (model, _) = VrmModel::from_fbx(&fbx, &options).expect("焼き込みは変換できる");
+    assert_eq!(model.meshes[0].vertices.positions[0], [1.125, 2.0, 3.0]);
+    assert_eq!(model.meshes[0].targets[0].positions[0], [0.375, 0.0, 0.0]);
+}
+
+/// stripped描画設定文書の部品を作る。所属PrefabInstanceを指定できる。
+fn stripped基準姿勢文書(文書id: i64, 描画fid: i64, 所属: i64, guid: &str) -> Vec<u8> {
+    format!(
+        "--- !u!137 &{文書id} stripped\n\
+         SkinnedMeshRenderer:\n\
+         \x20 m_CorrespondingSourceObject: {{fileID: {描画fid}, guid: {guid}, type: 3}}\n\
+         \x20 m_PrefabInstance: {{fileID: {所属}}}\n\
+         \x20 m_PrefabAsset: {{fileID: 0}}\n"
+    )
+    .into_bytes()
+}
+
+/// PrefabInstance文書の部品を作る。改変列は呼び出し側がYAML断片で渡す。
+fn 実体基準姿勢文書(文書id: i64, guid: &str, 改変ら: &str) -> Vec<u8> {
+    format!(
+        "--- !u!1001 &{文書id}\n\
+         PrefabInstance:\n\
+         \x20 m_ObjectHideFlags: 0\n\
+         \x20 m_Modification:\n\
+         \x20\x20\x20 m_Modifications:\n\
+         {改変ら}\
+         \x20 m_SourcePrefab: {{fileID: 100100000, guid: {guid}, type: 3}}\n"
+    )
+    .into_bytes()
+}
+
+/// 描画設定1件への重み改変の断片を作る。大きさと成分0の2件である。
+fn 重み改変(描画fid: i64, guid: &str, 値: &str) -> String {
+    format!(
+        "\x20\x20\x20 - target: {{fileID: {描画fid}, guid: {guid}, type: 3}}\n\
+         \x20\x20\x20   propertyPath: m_BlendShapeWeights.Array.size\n\
+         \x20\x20\x20   value: 2\n\
+         \x20\x20\x20   objectReference: {{fileID: 0}}\n\
+         \x20\x20\x20 - target: {{fileID: {描画fid}, guid: {guid}, type: 3}}\n\
+         \x20\x20\x20   propertyPath: m_BlendShapeWeights.Array.data[0]\n\
+         \x20\x20\x20   value: {値}\n\
+         \x20\x20\x20   objectReference: {{fileID: 0}}\n"
+    )
+}
+
+#[test]
+fn 所属の違うstripped文書の重みは復活させない() {
+    // 再現: instanceは100、stripped文書の所属は999、instance100の改変は重み25。
+    // 検証済み文書が無いsourceの非ゼロ改変は、出所検証の迂回になるため失敗する。
+    let fbx = 基準姿勢試験fbxを読む();
+    let 描画fid = skinned_mesh_renderer_file_id("Root/Owner");
+    let guid = 基準姿勢試験GUID;
+    let prefab = 基準姿勢試験prefabを読む(&[
+        実体基準姿勢文書(100, guid, &重み改変(描画fid, guid, "25")),
+        stripped基準姿勢文書(500, 描画fid, 999, guid),
+    ]);
+    let 結果 = prefab_baseline_weights(&prefab, "試験", &fbx, guid);
+    assert!(
+        matches!(
+            結果,
+            Err(ref error) if error.kind() == VrmErrorKind::InvalidPrefab
+        ),
+        "未検証sourceの非ゼロ改変は失敗する"
+    );
+}
+
+#[test]
+fn 直接と改変の混在は突き合わせて成功と失敗を分ける() {
+    // 同じジオメトリの直接記述と検証済み改変が一致すれば通り、違えば失敗する。
+    // ゼロ対非ゼロも不一致であり失敗する。
+    let fbx = 基準姿勢試験fbxを読む();
+    let 描画fid = skinned_mesh_renderer_file_id("Root/Owner");
+    let guid = 基準姿勢試験GUID;
+    let 混在 = |直接重み: &str, 改変値: &str| {
+        基準姿勢試験prefabを読む(&[
+            直接基準姿勢文書(600, Some(guid), 直接重み),
+            実体基準姿勢文書(100, guid, &重み改変(描画fid, guid, 改変値)),
+            stripped基準姿勢文書(500, 描画fid, 100, guid),
+        ])
+    };
+    let 一致 = prefab_baseline_weights(&混在("25, 0", "25"), "試験", &fbx, guid)
+        .expect("一致する混在は通る");
+    assert_eq!(一致.meshes[&ObjectId::new(10)].len(), 1);
+    for 直接重み in ["0, 0", "50, 0"] {
+        let 結果 = prefab_baseline_weights(&混在(直接重み, "25"), "試験", &fbx, guid);
+        assert!(
+            matches!(
+                結果,
+                Err(ref error) if error.kind() == VrmErrorKind::InvalidPrefab
+            ),
+            "直接{直接重み}と改変25の混在は失敗する"
+        );
+    }
+}
+
+#[test]
+fn 壊れたnullメッシュ参照の非ゼロは解決不能で失敗する() {
+    // `{fileID: 0, guid: fbx}` は対象FBXを指すため、解決不能は欠落させず失敗する。
+    // ゼロ重みと別GUIDは無視して成功する。
+    let fbx = 基準姿勢試験fbxを読む();
+    let guid = 基準姿勢試験GUID;
+    let 非ゼロ =
+        基準姿勢試験prefabを読む(&[直接基準姿勢の網文書(600, 0, Some(guid), "50, 0")]);
+    let 結果 = prefab_baseline_weights(&非ゼロ, "試験", &fbx, guid);
+    assert!(
+        matches!(
+            結果,
+            Err(ref error) if error.kind() == VrmErrorKind::InvalidPrefab
+        ),
+        "null参照の非ゼロ重みは失敗する"
+    );
+    let ゼロ =
+        基準姿勢試験prefabを読む(&[直接基準姿勢の網文書(600, 0, Some(guid), "0, 0")]);
+    let 空 = prefab_baseline_weights(&ゼロ, "試験", &fbx, guid).expect("ゼロは無視する");
+    assert!(空.meshes.is_empty());
+    let 別資産 = 基準姿勢試験prefabを読む(&[直接基準姿勢の網文書(
+        600,
+        0,
+        Some("7464d0b6ac9485e4c9b53c7a0f61a372"),
+        "50, 0",
+    )]);
+    let 空 = prefab_baseline_weights(&別資産, "試験", &fbx, guid).expect("別GUIDは無視する");
+    assert!(空.meshes.is_empty());
+}
+
+#[test]
+fn 文書の無いsourceの改変は矛盾が無ければ受け入れる() {
+    // 実データ（ChiffonのBody_base型）: stripped文書自体が無いsourceへの
+    // 非ゼロ改変は、出所の矛盾が無いため受け入れて焼き込む。
+    let fbx = 基準姿勢試験fbxを読む();
+    let 描画fid = skinned_mesh_renderer_file_id("Root/Owner");
+    let guid = 基準姿勢試験GUID;
+    let prefab = 基準姿勢試験prefabを読む(&[実体基準姿勢文書(
+        100,
+        guid,
+        &重み改変(描画fid, guid, "25"),
+    )]);
+    let weights =
+        prefab_baseline_weights(&prefab, "試験", &fbx, guid).expect("矛盾の無い改変は受け入れる");
+    let channels = &weights.meshes[&ObjectId::new(10)];
+    assert_eq!(channels.len(), 1);
+    assert_eq!(channels[0].channel, ObjectId::new(2000));
+    assert_eq!(channels[0].weight, 25.0);
+}
+
+/// 描画設定1件への成分のみの改変断片を作る。
+fn 成分改変(描画fid: i64, guid: &str, 索引: usize, 値: &str) -> String {
+    format!(
+        "\x20\x20\x20 - target: {{fileID: {描画fid}, guid: {guid}, type: 3}}\n\
+         \x20\x20\x20   propertyPath: m_BlendShapeWeights.Array.data[{索引}]\n\
+         \x20\x20\x20   value: {値}\n\
+         \x20\x20\x20   objectReference: {{fileID: 0}}\n"
+    )
+}
+
+/// 描画設定1件への大きさのみの改変断片を作る。
+fn 大きさ改変(描画fid: i64, guid: &str, 大きさ: usize) -> String {
+    format!(
+        "\x20\x20\x20 - target: {{fileID: {描画fid}, guid: {guid}, type: 3}}\n\
+         \x20\x20\x20   propertyPath: m_BlendShapeWeights.Array.size\n\
+         \x20\x20\x20   value: {大きさ}\n\
+         \x20\x20\x20   objectReference: {{fileID: 0}}\n"
+    )
+}
+
+/// 任意クラスのstripped文書の部品を作る。所属PrefabInstanceを指定できる。
+fn stripped任意文書(
+    文書id: i64,
+    クラスid: i32,
+    クラス名: &str,
+    対応fid: i64,
+    所属: i64,
+    guid: &str,
+) -> Vec<u8> {
+    format!(
+        "--- !u!{クラスid} &{文書id} stripped\n\
+         {クラス名}:\n\
+         \x20 m_CorrespondingSourceObject: {{fileID: {対応fid}, guid: {guid}, type: 3}}\n\
+         \x20 m_PrefabInstance: {{fileID: {所属}}}\n\
+         \x20 m_PrefabAsset: {{fileID: 0}}\n"
+    )
+    .into_bytes()
+}
+
+#[test]
+fn 文書なしsourceのゼロ改変も比較に参加する() {
+    // 直接 [25,0] に対し、文書なしsourceの [0,0] や大きさのみは不一致であり失敗する。
+    // 全ゼロ同士は成功し、焼き込み0件になる。
+    let fbx = 基準姿勢試験fbxを読む();
+    let 描画fid = skinned_mesh_renderer_file_id("Root/Owner");
+    let guid = 基準姿勢試験GUID;
+    for 改変 in [
+        成分改変(描画fid, guid, 0, "0"),
+        大きさ改変(描画fid, guid, 2),
+    ] {
+        let prefab = 基準姿勢試験prefabを読む(&[
+            直接基準姿勢文書(600, Some(guid), "25, 0"),
+            実体基準姿勢文書(100, guid, &改変),
+        ]);
+        let 結果 = prefab_baseline_weights(&prefab, "試験", &fbx, guid);
+        assert!(
+            matches!(
+                結果,
+                Err(ref error) if error.kind() == VrmErrorKind::InvalidPrefab
+            ),
+            "ゼロ改変でも実効値が違えば失敗する"
+        );
+    }
+    let 両ゼロ = 基準姿勢試験prefabを読む(&[
+        直接基準姿勢文書(600, Some(guid), "0, 0"),
+        実体基準姿勢文書(100, guid, &成分改変(描画fid, guid, 0, "0")),
+    ]);
+    let 空 = prefab_baseline_weights(&両ゼロ, "試験", &fbx, guid).expect("全ゼロ同士は成功する");
+    assert!(空.meshes.is_empty(), "焼き込みは0件になる");
+}
+
+#[test]
+fn 別クラスのstripped文書は対応元を汚染する() {
+    // 既知renderer IDを指す stripped Transform（classID=4）と同sourceへの非ゼロ改変は失敗する。
+    let fbx = 基準姿勢試験fbxを読む();
+    let 描画fid = skinned_mesh_renderer_file_id("Root/Owner");
+    let guid = 基準姿勢試験GUID;
+    let prefab = 基準姿勢試験prefabを読む(&[
+        stripped任意文書(700, 4, "Transform", 描画fid, 100, guid),
+        実体基準姿勢文書(100, guid, &成分改変(描画fid, guid, 0, "25")),
+    ]);
+    let 結果 = prefab_baseline_weights(&prefab, "試験", &fbx, guid);
+    assert!(
+        matches!(
+            結果,
+            Err(ref error) if error.kind() == VrmErrorKind::InvalidPrefab
+        ),
+        "別クラスのstripped文書の対応元への改変は失敗する"
+    );
+}
+
+#[test]
+fn 無関係なstripped文書は対応元を汚染しない() {
+    // 対応元がrenderer IDでないTransformはtaintedにせず、実rendererへの改変は受け入れる。
+    let fbx = 基準姿勢試験fbxを読む();
+    let 描画fid = skinned_mesh_renderer_file_id("Root/Owner");
+    let guid = 基準姿勢試験GUID;
+    let prefab = 基準姿勢試験prefabを読む(&[
+        stripped任意文書(701, 4, "Transform", 12345, 100, guid),
+        実体基準姿勢文書(100, guid, &成分改変(描画fid, guid, 0, "25")),
+    ]);
+    let weights =
+        prefab_baseline_weights(&prefab, "試験", &fbx, guid).expect("無関係な文書は汚染しない");
+    assert_eq!(weights.meshes[&ObjectId::new(10)].len(), 1);
+}
+
+#[test]
+fn 別資産のstripped文書は対応元を汚染しない() {
+    // 対応元GUIDが別資産のstripped文書は検証対象外であり、実rendererへの改変は受け入れる。
+    let fbx = 基準姿勢試験fbxを読む();
+    let 描画fid = skinned_mesh_renderer_file_id("Root/Owner");
+    let guid = 基準姿勢試験GUID;
+    let 別 = "7464d0b6ac9485e4c9b53c7a0f61a372";
+    let prefab = 基準姿勢試験prefabを読む(&[
+        stripped任意文書(702, 137, "SkinnedMeshRenderer", 描画fid, 100, 別),
+        実体基準姿勢文書(100, guid, &成分改変(描画fid, guid, 0, "25")),
+    ]);
+    let weights =
+        prefab_baseline_weights(&prefab, "試験", &fbx, guid).expect("別資産の文書は汚染しない");
+    assert_eq!(weights.meshes[&ObjectId::new(10)].len(), 1);
 }

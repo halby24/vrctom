@@ -1716,3 +1716,16 @@ fn 同率で唯一非ゼロなら採用して選択警告を要約より前に�
     let 要約位置 = stderr.find("書き出しが完了した").expect("要約がある");
     assert!(選択位置 < 要約位置, "選択警告は要約より前である");
 }
+
+#[test]
+fn no_baselineはprefabなしで終了コード2になる() {
+    // `--no-baseline` は `--prefab` 必須であり、無い場合は引数不正になる。
+    let work = tempfile::TempDir::new().expect("作業場所は作れる");
+    let output = run(
+        &["export", "dummy.fbx", "--no-baseline", "-o", "out.vrm"],
+        work.path(),
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+}

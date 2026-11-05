@@ -22,7 +22,8 @@ use vrctom::vrm::{
     SpringCompileOptions, VrmAvatarPermission, VrmCommercialUsage, VrmCreditNotation,
     VrmExportOptions, VrmExpressionProfile, VrmMaterials, VrmMeta, VrmModel, VrmModification,
     VrmOptions, apply_humanoid_t_pose, apply_renderer_plan, compile_springs,
-    expressions_from_avatar_descriptor, plan_renderer_assignment, resolve_look_at,
+    expressions_from_avatar_descriptor, plan_renderer_assignment, prefab_baseline_weights,
+    resolve_look_at,
 };
 
 #[derive(Debug, Parser)]
@@ -87,6 +88,11 @@ enum Command {
         /// `--expressions` とは同時に指定できない。
         #[arg(long, conflicts_with = "expressions")]
         no_expressions: bool,
+        /// 基準姿勢の焼き込みを行わない。`--prefab` 必須である。
+        /// 既定ではPrefabの `SkinnedMeshRenderer.m_BlendShapeWeights` を
+        /// ベース形状へ焼き込む。`--no-expressions` でも焼く。
+        #[arg(long, requires = "prefab")]
+        no_baseline: bool,
         /// アバターの人格権の扱い。既定は `only-author`。
         #[arg(long, value_enum, value_name = "PERMISSION")]
         avatar_permission: Option<AvatarPermissionArg>,
@@ -247,6 +253,7 @@ fn main() {
             physics_from_prefab: _,
             no_physics,
             no_expressions,
+            no_baseline,
             avatar_permission,
             commercial_usage,
             credit_notation,
@@ -268,6 +275,7 @@ fn main() {
             prefab,
             no_physics,
             no_expressions,
+            no_baseline,
             ExportMetaArgs {
                 avatar_permission,
                 commercial_usage,
@@ -425,6 +433,7 @@ fn export(
     prefab: Option<PathBuf>,
     no_physics: bool,
     no_expressions: bool,
+    no_baseline: bool,
     meta_args: ExportMetaArgs,
 ) -> i32 {
     // 既定出力先は入力の拡張子を `vrm` に変えたパスとする。
@@ -502,10 +511,15 @@ fn export(
             return 1;
         }
     };
-    // descriptor由来の表情はFBX解析後・中間モデル生成前に解決する。
+    // descriptor由来の表情と基準姿勢の焼き込みはFBX解析後・中間モデル生成前に解決する。
+    // Prefabの読み込みと `.fbx.meta`（GUID・humanoid対応表）の読み込みは、
+    // descriptorまたは基準姿勢のどちらかが必要な場合に一度だけ行う。
     // `.fbx.meta` の対応表は後段のhumanoid検出と共有し、二重に読まない。
+    // 材質割当が既にメタを要求するため、`--prefab` でメタが必要なのは退行ではないが、
+    // `--prefab --no-expressions` でも基準姿勢のためにメタを読む点で診断順が早まる。
+    let use_baseline = prefab.is_some() && !no_baseline;
     let mut early_mappings: Option<Vec<HumanBoneMapping>> = None;
-    if use_descriptor_expressions {
+    if use_descriptor_expressions || use_baseline {
         let Some(prefab_path) = prefab.as_ref() else {
             eprintln!("--expressions descriptor には --prefab が必須である");
             return 2;
@@ -533,56 +547,81 @@ fn export(
             Ok(fbx_meta) => fbx_meta,
             Err(code) => return code,
         };
-        // Prefab表情にはFBXのGUIDが必要である。無い場合は後段でも失敗するため、
-        // ここで明確に止める。全ゼロは未設定とみなす。
+        // Prefabの解決にはFBXのGUIDが必要である。無い場合は後段でも失敗するため、
+        // ここで明確に止める。全ゼロは未設定とみなす。用途が分かる文面にする。
         if fbx_meta.guid.chars().all(|c| c == '0') {
             let mut meta_os = input.as_os_str().to_owned();
             meta_os.push(".meta");
+            let purpose = match (use_descriptor_expressions, use_baseline) {
+                (true, true) => "Prefab表情と基準姿勢にはFBXのGUIDが必要である",
+                (true, false) => "Prefab表情にはFBXのGUIDが必要である",
+                _ => "Prefab基準姿勢にはFBXのGUIDが必要である",
+            };
             eprintln!(
-                "Prefab表情にはFBXのGUIDが必要である: {}",
+                "{purpose}: {}",
                 escape_diag(&format!("{:?}", PathBuf::from(meta_os)))
             );
             return 1;
         }
         let mappings = fbx_meta.mappings;
-        // 目条件はdescriptorの左右Eyeではなく、humanoidとして左右Eyeが
-        // 解決できることで判定する。モデル構築前に名前列で確かめる。
-        // 検出自体に失敗した場合は偽にし、後段の通常検出がエラーを出す。
-        let names: Vec<&str> = file
-            .models()
-            .iter()
-            .map(|model| model.name.as_str())
-            .collect();
-        let humanoid_eyes = match HumanoidBones::detect_with_mapping_names(&names, &mappings) {
-            Ok((bones, _)) => {
-                bones.get(HumanoidBone::LeftEye).is_some()
-                    && bones.get(HumanoidBone::RightEye).is_some()
-            }
-            Err(_) => false,
-        };
-        match expressions_from_avatar_descriptor(
-            &prefab_file,
-            &prefab_label,
-            &file,
-            &fbx_meta.guid,
-            humanoid_eyes,
-        ) {
-            Ok(plan) => {
-                for warning in &plan.warnings {
-                    eprintln!("表情の警告: {}", escape_diag(warning));
+        let fbx_guid = fbx_meta.guid;
+        if use_descriptor_expressions {
+            // 目条件はdescriptorの左右Eyeではなく、humanoidとして左右Eyeが
+            // 解決できることで判定する。モデル構築前に名前列で確かめる。
+            // 検出自体に失敗した場合は偽にし、後段の通常検出がエラーを出す。
+            let names: Vec<&str> = file
+                .models()
+                .iter()
+                .map(|model| model.name.as_str())
+                .collect();
+            let humanoid_eyes = match HumanoidBones::detect_with_mapping_names(&names, &mappings) {
+                Ok((bones, _)) => {
+                    bones.get(HumanoidBone::LeftEye).is_some()
+                        && bones.get(HumanoidBone::RightEye).is_some()
                 }
-                if !plan.profile.bindings.is_empty() {
-                    let count = plan.profile.bindings.len();
-                    vrm_options = vrm_options.with_expressions(plan.profile);
-                    if let Some(mesh) = plan.mesh {
-                        vrm_options = vrm_options.with_expression_mesh(mesh);
+                Err(_) => false,
+            };
+            match expressions_from_avatar_descriptor(
+                &prefab_file,
+                &prefab_label,
+                &file,
+                &fbx_guid,
+                humanoid_eyes,
+            ) {
+                Ok(plan) => {
+                    for warning in &plan.warnings {
+                        eprintln!("表情の警告: {}", escape_diag(warning));
                     }
-                    eprintln!("表情: VRCAvatarDescriptor から{count}件");
+                    if !plan.profile.bindings.is_empty() {
+                        let count = plan.profile.bindings.len();
+                        vrm_options = vrm_options.with_expressions(plan.profile);
+                        if let Some(mesh) = plan.mesh {
+                            vrm_options = vrm_options.with_expression_mesh(mesh);
+                        }
+                        eprintln!("表情: VRCAvatarDescriptor から{count}件");
+                    }
+                }
+                Err(error) => {
+                    diagnose_stage("表情の解決に失敗した", &error);
+                    return 1;
                 }
             }
-            Err(error) => {
-                diagnose_stage("表情の解決に失敗した", &error);
-                return 1;
+        }
+        // 基準姿勢の焼き込みは表情の有無に関わらず行う。`--no-expressions` でも焼く。
+        // `--prefab` が無い場合は重みの出所が無いため焼かない。
+        // `--no-baseline` で明示的に止められる。空の解決結果は何も焼かない。
+        // Prefabとメタは上で一度だけ読んだものを使い、二重に読まない。
+        if use_baseline {
+            match prefab_baseline_weights(&prefab_file, &prefab_label, &file, &fbx_guid) {
+                Ok(weights) => {
+                    if !weights.meshes.is_empty() {
+                        vrm_options = vrm_options.with_baseline_weights(weights);
+                    }
+                }
+                Err(error) => {
+                    diagnose_stage("基準姿勢の解決に失敗した", &error);
+                    return 1;
+                }
             }
         }
         early_mappings = Some(mappings);
@@ -602,6 +641,14 @@ fn export(
         );
     }
     emit_model_warnings(&report);
+    // 基準姿勢を焼き込んだ場合は、成功要約の前に診断を1行出す。
+    // 見出しは `emit_model_warnings` の後、成功要約より前である。
+    if report.baseline_shapes > 0 {
+        eprintln!(
+            "ベースライン: Prefabの基準姿勢から{}件を焼き込んだ（{}メッシュ）",
+            report.baseline_shapes, report.baseline_meshes
+        );
+    }
     // 物理適用時はhumanoid検出を解決より先に行い、明示指定で引き継ぐ。
     // 解決で追加する補助ノードはFBXの骨と同名のノードを含むことがあり、
     // 書き出し時の名前基準の検出が重複で失敗するためである。

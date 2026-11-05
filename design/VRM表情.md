@@ -63,8 +63,9 @@ CLIでは `vrctom export ... --expressions vrc` でこの8種類の対応から�
 `customEyeLookSettings` のいずれかを伴う `MonoBehaviour` 文書であり、
 別スクリプトの同名欄を誤認しない。参照実装（SoulFlame VRM Exporter 0.6.9）が
 descriptorから既定生成する表情と同じにする。対象は口とまぶたの束ねの生成までであり、
-ベースライン焼き込み・複数メッシュ束ね・法線デルタ・
+複数メッシュ束ね・法線デルタ・
 カスタム式・override・ARKitは対象外である。
+ベースライン焼き込みは「ベースライン焼き込み」に譲る。
 
 - 対応表：SDKのviseme順は `sil, PP, FF, TH, DD, kk, CH, SS, nn, RR, aa, E, ih, oh, ou` であり、
   VRM式への対応は `aa=10, ih=12, ou=14, ee=11("E"), oh=13`（SDK索引）である。
@@ -230,6 +231,83 @@ UVや法線の継ぎ目で複製された頂点すべてに同じ差分が載る
 差分は出力前にf32へ寄せ、非有限は破損として失敗する。
 ターゲットの長さは出力頂点数と同じにし、影響の無い頂点はゼロにする。
 
+## ベースライン焼き込み
+
+Unityを回さず `vrctom export <fbx> --prefab <prefab>` で、Prefabの
+`SkinnedMeshRenderer.m_BlendShapeWeights`（シーンでの既定の見た目）を
+ベース形状へ焼き込む。VRMランタイムは束ねたモーフ重みを毎フレーム戻すため、
+既定の見た目はベース形状に置く必要がある。参照実装（SoulFlame VRM Exporter 0.6.9）の
+`BaselineRebase.Rebase` と同じ結果にする。
+
+焼き込み式（単一フレーム）。チャンネルのUnity重み `b`（0..=100）、フルポーズの位置差分 `d` に対し、
+ベースと各ターゲットを次のとおり変える。
+
+- `base' = base + (b/100) * d`
+- `target' = (1 - b/100) * d`
+
+ベースには、非ゼロ重みを持つ全チャンネル分を累積する。刈り込みで落ちるチャンネルも含む。
+各ターゲットから引くのは自身のbaseline分だけであり、全baselineの合計ではない。
+baseline=0 は無変更、baseline=100 はベースにフルポーズが入り、ターゲットはゼロ差分になる。
+重みはすべてUnityの0..100（VRMの0..1ではない）。束ねの重みは従来どおり1.0のままでよい
+（`(100-b)/(100-b)=1`）。
+
+対象は `--prefab` 指定時のPrefabが参照する出力対象の全メッシュであり、表情の採用メッシュだけではない。
+`--no-expressions` でも焼く（見た目の再現であり表情とは独立）。
+`--expressions vrc`・`--expressions descriptor` のどちらでも焼く。
+`--prefab` なしでは焼かない（重みの出所が無い）。
+新設の `--no-baseline`（`--prefab` 必須）で明示的に止められる。
+
+重みの出所は次のとおり。FBXチャンネル順をUnity側のブレンドシェイプ索引と同一視する前提であり、
+`eyelidsBlendshapes` と同じ前提である（実データで確認済み: Milfyの索引448=`mouth_Λ`、498=`mouth_narrow`）。
+
+- Prefabの `SkinnedMeshRenderer.m_BlendShapeWeights`（直接記述文書）。
+- Prefabの `PrefabInstance` の改変 `m_BlendShapeWeights.Array.size` と
+  `m_BlendShapeWeights.Array.data[i]`（stripped文書の場合）。
+  対象は `target.guid == 入力FBXのGUID` かつ `target.fileID == 対応元rendererのfileID`。
+- 出所の検証はdescriptorと同じ規則を使う。stripped文書はclassID 137、
+  `m_CorrespondingSourceObject.guid == fbx_guid`、`m_PrefabInstance` が
+  外部GUIDを持たないローカル参照で特定したFBXのPrefabInstance IDと一致。
+  直接記述は `m_Mesh.guid == fbx_guid` かつ `m_Mesh.fileID` が取り込みメッシュID表にある。
+  FBXのPrefabInstanceが複数なら失敗（先勝ちにしない）。0件なら直接記述方式。
+- FBXの `DeformPercent` はbaselineに使わない。既存の「非ゼロDeformPercentは失敗」も
+  変更しない（keptチャンネルの検査として残す）。
+- 直接記述SMRの重み配列が短い/空の場合は、足りない索引を0として扱う。
+
+異常データは警告して見た目を欠落させず、失敗させる。
+
+- 重みが非有限・負値・100超・上限（100万スロット）超え。巨大な `.Array.size` や
+  `.data[i]` は疎に保持し、実体化や加算オーバーフローを起こさない。
+  上限超えの索引でも値がゼロなら寄与しないため無視して成功させる。
+- 非ゼロ重みの索引がチャンネル数を超える。
+- 非ゼロ重みのチャンネルが単一フレームでない（`shapes.len() != 1`）、または
+  `FullWeights` があるのに全100でない。
+- 同じジオメトリに複数のrendererが対応し、実効重みが一致しない。
+  受理した全rendererの明示成分の和集合を比べ、未設定は0として扱う（0詰め比較と同じ意味）。
+  ゼロのみ・大きさのみの改変も候補に入れて比べるため、実効値の違うゼロとの混在は失敗する。
+- 対応元GUID/instance/classIDの不一致など出所が検証できない文書自体は使わない（descriptorと同じ）。
+  ただし除外したstripped文書の対応元（classID不一致を含む）への非ゼロ改変は、
+  検証の迂回になるため失敗させる。
+  文書が存在しない対応元への改変は矛盾が無いため受け入れて突き合わせる。
+- 対象FBXを指す非ゼロ重みがメッシュへ解決できない場合は失敗する。null参照（`fileID: 0`）でも
+  GUIDが入力FBXなら対象FBXを指すため失敗させる。
+
+baseline=100 のチャンネルを参照する束ねは、その式だけ落として警告する。
+文面は欠落警告と同じ接頭辞で理由を変える。
+`表情ターゲットを適用しない: {名前}（基準姿勢で既に最大のため）`。
+全束ねが落ちたら式なし（`(None, warnings)`）。`expression_count` と要約の件数は
+残った束ね数に一致させる。`ResolvedPlan.channels` の索引（ターゲット索引）は
+従来どおり維持する（落とした束ねのチャンネルが残ってもよい）。
+
+非対応範囲は次のとおり。位置だけの再現であり、シェーディング完全一致は保証しない。
+
+- 法線/接線デルタ。
+- 複数フレームの評価。
+- custom式・override・ARKit・FX既定状態・SoulFlameのプリセット補正（`baselineWeights`）。
+
+Unity正解との比較方針は次のとおり。SoulFlame出力のスパースアクセサを展開し、
+座標回転を揃えて突き合わせると一致する（既存の表情差分と同じ手法）。
+Milfy実測では顔メッシュへ2件（索引448・498）が焼き込まれる。
+
 ## 中間表現
 
 - `VrmMesh.targets: Vec<VrmMorphTarget>` は名前と出力頂点ごとの位置差分を持つ。
@@ -336,7 +414,10 @@ Unity空間へ戻してから適用する。鏡像は群同型のため、往復
   descriptor名は残るが、束ねないdescriptor名をすべて残すことはしない。
 - 視線との連動（`overrideLookAt`）やまぶたの視線追従は扱わない。
   上書き指定は `none` のまま置く。
-- 法線モーフ（NORMAL）は出力しない。
+- 法線モーフ（NORMAL）は出力しない。ベースライン焼き込みも位置だけであり、
+  法線/接線デルタ・複数フレーム・custom式・override・ARKit・
+  SoulFlameのプリセット補正（`baselineWeights`）は扱わない。
+  詳細は「ベースライン焼き込み」に譲る。
 - スプリングボーン・揺れ物・アニメーションは扱わない。参照解決は [`VRMスプリング`](VRMスプリング.md) の担当であり、コンパイルと書き出しは将来の作業単位である。
 
 ## 外した選択肢

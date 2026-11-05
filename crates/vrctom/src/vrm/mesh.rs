@@ -29,6 +29,8 @@ pub(crate) struct MeshOutcome {
     pub degenerate_normals: usize,
     /// 鏡像で巻き方向を反転したかどうか。
     pub mirrored: bool,
+    /// 基準姿勢として焼き込んだ非ゼロチャンネル数。
+    pub baseline_shapes: usize,
 }
 
 /// 頂点統合の鍵。同じ組のcornerは1頂点にまとめる。
@@ -56,6 +58,8 @@ pub(crate) struct SelectedMorph<'a> {
 pub(crate) struct SelectedMorphChannel<'a> {
     /// チャンネル名。ターゲット名になる。
     pub name: &'a str,
+    /// チャンネルのObjectId。基準姿勢の倍率引きに使う。
+    pub id: ObjectId,
     /// 形状デルタ。
     pub data: &'a crate::fbx::ShapeData,
 }
@@ -67,6 +71,8 @@ pub(crate) struct SelectedMorphChannel<'a> {
 /// `node` は所有モデルのノード索引である。
 /// `morph` は対象メッシュの選択済みチャンネルであり、ある場合は位置の差分を
 /// 出力頂点へ配ってターゲットを作る。対象外のメッシュには `None` を渡す。
+/// `baseline` はそのメッシュ分の基準姿勢の重みであり、空の場合は焼き込まない。
+/// 重みはUnityの0..=100であり、呼び出し側が解決した適用値そのものを受け取る。
 // 入力の構成要素が多く、構造体へまとめると呼び出し側で同じ値を組み直すだけになる。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn convert_mesh(
@@ -78,6 +84,7 @@ pub(crate) fn convert_mesh(
     bind: &[f64; 16],
     skin: Option<(usize, &SkinData)>,
     morph: Option<SelectedMorph<'_>>,
+    baseline: &[super::BaselineChannel],
 ) -> Result<MeshOutcome, VrmError> {
     if matrix::det3(bind) == 0.0 {
         return Err(VrmError::new(
@@ -94,10 +101,11 @@ pub(crate) fn convert_mesh(
 
     let mut key_to_vertex: HashMap<VertexKey, u32> = HashMap::new();
     let mut positions: Vec<[f32; 3]> = Vec::new();
-    // モーフ対象のメッシュだけ、出力頂点ごとの制御点番号を残す。
-    // 差分は制御点単位で書かれるため、UVや法線の継ぎ目で複製された頂点へ
-    // 配る写像として使う。対象外では確保しない。
-    let mut control_points: Option<Vec<u32>> = morph.as_ref().map(|_| Vec::new());
+    // モーフ対象または基準姿勢の焼き込み対象のメッシュだけ、
+    // 出力頂点ごとの制御点番号を残す。差分は制御点単位で書かれるため、
+    // UVや法線の継ぎ目で複製された頂点へ配る写像として使う。対象外では確保しない。
+    let keep_control_points = morph.is_some() || !baseline.is_empty();
+    let mut control_points: Option<Vec<u32>> = keep_control_points.then(Vec::new);
     let mut normals: Option<Vec<[f32; 3]>> = data.normals.as_ref().map(|_| Vec::new());
     let mut uv_sets: Vec<Vec<[f32; 2]>> = data.uv_sets.iter().map(|_| Vec::new()).collect();
     let mut joints_out: Option<Vec<[u16; 4]>> = influences.as_ref().map(|_| Vec::new());
@@ -198,10 +206,29 @@ pub(crate) fn convert_mesh(
         })
         .collect::<Vec<_>>();
     let triangles = primitives.iter().map(|p| p.indices.len() / 3).sum();
-    let targets = match (morph, control_points) {
-        (Some(selected), Some(control_points)) => {
-            build_morph_targets(mesh.id, &positions, &control_points, bind, &selected)?
-        }
+    // 基準姿勢は位置を組み終えた後に焼き込む。ベースには非ゼロ重みの全チャンネル分を
+    // 累積し、各ターゲットからは自身の分だけを引くための倍率表を作る。
+    // 位置の焼き込みはf64で累積し、最後にf32へ寄せて非有限を検査する。
+    let (baseline_scales, baseline_shapes) = match control_points.as_ref() {
+        Some(control_points) if !baseline.is_empty() => apply_baseline(
+            file,
+            mesh.id,
+            &mut positions,
+            control_points,
+            bind,
+            baseline,
+        )?,
+        _ => (HashMap::new(), 0),
+    };
+    let targets = match (morph, control_points.as_ref()) {
+        (Some(selected), Some(control_points)) => build_morph_targets(
+            mesh.id,
+            &positions,
+            control_points,
+            bind,
+            &selected,
+            &baseline_scales,
+        )?,
         _ => Vec::new(),
     };
     let material_slots = owner
@@ -241,7 +268,163 @@ pub(crate) fn convert_mesh(
         non_triangles,
         degenerate_normals,
         mirrored,
+        baseline_shapes,
     })
+}
+
+/// 重み率と初期値の判定許容誤差。
+/// 中間モデル側の `FULL_WEIGHT_TOLERANCE` と同じ値であり、実データの丸めを吸収する。
+const FULL_WEIGHT_TOLERANCE: f64 = 1e-6;
+
+/// 制御点ごとの位置差分を線形変換して写像にまとめる。
+/// ベース焼き込みとターゲット生成で共用し、二重実装にしない。
+///
+/// 差分の変換は線形部分だけを使い、平行移動は掛けない。
+/// 入力・結果の非有限は破損として失敗する。
+fn transformed_deltas(
+    mesh_id: ObjectId,
+    bind: &[f64; 16],
+    data: &crate::fbx::ShapeData,
+) -> Result<HashMap<u32, [f64; 3]>, VrmError> {
+    let mut deltas: HashMap<u32, [f64; 3]> =
+        HashMap::with_capacity(data.control_point_indices.len());
+    for (control_point, delta) in data
+        .control_point_indices
+        .iter()
+        .zip(data.position_deltas.iter())
+    {
+        let moved = matrix::transform_vector(bind, *delta).ok_or_else(|| {
+            VrmError::new(VrmErrorKind::InvalidStructure, "差分の変換に失敗した")
+                .with_object(mesh_id)
+        })?;
+        // `transform_vector` は非有限の入出力を `None` にするため、
+        // ここに来る値は有限である。念のため不変条件として確かめる。
+        if !moved.iter().all(|v| v.is_finite()) {
+            return Err(
+                VrmError::new(VrmErrorKind::InvalidStructure, "有限でない差分がある")
+                    .with_object(mesh_id),
+            );
+        }
+        deltas.insert(*control_point, moved);
+    }
+    Ok(deltas)
+}
+
+/// 単一フレーム条件と重み率をkeptチャンネルと同じ規則で確かめる。
+/// 基準姿勢の適用値の検証に使い、違反は `UnsupportedBlendShape` で返す。
+/// 初期値（`DeformPercent`）は見ない。ベース焼き込みでは初期値を使わないためである。
+fn check_baseline_single_frame(
+    channel: &crate::fbx::BlendShapeChannel,
+    file: &FbxFile<'_>,
+) -> Result<(), VrmError> {
+    if channel.shapes.len() != 1 {
+        return Err(VrmError::new(
+            VrmErrorKind::UnsupportedBlendShape,
+            format!(
+                "単一フレームでないチャンネルがある: {}（形状数{}）",
+                channel.name,
+                channel.shapes.len()
+            ),
+        )
+        .with_object(channel.id));
+    }
+    if channel.has_full_weights {
+        let weights = file.blend_channel_weights(channel.id).map_err(|error| {
+            VrmError::new(VrmErrorKind::InvalidStructure, error.to_string()).with_object(channel.id)
+        })?;
+        let all_full = weights
+            .iter()
+            .all(|value| value.is_finite() && (*value - 100.0).abs() <= FULL_WEIGHT_TOLERANCE);
+        if !all_full {
+            return Err(VrmError::new(
+                VrmErrorKind::UnsupportedBlendShape,
+                format!("重み率が全100でないチャンネルがある: {}", channel.name),
+            )
+            .with_object(channel.id));
+        }
+    }
+    Ok(())
+}
+
+/// 基準姿勢の重みを検証する。非有限・負値・100超は構造破損として失敗する。
+fn check_baseline_weight(weight: f64, channel_id: ObjectId) -> Result<(), VrmError> {
+    if !weight.is_finite() || !(0.0..=100.0).contains(&weight) {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidStructure,
+            "基準姿勢の重みが範囲外である",
+        )
+        .with_object(channel_id));
+    }
+    Ok(())
+}
+
+/// ベース形状へ基準姿勢を焼き込み、ターゲット用の倍率表を返す。
+///
+/// ベースには非ゼロ重みの全チャンネル分を `(重み/100) * 差分` で累積する。
+/// 戻り値の写像はチャンネルIDから `1 - 重み/100` であり、
+/// `build_morph_targets` が該当ターゲットの各成分へ掛ける。
+/// 重み0の項目は検証も展開もせず、件数にも数えない。
+/// 非ゼロ重みのチャンネルだけ `shape_data` を読み、全チャンネルを展開しない。
+/// 焼き込み後の位置はf32へ寄せ、非有限は破損として失敗する。
+fn apply_baseline(
+    file: &FbxFile<'_>,
+    mesh_id: ObjectId,
+    positions: &mut [[f32; 3]],
+    control_points: &[u32],
+    bind: &[f64; 16],
+    baseline: &[super::BaselineChannel],
+) -> Result<(HashMap<ObjectId, f64>, usize), VrmError> {
+    let mut scales: HashMap<ObjectId, f64> = HashMap::new();
+    // f64で累積し、丸めは最後に1度だけ行う。
+    let mut accumulated = vec![[0.0; 3]; positions.len()];
+    let mut applied = 0usize;
+    // 決定的な診断のため、入力順を保って処理する。
+    for entry in baseline {
+        if entry.weight == 0.0 {
+            continue;
+        }
+        check_baseline_weight(entry.weight, entry.channel)?;
+        let channels = file.blend_shape_channels(mesh_id);
+        let Some(channel) = channels.iter().find(|channel| channel.id == entry.channel) else {
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidStructure,
+                "基準姿勢のチャンネルがメッシュに無い",
+            )
+            .with_object(entry.channel));
+        };
+        check_baseline_single_frame(channel, file)?;
+        let data = file.shape_data(channel.shapes[0].shape).map_err(|error| {
+            VrmError::new(VrmErrorKind::InvalidStructure, error.to_string())
+                .with_object(channel.shapes[0].shape)
+        })?;
+        let deltas = transformed_deltas(mesh_id, bind, &data)?;
+        let factor = entry.weight / 100.0;
+        for (vertex, control_point) in control_points.iter().enumerate() {
+            if let Some(delta) = deltas.get(control_point) {
+                accumulated[vertex][0] += factor * delta[0];
+                accumulated[vertex][1] += factor * delta[1];
+                accumulated[vertex][2] += factor * delta[2];
+            }
+        }
+        scales.insert(entry.channel, 1.0 - factor);
+        applied += 1;
+    }
+    for (vertex, position) in positions.iter_mut().enumerate() {
+        let baked = [
+            f64::from(position[0]) + accumulated[vertex][0],
+            f64::from(position[1]) + accumulated[vertex][1],
+            f64::from(position[2]) + accumulated[vertex][2],
+        ];
+        let baked32 = [baked[0] as f32, baked[1] as f32, baked[2] as f32];
+        if !baked32.iter().all(|v| v.is_finite()) {
+            return Err(
+                VrmError::new(VrmErrorKind::InvalidStructure, "有限でない位置がある")
+                    .with_object(mesh_id),
+            );
+        }
+        *position = baked32;
+    }
+    Ok((scales, applied))
 }
 
 /// 選択済みチャンネルからモーフターゲット列を作る。
@@ -255,6 +438,7 @@ fn build_morph_targets(
     control_points: &[u32],
     bind: &[f64; 16],
     selected: &SelectedMorph<'_>,
+    baseline_scales: &HashMap<ObjectId, f64>,
 ) -> Result<Vec<VrmMorphTarget>, VrmError> {
     if selected.channels.len() > selected.max_morph_targets {
         return Err(VrmError::new(
@@ -278,20 +462,16 @@ fn build_morph_targets(
     }
     let mut targets = Vec::with_capacity(selected.channels.len());
     for channel in selected.channels {
-        // 差分は出力前にf32へ寄せ、非有限は破損として失敗する。
+        // 差分の変換は [`transformed_deltas`] と共用する。掛け算はf64で行い、
+        // 出力前にf32へ寄せ、非有限は破損として失敗する。
+        let source = transformed_deltas(mesh_id, bind, channel.data)?;
+        // 基準姿勢で焼き込んだ分だけターゲットを縮める。該当しない場合は1.0である。
+        let scale = baseline_scales.get(&channel.id).copied().unwrap_or(1.0);
         let mut deltas: HashMap<u32, [f32; 3]> =
             HashMap::with_capacity(channel.data.control_point_indices.len());
-        for (control_point, delta) in channel
-            .data
-            .control_point_indices
-            .iter()
-            .zip(channel.data.position_deltas.iter())
-        {
-            let moved = matrix::transform_vector(bind, *delta).ok_or_else(|| {
-                VrmError::new(VrmErrorKind::InvalidStructure, "差分の変換に失敗した")
-                    .with_object(mesh_id)
-            })?;
-            let moved32 = [moved[0] as f32, moved[1] as f32, moved[2] as f32];
+        for (control_point, moved) in &source {
+            let scaled = [moved[0] * scale, moved[1] * scale, moved[2] * scale];
+            let moved32 = [scaled[0] as f32, scaled[1] as f32, scaled[2] as f32];
             if !moved32.iter().all(|v| v.is_finite()) {
                 return Err(
                     VrmError::new(VrmErrorKind::InvalidStructure, "有限でない差分がある")

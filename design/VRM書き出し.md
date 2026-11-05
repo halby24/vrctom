@@ -211,6 +211,27 @@ UVはFBXとUnityの左下原点からglTFの左上原点へ合わせるため、
 - 要約の `書き出しが完了した` には `表情{n}件` を含める。
 - 対応の作り方・分岐・失敗条件は [`VRM表情`](VRM表情.md) の「descriptorからの既定生成」に譲る。
 
+## CLI入力（`--prefab` による基準姿勢の焼き込み）
+
+`vrctom export --prefab <prefab>` を指定した場合は、既定でPrefabの
+`SkinnedMeshRenderer.m_BlendShapeWeights` をベース形状へ焼き込む（Unityを回さない）。
+`--no-baseline` を付けると止める（`--prefab` が必須であり、`requires` で受け付け時に検査する）。
+
+- `--no-expressions` を付けても焼く。見た目の再現であり表情とは独立のためである。
+- `--expressions vrc`・`--expressions descriptor` のどちらでも焼く。
+- `--prefab` が無い場合は焼かない。重みの出所が無いためである。
+- Prefabと `.fbx.meta`（GUID・humanoid対応表）の読み込みは、descriptorまたは
+  基準姿勢のどちらかが必要な場合に一度だけ行い、後段のhumanoid検出と共有して二重に読まない。
+  GUIDが全ゼロまたはメタが無い場合は用途の分かる文面で失敗する
+  （例 `Prefab基準姿勢にはFBXのGUIDが必要である`）。
+  `--prefab` は材質割当で既にメタを要求しているため退行ではないが、
+  `--prefab --no-expressions` でも基準姿勢のためにメタが必要になり、診断順が早まる。
+- 変換後に焼き込んだ件数が正の場合は、
+  `ベースライン: Prefabの基準姿勢から{shapes}件を焼き込んだ（{meshes}メッシュ）` を
+  標準エラーに出す（`emit_model_warnings` の後、成功要約より前）。
+- 要約の `書き出しが完了した` の形式は変えない。
+- 式・重み・出所・失敗条件は [`VRM表情`](VRM表情.md) の「ベースライン焼き込み」に譲る。
+
 ## CLI入力（`--prefab` による物理導出）
 
 `vrctom export --prefab <prefab>` を `--physics` 無しで指定した場合は、

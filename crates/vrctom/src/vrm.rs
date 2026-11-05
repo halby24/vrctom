@@ -28,6 +28,7 @@ mod mesh;
 pub mod physics;
 pub mod physics_prefab;
 pub mod prefab;
+mod prefab_baseline;
 pub(crate) mod psd;
 pub mod renderers;
 
@@ -64,6 +65,7 @@ pub use prefab::{
     apply_prefab_plan, plan_prefab_assignment, prefab_base_materials, prefab_hierarchy_paths,
     resolve_prefab_pool_paths,
 };
+pub use prefab_baseline::prefab_baseline_weights;
 #[cfg(not(target_arch = "wasm32"))]
 pub use renderers::load_renderer_materials;
 #[cfg(not(target_arch = "wasm32"))]
@@ -257,6 +259,25 @@ pub struct VrmPrimitive {
     pub indices: Vec<u32>,
 }
 
+/// 基準姿勢としてベース形状へ焼き込むチャンネル重み。
+/// キーはジオメトリのObjectId、値はチャンネルObjectIdとUnity重み（0..=100）である。
+/// Prefabの `SkinnedMeshRenderer.m_BlendShapeWeights` から解決した適用値そのものを持ち、
+/// 呼び出し側のヒントではない。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BaselineWeights {
+    /// ジオメトリごとの非ゼロ重み列。
+    pub meshes: std::collections::HashMap<ObjectId, Vec<BaselineChannel>>,
+}
+
+/// 基準姿勢としてベース形状へ焼き込む1チャンネル分の重み。
+#[derive(Debug, Clone, PartialEq)]
+pub struct BaselineChannel {
+    /// 焼き込むブレンドシェイプチャンネルのObjectId。
+    pub channel: ObjectId,
+    /// Unity重み（0..=100）。VRMの0..1ではない。
+    pub weight: f64,
+}
+
 /// 中間モデル生成の件数と警告の報告。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VrmReport {
@@ -294,6 +315,10 @@ pub struct VrmReport {
     pub bind_cluster_models: usize,
     /// いずれも無くrestのワールド行列で補ったモデル数。
     pub bind_rest_models: usize,
+    /// 焼き込んだメッシュ数。基準姿勢の適用値を持ったジオメトリの数である。
+    pub baseline_meshes: usize,
+    /// 焼き込んだ非ゼロチャンネル数。全メッシュの適用値の合計である。
+    pub baseline_shapes: usize,
     /// 表情の欠落など、中間モデル生成時の警告文。失敗とは区別する。
     pub warnings: Vec<String>,
 }
@@ -311,6 +336,7 @@ pub struct VrmOptions {
     max_morph_bytes: usize,
     expressions: Option<VrmExpressionProfile>,
     expression_mesh: Option<ObjectId>,
+    baseline_weights: Option<BaselineWeights>,
 }
 
 /// モーフターゲットとプリセット式の選択指定。
@@ -376,6 +402,7 @@ impl VrmOptions {
             max_morph_bytes: DEFAULT_MAX_MORPH_BYTES,
             expressions: None,
             expression_mesh: None,
+            baseline_weights: None,
         }
     }
 
@@ -422,6 +449,16 @@ impl VrmOptions {
     /// 解決の選択を行わず、このメッシュで束ねを絞る。
     pub fn with_expression_mesh(mut self, mesh: ObjectId) -> Self {
         self.expression_mesh = Some(mesh);
+        self
+    }
+
+    /// 基準姿勢としてベース形状へ焼き込む重みを付ける。
+    ///
+    /// 引数はヒントではなく適用値そのものであり、呼び出し側は
+    /// [`prefab_baseline_weights`] で解決した値をそのまま渡す。
+    /// 付けない場合は従来どおり焼き込みを行わない。
+    pub fn with_baseline_weights(mut self, weights: BaselineWeights) -> Self {
+        self.baseline_weights = Some(weights);
         self
     }
 }
@@ -618,6 +655,8 @@ struct ResolvedPlan {
 struct ResolvedChannel {
     /// チャンネル名。ターゲット名になる。
     name: String,
+    /// チャンネルのObjectId。基準姿勢の倍率引きに使う。
+    id: ObjectId,
     /// 形状デルタ。
     data: crate::fbx::ShapeData,
 }
@@ -1113,7 +1152,7 @@ fn resolve_with_geometry(
         .with_object(geometry));
     }
     let mut resolved = Vec::with_capacity(kept.len());
-    for channel in kept {
+    for channel in &kept {
         let name = channel.name.as_str();
         if channel.shapes.len() != 1 {
             return Err(VrmError::new(
@@ -1155,14 +1194,55 @@ fn resolve_with_geometry(
             .map_err(wrap_fbx_error)?;
         resolved.push(ResolvedChannel {
             name: name.to_owned(),
+            id: channel.id,
             data,
         });
+    }
+    // 基準姿勢で既に最大のチャンネルを参照する束ねは、その式だけ落として警告する。
+    // ベースへ焼き込んだ分はVRMランタイムが戻せないため、束ねを残すと二重に掛かる。
+    // チャンネル列の索引は従来どおり維持し、落とした束ねのチャンネルが残ってもよい。
+    let baseline_map: HashMap<ObjectId, f64> = options
+        .baseline_weights
+        .as_ref()
+        .and_then(|weights| weights.meshes.get(&geometry))
+        .map(|channels| {
+            channels
+                .iter()
+                .map(|entry| (entry.channel, entry.weight))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut filtered: Vec<VrmExpressionBinding> = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        // 束ねの解決先はkept列の最初の同名チャンネルであり、
+        // `build_expressions` の名前解決と同じ向きである。
+        // 束ね名の重複は上で失敗済みのため、ここでは最初の一致を見る。
+        let target_id = kept
+            .iter()
+            .find(|channel| channel.name == binding.target)
+            .map(|channel| channel.id);
+        let is_full = target_id.is_some_and(|id| {
+            baseline_map
+                .get(&id)
+                .is_some_and(|weight| (*weight - 100.0).abs() <= FULL_WEIGHT_TOLERANCE)
+        });
+        if is_full {
+            warnings.push(format!(
+                "表情ターゲットを適用しない: {}（基準姿勢で既に最大のため）",
+                binding.target
+            ));
+            continue;
+        }
+        filtered.push(binding);
+    }
+    if filtered.is_empty() {
+        return Ok((None, warnings));
     }
     Ok((
         Some(ResolvedPlan {
             geometry,
             channels: resolved,
-            bindings,
+            bindings: filtered,
         }),
         warnings,
     ))
@@ -1803,6 +1883,8 @@ fn build_meshes(
     let mut degenerate_normals = 0usize;
     let mut mirrored_meshes = 0usize;
     let mut morph_target_count = 0usize;
+    let mut baseline_meshes = 0usize;
+    let mut baseline_shapes = 0usize;
     // 選択順のチャンネル借用は対象メッシュの変換時だけ使う。
     // 所有権は解決結果が持ち、ここでは参照だけを束ねる。
     let plan_channels: Vec<mesh::SelectedMorphChannel> = plan
@@ -1811,6 +1893,7 @@ fn build_meshes(
                 .iter()
                 .map(|channel| mesh::SelectedMorphChannel {
                     name: &channel.name,
+                    id: channel.id,
                     data: &channel.data,
                 })
                 .collect()
@@ -1906,6 +1989,15 @@ fn build_meshes(
             }),
             _ => None,
         };
+        // 基準姿勢は出力対象のうちPrefabが参照する全メッシュへ適用する。
+        // 表情の採用メッシュだけではなく、`--no-expressions` でも焼く。
+        // `--prefab` 無しでは重みの出所が無いため、`None` のまま焼かない。
+        let baseline: &[BaselineChannel] = options
+            .baseline_weights
+            .as_ref()
+            .and_then(|weights| weights.meshes.get(&mesh.id))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let outcome = mesh::convert_mesh(
             file,
             mesh,
@@ -1915,6 +2007,7 @@ fn build_meshes(
             &combined,
             skin_ref,
             selected,
+            baseline,
         )?;
         vertex_count += outcome.mesh.vertices.positions.len();
         if vertex_count > options.max_vertices {
@@ -1939,6 +2032,10 @@ fn build_meshes(
         if outcome.mirrored {
             mirrored_meshes += 1;
         }
+        if outcome.baseline_shapes > 0 {
+            baseline_meshes += 1;
+            baseline_shapes += outcome.baseline_shapes;
+        }
         meshes.push(outcome.mesh);
     }
     let expression_mesh = match plan {
@@ -1962,6 +2059,8 @@ fn build_meshes(
         morph_target_count,
         degenerate_normals,
         expression_count: plan.map(|plan| plan.bindings.len()).unwrap_or(0),
+        baseline_meshes,
+        baseline_shapes,
         bind_pose_models: 0,
         bind_cluster_models: 0,
         bind_rest_models: 0,
