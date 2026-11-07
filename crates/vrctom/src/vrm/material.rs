@@ -894,8 +894,6 @@ impl<'a> LoadContext<'a> {
     /// `slot` は材質プールの共有名であり、重複時は最初の読み取りを残す。
     /// `mat_path` はsidecarの `.mat` 資産パスであり、索引と食い違う場合は
     /// 警告して索引側を使う。
-    // レンダラ経路はnative限定のため、対象外ターゲットでは未使用になる。
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) fn load_renderer_material(
         &mut self,
         guid_text: &str,

@@ -42,10 +42,38 @@ impl WebPackage {
             .map_err(to_js_error)
     }
 
+    /// 全Prefabの解決状態のJSON文字列を返す。
+    ///
+    /// `core` の一覧結果をそのまま返し、解釈は呼び出し側に任せる。
+    /// 失敗は既存の `to_js_error` でJSの `Error` へ写す。
+    #[wasm_bindgen(js_name = prefabTargets)]
+    pub fn prefab_targets(&self) -> Result<String, JsValue> {
+        self.package.prefab_targets_json().map_err(to_js_error)
+    }
+
     /// 選んだFBXを変換し、VRMバイト列とレポートJSONを持つ [`Converted`] を返す。
     pub fn convert(&self, fbx_path: &str, options_json: &str) -> Result<Converted, JsValue> {
         self.package
             .convert(fbx_path, options_json)
+            .map(|converted| Converted {
+                vrm: converted.vrm,
+                report: converted.report_json,
+            })
+            .map_err(to_js_error)
+    }
+
+    /// 選んだPrefabを変換し、VRMバイト列とレポートJSONを持つ [`Converted`] を返す。
+    ///
+    /// `options_json` は `{"name","authors","expressions","baseline","physics"}` のJSONである。
+    /// 失敗は既存の `to_js_error` でJSの `Error` へ写す。
+    #[wasm_bindgen(js_name = convertPrefab)]
+    pub fn convert_prefab(
+        &self,
+        prefab_path: &str,
+        options_json: &str,
+    ) -> Result<Converted, JsValue> {
+        self.package
+            .convert_prefab(prefab_path, options_json)
             .map(|converted| Converted {
                 vrm: converted.vrm,
                 report: converted.report_json,

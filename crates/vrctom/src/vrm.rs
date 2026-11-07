@@ -30,6 +30,7 @@ mod physics_apply;
 pub mod physics_prefab;
 pub mod prefab;
 mod prefab_baseline;
+pub mod prefab_target;
 pub(crate) mod psd;
 pub mod renderers;
 
@@ -74,6 +75,10 @@ pub use prefab::{
     resolve_prefab_pool_paths,
 };
 pub use prefab_baseline::prefab_baseline_weights;
+pub use prefab_target::{
+    PrefabTargetFbx, PrefabTargetIssue, PrefabTargetLimits, PrefabTargetList,
+    PrefabTargetResolution, PrefabTargetState, list_prefab_targets, resolve_prefab_target,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use renderers::load_renderer_materials;
 #[cfg(not(target_arch = "wasm32"))]
@@ -81,7 +86,7 @@ pub use renderers::load_renderer_materials_with_index;
 pub use renderers::{
     RendererApplyReport, RendererEntry, RendererLimits, RendererMesh, RendererMeshAssignment,
     RendererMeshView, RendererPlan, RendererPoolEntry, RendererSidecar, apply_renderer_plan,
-    plan_renderer_assignment,
+    load_renderer_materials_from, plan_renderer_assignment,
 };
 use std::collections::{HashMap, HashSet};
 

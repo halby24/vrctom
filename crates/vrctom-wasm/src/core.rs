@@ -5,14 +5,20 @@
 //! テストできる。JS境界の薄い写しは [`crate::WebPackage`] を参照。
 
 use serde::{Deserialize, Serialize};
+use vrctom::conversion::prefab::{
+    PrefabConversionError, PrefabConversionLimits, PrefabConversionOptions, PrefabExpressions,
+    PrefabPhysics,
+};
 use vrctom::conversion::{ConversionError, build_model_from_fbx, export_model};
 use vrctom::fbx::{FbxFile, FbxOptions};
 use vrctom::unity::{AssetIndex, HumanBoneMapping, IndexOptions, ParseOptions};
 use vrctom::unitypackage::{EntryKind, MemoryPackage, UnpackOptions, unpack_in_memory};
 use vrctom::vrm::{
     HumanoidBones, MaterialOptions, PhysicsDeriveLimits, PhysicsLimits, PhysicsSidecar,
-    PrefabDeriveSource, SpringCompileOptions, VrmExportOptions, VrmExpressionProfile, VrmMeta,
-    VrmOptions, apply_physics_sidecar, derive_physics_sidecar_with, find_prefab_candidates,
+    PrefabDeriveSource, PrefabMode, PrefabTargetLimits, PrefabTargetState, SpringCompileOptions,
+    VrmExportOptions, VrmExpressionProfile, VrmMeta, VrmOptions, apply_physics_sidecar,
+    derive_physics_sidecar_with, find_prefab_candidates, list_prefab_targets,
+    resolve_prefab_target,
 };
 
 /// Web向けの資源上限。
@@ -171,6 +177,10 @@ pub enum Stage {
     Export,
     /// 物理（Prefab由来のspringBone）の導出・適用。
     Physics,
+    /// Prefab入口の対象解決・本文読み取り。
+    Prefab,
+    /// Prefab由来の材質割当の解決・適用。
+    Assignment,
 }
 
 impl Stage {
@@ -184,6 +194,8 @@ impl Stage {
             Self::Material => "material",
             Self::Export => "export",
             Self::Physics => "physics",
+            Self::Prefab => "prefab",
+            Self::Assignment => "assignment",
         }
     }
 }
@@ -281,6 +293,169 @@ pub struct PrefabCandidatesReport {
     pub candidates: Vec<String>,
     /// 走査中に解析できなかったPrefabの記録列（パス昇順）。
     pub unreadable: Vec<PrefabScanIssue>,
+}
+
+/// Prefab入口の一覧で使う解決状態の報告。
+///
+/// JS向けの文字列であり、`resolved`・`noModel`・`unsupportedMultipleFbx`・
+/// `requiresPrefabResolution`・`unresolved` のいずれかである。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PrefabTargetStateReport {
+    /// 直接FBXがちょうど1種あり、変換対象にできる場合。
+    Resolved,
+    /// 直接FBXもネストPrefabも無い場合。
+    NoModel,
+    /// 直接FBXが2種以上あり、先勝ちにできない場合。
+    UnsupportedMultipleFbx,
+    /// 直接FBXが無く、ネストPrefabの解決が必要な場合。
+    RequiresPrefabResolution,
+    /// 直接FBXが無く、参照先が索引に無いなど未解決の参照がある場合。
+    Unresolved,
+}
+
+/// Prefab入口の一覧で使う変換対象FBX1件の報告。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrefabTargetFbxReport {
+    /// 資産パス（`Assets/...`）。
+    pub path: String,
+    /// 資産GUID（小文字hex）。
+    pub guid: String,
+}
+
+/// Prefab1件の解決結果の報告。JS向けに `camelCase` で送る。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrefabTargetCandidateReport {
+    /// 解決したPrefabの資産パス（`Assets/...`）。
+    pub prefab: String,
+    /// 解決結果の状態。
+    pub state: PrefabTargetStateReport,
+    /// 変換対象のFBX。`resolved` の場合だけ `Some` である。
+    pub fbx: Option<PrefabTargetFbxReport>,
+    /// ネストPrefabの資産パス列（`Assets/...`、昇順・重複なし）。
+    pub nested_prefabs: Vec<String>,
+    /// 非FBXモデルや種別不明の解決済み参照の資産パス列（表示用、昇順・重複なし）。
+    pub other_references: Vec<String>,
+    /// GUID欠落・索引不在・不正GUIDの参照の記録列（表示用、昇順・重複なし）。
+    pub unresolved_references: Vec<String>,
+}
+
+/// Prefab入口の一覧で読めなかった1件の報告。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrefabTargetIssueReport {
+    /// 出力パス（`Assets/...`）。
+    pub path: String,
+    /// 読めなかった理由の日本語診断。
+    pub reason: String,
+}
+
+/// 全Prefabの走査結果の報告。JS向けに `camelCase` で送る。
+///
+/// `candidates` は解決できたPrefabの列（パス昇順）であり、
+/// `unreadable` は読めなかったPrefabの記録列（パス昇順）である。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrefabTargetsReport {
+    /// 解決できたPrefabの列（パス昇順）。
+    pub candidates: Vec<PrefabTargetCandidateReport>,
+    /// 読めなかったPrefabの記録列（パス昇順）。
+    pub unreadable: Vec<PrefabTargetIssueReport>,
+}
+
+/// Prefab変換の材質割当の報告。JS向けに `camelCase` で送る。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrefabAssignmentReport {
+    /// 解決に使った記述方式。`instance`・`direct` のいずれかであり、無い場合は `null` である。
+    mode: Option<String>,
+    /// 有効レンダラ数。
+    active_meshes: usize,
+    /// 除外したメッシュ数。
+    excluded_meshes: usize,
+    /// 除外したメッシュのModel名（中間モデル順）。
+    excluded_names: Vec<String>,
+    /// 材質プールの件数。
+    material_pool: usize,
+}
+
+/// Prefab変換の基準姿勢の報告。JS向けに `camelCase` で送る。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrefabBaselineReport {
+    /// 焼き込んだメッシュ数。
+    meshes: usize,
+    /// 焼き込んだ非ゼロチャンネル数。
+    shapes: usize,
+}
+
+/// Prefab変換の物理の報告。JS向けに `camelCase` で送る。
+///
+/// 選択理由（`selection`）は `target` であり、既存FBX APIの
+/// `auto`・`explicit`・`none`・`undetected` とは別である。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrefabPhysicsReport {
+    /// 使ったPrefabパス（`Assets/...`）。物理なしの場合は `null` である。
+    prefab: Option<String>,
+    /// 選択理由。Prefab入口では `target` である。
+    selection: String,
+    /// 出力したspring数。
+    springs: usize,
+    /// 出力したjoint総数。
+    joints: usize,
+    /// 出力したcollider数。
+    colliders: usize,
+    /// 出力したcolliderグループ数。
+    groups: usize,
+    /// T-poseで上書きした骨数。
+    tpose_applied: usize,
+    /// T-poseで飛ばした骨数。
+    tpose_skipped: usize,
+    /// 視線の種別（`bone`・`expression`）。無い場合は `null` である。
+    look_at: Option<String>,
+}
+
+/// Prefab入口の変換結果の報告。JS向けに `camelCase` で送る。
+///
+/// 件数は [`vrctom::conversion::prefab::PrefabConversionReport`] の値を使い、
+/// 生成直後の `VrmReport` は流用しない。警告は変換報告の警告そのままである。
+/// `nested_prefabs` は空でも必ず出す。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrefabReport {
+    /// 解決したPrefabの資産パス（`Assets/...`）。
+    prefab: String,
+    /// 変換対象のFBXの資産パス（`Assets/...`）。
+    fbx: String,
+    /// 変換対象のFBXのGUID（小文字hex）。
+    fbx_guid: String,
+    /// ネストPrefabの資産パス列（昇順・重複なし）。空でも必ず出す。
+    nested_prefabs: Vec<String>,
+    /// VRMバイト列の大きさ。
+    bytes: u64,
+    /// ノード数（物理・割当の適用後）。
+    nodes: usize,
+    /// メッシュ数（割当の適用後）。
+    meshes: usize,
+    /// スキン数。
+    skins: usize,
+    /// 材質数。
+    materials: usize,
+    /// 画像数。
+    images: usize,
+    /// 表情数。
+    expressions: usize,
+    /// 診断の警告文。失敗とは区別する。
+    warnings: Vec<String>,
+    /// 材質割当の報告。
+    assignment: PrefabAssignmentReport,
+    /// 基準姿勢の報告。
+    baseline: PrefabBaselineReport,
+    /// 物理の報告。
+    physics: PrefabPhysicsReport,
 }
 
 /// 変換結果。VRMバイト列とレポートJSONを持つ。
@@ -433,6 +608,251 @@ impl Package {
             )
             .with_path(fbx_path.to_owned())
         })
+    }
+
+    /// 全Prefabの解決状態を一覧する。
+    ///
+    /// 判定は型付き参照だけを使い、GUID文字列の部分一致検索はしない。
+    /// 解析できなかったPrefabは失敗にせず `unreadable` に記録する。
+    /// 資源上限はWeb向けの既定値を使う。
+    ///
+    /// # Errors
+    ///
+    /// 走査の合計上限超過の場合に段階付きで返す。
+    pub fn prefab_targets(&self) -> Result<PrefabTargetsReport, CoreError> {
+        self.prefab_targets_with_limits(&Limits::new())
+    }
+
+    /// 上限を指定して全Prefabの解決状態を一覧する。テストで小さな上限を使うための入口である。
+    fn prefab_targets_with_limits(
+        &self,
+        limits: &Limits,
+    ) -> Result<PrefabTargetsReport, CoreError> {
+        let found = list_prefab_targets(&self.package, &self.index, &prefab_target_limits(limits))
+            .map_err(|error| {
+                CoreError::new(
+                    Stage::Prefab,
+                    format!("Prefab一覧の走査に失敗した: {error}"),
+                )
+            })?;
+        Ok(PrefabTargetsReport {
+            candidates: found
+                .candidates
+                .into_iter()
+                .map(|resolution| PrefabTargetCandidateReport {
+                    prefab: resolution.prefab,
+                    state: PrefabTargetStateReport::from(resolution.state),
+                    fbx: resolution.fbx.map(|fbx| PrefabTargetFbxReport {
+                        path: fbx.path,
+                        guid: fbx.guid,
+                    }),
+                    nested_prefabs: resolution.nested_prefabs,
+                    other_references: resolution.other_references,
+                    unresolved_references: resolution.unresolved_references,
+                })
+                .collect(),
+            unreadable: found
+                .unreadable
+                .into_iter()
+                .map(|issue| PrefabTargetIssueReport {
+                    path: issue.path,
+                    reason: issue.reason,
+                })
+                .collect(),
+        })
+    }
+
+    /// 全Prefabの解決状態のJSON文字列を返す。
+    ///
+    /// # Errors
+    ///
+    /// 走査の合計上限超過・JSON化の失敗の場合に返す。
+    pub fn prefab_targets_json(&self) -> Result<String, CoreError> {
+        let report = self.prefab_targets()?;
+        serde_json::to_string(&report).map_err(|error| {
+            CoreError::new(
+                Stage::Export,
+                format!("Prefab一覧のJSON化に失敗した: {error}"),
+            )
+        })
+    }
+
+    /// 選んだPrefabを変換する。
+    ///
+    /// `prefab_path` は `Assets/...` の出力パス、`options_json` は
+    /// `{"name","authors","expressions","baseline","physics"}` のJSONである。
+    /// 資源上限はWeb向けの既定値を使う。
+    ///
+    /// # Errors
+    ///
+    /// オプション不正・対象解決の失敗・FBX不在・材質読み取り・変換の失敗の場合に段階付きで返す。
+    pub fn convert_prefab(
+        &self,
+        prefab_path: &str,
+        options_json: &str,
+    ) -> Result<ConvertedPackage, CoreError> {
+        self.convert_prefab_with_limits(prefab_path, options_json, &Limits::new())
+    }
+
+    /// 上限を指定して選んだPrefabを変換する。テストで小さな上限を使うための入口である。
+    ///
+    /// 順序は対象解決→FBX読み取り→表情・基準姿勢の解決→中間モデル→
+    /// humanoid確定→物理の導出・適用→材質割当→VRM書き出しである。
+    /// 対象解決で `Resolved` 以外は失敗にし、黙って別対象を選ばない。
+    fn convert_prefab_with_limits(
+        &self,
+        prefab_path: &str,
+        options_json: &str,
+        limits: &Limits,
+    ) -> Result<ConvertedPackage, CoreError> {
+        let options = parse_prefab_options(options_json)?;
+        // 1. Prefabから直接FBXを解決する。`Resolved` 以外は失敗にする。
+        let resolution = resolve_prefab_target(
+            &self.package,
+            &self.index,
+            prefab_path,
+            &prefab_target_limits(limits),
+        )
+        .map_err(|error| {
+            CoreError::new(
+                Stage::Prefab,
+                format!("Prefab対象の解決に失敗した: {error}"),
+            )
+            .with_path(prefab_path.to_owned())
+        })?;
+        let fbx_path = match resolution.state {
+            PrefabTargetState::Resolved => {
+                let fbx = resolution.fbx.clone().ok_or_else(|| {
+                    CoreError::new(
+                        Stage::Prefab,
+                        format!("Prefabから直接FBXを解決できない: {prefab_path}"),
+                    )
+                    .with_path(prefab_path.to_owned())
+                })?;
+                fbx.path
+            }
+            PrefabTargetState::NoModel => {
+                return Err(prefab_unresolved_error(
+                    prefab_path,
+                    "モデル参照が無い",
+                    &resolution,
+                ));
+            }
+            PrefabTargetState::UnsupportedMultipleFbx => {
+                return Err(prefab_unresolved_error(
+                    prefab_path,
+                    "直接FBXが複数ある",
+                    &resolution,
+                ));
+            }
+            PrefabTargetState::RequiresPrefabResolution => {
+                return Err(prefab_unresolved_error(
+                    prefab_path,
+                    "ネストPrefabの解決が必要である",
+                    &resolution,
+                ));
+            }
+            PrefabTargetState::Unresolved => {
+                return Err(prefab_unresolved_error(
+                    prefab_path,
+                    "未解決の参照がある",
+                    &resolution,
+                ));
+            }
+        };
+        // 2. 解決したFBXのバイト列を読む。
+        let fbx_bytes = self.fbx_bytes(&fbx_path, limits.max_fbx_bytes)?;
+        // 3. 作品情報と出力上限を作る。
+        let meta = VrmMeta::new(options.name(&fbx_path), options.authors());
+        let export_options =
+            VrmExportOptions::new(meta).with_max_output_bytes(limits.max_output_bytes);
+        // 4. 中間モデルの選択は既定であり、上限は既定値でよい。
+        let vrm_options = VrmOptions::new();
+        // 5. Prefab変換の選択と資源上限を作る。
+        let prefab_options = PrefabConversionOptions {
+            expressions: if options.expressions_descriptor {
+                PrefabExpressions::Descriptor
+            } else {
+                PrefabExpressions::None
+            },
+            baseline: options.baseline,
+            physics: if options.physics_derive {
+                PrefabPhysics::Derive
+            } else {
+                PrefabPhysics::None
+            },
+            material_options: limits.material_options(),
+            limits: PrefabConversionLimits::new()
+                .with_max_prefab_bytes(limits.max_prefab_bytes)
+                .with_max_fbx_bytes(limits.max_fbx_bytes)
+                .with_max_extra_fbx_bytes(limits.max_fbx_bytes)
+                .with_max_total_bytes(limits.max_physics_total_bytes)
+                .with_max_output_bytes(limits.max_output_bytes),
+        };
+        // 6. 共有のPrefab変換本体を呼ぶ。
+        let (vrm, report) = vrctom::conversion::prefab::convert_prefab(
+            &self.package,
+            &self.index,
+            prefab_path,
+            &fbx_bytes,
+            &FbxOptions::default(),
+            &vrm_options,
+            export_options,
+            &prefab_options,
+        )
+        .map_err(|error| prefab_conversion_error(&error, prefab_path))?;
+        // 7. 報告をJSON用へ写す。件数は変換報告の値を使い、生成直後の報告は流用しない。
+        let rendered = PrefabReport {
+            prefab: report.prefab,
+            fbx: report.fbx,
+            fbx_guid: report.fbx_guid,
+            nested_prefabs: report.nested_prefabs,
+            bytes: report.bytes as u64,
+            nodes: report.nodes,
+            meshes: report.meshes,
+            skins: report.skins,
+            materials: report.materials,
+            images: report.images,
+            expressions: report.expressions,
+            warnings: report.warnings,
+            assignment: PrefabAssignmentReport {
+                mode: report.assignment_mode.map(|mode| match mode {
+                    PrefabMode::Instance => "instance".to_owned(),
+                    PrefabMode::Direct => "direct".to_owned(),
+                }),
+                active_meshes: report.active_meshes,
+                excluded_meshes: report.excluded_meshes,
+                excluded_names: report.excluded_names,
+                material_pool: report.material_pool,
+            },
+            baseline: PrefabBaselineReport {
+                meshes: report.baseline_meshes,
+                shapes: report.baseline_shapes,
+            },
+            physics: PrefabPhysicsReport {
+                prefab: if report.physics.used {
+                    Some(prefab_path.to_owned())
+                } else {
+                    None
+                },
+                selection: "target".to_owned(),
+                springs: report.physics.springs,
+                joints: report.physics.joints,
+                colliders: report.physics.colliders,
+                groups: report.physics.groups,
+                tpose_applied: report.physics.tpose_applied,
+                tpose_skipped: report.physics.tpose_skipped,
+                look_at: report.physics.look_at,
+            },
+        };
+        let report_json = serde_json::to_string(&rendered).map_err(|error| {
+            CoreError::new(
+                Stage::Export,
+                format!("レポートのJSON化に失敗した: {error}"),
+            )
+            .with_path(prefab_path.to_owned())
+        })?;
+        Ok(ConvertedPackage { vrm, report_json })
     }
 
     /// 選んだFBXを変換する。
@@ -829,6 +1249,74 @@ fn derive_limits(limits: &Limits) -> PhysicsDeriveLimits {
         .with_max_total_bytes(limits.max_physics_total_bytes)
 }
 
+/// `Limits` からPrefab対象解決の上限を作る.
+///
+/// Prefab本文は専用の上限を使い、走査の合計は物理の依存合計の上限を使う。
+fn prefab_target_limits(limits: &Limits) -> PrefabTargetLimits {
+    PrefabTargetLimits::new()
+        .with_max_prefab_bytes(limits.max_prefab_bytes)
+        .with_max_total_bytes(limits.max_physics_total_bytes)
+}
+
+impl From<PrefabTargetState> for PrefabTargetStateReport {
+    fn from(state: PrefabTargetState) -> Self {
+        match state {
+            PrefabTargetState::Resolved => Self::Resolved,
+            PrefabTargetState::NoModel => Self::NoModel,
+            PrefabTargetState::UnsupportedMultipleFbx => Self::UnsupportedMultipleFbx,
+            PrefabTargetState::RequiresPrefabResolution => Self::RequiresPrefabResolution,
+            PrefabTargetState::Unresolved => Self::Unresolved,
+        }
+    }
+}
+
+/// 未解決のPrefab対象を段階付きエラーにする.
+///
+/// 状態・ネストPrefab・未解決参照を含み、黙って別対象を選ばない。
+fn prefab_unresolved_error(
+    prefab_path: &str,
+    reason: &str,
+    resolution: &vrctom::vrm::PrefabTargetResolution,
+) -> CoreError {
+    let nested = if resolution.nested_prefabs.is_empty() {
+        "なし".to_owned()
+    } else {
+        resolution.nested_prefabs.join(", ")
+    };
+    let unresolved = if resolution.unresolved_references.is_empty() {
+        "なし".to_owned()
+    } else {
+        resolution.unresolved_references.join(", ")
+    };
+    CoreError::new(
+        Stage::Prefab,
+        format!(
+            "Prefabから直接FBXを解決できない: {reason} ({prefab_path}、ネスト: {nested}、未解決: {unresolved})",
+        ),
+    )
+    .with_path(prefab_path.to_owned())
+}
+
+/// Prefab変換の失敗を段階付きエラーへ写す.
+fn prefab_conversion_error(error: &PrefabConversionError, prefab_path: &str) -> CoreError {
+    let (stage, stage_ja) = match error {
+        PrefabConversionError::Target(_) => (Stage::Prefab, "対象解決"),
+        PrefabConversionError::Prefab(_) => (Stage::Prefab, "Prefabの読み取り"),
+        PrefabConversionError::Baseline(_) => (Stage::Prefab, "基準姿勢の解決"),
+        PrefabConversionError::Expressions(_) => (Stage::Prefab, "表情の解決"),
+        PrefabConversionError::Fbx(_) => (Stage::Model, "FBXの解析"),
+        PrefabConversionError::Model(_) => (Stage::Model, "中間モデルの生成"),
+        PrefabConversionError::Physics(_) | PrefabConversionError::PhysicsApply(_) => {
+            (Stage::Physics, "物理の導出・適用")
+        }
+        PrefabConversionError::Material(_) => (Stage::Material, "材質の読み取り"),
+        PrefabConversionError::Assignment(_) => (Stage::Assignment, "Prefab割当"),
+        PrefabConversionError::Export(_) => (Stage::Export, "VRMの書き出し"),
+    };
+    CoreError::new(stage, format!("Prefab変換の{stage_ja}に失敗した: {error}"))
+        .with_path(prefab_path.to_owned())
+}
+
 /// 解析不能Prefabの記録を警告文にする。候補の有無とは別に残し、黙って捨てない。
 fn unreadable_warning(unreadable: &[vrctom::vrm::PrefabScanIssue]) -> String {
     let paths: Vec<&str> = unreadable.iter().map(|issue| issue.path.as_str()).collect();
@@ -1023,6 +1511,100 @@ fn parse_options(options_json: &str) -> Result<ResolvedOptions, CoreError> {
         authors: raw.authors.unwrap_or_default(),
         expressions_vrc: raw.expressions.as_deref() == Some("vrc"),
         physics: raw.physics,
+    })
+}
+
+/// Prefab変換オプションのJSONの読み取り結果.
+///
+/// 既存 `RawOptions` の `physics` とは混ぜず、新しい形として読む。
+/// 未知のキーは拒否する。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawPrefabOptions {
+    /// 作品名。空・未指定なら解決したFBXのstemになる。
+    name: Option<String>,
+    /// 作者列。空・未指定なら `["unknown"]` になる。
+    authors: Option<Vec<String>>,
+    /// 表情指定。`descriptor`（既定）か `none` である。
+    expressions: Option<String>,
+    /// 基準姿勢の焼き込みを行うかどうか。省略時は真である。
+    baseline: Option<bool>,
+    /// 物理を導出して適用するかどうか。省略時は真である。
+    physics: Option<bool>,
+}
+
+/// 解釈済みのPrefab変換オプション。
+#[derive(Debug, Clone)]
+struct ResolvedPrefabOptions {
+    name: Option<String>,
+    authors: Vec<String>,
+    expressions_descriptor: bool,
+    baseline: bool,
+    physics_derive: bool,
+}
+
+impl ResolvedPrefabOptions {
+    /// 作品名を決める。空・未指定なら解決したFBXのstem、stemも空なら `model` である。
+    ///
+    /// `VrmMeta` が空のnameを受け付けないため、空では返さない。
+    fn name(&self, fbx_path: &str) -> String {
+        if let Some(name) = self.name.as_deref().map(str::trim)
+            && !name.is_empty()
+        {
+            return name.to_owned();
+        }
+        let file = fbx_path.rsplit('/').next().unwrap_or(fbx_path);
+        let stem = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
+        if stem.is_empty() {
+            return "model".to_owned();
+        }
+        stem.to_owned()
+    }
+
+    /// 作者列を決める。空要素を除き、残らなければ `["unknown"]` である。
+    fn authors(&self) -> Vec<String> {
+        let kept: Vec<String> = self
+            .authors
+            .iter()
+            .map(|author| author.trim().to_owned())
+            .filter(|author| !author.is_empty())
+            .collect();
+        if kept.is_empty() {
+            vec!["unknown".to_owned()]
+        } else {
+            kept
+        }
+    }
+}
+
+/// Prefab変換オプションJSONを解釈する.
+///
+/// `expressions` の省略時は `descriptor` と同じであり、`baseline`・`physics` の
+/// 省略時は真である。不正値は段階付きで失敗させる。
+fn parse_prefab_options(options_json: &str) -> Result<ResolvedPrefabOptions, CoreError> {
+    let raw: RawPrefabOptions = serde_json::from_str(options_json).map_err(|error| {
+        CoreError::new(
+            Stage::Options,
+            format!("Prefab変換オプションのJSONを読めない: {error}"),
+        )
+    })?;
+    let expressions_descriptor = match raw.expressions.as_deref() {
+        None => true,
+        Some("descriptor") => true,
+        Some("none") => false,
+        Some(other) => {
+            return Err(CoreError::new(
+                Stage::Options,
+                format!("表情指定を読めない: {other:?}（\"descriptor\"・\"none\"のいずれか）"),
+            ));
+        }
+    };
+    Ok(ResolvedPrefabOptions {
+        name: raw.name,
+        authors: raw.authors.unwrap_or_default(),
+        expressions_descriptor,
+        baseline: raw.baseline.unwrap_or(true),
+        physics_derive: raw.physics.unwrap_or(true),
     })
 }
 
@@ -2925,5 +3507,306 @@ mod tests {
             report["physics"]["tpose_skipped"].as_u64().unwrap_or(0),
             report["physics"]["look_at"].as_str().unwrap_or("null"),
         );
+    }
+
+    /// Prefab本文1件を作る。結合時は先頭以外からdirectiveを落とす前提の単文書である。
+    fn prefab_実体文書(anchor: &str, target_guid: &str) -> String {
+        format!(
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1001 &{anchor}\nPrefabInstance:\n  m_ObjectHideFlags: 0\n  m_SourcePrefab: {{fileID: 100100000, guid: {target_guid}, type: 2}}\n"
+        )
+    }
+
+    /// 複数文書を1つのPrefab本文に結合する。先頭以外からdirectiveを落とす。
+    fn prefab_結合(個々: &[String]) -> Vec<u8> {
+        const DIRECTIVE: &str = "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n";
+        let mut out = String::new();
+        for (番号, 文書) in 個々.iter().enumerate() {
+            if 番号 == 0 {
+                out.push_str(文書);
+            } else {
+                out.push_str(文書.strip_prefix(DIRECTIVE).expect("directiveがある"));
+            }
+        }
+        out.into_bytes()
+    }
+
+    /// 参照を持たない空Prefab文書を作る。
+    fn prefab_空文書() -> String {
+        "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &100000\nGameObject:\n  m_ObjectHideFlags: 0\n  m_Name: Root\n  m_IsActive: 1\n  m_Component: []\n"
+            .to_owned()
+    }
+
+    /// Prefabの `.meta` を組み立てる。
+    fn prefab_メタ(n: u128) -> Vec<u8> {
+        file_meta(n, "PrefabImporter", "  externalObjects: {}\n")
+    }
+
+    /// Prefab入口の一覧用の小さなパッケージを作る。
+    ///
+    /// `Model.fbx`（guid 1）と解決済み `Avatar.prefab`（guid 4、Model参照）、
+    /// 参照なし `Empty.prefab`（guid 5）を持つ。
+    fn prefab_targets_パッケージ() -> Vec<u8> {
+        package_bytes(&[
+            Member::Pathname {
+                guid: guid(1),
+                content: b"Assets/Model.fbx".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(1),
+                content: b"dummy-fbx".to_vec(),
+            },
+            Member::Meta {
+                guid: guid(1),
+                content: file_meta(1, "ModelImporter", "  externalObjects: {}\n"),
+            },
+            Member::Pathname {
+                guid: guid(4),
+                content: b"Assets/Avatar.prefab".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(4),
+                content: prefab_実体文書("100100000", &guid(1)).into_bytes(),
+            },
+            Member::Meta {
+                guid: guid(4),
+                content: prefab_メタ(4),
+            },
+            Member::Pathname {
+                guid: guid(5),
+                content: b"Assets/Empty.prefab".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(5),
+                content: prefab_空文書().into_bytes(),
+            },
+            Member::Meta {
+                guid: guid(5),
+                content: prefab_メタ(5),
+            },
+        ])
+    }
+
+    #[test]
+    fn prefab一覧をjsonで取得できる() {
+        // 解決済みとモデルなしの2件がパス昇順で並び、未読は空である。
+        let package = Package::open(&prefab_targets_パッケージ()).expect("Prefab付きは開ける");
+        let json = package.prefab_targets_json().expect("一覧はJSONになる");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("JSONは読める");
+        assert_eq!(parsed["candidates"].as_array().expect("配列").len(), 2);
+        assert_eq!(
+            parsed["candidates"][0]["prefab"],
+            serde_json::json!("Assets/Avatar.prefab")
+        );
+        assert_eq!(
+            parsed["candidates"][0]["state"],
+            serde_json::json!("resolved")
+        );
+        assert_eq!(
+            parsed["candidates"][0]["fbx"]["path"],
+            serde_json::json!("Assets/Model.fbx")
+        );
+        assert_eq!(
+            parsed["candidates"][1]["prefab"],
+            serde_json::json!("Assets/Empty.prefab")
+        );
+        assert_eq!(
+            parsed["candidates"][1]["state"],
+            serde_json::json!("noModel")
+        );
+        // `nestedPrefabs` は空でも必ず出す。
+        assert_eq!(
+            parsed["candidates"][0]["nestedPrefabs"],
+            serde_json::json!([])
+        );
+        assert_eq!(parsed["unreadable"], serde_json::json!([]));
+    }
+
+    /// 変換失敗系の共通材料を作る。要素は（Prefab本文）である。
+    fn prefab_変換パッケージ(
+        prefab_body: Vec<u8>,
+        fbx_guid_n: u128,
+        fbx_path: &str,
+    ) -> Vec<u8> {
+        let fbx_guid = guid(fbx_guid_n);
+        let fbx_meta = file_meta(fbx_guid_n, "ModelImporter", "  externalObjects: {}\n");
+        package_bytes(&[
+            Member::Pathname {
+                guid: fbx_guid.clone(),
+                content: fbx_path.as_bytes().to_vec(),
+            },
+            Member::Asset {
+                guid: fbx_guid.clone(),
+                content: b"dummy-fbx".to_vec(),
+            },
+            Member::Meta {
+                guid: fbx_guid,
+                content: fbx_meta,
+            },
+            Member::Pathname {
+                guid: guid(4),
+                content: b"Assets/Avatar.prefab".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(4),
+                content: prefab_body,
+            },
+            Member::Meta {
+                guid: guid(4),
+                content: prefab_メタ(4),
+            },
+        ])
+    }
+
+    #[test]
+    fn 直接fbx複数ではprefab変換がprefab段階で失敗する() {
+        // 直接FBXが2種あるPrefabは先勝ちにせず失敗する。
+        let prefab_body = prefab_結合(&[
+            prefab_実体文書("100100000", &guid(1)),
+            prefab_実体文書("100100001", &guid(2)),
+        ]);
+        // 2件のFBXを持つ材料を手で組む。
+        let members = vec![
+            Member::Pathname {
+                guid: guid(1),
+                content: b"Assets/Model.fbx".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(1),
+                content: b"dummy-fbx".to_vec(),
+            },
+            Member::Meta {
+                guid: guid(1),
+                content: file_meta(1, "ModelImporter", "  externalObjects: {}\n"),
+            },
+            Member::Pathname {
+                guid: guid(2),
+                content: b"Assets/Other.fbx".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(2),
+                content: b"other".to_vec(),
+            },
+            Member::Meta {
+                guid: guid(2),
+                content: file_meta(2, "ModelImporter", "  externalObjects: {}\n"),
+            },
+            Member::Pathname {
+                guid: guid(4),
+                content: b"Assets/Avatar.prefab".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(4),
+                content: prefab_body,
+            },
+            Member::Meta {
+                guid: guid(4),
+                content: prefab_メタ(4),
+            },
+        ];
+        let package = Package::open(&package_bytes(&members)).expect("開ける");
+        let error = package
+            .convert_prefab("Assets/Avatar.prefab", "{}")
+            .expect_err("直接FBX複数は失敗する");
+        assert_eq!(error.stage(), Stage::Prefab);
+        assert_eq!(error.stage().as_str(), "prefab");
+        assert_eq!(error.path(), Some("Assets/Avatar.prefab"));
+        assert!(
+            error.message().contains("直接FBXが複数ある"),
+            "診断: {}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn ネストのみではprefab変換がprefab段階で失敗する() {
+        // 直接FBXが無くネストだけのPrefabは要解決として失敗する。
+        let nest_body = prefab_空文書().into_bytes();
+        let members = vec![
+            Member::Pathname {
+                guid: guid(1),
+                content: b"Assets/Model.fbx".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(1),
+                content: b"dummy-fbx".to_vec(),
+            },
+            Member::Meta {
+                guid: guid(1),
+                content: file_meta(1, "ModelImporter", "  externalObjects: {}\n"),
+            },
+            Member::Pathname {
+                guid: guid(6),
+                content: b"Assets/Nest.prefab".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(6),
+                content: nest_body,
+            },
+            Member::Meta {
+                guid: guid(6),
+                content: prefab_メタ(6),
+            },
+            Member::Pathname {
+                guid: guid(4),
+                content: b"Assets/Avatar.prefab".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(4),
+                content: prefab_実体文書("100100000", &guid(6)).into_bytes(),
+            },
+            Member::Meta {
+                guid: guid(4),
+                content: prefab_メタ(4),
+            },
+        ];
+        let package = Package::open(&package_bytes(&members)).expect("開ける");
+        let error = package
+            .convert_prefab("Assets/Avatar.prefab", "{}")
+            .expect_err("ネストのみは失敗する");
+        assert_eq!(error.stage(), Stage::Prefab);
+        assert!(
+            error.message().contains("ネストPrefabの解決が必要"),
+            "診断: {}",
+            error.message()
+        );
+        assert!(
+            error.message().contains("Assets/Nest.prefab"),
+            "ネストを含む: {}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn guid全ゼロではprefab変換がprefab段階で失敗する() {
+        // FBXのGUIDが全ゼロの場合は未設定として失敗する。
+        let prefab_body = prefab_実体文書("100100000", &guid(0)).into_bytes();
+        let bytes = prefab_変換パッケージ(prefab_body, 0, "Assets/Model.fbx");
+        let package = Package::open(&bytes).expect("開ける");
+        let error = package
+            .convert_prefab("Assets/Avatar.prefab", "{}")
+            .expect_err("GUID全ゼロは失敗する");
+        assert_eq!(error.stage(), Stage::Prefab);
+        assert!(
+            error.message().contains("全ゼロ"),
+            "診断: {}",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn 不正なprefabオプションはoptions段階で失敗する() {
+        // 未知キー・不正値は `Stage::Options` で失敗する。
+        let package = Package::open(&prefab_targets_パッケージ()).expect("開ける");
+        for json in [
+            "{壊れた",
+            r#"{"unknown":1}"#,
+            r#"{"expressions":"vrc"}"#,
+            r#"{"baseline":"yes"}"#,
+        ] {
+            let error = package
+                .convert_prefab("Assets/Avatar.prefab", json)
+                .expect_err(&format!("不正は失敗する: {json}"));
+            assert_eq!(error.stage(), Stage::Options, "入力: {json}");
+        }
     }
 }

@@ -17,7 +17,7 @@
         <a href="https://github.com/halby24/vrctom">GitHub: halby24/vrctom</a>
       </p>
       <p class="privacy">ファイルはブラウザ内だけで処理され、送信・保存されません。</p>
-      <p class="limits">Prefabの材質割当・有効状態は反映されません。対応Prefabがある場合、揺れ（springBone）を反映できます。</p>
+      <p class="limits">Prefabを変換対象にします。Prefabが参照するFBXのメッシュを使い、材質割当・有効状態・表情・基準姿勢・物理を反映します。ネストPrefabのジオメトリは出力しません。</p>
     </header>
     <main class="layout">
       <section class="panel controls" aria-label="操作">
@@ -43,18 +43,13 @@
         </p>
         <div class="error-panel" data-testid="error-panel" hidden></div>
         <fieldset class="candidates-field">
-          <legend>変換するFBX</legend>
+          <legend>変換するPrefab</legend>
           <div data-testid="candidates">
-            <p class="hint">パッケージを開くと候補が並びます</p>
+            <p class="hint">パッケージを開くとPrefab候補が並びます</p>
           </div>
         </fieldset>
-        <fieldset class="candidates-field">
-          <legend>Prefab由来の物理</legend>
-          <div data-testid="prefab-candidates">
-            <p class="hint">FBXを選ぶと候補が並びます</p>
-          </div>
-          <p class="hint" data-testid="prefab-status" data-state="idle">FBXを選ぶとPrefab候補を取得します</p>
-        </fieldset>
+        <p class="hint" data-testid="resolved-fbx">Prefabを選ぶと対象FBXを表示します</p>
+        <p class="hint" data-testid="prefab-note" hidden></p>
         <div class="settings">
           <label>
             作品名
@@ -66,9 +61,17 @@
           </label>
           <label class="check">
             <input type="checkbox" data-testid="expressions-check" checked />
-            VRChat向け表情を生成する
+            PrefabのVRCAvatarDescriptorから表情を生成する
           </label>
-          <p class="hint">見つかる表情だけ適用し、欠落は警告に残す</p>
+          <label class="check">
+            <input type="checkbox" data-testid="baseline-check" checked />
+            Prefabの基準姿勢（BlendShapeの重み）を焼き込む
+          </label>
+          <label class="check">
+            <input type="checkbox" data-testid="physics-check" checked />
+            Prefabから物理（揺れもの）を導出する
+          </label>
+          <p class="hint">表情は見つかる分だけ適用し、欠落は警告に残します</p>
         </div>
         <div class="buttons">
           <button type="button" data-testid="convert-button" disabled>変換</button>

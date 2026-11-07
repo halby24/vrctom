@@ -104,7 +104,7 @@ pnpm --dir web preview  # ビルド結果を確認する
 ```
 
 mise経由なら `mise run web-dev`・`mise run web-build`・`mise run wasm`（Wasmだけ作り直す）。
-`.unitypackage` をブラウザ内で読み込んで変換する。ファイルは外部へ送らない。
+`.unitypackage` をブラウザ内で読み込み、Prefabを選んで参照FBXを変換する。ファイルは外部へ送らない。
 公開版は <https://halby24.github.io/vrctom/> にある。
 
 ## npmパッケージ
@@ -125,7 +125,8 @@ npm pack ./crates/vrctom-wasm/pkg --dry-run
 - Matcap合成・デカール・lilToon材質拡張は未対応である。
 - 2019.3より前のFBX取り込み方式（`.meta` の `fileIDToRecycleName`）は未対応である。
 - WebアプリはデスクトップのChromeを想定し、モバイルは対象外である。
-  Prefabの材質割当・有効状態は反映しない（CLIの `--prefab` は反映する）。物理はPrefabから自動導出し、候補が複数あるときは利用者が選ぶ。候補がなければ物理なしで警告する。
+  ネストPrefabのジオメトリは出力しない。1つのPrefabが複数FBXを直接参照する場合の合成・
+  Prefab Variantの汎用解決には未対応である。物理は選んだPrefabから導出し、使わない再変換もできる。
 
 ## 開発
 

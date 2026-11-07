@@ -10,6 +10,8 @@ import {
   parseConversionReport,
   parseFbxCandidates,
   parsePrefabCandidatesReport,
+  parsePrefabConversionReport,
+  parsePrefabTargetsReport,
 } from "./conversion-client.js";
 import type {
   MainToWorkerMessage,
@@ -19,6 +21,9 @@ import type {
 
 /** `convert`要求だけを抜き出した型。設定の受け渡しに使う。 */
 type ConvertRequest = Extract<MainToWorkerMessage, { readonly type: "convert" }>;
+
+/** `convertPrefab`要求だけを抜き出した型。設定の受け渡しに使う。 */
+type ConvertPrefabRequest = Extract<MainToWorkerMessage, { readonly type: "convertPrefab" }>;
 
 /** wasmの初期化。一度だけ行い、並行した要求で共有する。 */
 let initialized: Promise<void> | null = null;
@@ -192,6 +197,74 @@ async function handlePrefabCandidates(id: number, fbxPath: string): Promise<void
   }
 }
 
+/**
+ * 全Prefabの解決状態を取り出して返す。直前に重い処理の段階を知らせる。
+ *
+ * 走査自体はPrefab本文を読むため段階を知らせる。
+ * パッケージ未開封の要求は変換と同様に`package`段階の失敗で返す。
+ *
+ * @param id - 要求の`id`。
+ */
+async function handlePrefabTargets(id: number): Promise<void> {
+  post({ type: "progress", id, stage: "package" });
+  try {
+    await ensureInit();
+    if (currentPackage === null) {
+      post({ type: "error", id, stage: "package", message: "パッケージが開かれていないため一覧を取り出せない" });
+      return;
+    }
+    const raw: unknown = JSON.parse(currentPackage.prefabTargets());
+    post({ type: "prefabTargets", id, report: parsePrefabTargetsReport(raw) });
+  } catch (error) {
+    post(toErrorMessage(id, error));
+  }
+}
+
+/**
+ * 選んだPrefabを変換し、VRMとレポートを返す。直前に重い処理の段階を知らせる。
+ *
+ * VRMバイト列は転送で渡す。`Converted`は使い終わったら破棄する。
+ *
+ * @param id - 要求の`id`。
+ * @param request - `convertPrefab`要求全体。設定の真偽値をwasm側へ写す。
+ */
+async function handleConvertPrefab(id: number, request: ConvertPrefabRequest): Promise<void> {
+  post({ type: "progress", id, stage: "convert" });
+  try {
+    await ensureInit();
+    if (currentPackage === null) {
+      post({ type: "error", id, stage: "package", message: "パッケージが開かれていないため変換できない" });
+      return;
+    }
+    const optionsJson = JSON.stringify({
+      name: request.options.name,
+      authors: [...request.options.authors],
+      expressions: request.options.expressions ? "descriptor" : "none",
+      baseline: request.options.baseline,
+      physics: request.options.physics,
+    });
+    const converted = currentPackage.convertPrefab(request.prefabPath, optionsJson);
+    try {
+      // 所有権ごと取り出し、全体を占める裏側の領域は複写せず転送する。
+      const source: Uint8Array = converted.takeVrm();
+      const backing: ArrayBufferLike = source.buffer;
+      const vrm: ArrayBuffer =
+        backing instanceof ArrayBuffer && source.byteOffset === 0 && backing.byteLength === source.byteLength
+          ? backing
+          : // 部分ビューの場合だけ転送できる範囲を切り出す。
+            source.slice().buffer;
+      const raw: unknown = JSON.parse(converted.report);
+      // wasm境界の検証で`camelCase`を受けて送る。client側はWorker→client境界の
+      // 検証で受け直すため、ここでwasm由来の検証を済ませておく。
+      post({ type: "converted", id, vrm, report: parsePrefabConversionReport(raw) }, [vrm]);
+    } finally {
+      converted.free();
+    }
+  } catch (error) {
+    post(toErrorMessage(id, error));
+  }
+}
+
 /** 受信した要求を振り分ける。`cancel`はmain側の破棄に任せて無視する。 */
 function handleMessage(data: unknown): void {
   if (!isMainToWorkerMessage(data)) {
@@ -206,6 +279,12 @@ function handleMessage(data: unknown): void {
       break;
     case "prefabCandidates":
       void handlePrefabCandidates(data.id, data.fbxPath);
+      break;
+    case "prefabTargets":
+      void handlePrefabTargets(data.id);
+      break;
+    case "convertPrefab":
+      void handleConvertPrefab(data.id, data);
       break;
     case "cancel":
       break;

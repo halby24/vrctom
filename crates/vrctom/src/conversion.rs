@@ -5,6 +5,8 @@
 //! 呼び出し側に残し、材質の読み取りは呼び出し側が [`crate::vrm::VrmExportOptions`] に渡す。
 //! Prefab・sidecarを使う特殊経路は含めない。
 
+pub mod prefab;
+
 use crate::fbx::{FbxError, FbxFile, FbxOptions};
 use crate::vrm::{VrmError, VrmExportError, VrmExportOptions, VrmModel, VrmOptions, VrmReport};
 

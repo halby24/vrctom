@@ -21,15 +21,20 @@ await init();
 
 const pkg = new WebPackage(new Uint8Array(unityPackageBytes));
 
-// パス昇順の FBX 候補。例: [{ path: "Assets/Model.fbx", size: 12345 }]
-const candidates = JSON.parse(pkg.fbxCandidates());
+// パス昇順の Prefab 一覧。例: { candidates: [{ prefab: "Assets/Model.prefab",
+//   state: "resolved", fbx: { path: "Assets/Model.fbx", ... }, ... }], unreadable: [] }
+const targets = JSON.parse(pkg.prefabTargets());
 
-const converted = pkg.convert(
-  candidates[0].path,
+// `resolved` の Prefab を選んで変換する。
+const resolved = targets.candidates.find((candidate) => candidate.state === "resolved");
+if (resolved === undefined) {
+  throw new Error("変換できる Prefab がありません");
+}
+const converted = pkg.convertPrefab(
+  resolved.prefab,
   JSON.stringify({
     name: "作品名",
     authors: ["作者名"],
-    expressions: "vrc",
   }),
 );
 
@@ -60,18 +65,40 @@ UI を止めないため、Web Worker 内で呼び出してください。
 | API | 説明 |
 |---|---|
 | `new WebPackage(bytes)` | パッケージを検証・展開・索引化する。失敗したら例外 |
-| `pkg.fbxCandidates()` | FBX 候補を JSON 文字列で返す（パス昇順） |
-| `pkg.prefabCandidates(fbxPath)` | 対象 FBX を参照する Prefab 候補を JSON 文字列で返す |
-| `pkg.convert(fbxPath, optionsJson)` | 選んだ FBX を VRM に変換する |
+| `pkg.prefabTargets()` | 全 Prefab の解決状態を JSON 文字列で返す（パス昇順） |
+| `pkg.convertPrefab(prefabPath, optionsJson)` | 選んだ Prefab を VRM に変換する |
+| `pkg.fbxCandidates()` | FBX 候補を JSON 文字列で返す（パス昇順。互換用） |
+| `pkg.prefabCandidates(fbxPath)` | 対象 FBX を参照する Prefab 候補を JSON 文字列で返す（互換用） |
+| `pkg.convert(fbxPath, optionsJson)` | 選んだ FBX を VRM に変換する（互換用） |
 | `converted.takeVrm()` | GLB バイト列を複製せず取り出す。呼び出し後は空になる |
 | `converted.vrm` | GLB バイト列を複製して返す（互換用） |
 | `converted.report` | レポートを JSON 文字列で返す |
 | `.free()` | wasm 側のメモリを解放する |
 
 `WebPackage` は展開済みの内容を保持します。開き直す前に古い `WebPackage` を
-`free()` してください。同じ `WebPackage` からは何度でも `convert` できます。
+`free()` してください。同じ `WebPackage` からは何度でも `convertPrefab`・`convert` できます。
 
 ## 変換オプション
+
+Prefab 入口（`convertPrefab`）のオプションは次のとおりです。
+
+```json
+{
+  "name": "作品名",
+  "authors": ["作者A", "作者B"],
+  "expressions": "descriptor",
+  "baseline": true,
+  "physics": true
+}
+```
+
+- `name` … 空・未指定なら解決した FBX のファイル名（拡張子を除く）になる
+- `authors` … 空要素を除き、残らなければ `["unknown"]` になる
+- `expressions` … 省略時は `"descriptor"` と同じで、descriptor 由来の表情を作る。`"none"` で作らない
+- `baseline` … 省略時は真。偽で基準姿勢の焼き込みを止める
+- `physics` … 省略時は真で、選んだ Prefab から物理を導出して適用する。偽で物理なしにする
+
+旧 FBX 入口（`convert`）のオプションは次のとおりです。互換のため残ります。
 
 ```json
 {
@@ -93,6 +120,55 @@ UI を止めないため、Web Worker 内で呼び出してください。
   `"none"`は警告なしで物理なしになる
 
 ## レポート
+
+Prefab 入口（`convertPrefab`）のレポートは次のとおりです。
+
+```json
+{
+  "prefab": "Assets/Avatar.prefab",
+  "fbx": "Assets/Model.fbx",
+  "fbxGuid": "0123456789abcdef0123456789abcdef",
+  "nestedPrefabs": ["Assets/Phone.prefab"],
+  "bytes": 123456,
+  "nodes": 10,
+  "meshes": 2,
+  "skins": 1,
+  "materials": 3,
+  "images": 4,
+  "expressions": 8,
+  "warnings": ["ネストPrefabのジオメトリは出力しない: Assets/Phone.prefab"],
+  "assignment": {
+    "mode": "instance",
+    "activeMeshes": 2,
+    "excludedMeshes": 1,
+    "excludedNames": ["Hidden"],
+    "materialPool": 3
+  },
+  "baseline": {
+    "meshes": 1,
+    "shapes": 2
+  },
+  "physics": {
+    "prefab": "Assets/Avatar.prefab",
+    "selection": "target",
+    "springs": 2,
+    "joints": 6,
+    "colliders": 3,
+    "groups": 1,
+    "tposeApplied": 4,
+    "tposeSkipped": 1,
+    "lookAt": "bone"
+  }
+}
+```
+
+`assignment.mode` は割当の出所（`instance`=改変内容、`direct`=直接記述）であり、
+無い場合は `null` です。`nestedPrefabs` は空でも必ず出ます。
+`physics.selection` は Prefab 入口では `"target"` であり、
+物理なしの場合は `prefab` と `lookAt` が `null` になります。
+`baseline` は焼き込んだメッシュ数と非ゼロチャンネル数です。
+
+旧 FBX 入口（`convert`）のレポートは次のとおりです。互換のため残ります。
 
 ```json
 {
@@ -120,7 +196,7 @@ UI を止めないため、Web Worker 内で呼び出してください。
 ```
 
 警告は `warnings` に入り、変換の失敗とは区別されます。
-`physics` の `selection` は `"auto"`・`"explicit"`・`"none"`・`"undetected"` のいずれかであり、
+旧 FBX 入口の `physics.selection` は `"auto"`・`"explicit"`・`"none"`・`"undetected"` のいずれかであり、
 `prefab` と `look_at` は物理なしの場合に `null` になります。
 
 ## エラー
@@ -131,11 +207,13 @@ UI を止めないため、Web Worker 内で呼び出してください。
 |---|---|
 | `package` | 展開・索引化 |
 | `options` | オプション JSON の解釈 |
-| `fbx` | FBX の取り出し・解析 |
+| `prefab` | Prefab対象の解決・本文読み取り・表情・基準姿勢の解決 |
+| `fbx` | FBX の取り出し・解析（旧 FBX 入口） |
 | `model` | 中間モデルの生成 |
 | `material` | 材質・画像の読み取り |
+| `assignment` | Prefab由来の材質割当の解決・適用（Prefab 入口） |
 | `export` | VRM の書き出し |
-| `physics` | Prefab物理（候補走査・導出・適用） |
+| `physics` | Prefab物理（旧入口の候補走査・導出・適用、Prefab入口の導出・適用） |
 
 ```ts
 try {
@@ -169,9 +247,14 @@ try {
 ## 制限
 
 - 入力は `.unitypackage` のみです。FBX 単体は受け付けません。
-- Prefab 由来の材質割当・有効状態は反映しません。物理（揺れ）は Prefab から自動導出します。
+- ネスト Prefab のジオメトリは出力しません。直接 FBX が複数の Prefab の合成・
+  Prefab Variant の汎用解決は未対応です。物理は選んだ Prefab から導出し、使わない再変換もできます。
 - 生成した VRM が第三者製の validator をすべて通ることは保証しません。
 - 現行版は `0.x` であり、API は変更される可能性があります。
+
+旧 FBX 入口（`fbxCandidates`・`prefabCandidates`・`convert`）は互換のため残ります。
+Web UI は Prefab 入口（`prefabTargets`・`convertPrefab`）を使い、
+選んだ Prefab が直接参照する FBX を変換します。
 
 ## ライセンス
 

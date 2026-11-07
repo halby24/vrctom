@@ -29,9 +29,7 @@ use std::collections::{HashMap, HashSet};
 use serde::Deserialize;
 
 use super::error::{VrmError, VrmErrorKind};
-#[cfg(not(target_arch = "wasm32"))]
-use super::material::MaterialReport;
-use super::material::VrmMaterials;
+use super::material::{MaterialReport, VrmMaterials};
 
 /// レンダラsidecar JSONの書式名。
 const SIDECAR_FORMAT: &str = "vrctom.renderers";
@@ -791,10 +789,32 @@ pub fn load_renderer_materials_with_index(
     pool: &[RendererPoolEntry],
     options: &super::material::MaterialOptions,
 ) -> Result<(VrmMaterials, MaterialReport), super::material::MaterialError> {
+    let source = crate::unity::FsAssetSource::new(assets);
+    load_renderer_materials_from(&source, index, pool, options)
+}
+
+/// 材質プールを `.mat` から読み取る（ターゲット非依存）。
+///
+/// `source` は `Assets` 直下を基準とする読み手、`index` はその索引であり、
+/// Nativeの展開済み配置とWebのメモリ内パッケージのどちらでも使う。
+/// `pool` は [`plan_renderer_assignment`] の初出順の列であり、
+/// 同じ `(guid, fileID)` は1つの材質にまとまる。
+/// 材質名は `.mat` の `m_Name` を使い、写像・ベイク・取り込み解像度合わせは
+/// [`VrmMaterials`] の既存の処理を使う。null材質は計画時に弾くため、
+/// ここでは扱わない。
+///
+/// # Errors
+///
+/// [`VrmMaterials::load`](super::material::VrmMaterials::load) と同じ条件で返す。
+pub fn load_renderer_materials_from(
+    source: &dyn crate::unity::AssetSource,
+    index: &crate::unity::AssetIndex,
+    pool: &[RendererPoolEntry],
+    options: &super::material::MaterialOptions,
+) -> Result<(VrmMaterials, MaterialReport), super::material::MaterialError> {
     use super::material::LoadContext;
 
-    let source = crate::unity::FsAssetSource::new(assets);
-    let mut context = LoadContext::new(&source, index, options);
+    let mut context = LoadContext::new(source, index, options);
     for entry in pool {
         context.load_renderer_material(&entry.guid, &entry.path, &slot_key_of(entry))?;
     }
@@ -805,7 +825,6 @@ pub fn load_renderer_materials_with_index(
 /// 材質プール1件に対応する材質スロット名を作る.
 ///
 /// sidecar由来とPrefab由来で同じ写像を使い、書き出し側の共有に合流させる。
-#[cfg(not(target_arch = "wasm32"))]
 fn slot_key_of(entry: &RendererPoolEntry) -> String {
     renderer_slot_key(&entry.guid, entry.file_id)
 }
@@ -827,5 +846,139 @@ fn check_sha256_hex(text: &str) -> Result<(), &'static str> {
         Ok(())
     } else {
         Err("64桁hexでない")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    use crate::unity::{AssetIndex, AssetMeta, AssetSource};
+    use crate::vrm::MaterialOptions;
+
+    // テスト名は日本語で書く（テストは仕様・契約であるため）。
+
+    /// メモリ内の読み手。パスと内容の対だけを持ち、ファイルシステムに触れない。
+    struct MapSource {
+        files: HashMap<String, Vec<u8>>,
+    }
+
+    impl AssetSource for MapSource {
+        fn read_limited(&self, path: &str, limit: u64) -> std::io::Result<Vec<u8>> {
+            let Some(bytes) = self.files.get(path) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "持たない",
+                ));
+            };
+            if bytes.len() as u64 > limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "上限を超えた",
+                ));
+            }
+            Ok(bytes.clone())
+        }
+    }
+
+    /// 検査用の材質GUID（32桁hex）。引用符なしでも数値化されないよう英字を含む。
+    const TEST_MAT_GUID: &str = "b0d71111111111111111111111111111";
+    /// 不透明lilToonシェーダのGUID。`.shader` が無くても系列を判定できる。
+    const TEST_SHADER_OPAQUE: &str = "df12117ecd77c31469c224178886498e";
+
+    /// 検査用の最小 `.mat` を組み立てる。テクスチャを持たない。
+    fn 検査材質を作る(名前: &str) -> Vec<u8> {
+        format!(
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!21 &2100000\nMaterial:\n  m_Name: {名前}\n  m_Shader: {{fileID: 4800000, guid: {TEST_SHADER_OPAQUE}, type: 3}}\n  m_SavedProperties:\n    m_TexEnvs: []\n    m_Floats:\n    - _Cutoff: 0.5\n    - _Cull: 2.0\n    - _ZWrite: 1.0\n    - _UseShadow: 1.0\n    - _ShadowBorder: 0.5\n    - _ShadowBlur: 0.1\n    - _lilToonVersion: 45.0\n    m_Ints: []\n    m_Colors:\n    - _Color: {{r: 1, g: 1, b: 1, a: 1}}\n    - _ShadowColor: {{r: 0.82, g: 0.76, b: 0.85, a: 1}}\n"
+        )
+        .into_bytes()
+    }
+
+    /// 検査材質だけを持つ索引を作る。
+    fn 検査索引を作る() -> AssetIndex {
+        let mut index = AssetIndex::new();
+        let meta = AssetMeta::parse(
+            format!(
+                "fileFormatVersion: 2\nguid: {TEST_MAT_GUID}\nNativeFormatImporter:\n  externalObjects: {{}}\n  userData: \n"
+            )
+            .as_bytes(),
+        )
+        .expect("検査metaは読める");
+        index
+            .insert("Materials/Body.mat", meta)
+            .expect("索引に入る");
+        index
+    }
+
+    /// 検査材質1件の材質プールを作る。
+    fn 検査プールを作る() -> Vec<RendererPoolEntry> {
+        vec![RendererPoolEntry {
+            guid: TEST_MAT_GUID.to_owned(),
+            file_id: 2100000,
+            path: "Assets/Materials/Body.mat".to_owned(),
+            first_renderer_path: "Body".to_owned(),
+        }]
+    }
+
+    #[test]
+    fn メモリ内読み手から材質プールを読める() {
+        // `MemoryPackage` などwasm側の読み手と同じく、ファイルシステムに触れない。
+        let source = MapSource {
+            files: HashMap::from([("Materials/Body.mat".to_owned(), 検査材質を作る("肌"))]),
+        };
+        let index = 検査索引を作る();
+        let options = MaterialOptions::new();
+        let (materials, _) =
+            load_renderer_materials_from(&source, &index, &検査プールを作る(), &options)
+                .expect("材質プールは読める");
+        assert_eq!(materials.entries().len(), 1);
+        let entry = &materials.entries()[0];
+        // スロット名は `(guid, fileID)` の共有名であり、読み手によらない。
+        assert_eq!(entry.slot, format!("renderer:{TEST_MAT_GUID}:2100000"));
+        assert_eq!(entry.material.name, "肌");
+    }
+
+    /// fs版とメモリ版で同じ材質プールが同じ材質名・スロットになる。
+    ///
+    /// どちらも同じ `.mat` バイト列・同じ索引内容から読む。fs版は
+    /// `FsAssetSource` を作る委譲先であり、読み手の違いで結果が変わらない。
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn fs版とメモリ版で同じ材質プールが同じ結果になる() {
+        let mat = 検査材質を作る("肌");
+        let meta = format!(
+            "fileFormatVersion: 2\nguid: {TEST_MAT_GUID}\nNativeFormatImporter:\n  externalObjects: {{}}\n  userData: \n"
+        );
+        let guard = tempfile::TempDir::new().expect("作業域は作れる");
+        let assets = guard.path().join("Assets");
+        std::fs::create_dir_all(assets.join("Materials")).expect("親ディレクトリは作れる");
+        std::fs::write(assets.join("Materials/Body.mat"), &mat).expect("資産は書ける");
+        std::fs::write(assets.join("Materials/Body.mat.meta"), meta.as_bytes())
+            .expect("metaは書ける");
+        let mut fs_index = AssetIndex::new();
+        let fs_meta = AssetMeta::parse(meta.as_bytes()).expect("検査metaは読める");
+        fs_index
+            .insert("Materials/Body.mat", fs_meta)
+            .expect("索引に入る");
+
+        let options = MaterialOptions::new();
+        let pool = 検査プールを作る();
+        let (from_fs, _) = load_renderer_materials_with_index(&assets, &fs_index, &pool, &options)
+            .expect("fs版は読める");
+        let memory = MapSource {
+            files: HashMap::from([("Materials/Body.mat".to_owned(), mat)]),
+        };
+        let (from_memory, _) =
+            load_renderer_materials_from(&memory, &検査索引を作る(), &pool, &options)
+                .expect("メモリ版は読める");
+        assert_eq!(from_fs.entries().len(), 1);
+        assert_eq!(from_memory.entries().len(), 1);
+        assert_eq!(from_fs.entries()[0].slot, from_memory.entries()[0].slot);
+        assert_eq!(
+            from_fs.entries()[0].material.name,
+            from_memory.entries()[0].material.name
+        );
+        assert_eq!(from_fs.entries()[0].material.name, "肌");
     }
 }

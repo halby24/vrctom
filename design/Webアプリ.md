@@ -14,16 +14,18 @@ VRMのダウンロードまでを受け持ち、サーバへの送信や永続�
 
 入力は `.unitypackage` のみとし、ブラウザ内で完結する。
 Fileとして受け取ったバイト列をWorker内のwasmへ渡し、
-展開・FBX選択・変換・プレビュー・ダウンロードの順に進める。
+展開・Prefab一覧・選択・対象FBX解決・変換・プレビュー・ダウンロードの順に進める。
 
 ```mermaid
 flowchart TB
     file[入力File<br/>.unitypackage] --> ui[UIスレッド<br/>選択・表示・保存]
     ui --> worker[Worker<br/>変換の実行]
-    worker --> wasm[vrctom-wasm<br/>展開・選択・変換]
+    worker --> wasm[vrctom-wasm<br/>展開・一覧・変換]
     wasm --> mem[メモリ内パッケージ<br/>検証済み内容]
-    mem --> fbxsel[FBXとPrefabの選択<br/>候補列挙・利用者選択]
-    fbxsel --> conv[変換<br/>FBX→モデル→物理→VRM]
+    mem --> plist[Prefab一覧<br/>解決状態付き]
+    plist --> psel[Prefabの選択<br/>利用者・自動]
+    psel --> fbxres[対象FBXの解決<br/>直接参照の表示]
+    fbxres --> conv[変換<br/>Prefab→モデル→物理→VRM]
     conv --> back[UIへ返却<br/>VRMとレポート]
     back --> prev[プレビュー<br/>three.js]
     back --> dl[ダウンロード]
@@ -36,12 +38,10 @@ sequenceDiagram
     U->>U: Fileを受け取る
     U->>W: バイト列を渡す
     W->>W: 展開して検証する
-    W->>U: FBX候補を返す
+    U->>W: Prefab一覧を要求する
+    W->>U: Prefab一覧を返す
     U->>U: 候補を一覧して選ぶ
-    U->>W: 選んだFBXのPrefab候補を求める
-    W->>U: Prefab候補を返す
-    U->>U: 候補を一覧して選ぶ
-    U->>W: 選択したFBXと物理指定で変換する
+    U->>W: 選んだPrefabを対象解決つきで変換する
     W->>U: VRMとレポートを返す
     U->>U: プレビューして保存する
 ```
@@ -49,22 +49,37 @@ sequenceDiagram
 ## 利用フロー
 
 - 入力Fileを受け取り、ArrayBufferとしてWorkerへ渡す。
-- Worker内のwasmがパッケージを検証し、FBX候補を返す。
-- 候補が0件なら理由を表示し、1件なら自動で進み、
-  複数ならパス順の一覧から利用者が選ぶ。
-- 選んだFBXを参照するPrefab候補をwasmが走査して返し、利用者が選ぶ。
-  候補1件はそのまま使い、複数件は利用者が選ぶ。0件なら`auto`のまま進み、
-  物理なし（`undetected`）で続ける。読めなかったPrefabがある場合は自動で
-  進めず、利用者が明示選択するか物理なしを選ぶ。候補の取得に失敗した場合も
-  自動で物理なしにせず、利用者の明示操作を待つ。
-- 選択したFBXと物理指定で変換し、VRMとレポートをUIへ返す。
+- Worker内のwasmがパッケージを検証し、Prefab一覧（`prefabTargets`）を返す。
+- Prefabごとの解決状態は次のいずれかである。
+  判定は型付き参照だけを使い、GUID文字列の部分一致検索はしない。
+
+  | 状態 | 意味 |
+  |---|---|
+  | `resolved` | 直接FBXがちょうど1種あり、変換対象にできる |
+  | `unsupportedMultipleFbx` | 直接FBXが2種以上あり、先勝ちにしない |
+  | `requiresPrefabResolution` | 直接FBXが無く、ネストPrefabの解決が必要である（今回未対応） |
+  | `unresolved` | 直接FBXが無く、参照先が索引に無いなどの未解決参照がある |
+  | `noModel` | 直接FBXもネストPrefabも無い |
+  | `unreadable` | Prefab自体を読めなかった記録であり、候補数に含めない |
+
+  解決は `PrefabInstance.m_SourcePrefab` と `SkinnedMeshRenderer.m_Mesh` の
+  GUIDを索引で解決する。`MonoBehaviour.m_Script` の外部GUID
+  （VRCSDK・Unity内蔵）はFBX解決に使わず、未解決にも数えない。
+- `resolved` が1件だけなら自動で選び、複数ならパス順の一覧から利用者が選ぶ。
+  `resolved` が0件なら変換に進めず止まる。
+- 選んだPrefabが直接参照するFBXを表示し、そのFBXを変換する。
+  作品名（空なら解決したFBXのstem）・作者（空ならunknown）・
+  descriptor表情（既定で作る）・基準姿勢（既定で焼く）・
+  物理（既定で対象Prefabから導出）を設定して変換し、VRMとレポートをUIへ返す。
 - プレビューで見た目を確かめ、利用者が保存する。
 
-FBXの選び方はこの文書の判断であり、推測による自動決定はしない。
-Prefab推定・最大ファイル採用・暗黙の先頭採用・複数合成はしない。
+Prefabの選び方はこの文書の判断であり、推測による自動決定はしない。
+複数FBXの合成・先勝ち・ネストPrefabの汎用解決はしない。
 物理の導出・適用の中身は [`VRMスプリング`](VRMスプリング.md) に譲り、
 ここでは選択と失敗時の扱いだけを決める。
 詳しい境界は [`変換処理`](変換処理.md) に譲る。
+旧FBX入口（`fbxCandidates`・`prefabCandidates`・`convert`）は互換のため残るが、
+Web UIは使わない。
 
 ## メモリ内パッケージ方式
 
@@ -93,35 +108,34 @@ OPFSへの退避と再読込ではピークメモリ削減を保証できない�
 遅れて届いても新しい変換の表示を変えない。
 
 wasm側は同期APIの小さな入口に絞る。
-開く・候補を挙げる・選んだFBXを変換するの三つであり、
+開く・Prefab一覧を挙げる・選んだPrefabを変換するの三つであり、
 成功はVRMとレポート、失敗は段階・文面・対象パスで返す。
-警告はレポートに含め、失敗と混同しない。
+旧FBX入口（`fbxCandidates`・`prefabCandidates`・`convert`）は互換のため残るが、
+Web UIは使わない。警告はレポートに含め、失敗と混同しない。
 スレッド並列は使わない。
 
 プレビューは表示・回転・ズームだけとする。
-Prefab由来の物理はメモリ内パッケージから導出して出力する。
-CLIと同じ `derive_physics_sidecar_with`（`AssetSource` 越し）と
-`apply_physics_sidecar` を使い、順序も解決→T-pose→lookAt→スプリング生成で
-揃える。CLIの表示・終了コードはCLI側に残す。
-材質割当・有効状態のうちPrefab由来の分は範囲外であり、
-UIには「Prefabの材質割当・有効状態は未反映」を常時明示する。
+変換は共有関数 `vrctom::conversion::prefab::convert_prefab` を使い、
+順序は対象解決→`.fbx.meta`（GUID・humanoid対応表・材質置換表）→
+descriptor表情・基準姿勢→中間モデル→humanoid確定→物理導出・適用→
+材質割当・有効状態→書き出しである。CLIの表示・終了コードはCLI側に残す。
+材質割当・有効状態のうちPrefab由来の分は、Prefab入口の割当で反映する。
 材質自体は [`VRM材質`](VRM材質.md) の共通経路をそのまま使い、
 Web専用の簡易写像は作らない。
 
-物理指定の扱いは次のとおりである。`auto`（既定）は候補1件なら自動で使い、
-複数件なら先勝ちせず `stage=physics` で失敗する。解析できないPrefab
-（`unreadable`）が1件でもあれば、唯一候補でも自動確定せず `stage=physics`
-で失敗し、対象パスを含めて返す。候補0件かつ`unreadable` 0件のときだけ
-警告して物理なし（`selection: "undetected"`）で続ける。
-`{"prefab": "..."}` は明示選択であり、候補一致が必須である。候補外や
-読めない指定は `stage=physics` で失敗する。明示の対象が候補にある場合も
-`unreadable` の情報は警告として残し、黙って捨てない。
-`"none"` は警告なしで物理なしである。
-明示Prefabの導出・適用の失敗は変換全体を失敗させる。失敗時はUIから
-「Prefab由来の物理を使わず再変換」でき、このときT-poseの適用と視線も
-省く。レポートには `physics`（使ったPrefab、選択理由 auto/explicit/none/
-undetected、spring・joint・collider・group件数、T-pose適用・スキップ、
-lookAt）を載せる。読めなかったPrefabは診断に残し、0件扱いにしない。
+ネストPrefabのジオメトリは出力しない。対象のPrefabを選ぶときと、
+レポート・警告にネスト先のパスを残す。物理の導出は既存処理に任せ、
+ネスト参照も扱う。
+
+物理の扱いは次のとおりである。対象Prefabから取得する（既定）か、
+使わないかの二択であり、新入口では別のPrefab指定はしない。
+旧FBX APIの `auto`・明示・`none` は互換のため残るが、Web UIは使わない。
+新入口のレポートの `physics.selection` は `target` である。
+物理の導出・適用の失敗は変換全体を失敗させる。失敗時はUIから
+「物理を使わず再変換」でき、このとき他設定を保ったまま物理なしで変換し直し、
+T-poseの適用と視線も省く。レポートには `physics`（使ったPrefab、選択理由、
+spring・joint・collider・group件数、T-pose適用・スキップ、lookAt）を載せる。
+読めなかったPrefabは診断に残し、0件扱いにしない。
 読み取り上限はPrefab本文64MiB、導出の依存合計512MiBである。
 詳しい導出・適用の判断は [`VRMスプリング`](VRMスプリング.md) に譲る。
 
@@ -150,7 +164,7 @@ OPFSの採用評価と公開条件を混同しない。
 
 - サーバへの送信やブラウザへの永続保存はしない。
 - 巨大な入力に対する時間の上限は設けない。資源上限は量だけを抑える。
-- Prefab由来の材質割当・有効状態の再現はしない。
+- ネストPrefabのジオメトリ合成、Prefab Variantの汎用解決、複数FBXの合成はしない。
 - 生成したVRMが第三者製のvalidatorをすべて通ることは保証しない。
 
 ## 外した選択肢
@@ -161,6 +175,8 @@ OPFSの採用評価と公開条件を混同しない。
   Web初版の入力は `.unitypackage` のみに絞り、配置の持ち込みは扱わない。
 - FBX単体入力は受け付けない。材質の置換表と `.mat` の解決に
   パッケージ全体の索引が要るためである。
+- 複数FBXの合成・先勝ちはしない。対象は解決した1件に絞り、
+  複数あるPrefabは選べず、利用者に別のPrefabを選び直してもらう。
 - サーバ変換は行わない。ブラウザ内で完結させる要求であり、
   送信と保存の扱いを増やさない。
 - Web専用の簡易材質写像は作らない。見た目の二重解釈を避けるため、

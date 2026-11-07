@@ -36,11 +36,62 @@ export interface PrefabCandidatesReport {
   readonly unreadable: readonly PrefabScanIssue[];
 }
 
+/** Prefab入口の一覧で使う解決状態。 */
+export type PrefabTargetState =
+  | "resolved"
+  | "noModel"
+  | "unsupportedMultipleFbx"
+  | "requiresPrefabResolution"
+  | "unresolved";
+
+/** Prefab入口の一覧で使う変換対象FBX1件。 */
+export interface PrefabTargetFbx {
+  /** 資産パス（`Assets/...`）。 */
+  readonly path: string;
+  /** 資産GUID。 */
+  readonly guid: string;
+}
+
+/** Prefab1件の解決結果。 */
+export interface PrefabTargetCandidate {
+  /** 解決したPrefabの資産パス（`Assets/...`）。 */
+  readonly prefab: string;
+  /** 解決結果の状態。 */
+  readonly state: PrefabTargetState;
+  /** 変換対象のFBX。`resolved`の場合だけ存在する。 */
+  readonly fbx: PrefabTargetFbx | null;
+  /** ネストPrefabの資産パス列。空でも必ず出す。 */
+  readonly nestedPrefabs: readonly string[];
+  /** 非FBXモデルや種別不明の解決済み参照の資産パス列。 */
+  readonly otherReferences: readonly string[];
+  /** GUID欠落・索引不在・不正GUIDの参照の記録列。 */
+  readonly unresolvedReferences: readonly string[];
+}
+
+/** Prefab入口の一覧で読めなかった1件。 */
+export interface PrefabTargetIssue {
+  /** 出力パス（`Assets/...`）。 */
+  readonly path: string;
+  /** 読めなかった理由の日本語診断。 */
+  readonly reason: string;
+}
+
+/** 全Prefabの走査結果。候補はパス昇順である。 */
+export interface PrefabTargetsReport {
+  /** 解決できたPrefabの列。 */
+  readonly candidates: readonly PrefabTargetCandidate[];
+  /** 読めなかったPrefabの記録列。 */
+  readonly unreadable: readonly PrefabTargetIssue[];
+}
+
 /** 物理の使い分け。未指定は`auto`と同じである。 */
 export type PhysicsOption = "auto" | "none" | { readonly prefab: string };
 
 /** レポート側の物理の選択理由。 */
 export type PhysicsSelection = "auto" | "explicit" | "none" | "undetected";
+
+/** Prefabレポート側の物理の選択理由。Prefab APIでは`target`である。 */
+export type PrefabPhysicsSelection = "target";
 
 /** レポート側の視線の種別。無い場合は`null`になる。 */
 export type PhysicsLookAt = "bone" | "expression";
@@ -51,6 +102,28 @@ export interface PhysicsReport {
   readonly prefab: string | null;
   /** 選択理由。 */
   readonly selection: PhysicsSelection;
+  /** 出力したspring数。 */
+  readonly springs: number;
+  /** 出力したjoint総数。 */
+  readonly joints: number;
+  /** 出力したcollider数。 */
+  readonly colliders: number;
+  /** 出力したcolliderグループ数。 */
+  readonly groups: number;
+  /** T-poseで上書きした骨数。 */
+  readonly tposeApplied: number;
+  /** T-poseで飛ばした骨数。 */
+  readonly tposeSkipped: number;
+  /** 視線の種別。無い場合は`null`である。 */
+  readonly lookAt: PhysicsLookAt | null;
+}
+
+/** Prefab変換結果に含まれる物理の構造化情報。 */
+export interface PrefabPhysicsReport {
+  /** 使ったPrefabパス。物理なしの場合は`null`である。 */
+  readonly prefab: string | null;
+  /** 選択理由。Prefab APIでは`target`である。 */
+  readonly selection: PrefabPhysicsSelection;
   /** 出力したspring数。 */
   readonly springs: number;
   /** 出力したjoint総数。 */
@@ -108,6 +181,58 @@ export interface ConversionReport {
   readonly physics: PhysicsReport;
 }
 
+/** Prefab変換設定。UIの入力欄と対応する。 */
+export interface ConvertPrefabOptions {
+  /** 作品名。空なら解決したFBXのstemに倒す（wasm側で行う）。 */
+  readonly name: string;
+  /** 作者列。空要素はwasm側で除き、残らなければ`unknown`になる。 */
+  readonly authors: readonly string[];
+  /** 表情を生成するか。真なら`descriptor`、偽なら`none`になる。 */
+  readonly expressions: boolean;
+  /** 基準姿勢の焼き込みを行うかどうか。 */
+  readonly baseline: boolean;
+  /** 物理を導出して適用するかどうか。 */
+  readonly physics: boolean;
+}
+
+/** Prefab変換結果に含まれる材質割当の構造化情報。 */
+export interface PrefabAssignmentReport {
+  /** 解決に使った記述方式。無い場合は`null`である。 */
+  readonly mode: "instance" | "direct" | null;
+  /** 有効レンダラ数。 */
+  readonly activeMeshes: number;
+  /** 除外したメッシュ数。 */
+  readonly excludedMeshes: number;
+  /** 除外したメッシュのModel名。 */
+  readonly excludedNames: readonly string[];
+  /** 材質プールの件数。 */
+  readonly materialPool: number;
+}
+
+/** Prefab変換結果に含まれる基準姿勢の構造化情報。 */
+export interface PrefabBaselineReport {
+  /** 焼き込んだメッシュ数。 */
+  readonly meshes: number;
+  /** 焼き込んだ非ゼロチャンネル数。 */
+  readonly shapes: number;
+}
+
+/** Prefab変換結果のレポート。wasm側のJSONと対応する。 */
+export interface PrefabConversionReport extends Omit<ConversionReport, "physics"> {
+  /** 解決したPrefabの資産パス（`Assets/...`）。 */
+  readonly prefab: string;
+  /** 変換対象のFBXのGUID。 */
+  readonly fbxGuid: string;
+  /** ネストPrefabの資産パス列。空でも必ず出す。 */
+  readonly nestedPrefabs: readonly string[];
+  /** 材質割当の報告。 */
+  readonly assignment: PrefabAssignmentReport;
+  /** 基準姿勢の報告。 */
+  readonly baseline: PrefabBaselineReport;
+  /** 物理の構造化情報。選択理由は`target`である。 */
+  readonly physics: PrefabPhysicsReport;
+}
+
 /** 変換結果。VRMバイト列とレポートを持つ。 */
 export interface ConversionResult {
   /** VRM 1.0のGLBバイト列。呼び出し側が所有する。 */
@@ -116,25 +241,37 @@ export interface ConversionResult {
   readonly report: ConversionReport;
 }
 
+/** Prefab変換結果。VRMバイト列とPrefabレポートを持つ。 */
+export interface PrefabConversionResult {
+  /** VRM 1.0のGLBバイト列。呼び出し側が所有する。 */
+  readonly vrm: ArrayBuffer;
+  /** Prefab変換結果のレポート。 */
+  readonly report: PrefabConversionReport;
+}
+
 /** main→workerの要求。一意の`id`で応答と対応付ける。 */
 export type MainToWorkerMessage =
   | { readonly type: "open"; readonly id: number; readonly bytes: ArrayBuffer }
   | { readonly type: "convert"; readonly id: number; readonly fbxPath: string; readonly options: ConvertOptions }
   | { readonly type: "prefabCandidates"; readonly id: number; readonly fbxPath: string }
+  | { readonly type: "prefabTargets"; readonly id: number }
+  | { readonly type: "convertPrefab"; readonly id: number; readonly prefabPath: string; readonly options: ConvertPrefabOptions }
   | { readonly type: "cancel"; readonly id: number };
 
 /** worker→mainの応答。`id`は要求のものと一致する。 */
 export type WorkerToMainMessage =
   | { readonly type: "opened"; readonly id: number; readonly candidates: readonly FbxCandidate[] }
-  | { readonly type: "converted"; readonly id: number; readonly vrm: ArrayBuffer; readonly report: ConversionReport }
+  | { readonly type: "converted"; readonly id: number; readonly vrm: ArrayBuffer; readonly report: ConversionReport | PrefabConversionReport }
   | { readonly type: "prefabCandidates"; readonly id: number; readonly report: PrefabCandidatesReport }
+  | { readonly type: "prefabTargets"; readonly id: number; readonly report: PrefabTargetsReport }
   | { readonly type: "error"; readonly id: number; readonly stage: string; readonly message: string; readonly path?: string }
   | { readonly type: "progress"; readonly id: number; readonly stage: string };
 
 /**
  * 変換の失敗。wasm側の段階・文面・対象パスを持ち歩く。
  *
- * 段階は`package`・`options`・`fbx`・`model`・`material`・`export`・`physics`のいずれかであり、
+ * 段階は`package`・`options`・`fbx`・`model`・`material`・`export`・`physics`・
+ * `prefab`・`assignment`のいずれかであり、
  * `cancel`は利用者の中断、`worker`はWorker自体の異常を表す。
  */
 export class ConversionError extends Error {
@@ -347,10 +484,30 @@ function finishPhysicsReport(
   tposeSkipped: unknown,
   lookAt: unknown,
 ): PhysicsReport {
+  return finishPhysicsReportWith(prefab, selection, springs, joints, colliders, groups, tposeApplied, tposeSkipped, lookAt, false);
+}
+
+/** 物理の共通制約を検証する本体。`allowTarget`が真の場合だけ`target`を受け付ける。 */
+function finishPhysicsReportWith(
+  prefab: unknown,
+  selection: unknown,
+  springs: unknown,
+  joints: unknown,
+  colliders: unknown,
+  groups: unknown,
+  tposeApplied: unknown,
+  tposeSkipped: unknown,
+  lookAt: unknown,
+  allowTarget: boolean,
+): PhysicsReport {
   if (
     !(typeof prefab === "string" || prefab === null) ||
     (typeof prefab === "string" && prefab === "") ||
-    (selection !== "auto" && selection !== "explicit" && selection !== "none" && selection !== "undetected") ||
+    (selection !== "auto" &&
+      selection !== "explicit" &&
+      selection !== "none" &&
+      selection !== "undetected" &&
+      !(allowTarget && selection === "target")) ||
     !isCount(springs) ||
     !isCount(joints) ||
     !isCount(colliders) ||
@@ -363,6 +520,33 @@ function finishPhysicsReport(
   }
   return {
     prefab,
+    selection: selection as PhysicsSelection,
+    springs: springs as number,
+    joints: joints as number,
+    colliders: colliders as number,
+    groups: groups as number,
+    tposeApplied: tposeApplied as number,
+    tposeSkipped: tposeSkipped as number,
+    lookAt: lookAt as PhysicsLookAt | null,
+  };
+}
+
+/**
+ * Prefab用の物理の検証済み値を受け取り直して検証して返す。
+ *
+ * 選択理由は`target`だけを受け付ける。共通制約は{@link finishPhysicsReport}の
+ * 本体を`target`許容で再利用する。
+ *
+ * @param value - Workerから受信した`physics`の値。
+ * @returns 検証済みのPrefab物理報告。
+ * @throws `ConversionError` — 必要な項目が欠けている場合。
+ */
+function parsePrefabPhysicsReport(value: unknown): PrefabPhysicsReport {
+  if (!isRecord(value)) {
+    throw new ConversionError("export", "レポートの読み取りに失敗した");
+  }
+  const {
+    prefab,
     selection,
     springs,
     joints,
@@ -371,6 +555,32 @@ function finishPhysicsReport(
     tposeApplied,
     tposeSkipped,
     lookAt,
+  } = value;
+  const finished = finishPhysicsReportWith(
+    prefab,
+    selection,
+    springs,
+    joints,
+    colliders,
+    groups,
+    tposeApplied,
+    tposeSkipped,
+    lookAt,
+    true,
+  );
+  if ((finished.selection as string) !== "target") {
+    throw new ConversionError("export", "レポートの読み取りに失敗した");
+  }
+  return {
+    prefab: finished.prefab,
+    selection: "target",
+    springs: finished.springs,
+    joints: finished.joints,
+    colliders: finished.colliders,
+    groups: finished.groups,
+    tposeApplied: finished.tposeApplied,
+    tposeSkipped: finished.tposeSkipped,
+    lookAt: finished.lookAt,
   };
 }
 
@@ -422,6 +632,217 @@ function isPhysicsOption(value: unknown): value is PhysicsOption {
   return false;
 }
 
+/** 文字列の配列かを確かめる。空配列は通す。 */
+function isStringArray(value: unknown): value is readonly string[] {
+  return Array.isArray(value) && value.every((entry): entry is string => typeof entry === "string");
+}
+
+/** 空でない文字列の配列かを確かめる。空配列は通す。 */
+function isNonEmptyStringArray(value: unknown): value is readonly string[] {
+  return (
+    Array.isArray(value) &&
+    value.every((entry): entry is string => typeof entry === "string" && entry !== "")
+  );
+}
+
+/**
+ * Prefab入口の一覧の報告値を検証して返す。
+ *
+ * wasm・Worker由来のJSONを想定し、`camelCase`を受け付ける。未知の状態は拒否する。
+ *
+ * @param value - `prefabTargets()`のJSONを解釈した値。
+ * @returns 検証済みの一覧報告。
+ * @throws `ConversionError` — 必要な項目が欠けている場合。
+ */
+export function parsePrefabTargetsReport(value: unknown): PrefabTargetsReport {
+  if (!isRecord(value)) {
+    throw new ConversionError("prefab", "Prefab一覧の読み取りに失敗した");
+  }
+  const { candidates, unreadable } = value;
+  if (!Array.isArray(candidates) || !Array.isArray(unreadable)) {
+    throw new ConversionError("prefab", "Prefab一覧の読み取りに失敗した");
+  }
+  const verified: PrefabTargetCandidate[] = [];
+  for (const entry of candidates) {
+    if (!isRecord(entry)) {
+      throw new ConversionError("prefab", "Prefab一覧の読み取りに失敗した");
+    }
+    const { prefab, state, fbx, nestedPrefabs, otherReferences, unresolvedReferences } = entry;
+    if (typeof prefab !== "string" || prefab === "") {
+      throw new ConversionError("prefab", "Prefab一覧の読み取りに失敗した");
+    }
+    if (
+      state !== "resolved" &&
+      state !== "noModel" &&
+      state !== "unsupportedMultipleFbx" &&
+      state !== "requiresPrefabResolution" &&
+      state !== "unresolved"
+    ) {
+      throw new ConversionError("prefab", "Prefab一覧の読み取りに失敗した");
+    }
+    let verifiedFbx: PrefabTargetFbx | null = null;
+    if (fbx !== null) {
+      if (
+        !isRecord(fbx) ||
+        typeof fbx["path"] !== "string" ||
+        fbx["path"] === "" ||
+        typeof fbx["guid"] !== "string" ||
+        fbx["guid"] === ""
+      ) {
+        throw new ConversionError("prefab", "Prefab一覧の読み取りに失敗した");
+      }
+      verifiedFbx = { path: fbx["path"], guid: fbx["guid"] };
+    }
+    if (
+      !isStringArray(nestedPrefabs) ||
+      !isStringArray(otherReferences) ||
+      !isStringArray(unresolvedReferences)
+    ) {
+      throw new ConversionError("prefab", "Prefab一覧の読み取りに失敗した");
+    }
+    verified.push({
+      prefab,
+      state,
+      fbx: verifiedFbx,
+      nestedPrefabs: [...nestedPrefabs],
+      otherReferences: [...otherReferences],
+      unresolvedReferences: [...unresolvedReferences],
+    });
+  }
+  const issues: PrefabTargetIssue[] = [];
+  for (const entry of unreadable) {
+    if (
+      !isRecord(entry) ||
+      typeof entry["path"] !== "string" ||
+      entry["path"] === "" ||
+      typeof entry["reason"] !== "string" ||
+      entry["reason"] === ""
+    ) {
+      throw new ConversionError("prefab", "Prefab一覧の読み取りに失敗した");
+    }
+    issues.push({ path: entry["path"], reason: entry["reason"] });
+  }
+  return { candidates: verified, unreadable: issues };
+}
+
+/**
+ * Prefab変換の材質割当の報告値を検証して返す。
+ *
+ * @param value - レポート内の`assignment`の値。
+ * @returns 検証済みの割当報告。
+ * @throws `ConversionError` — 必要な項目が欠けている場合。
+ */
+function parsePrefabAssignmentReport(value: unknown): PrefabAssignmentReport {
+  if (!isRecord(value)) {
+    throw new ConversionError("export", "レポートの読み取りに失敗した");
+  }
+  const { mode, activeMeshes, excludedMeshes, excludedNames, materialPool } = value;
+  if (
+    !(mode === null || mode === "instance" || mode === "direct") ||
+    !isCount(activeMeshes) ||
+    !isCount(excludedMeshes) ||
+    !isStringArray(excludedNames) ||
+    !isCount(materialPool)
+  ) {
+    throw new ConversionError("export", "レポートの読み取りに失敗した");
+  }
+  return {
+    mode,
+    activeMeshes,
+    excludedMeshes,
+    excludedNames: [...excludedNames],
+    materialPool,
+  };
+}
+
+/**
+ * Prefab変換の基準姿勢の報告値を検証して返す。
+ *
+ * @param value - レポート内の`baseline`の値。
+ * @returns 検証済みの基準姿勢報告。
+ * @throws `ConversionError` — 必要な項目が欠けている場合。
+ */
+function parsePrefabBaselineReport(value: unknown): PrefabBaselineReport {
+  if (!isRecord(value)) {
+    throw new ConversionError("export", "レポートの読み取りに失敗した");
+  }
+  const { meshes, shapes } = value;
+  if (!isCount(meshes) || !isCount(shapes)) {
+    throw new ConversionError("export", "レポートの読み取りに失敗した");
+  }
+  return { meshes, shapes };
+}
+
+/**
+ * Prefab変換レポートのJSON値を検証して返す（Worker→client境界用）。
+ *
+ * wasm側は`camelCase`で送るため、ここでは`camelCase`を受け付ける。
+ * 受け取る値は`unknown`として扱い、利用前に検証する。
+ *
+ * @param value - Workerから受信したレポートの値。
+ * @returns 検証済みのPrefabレポート。
+ * @throws `ConversionError` — 必要な項目が欠けている場合。
+ */
+export function parsePrefabConversionReport(value: unknown): PrefabConversionReport {
+  if (!isRecord(value)) {
+    throw new ConversionError("export", "レポートの読み取りに失敗した");
+  }
+  const {
+    prefab,
+    fbx,
+    fbxGuid,
+    nestedPrefabs,
+    bytes,
+    nodes,
+    meshes,
+    skins,
+    materials,
+    images,
+    expressions,
+    warnings,
+    assignment,
+    baseline,
+    physics,
+  } = value;
+  if (
+    typeof prefab !== "string" ||
+    prefab === "" ||
+    typeof fbx !== "string" ||
+    fbx === "" ||
+    typeof fbxGuid !== "string" ||
+    fbxGuid === "" ||
+    !isStringArray(nestedPrefabs) ||
+    !isCount(bytes) ||
+    !isCount(nodes) ||
+    !isCount(meshes) ||
+    !isCount(skins) ||
+    !isCount(materials) ||
+    !isCount(images) ||
+    !isCount(expressions) ||
+    !Array.isArray(warnings) ||
+    !warnings.every((entry): entry is string => typeof entry === "string")
+  ) {
+    throw new ConversionError("export", "レポートの読み取りに失敗した");
+  }
+  return {
+    prefab,
+    fbx,
+    fbxGuid,
+    nestedPrefabs: [...nestedPrefabs],
+    bytes,
+    nodes,
+    meshes,
+    skins,
+    materials,
+    images,
+    expressions,
+    warnings: [...warnings],
+    assignment: parsePrefabAssignmentReport(assignment),
+    baseline: parsePrefabBaselineReport(baseline),
+    physics: parsePrefabPhysicsReport(physics),
+  };
+}
+
 /**
  * main→workerの要求値を検証する。Worker側で受信の正当性を確かめるために使う。
  *
@@ -450,6 +871,26 @@ export function isMainToWorkerMessage(value: unknown): value is MainToWorkerMess
     }
     case "prefabCandidates":
       return typeof value["fbxPath"] === "string" && value["fbxPath"] !== "";
+    case "prefabTargets":
+      return true;
+    case "convertPrefab": {
+      if (
+        typeof value["prefabPath"] !== "string" ||
+        value["prefabPath"] === "" ||
+        !isRecord(value["options"])
+      ) {
+        return false;
+      }
+      const options = value["options"];
+      return (
+        typeof options["name"] === "string" &&
+        Array.isArray(options["authors"]) &&
+        options["authors"].every((entry): entry is string => typeof entry === "string") &&
+        typeof options["expressions"] === "boolean" &&
+        typeof options["baseline"] === "boolean" &&
+        typeof options["physics"] === "boolean"
+      );
+    }
     case "cancel":
       return true;
     default:
@@ -458,9 +899,10 @@ export function isMainToWorkerMessage(value: unknown): value is MainToWorkerMess
 }
 
 /**
- * worker→mainの応答値を検証する。`converted`・`prefabCandidates`のレポートは
+ * worker→mainの応答値を検証する。`converted`・`prefabCandidates`・`prefabTargets`のレポートは
  * ここでは検証せず、解決時に{@link parseClientConversionReport}・
- * {@link parsePrefabCandidatesReport}で検証する。`converted`の検証は
+ * {@link parsePrefabConversionReport}・{@link parsePrefabCandidatesReport}・
+ * {@link parsePrefabTargetsReport}で検証する。`converted`の検証は
  * Worker→client境界の`camelCase`用であり、wasm境界の
  * {@link parseConversionReport}とは別である。
  *
@@ -477,6 +919,8 @@ function isWorkerToMainMessage(value: unknown): value is WorkerToMainMessage {
     case "converted":
       return value["vrm"] instanceof ArrayBuffer;
     case "prefabCandidates":
+      return isRecord(value["report"]);
+    case "prefabTargets":
       return isRecord(value["report"]);
     case "error":
       return (
@@ -508,6 +952,18 @@ type PendingRequest =
   | {
       readonly kind: "prefabCandidates";
       readonly resolve: (report: PrefabCandidatesReport) => void;
+      readonly reject: (error: ConversionError) => void;
+      readonly onProgress?: (stage: string) => void;
+    }
+  | {
+      readonly kind: "prefabTargets";
+      readonly resolve: (report: PrefabTargetsReport) => void;
+      readonly reject: (error: ConversionError) => void;
+      readonly onProgress?: (stage: string) => void;
+    }
+  | {
+      readonly kind: "convertPrefab";
+      readonly resolve: (result: PrefabConversionResult) => void;
       readonly reject: (error: ConversionError) => void;
       readonly onProgress?: (stage: string) => void;
     };
@@ -608,6 +1064,48 @@ export class ConversionClient {
   }
 
   /**
+   * 全Prefabの解決状態を取り出す。
+   *
+   * @param onProgress - 重い処理の直前に段階を受け取る場合に渡す。
+   * @returns 一覧報告（候補はパス昇順）。呼び出し側が所有する。
+   * @throws `ConversionError` — 走査の失敗・中断・Worker異常の場合。
+   */
+  prefabTargets(onProgress?: (stage: string) => void): Promise<PrefabTargetsReport> {
+    this.ensureAlive();
+    const id = this.nextId;
+    this.nextId += 1;
+    return new Promise<PrefabTargetsReport>((resolve, reject) => {
+      const request: PendingRequest = { kind: "prefabTargets", resolve, reject };
+      this.pending.set(id, onProgress === undefined ? request : { ...request, onProgress });
+      this.worker.postMessage({ type: "prefabTargets", id } satisfies MainToWorkerMessage);
+    });
+  }
+
+  /**
+   * 選んだPrefabを変換する。VRMバイト列は転送で受け取る。
+   *
+   * @param prefabPath - 変換するPrefabの出力パス（`Assets/...`）。
+   * @param options - Prefab変換設定。
+   * @param onProgress - 重い処理の直前に段階を受け取る場合に渡す。
+   * @returns VRMバイト列とPrefabレポート。バイト列の所有権は呼び出し側へ移る。
+   * @throws `ConversionError` — 変換の失敗・中断・Worker異常の場合。
+   */
+  convertPrefab(
+    prefabPath: string,
+    options: ConvertPrefabOptions,
+    onProgress?: (stage: string) => void,
+  ): Promise<PrefabConversionResult> {
+    this.ensureAlive();
+    const id = this.nextId;
+    this.nextId += 1;
+    return new Promise<PrefabConversionResult>((resolve, reject) => {
+      const request: PendingRequest = { kind: "convertPrefab", resolve, reject };
+      this.pending.set(id, onProgress === undefined ? request : { ...request, onProgress });
+      this.worker.postMessage({ type: "convertPrefab", id, prefabPath, options } satisfies MainToWorkerMessage);
+    });
+  }
+
+  /**
    * Workerを破棄し、待ち合わせ中の要求を中断として失敗させる。
    *
    * 変換側に専用の中断手順はなく、破棄が中断を兼ねる。呼び出し側は中断を
@@ -663,7 +1161,7 @@ export class ConversionClient {
         }
         break;
       case "converted":
-        if (request.kind !== "convert") {
+        if (request.kind !== "convert" && request.kind !== "convertPrefab") {
           return;
         }
         this.pending.delete(data.id);
@@ -671,7 +1169,12 @@ export class ConversionClient {
           // Workerはwasm境界で検証して`camelCase`へ写した済みの値を送るため、
           // ここではWorker→client境界の検証で受け直す。wasm境界の検証を
           // 重ねると`snake_case`要求に当たり成功応答が失敗になる。
-          request.resolve({ vrm: data.vrm, report: parseClientConversionReport(data.report) });
+          // Prefab変換は`target`選択を含むため専用の検証を使う。
+          if (request.kind === "convertPrefab") {
+            request.resolve({ vrm: data.vrm, report: parsePrefabConversionReport(data.report) });
+          } else {
+            request.resolve({ vrm: data.vrm, report: parseClientConversionReport(data.report) });
+          }
         } catch (error) {
           request.reject(toConversionError(error));
         }
@@ -683,6 +1186,17 @@ export class ConversionClient {
         this.pending.delete(data.id);
         try {
           request.resolve(parsePrefabCandidatesReport(data.report));
+        } catch (error) {
+          request.reject(toConversionError(error));
+        }
+        break;
+      case "prefabTargets":
+        if (request.kind !== "prefabTargets") {
+          return;
+        }
+        this.pending.delete(data.id);
+        try {
+          request.resolve(parsePrefabTargetsReport(data.report));
         } catch (error) {
           request.reject(toConversionError(error));
         }

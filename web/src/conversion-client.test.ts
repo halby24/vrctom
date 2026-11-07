@@ -12,6 +12,8 @@ import {
   parseConversionReport,
   parseFbxCandidates,
   parsePrefabCandidatesReport,
+  parsePrefabConversionReport,
+  parsePrefabTargetsReport,
   parsePhysicsReport,
 } from "./conversion-client.js";
 import type { ConversionReport } from "./conversion-client.js";
@@ -403,5 +405,204 @@ describe("mainからWorkerへの要求の検証", () => {
 
   it("Prefab候補の取得要求でパスが空だと要求として扱わない", () => {
     expect(isMainToWorkerMessage({ type: "prefabCandidates", id: 12, fbxPath: "" })).toBe(false);
+  });
+});
+
+describe("Prefab一覧の検証", () => {
+  /** 検査用の正当な一覧。項目ごとに崩して失敗を確かめる。 */
+  function validTargets(): Record<string, unknown> {
+    return {
+      candidates: [
+        {
+          prefab: "Assets/A/avatar.prefab",
+          state: "resolved",
+          fbx: { path: "Assets/A/avatar.fbx", guid: "0123456789abcdef0123456789abcdef" },
+          nestedPrefabs: [],
+          otherReferences: [],
+          unresolvedReferences: [],
+        },
+        {
+          prefab: "Assets/B/nested.prefab",
+          state: "requiresPrefabResolution",
+          fbx: null,
+          nestedPrefabs: ["Assets/C/kuma.prefab"],
+          otherReferences: [],
+          unresolvedReferences: [],
+        },
+      ],
+      unreadable: [{ path: "Assets/B/broken.prefab", reason: "Prefabの解析に失敗した" }],
+    };
+  }
+
+  it("解決状態とネストの組をそのまま通す", () => {
+    const report = parsePrefabTargetsReport(validTargets());
+    expect(report.candidates).toHaveLength(2);
+    expect(report.candidates[0]?.state).toBe("resolved");
+    expect(report.candidates[0]?.fbx?.path).toBe("Assets/A/avatar.fbx");
+    expect(report.candidates[0]?.nestedPrefabs).toStrictEqual([]);
+    expect(report.candidates[1]?.state).toBe("requiresPrefabResolution");
+    expect(report.candidates[1]?.nestedPrefabs).toStrictEqual(["Assets/C/kuma.prefab"]);
+  });
+
+  it("空の候補と空の読めなかった記録を通す", () => {
+    const report = parsePrefabTargetsReport({ candidates: [], unreadable: [] });
+    expect(report.candidates).toStrictEqual([]);
+    expect(report.unreadable).toStrictEqual([]);
+  });
+
+  it("未知の状態は一覧の読み取り失敗になる", () => {
+    const broken = validTargets();
+    const candidates = broken["candidates"] as Record<string, unknown>[];
+    candidates[0] = { ...(candidates[0] as Record<string, unknown>), state: "sometimes" };
+    expect(() => parsePrefabTargetsReport(broken)).toThrow(ConversionError);
+  });
+
+  it("候補の形が崩れると一覧の読み取り失敗になる", () => {
+    const broken = validTargets();
+    const candidates = broken["candidates"] as Record<string, unknown>[];
+    candidates[0] = { ...(candidates[0] as Record<string, unknown>), prefab: "" };
+    expect(() => parsePrefabTargetsReport(broken)).toThrow(ConversionError);
+  });
+});
+
+describe("Prefab変換レポートの検証", () => {
+  /** 検査用の正当なPrefabレポート。項目ごとに崩して失敗を確かめる。 */
+  function validPrefabReport(): Record<string, unknown> {
+    return {
+      prefab: "Assets/A/avatar.prefab",
+      fbx: "Assets/A/avatar.fbx",
+      fbxGuid: "0123456789abcdef0123456789abcdef",
+      nestedPrefabs: [],
+      bytes: 100,
+      nodes: 10,
+      meshes: 2,
+      skins: 1,
+      materials: 1,
+      images: 0,
+      expressions: 0,
+      warnings: [],
+      assignment: {
+        mode: "instance",
+        activeMeshes: 2,
+        excludedMeshes: 0,
+        excludedNames: [],
+        materialPool: 1,
+      },
+      baseline: { meshes: 0, shapes: 0 },
+      physics: {
+        prefab: "Assets/A/avatar.prefab",
+        selection: "target",
+        springs: 1,
+        joints: 2,
+        colliders: 0,
+        groups: 1,
+        tposeApplied: 3,
+        tposeSkipped: 0,
+        lookAt: "bone",
+      },
+    };
+  }
+
+  it("target選択を含む組をそのまま通す", () => {
+    const report = parsePrefabConversionReport(validPrefabReport());
+    expect(report.prefab).toBe("Assets/A/avatar.prefab");
+    expect(report.fbxGuid).toBe("0123456789abcdef0123456789abcdef");
+    expect(report.nestedPrefabs).toStrictEqual([]);
+    expect(report.assignment.mode).toBe("instance");
+    expect(report.physics.selection).toBe("target");
+    expect(report.physics.tposeApplied).toBe(3);
+  });
+
+  it("direct・nullの割当と空ネストを通す", () => {
+    const report = parsePrefabConversionReport({
+      ...validPrefabReport(),
+      nestedPrefabs: ["Assets/C/kuma.prefab"],
+      assignment: {
+        mode: null,
+        activeMeshes: 0,
+        excludedMeshes: 1,
+        excludedNames: ["Body"],
+        materialPool: 0,
+      },
+      physics: {
+        prefab: null,
+        selection: "target",
+        springs: 0,
+        joints: 0,
+        colliders: 0,
+        groups: 0,
+        tposeApplied: 0,
+        tposeSkipped: 0,
+        lookAt: null,
+      },
+    });
+    expect(report.nestedPrefabs).toStrictEqual(["Assets/C/kuma.prefab"]);
+    expect(report.assignment.mode).toBeNull();
+    expect(report.physics.prefab).toBeNull();
+  });
+
+  it("項目が欠けた値はレポートの読み取り失敗になる", () => {
+    const broken = validPrefabReport();
+    delete broken["fbxGuid"];
+    expect(() => parsePrefabConversionReport(broken)).toThrow(ConversionError);
+  });
+
+  it("割当の形が崩れるとレポートの読み取り失敗になる", () => {
+    const broken = validPrefabReport();
+    broken["assignment"] = { ...(broken["assignment"] as Record<string, unknown>), mode: "sometimes" };
+    expect(() => parsePrefabConversionReport(broken)).toThrow(ConversionError);
+  });
+
+  it("物理の選択理由が崩れるとレポートの読み取り失敗になる", () => {
+    const broken = validPrefabReport();
+    broken["physics"] = { ...(broken["physics"] as Record<string, unknown>), selection: "sometimes" };
+    expect(() => parsePrefabConversionReport(broken)).toThrow(ConversionError);
+  });
+});
+
+describe("Prefab入口の要求の検証", () => {
+  it("Prefab一覧の取得要求は引数なしで通す", () => {
+    expect(isMainToWorkerMessage({ type: "prefabTargets", id: 13 })).toBe(true);
+  });
+
+  it("Prefab変換要求は設定の組とともに通す", () => {
+    expect(
+      isMainToWorkerMessage({
+        type: "convertPrefab",
+        id: 14,
+        prefabPath: "Assets/A/avatar.prefab",
+        options: { name: "avatar", authors: ["ある作者"], expressions: true, baseline: true, physics: true },
+      }),
+    ).toBe(true);
+  });
+
+  it("Prefab変換要求でパスが空だと要求として扱わない", () => {
+    expect(
+      isMainToWorkerMessage({
+        type: "convertPrefab",
+        id: 15,
+        prefabPath: "",
+        options: { name: "", authors: [], expressions: false, baseline: false, physics: false },
+      }),
+    ).toBe(false);
+  });
+
+  it("Prefab変換要求で設定の形が崩れていると要求として扱わない", () => {
+    expect(
+      isMainToWorkerMessage({
+        type: "convertPrefab",
+        id: 16,
+        prefabPath: "Assets/A/avatar.prefab",
+        options: { name: "", authors: [], expressions: "yes", baseline: true, physics: true },
+      }),
+    ).toBe(false);
+    expect(
+      isMainToWorkerMessage({
+        type: "convertPrefab",
+        id: 17,
+        prefabPath: "Assets/A/avatar.prefab",
+        options: { name: "", authors: [], expressions: true, baseline: true },
+      }),
+    ).toBe(false);
   });
 });
