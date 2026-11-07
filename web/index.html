@@ -17,7 +17,7 @@
         <a href="https://github.com/halby24/vrctom">GitHub: halby24/vrctom</a>
       </p>
       <p class="privacy">ファイルはブラウザ内だけで処理され、送信・保存されません。</p>
-      <p class="limits">Prefabの材質割当・有効状態と物理（揺れ）は反映されません。</p>
+      <p class="limits">Prefabの材質割当・有効状態は反映されません。対応Prefabがある場合、揺れ（springBone）を反映できます。</p>
     </header>
     <main class="layout">
       <section class="panel controls" aria-label="操作">
@@ -47,6 +47,13 @@
           <div data-testid="candidates">
             <p class="hint">パッケージを開くと候補が並びます</p>
           </div>
+        </fieldset>
+        <fieldset class="candidates-field">
+          <legend>Prefab由来の物理</legend>
+          <div data-testid="prefab-candidates">
+            <p class="hint">FBXを選ぶと候補が並びます</p>
+          </div>
+          <p class="hint" data-testid="prefab-status" data-state="idle">FBXを選ぶとPrefab候補を取得します</p>
         </fieldset>
         <div class="settings">
           <label>

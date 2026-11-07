@@ -102,7 +102,22 @@ pub fn build_model(
     vrm_options: &VrmOptions,
 ) -> Result<BuiltModel, ConversionError> {
     let file = FbxFile::parse(fbx_bytes, fbx_options).map_err(ConversionError::Fbx)?;
-    let (model, report) = VrmModel::from_fbx(&file, vrm_options).map_err(ConversionError::Model)?;
+    build_model_from_fbx(&file, vrm_options)
+}
+
+/// 解析済みFBXから中間モデルと件数・警告の報告を作る。
+///
+/// [`build_model`] の解析済み入力版であり、FBX解析を繰り返さない。
+/// Webなどで解析結果を使い回す場合の入口である。返す内容は [`build_model`] と同じである。
+///
+/// # Errors
+///
+/// 中間モデルの生成に失敗した場合は [`ConversionError::Model`] を返す。
+pub fn build_model_from_fbx(
+    file: &FbxFile<'_>,
+    vrm_options: &VrmOptions,
+) -> Result<BuiltModel, ConversionError> {
+    let (model, report) = VrmModel::from_fbx(file, vrm_options).map_err(ConversionError::Model)?;
     Ok(BuiltModel { model, report })
 }
 

@@ -21,9 +21,8 @@ use vrctom::vrm::{
     PhysicsSidecar, RendererApplyReport, RendererLimits, RendererMeshView, RendererSidecar,
     SpringCompileOptions, VrmAvatarPermission, VrmCommercialUsage, VrmCreditNotation,
     VrmExportOptions, VrmExpressionProfile, VrmMaterials, VrmMeta, VrmModel, VrmModification,
-    VrmOptions, apply_humanoid_t_pose, apply_renderer_plan, compile_springs,
-    expressions_from_avatar_descriptor, plan_renderer_assignment, prefab_baseline_weights,
-    resolve_look_at,
+    VrmOptions, apply_renderer_plan, expressions_from_avatar_descriptor, plan_renderer_assignment,
+    prefab_baseline_weights,
 };
 
 #[derive(Debug, Parser)]
@@ -1275,159 +1274,56 @@ fn derive_physics_from_prefab(
 
 /// 解決済みの物理sidecarを中間モデルへ適用し、要約文を返す。
 ///
-/// 解決・T-pose・視線・スプリング生成が通ってからモデルを更新する。
+/// 共通適用関数の薄い配線であり、表示の順序と文面だけを受け持つ。
+/// 解決・T-pose・視線・スプリング生成の順序と集計はライブラリ側にあり、
+/// ここでは診断行を標準エラーに出して要約を返す。
 /// 失敗時はモデルを部分更新せず、診断を標準エラーに出して終了コードを返す。
-#[allow(clippy::too_many_lines)]
 fn apply_physics_sidecar(
     model: &mut VrmModel,
     sidecar: &PhysicsSidecar,
     fbx_bytes: &[u8],
     humanoid: &HumanoidBones,
 ) -> Result<String, i32> {
-    let resolution = match model.resolve_physics_sidecar(sidecar, fbx_bytes) {
-        Ok(resolution) => {
-            if resolution.auxiliary_nodes.is_empty() {
-                eprintln!("物理: 補助ノードの追加は無い");
-            } else {
-                let names: Vec<&str> = resolution
-                    .auxiliary_nodes
-                    .iter()
-                    .map(|aux| aux.name.as_str())
-                    .collect();
+    match vrctom::vrm::apply_physics_sidecar(
+        model,
+        sidecar,
+        fbx_bytes,
+        humanoid,
+        &SpringCompileOptions::new(),
+    ) {
+        Ok(report) => {
+            eprintln!("{}", report.auxiliary_message());
+            for skipped in &report.tpose_skipped {
                 eprintln!(
-                    "物理: 補助ノード{}件を追加（{}）",
-                    resolution.auxiliary_nodes.len(),
-                    names.join(", "),
+                    "T-ポーズのスキップ: {} {}: {}",
+                    escape_diag(&skipped.bone),
+                    escape_diag(&skipped.node_id),
+                    skipped.reason,
                 );
             }
-            resolution
+            if let Some(message) = report.tpose_count_message() {
+                eprintln!("{message}");
+            }
+            if let Some(message) = report.look_at_message() {
+                eprintln!("{message}");
+            }
+            Ok(report.summary())
         }
         Err(error) => {
-            diagnose_stage("物理sidecarの解決に失敗した", &error);
-            return Err(1);
-        }
-    };
-    // humanoidのrest姿勢はsidecarのT-poseを優先する。無い骨は
-    // ノードの姿勢のまま残す。参照実装もリグ構築直後にT-poseを当ててから
-    // 物理を解決するため、視線の測定とスプリングの生成より前に適用する。
-    // 書き出しに使う解決済み対応を渡し、不一致は適用前に失敗させる。
-    // 失敗時はモデルを部分更新せず打ち切る。
-    let (tpose_applied, tpose_skipped) =
-        match apply_humanoid_t_pose(sidecar, model, &resolution, humanoid) {
-            Ok(report) => {
-                for skipped in &report.skipped {
-                    eprintln!(
-                        "T-ポーズのスキップ: {} {}: {}",
-                        escape_diag(&skipped.bone),
-                        escape_diag(&skipped.node_id),
-                        skipped.reason,
-                    );
-                }
-                (report.applied.len(), report.skipped.len())
+            // 失敗前に確定した診断も従来どおり先に出し、順序を保つ。
+            // 解決前は何も出さず、T-pose成功後はスキップ行まで出す。
+            if let Some(message) = error.auxiliary_message() {
+                eprintln!("{message}");
             }
-            Err(error) => {
-                diagnose_stage("T-ポーズの適用に失敗した", &error);
-                return Err(1);
-            }
-        };
-    // 視線の解決。sidecarに視線記録が無い旧形式では何もしない。
-    // 測定も既定もここで確定する。モデルは変更しないため、
-    // 失敗時は部分更新なく打ち切る。humanoidは解決より前に検出したものを
-    // 使い、補助ノード（同名ノードを含む）の影響を受けない。
-    let look_at = match sidecar.look_at.as_ref() {
-        Some(_) => match resolve_look_at(sidecar, model, &resolution, humanoid) {
-            Ok(look_at) => look_at,
-            Err(error) => {
-                diagnose_stage("視線の解決に失敗した", &error);
-                return Err(1);
-            }
-        },
-        None => None,
-    };
-    match compile_springs(sidecar, model, &resolution, &SpringCompileOptions::new()) {
-        Ok(compiled) => {
-            // 主要な近似件数と関節値の目安も出し、文書の制限と突き合わせられるようにする。
-            let world = compiled
-                .report
-                .center_applied
-                .iter()
-                .filter(|entry| entry.kind == vrctom::vrm::CenterKind::World)
-                .count();
-            let all_motion = compiled
-                .report
-                .center_applied
-                .iter()
-                .filter(|entry| entry.kind == vrctom::vrm::CenterKind::AllMotion)
-                .count();
-            let mut stiff_sum = 0.0f64;
-            let mut grav_count = 0usize;
-            let mut joint_total = 0usize;
-            for spring in &compiled.bones.springs {
-                for joint in &spring.joints {
-                    stiff_sum += f64::from(joint.stiffness);
-                    if joint.gravity_power > 0.0 {
-                        grav_count += 1;
-                    }
-                    joint_total += 1;
-                }
-            }
-            let stiff_mean = if joint_total > 0 {
-                stiff_sum / joint_total as f64
-            } else {
-                0.0
-            };
-            let summary = format!(
-                "スプリング{}件 関節{}件 collider{}件 グループ{}件 分岐{}件 center{}件（world{} / all-motion{} / なし{}） 近似(endpoint未生成{} gravity0関節{} first-child{} 平均近似{} 平面落下{}) 関節値(硬さ平均{:.3} 重力あり{}件) 共有{}件 スキップ{}件 制約{}件 制約スキップ{}件 T-ポーズ{}件",
-                compiled.report.spring_count,
-                compiled.report.joint_count,
-                compiled.report.collider_count,
-                compiled.report.group_count,
-                compiled.report.branch_splits.len(),
-                compiled.report.center_applied.len(),
-                world,
-                all_motion,
-                compiled.report.center_missing.len(),
-                compiled.report.no_endpoint.len(),
-                compiled.report.gravity_zero_joints,
-                compiled.report.first_child_multichild.len(),
-                compiled.report.average_approximated.len(),
-                compiled.report.plane_colliders_dropped.len(),
-                stiff_mean,
-                grav_count,
-                compiled.report.lost_nodes.len(),
-                compiled.report.skipped_bones.len(),
-                model.node_constraints.len(),
-                compiled.report.skipped_constraints.len(),
-                tpose_applied,
-            );
-            if tpose_skipped > 0 {
-                eprintln!("T-ポーズのスキップ: {tpose_skipped}件");
-            }
-            model.spring_bones = compiled.bones;
-            // 視線は鎖の生成が通ってから代入する。失敗時はモデルを更新しない。
-            if let Some((look, report)) = look_at {
-                model.look_at = Some(look);
+            for skipped in error.tpose_skipped() {
                 eprintln!(
-                    "視線: lookAt={} {} 内{:.3}度 外{:.3}度 下{:.3}度 上{:.3}度 頭基準ずれ[{:.6}, {:.6}, {:.6}]",
-                    report.look_type,
-                    if report.measured {
-                        "測定値"
-                    } else {
-                        "既定値"
-                    },
-                    report.range.horizontal_inner,
-                    report.range.horizontal_outer,
-                    report.range.vertical_down,
-                    report.range.vertical_up,
-                    report.offset_from_head[0],
-                    report.offset_from_head[1],
-                    report.offset_from_head[2],
+                    "T-ポーズのスキップ: {} {}: {}",
+                    escape_diag(&skipped.bone),
+                    escape_diag(&skipped.node_id),
+                    skipped.reason,
                 );
             }
-            Ok(summary)
-        }
-        Err(error) => {
-            diagnose_stage("スプリングの生成に失敗した", &error);
+            diagnose_stage(error.stage(), error.error());
             Err(1)
         }
     }

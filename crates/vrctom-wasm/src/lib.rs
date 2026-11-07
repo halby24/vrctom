@@ -31,6 +31,17 @@ impl WebPackage {
         Ok(self.package.candidates_json())
     }
 
+    /// 対象FBXを参照するPrefab候補のJSON文字列を返す。
+    ///
+    /// `core` の走査結果をそのまま返し、解釈は呼び出し側に任せる。
+    /// 失敗は既存の `to_js_error` でJSの `Error` へ写す。
+    #[wasm_bindgen(js_name = prefabCandidates)]
+    pub fn prefab_candidates(&self, fbx_path: &str) -> Result<String, JsValue> {
+        self.package
+            .prefab_candidates_json(fbx_path)
+            .map_err(to_js_error)
+    }
+
     /// 選んだFBXを変換し、VRMバイト列とレポートJSONを持つ [`Converted`] を返す。
     pub fn convert(&self, fbx_path: &str, options_json: &str) -> Result<Converted, JsValue> {
         self.package

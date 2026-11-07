@@ -144,6 +144,21 @@ body {
   font-size: 0.85rem;
 }
 
+.prefab-warn {
+  color: var(--danger);
+  font-size: 0.9rem;
+}
+
+.error-panel button {
+  padding: 0.5rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 1rem;
+  cursor: pointer;
+}
+
 .settings {
   display: grid;
   gap: 0.5rem;

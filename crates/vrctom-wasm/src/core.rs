@@ -5,12 +5,14 @@
 //! テストできる。JS境界の薄い写しは [`crate::WebPackage`] を参照。
 
 use serde::{Deserialize, Serialize};
-use vrctom::conversion::{ConversionError, build_model, export_model};
-use vrctom::fbx::FbxOptions;
-use vrctom::unity::{AssetIndex, HumanBoneMapping, IndexOptions};
+use vrctom::conversion::{ConversionError, build_model_from_fbx, export_model};
+use vrctom::fbx::{FbxFile, FbxOptions};
+use vrctom::unity::{AssetIndex, HumanBoneMapping, IndexOptions, ParseOptions};
 use vrctom::unitypackage::{EntryKind, MemoryPackage, UnpackOptions, unpack_in_memory};
 use vrctom::vrm::{
-    HumanoidBones, MaterialOptions, VrmExportOptions, VrmExpressionProfile, VrmMeta, VrmOptions,
+    HumanoidBones, MaterialOptions, PhysicsDeriveLimits, PhysicsLimits, PhysicsSidecar,
+    PrefabDeriveSource, SpringCompileOptions, VrmExportOptions, VrmExpressionProfile, VrmMeta,
+    VrmOptions, apply_physics_sidecar, derive_physics_sidecar_with, find_prefab_candidates,
 };
 
 /// Web向けの資源上限。
@@ -30,6 +32,8 @@ pub struct Limits {
     max_image_pixels: u64,
     max_total_image_pixels: u64,
     max_output_bytes: usize,
+    max_prefab_bytes: u64,
+    max_physics_total_bytes: u64,
 }
 
 impl Limits {
@@ -38,11 +42,13 @@ impl Limits {
     /// 圧縮入力512MiB・展開後2GiB・tar10万件・FBX1件128MiB・
     /// 画像1枚32MiB・合計256MiB・画素1枚16777216（4096²）・
     /// 復号結果の保持量の予算67108864（4096²x4、RGBAで256MiB）・
-    /// VRM出力512MiBである。
+    /// VRM出力512MiB・Prefab本文64MiB・物理の依存合計512MiBである。
     ///
     /// 保持量の予算は復号結果の共有表が持つ画素数の目安であり、
     /// 超えたら保持を捨てて再復号する。上限は安全のための
     /// 目安であり、代表パッケージの計測で見直す。
+    /// Prefab本文は導出の既定（実測約300KBに2桁の余裕）に合わせ、
+    /// 物理の依存合計はWebの入出力規模に合わせる。
     pub fn new() -> Self {
         Self {
             max_input_bytes: 512 * 1024 * 1024,
@@ -54,6 +60,8 @@ impl Limits {
             max_image_pixels: 16_777_216,
             max_total_image_pixels: 67_108_864,
             max_output_bytes: 512 * 1024 * 1024,
+            max_prefab_bytes: 64 * 1024 * 1024,
+            max_physics_total_bytes: 512 * 1024 * 1024,
         }
     }
 
@@ -114,6 +122,22 @@ impl Limits {
         self
     }
 
+    /// Prefab本文1件の上限（バイト数）を変更する。
+    ///
+    /// 候補走査と導出の両方に使い、物理導出の上限へ渡す。
+    pub fn with_max_prefab_bytes(mut self, bytes: u64) -> Self {
+        self.max_prefab_bytes = bytes;
+        self
+    }
+
+    /// 物理の依存資産の合計上限（バイト数）を変更する。
+    ///
+    /// 候補走査と導出の両方に使い、物理導出の上限へ渡す。
+    pub fn with_max_physics_total_bytes(mut self, bytes: u64) -> Self {
+        self.max_physics_total_bytes = bytes;
+        self
+    }
+
     /// 材質読み取りの設定を作る。画素上限はここから渡す。
     fn material_options(&self) -> MaterialOptions {
         MaterialOptions::new()
@@ -145,6 +169,8 @@ pub enum Stage {
     Material,
     /// VRMの書き出し。
     Export,
+    /// 物理（Prefab由来のspringBone）の導出・適用。
+    Physics,
 }
 
 impl Stage {
@@ -157,6 +183,7 @@ impl Stage {
             Self::Model => "model",
             Self::Material => "material",
             Self::Export => "export",
+            Self::Physics => "physics",
         }
     }
 }
@@ -228,6 +255,32 @@ pub struct FbxCandidate {
     pub path: String,
     /// 実体のバイト数。
     pub size: u64,
+}
+
+/// Prefab走査で読めなかった1件。候補とは別に報告する。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PrefabScanIssue {
+    /// 出力パス（`Assets/...`）。
+    pub path: String,
+    /// 読めなかった理由の日本語診断。
+    pub reason: String,
+}
+
+/// 対象FBXを参照するPrefabの走査結果。
+///
+/// `candidates` は出力パス（`Assets/...`）の昇順であり、重複しない。
+/// `unreadable` は走査中に出会った解析不能Prefabの記録であり、
+/// 解析失敗を握りつぶして0件扱いにしないための診断である。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PrefabCandidatesReport {
+    /// 対象FBXの出力パス（`Assets/...`）。
+    pub fbx: String,
+    /// 対象FBXのGUID（索引の記録）。
+    pub guid: String,
+    /// 対象FBXを参照するPrefabの出力パス列（`Assets/...`、昇順）。
+    pub candidates: Vec<String>,
+    /// 走査中に解析できなかったPrefabの記録列（パス昇順）。
+    pub unreadable: Vec<PrefabScanIssue>,
 }
 
 /// 変換結果。VRMバイト列とレポートJSONを持つ。
@@ -317,6 +370,71 @@ impl Package {
         serde_json::to_string(&self.fbx_candidates()).unwrap_or_else(|_| "[]".to_owned())
     }
 
+    /// 対象FBXを参照するPrefabの候補を走査する。
+    ///
+    /// `fbx_path` は `Assets/...` の出力パスである。判定は構造化された参照
+    /// だけを使い、GUID文字列の部分一致検索はしない。
+    /// 解析できなかったPrefabは失敗にせず `unreadable` に記録する。
+    ///
+    /// # Errors
+    ///
+    /// FBXパス不正・索引にFBXが無い・走査の合計上限超過の場合に段階付きで返す。
+    pub fn prefab_candidates(&self, fbx_path: &str) -> Result<PrefabCandidatesReport, CoreError> {
+        self.prefab_candidates_with_limits(fbx_path, &Limits::new())
+    }
+
+    /// 上限を指定してPrefab候補を走査する。テストで小さな上限を使うための入口である。
+    fn prefab_candidates_with_limits(
+        &self,
+        fbx_path: &str,
+        limits: &Limits,
+    ) -> Result<PrefabCandidatesReport, CoreError> {
+        let relative = fbx_relative(fbx_path)?;
+        let record = self.index.get_by_path(&relative).ok_or_else(|| {
+            CoreError::new(Stage::Package, format!("索引にFBXが無い: {fbx_path}"))
+                .with_path(fbx_path.to_owned())
+        })?;
+        let guid = record.meta.guid().as_str().to_owned();
+        let found =
+            find_prefab_candidates(&self.package, &self.index, fbx_path, &derive_limits(limits))
+                .map_err(|error| {
+                    CoreError::new(
+                        Stage::Physics,
+                        format!("Prefab候補の走査に失敗した: {error}"),
+                    )
+                    .with_path(fbx_path.to_owned())
+                })?;
+        Ok(PrefabCandidatesReport {
+            fbx: fbx_path.to_owned(),
+            guid,
+            candidates: found.candidates,
+            unreadable: found
+                .unreadable
+                .into_iter()
+                .map(|issue| PrefabScanIssue {
+                    path: issue.path,
+                    reason: issue.reason,
+                })
+                .collect(),
+        })
+    }
+
+    /// Prefab候補のJSON文字列を返す。
+    ///
+    /// # Errors
+    ///
+    /// FBXパス不正・索引にFBXが無い・走査の合計上限超過・JSON化の失敗の場合に返す。
+    pub fn prefab_candidates_json(&self, fbx_path: &str) -> Result<String, CoreError> {
+        let report = self.prefab_candidates(fbx_path)?;
+        serde_json::to_string(&report).map_err(|error| {
+            CoreError::new(
+                Stage::Export,
+                format!("候補一覧のJSON化に失敗した: {error}"),
+            )
+            .with_path(fbx_path.to_owned())
+        })
+    }
+
     /// 選んだFBXを変換する。
     ///
     /// `fbx_path` は `Assets/...` の出力パス、`options_json` は
@@ -336,9 +454,11 @@ impl Package {
 
     /// 上限を指定して変換する。テストで小さな上限を使うための入口である。
     ///
-    /// 順序は中間モデルの生成→humanoid対応の解決→VRM書き出しである。
-    /// FBX解析は [`build_model`](vrctom::conversion::build_model) の一度だけであり、
+    /// 順序はFBX解析→中間モデルの生成→humanoid対応の解決→物理の導出・適用→
+    /// VRM書き出しである。FBX解析は一度だけであり、解析済みFBXを使い回す。
     /// humanoid対応は索引の `.fbx.meta` から引いた対応表と名前推測で決める。
+    /// 物理は変換オプションの指定に従い、失敗したら物理なしにせず変換全体を
+    /// 失敗させる。明示の `"none"` だけが物理なしである。
     fn convert_with_limits(
         &self,
         fbx_path: &str,
@@ -376,7 +496,12 @@ impl Package {
             vrm_options = vrm_options.with_expressions(VrmExpressionProfile::vrchat());
         }
         let meta = VrmMeta::new(options.name(&relative), options.authors());
-        let built = build_model(&fbx_bytes, &FbxOptions::default(), &vrm_options)
+        // FBX解析は一度だけ行い、導出でも同じ解析結果を使い回す。
+        let fbx_file = FbxFile::parse(&fbx_bytes, &FbxOptions::default()).map_err(|error| {
+            CoreError::new(Stage::Fbx, format!("FBXの解析に失敗した: {error}"))
+                .with_path(fbx_path.to_owned())
+        })?;
+        let mut built = build_model_from_fbx(&fbx_file, &vrm_options)
             .map_err(|error| conversion_error(&error, fbx_path))?;
         // `.fbx.meta` の対応表を索引から引き、名前推測で不足分を補う。
         // 対応表が空の場合も同じ経路を通すため、名前推測だけの既存挙動と同じ結果になる。
@@ -387,9 +512,20 @@ impl Package {
                     .with_path(fbx_path.to_owned())
             })?;
         // 順序は材質警告・灰色出力警告の後にモデル警告、最後に対応表由来の警告を置く。
-        // 既存の `Report.warnings` に統合し、JSONスキーマは変えない。
+        // 物理の警告は対応表の警告の後ろに置く。既存の `Report.warnings` の
+        // 並びを崩さず、末尾に足すだけにする。
         warnings.extend(built.report.warnings.iter().cloned());
         warnings.extend(mapping_warnings);
+        // 物理指定の解決。`"none"` と候補0件の `"auto"` は物理なしであり、
+        // それ以外はPrefabを1件に定めて導出・適用する。
+        let physics =
+            match self.resolve_physics_prefab(fbx_path, &options, limits, &mut warnings)? {
+                PhysicsPlan::Skip { selection } => PhysicsReport::skipped(selection),
+                PhysicsPlan::Apply { prefab, selection } => self.apply_prefab_physics(
+                    fbx_path, &prefab, selection, &fbx_file, &fbx_bytes, &humanoid, limits,
+                    &mut built,
+                )?,
+            };
         let mut export_options = VrmExportOptions::new(meta)
             .with_max_output_bytes(limits.max_output_bytes)
             .with_humanoid(humanoid);
@@ -398,16 +534,19 @@ impl Package {
         }
         let vrm = export_model(&built.model, &export_options)
             .map_err(|error| conversion_error(&error, fbx_path))?;
+        // ノード数は物理適用後の実モデルに合わせる。物理なしの場合は
+        // 生成直後の件数と同じである。
         let report = Report {
             fbx: fbx_path.to_owned(),
             bytes: vrm.len() as u64,
-            nodes: built.report.node_count,
+            nodes: built.model.nodes.len(),
             meshes: built.report.mesh_count,
             skins: built.report.skin_count,
             materials: material_count,
             images: image_count,
             expressions: built.report.expression_count,
             warnings,
+            physics,
         };
         let report_json = serde_json::to_string(&report).map_err(|error| {
             CoreError::new(
@@ -417,6 +556,194 @@ impl Package {
             .with_path(fbx_path.to_owned())
         })?;
         Ok(ConvertedPackage { vrm, report_json })
+    }
+
+    /// 物理指定を解決し、使うPrefabパスを返す。
+    ///
+    /// `"auto"` は候補1件なら自動選択するが、解析不能Prefab（`unreadable`）が
+    /// 1件でもあれば自動確定せず失敗する。候補が複数ある場合も失敗する。
+    /// 候補0件かつ `unreadable` 0件のときだけ警告を積んで物理なしにする。
+    /// 明示は候補一致が必須であり、候補外や読めない指定は失敗する。
+    /// 明示の対象が候補にある場合も `unreadable` の情報は警告として残す。
+    /// `"none"` は警告も出さず物理なしである。
+    /// 物理段階の失敗は黙って物理なしにせず、呼び出し側が変換全体を失敗させる。
+    /// 候補0件の警告だけが `warnings` に入る。
+    fn resolve_physics_prefab(
+        &self,
+        fbx_path: &str,
+        options: &ResolvedOptions,
+        limits: &Limits,
+        warnings: &mut Vec<String>,
+    ) -> Result<PhysicsPlan, CoreError> {
+        match &options.physics {
+            PhysicsSelection::None => Ok(PhysicsPlan::Skip { selection: "none" }),
+            PhysicsSelection::Explicit(path) => {
+                let found = self.scan_prefabs(fbx_path, limits)?;
+                if found.candidates.iter().any(|entry| entry == path) {
+                    // 明示の対象は候補にあるが、他の解析不能Prefabの情報は
+                    // 黙って捨てず警告として残す。
+                    if !found.unreadable.is_empty() {
+                        warnings.push(unreadable_warning(&found.unreadable));
+                    }
+                    return Ok(PhysicsPlan::Apply {
+                        prefab: path.clone(),
+                        selection: "explicit",
+                    });
+                }
+                if let Some(issue) = found.unreadable.iter().find(|issue| &issue.path == path) {
+                    return Err(CoreError::new(
+                        Stage::Physics,
+                        format!(
+                            "指定したPrefabを読めないため物理に使わない: {path}（{}）",
+                            issue.reason,
+                        ),
+                    )
+                    .with_path(fbx_path.to_owned()));
+                }
+                Err(CoreError::new(
+                    Stage::Physics,
+                    format!("指定したPrefabは対象FBXを参照しないため物理に使わない: {path}"),
+                )
+                .with_path(fbx_path.to_owned()))
+            }
+            PhysicsSelection::Auto => {
+                let found = self.scan_prefabs(fbx_path, limits)?;
+                // 解析不能Prefabがある場合は、唯一候補でも自動確定しない。
+                // 見えていない参照が候補判定を変えた可能性があり、先勝ちにしない。
+                if !found.unreadable.is_empty() {
+                    let paths: Vec<&str> = found
+                        .unreadable
+                        .iter()
+                        .map(|issue| issue.path.as_str())
+                        .collect();
+                    return Err(CoreError::new(
+                        Stage::Physics,
+                        format!(
+                            "解析できないPrefabがあるため自動で選ばない。Prefabを明示選択するか物理なしを選べ: {}",
+                            paths.join(", "),
+                        ),
+                    )
+                    .with_path(fbx_path.to_owned()));
+                }
+                match found.candidates.as_slice() {
+                    [] => {
+                        warnings
+                            .push("対応Prefabを検出できないためPrefab由来の物理なし".to_owned());
+                        Ok(PhysicsPlan::Skip {
+                            selection: "undetected",
+                        })
+                    }
+                    [only] => Ok(PhysicsPlan::Apply {
+                        prefab: only.clone(),
+                        selection: "auto",
+                    }),
+                    many => Err(CoreError::new(
+                        Stage::Physics,
+                        format!(
+                            "対象FBXを参照するPrefabが{}件あるため自動で選ばない: {}",
+                            many.len(),
+                            many.join(", "),
+                        ),
+                    )
+                    .with_path(fbx_path.to_owned())),
+                }
+            }
+        }
+    }
+
+    /// Prefab候補を走査する。物理指定の解決と候補一覧の両方で使う。
+    fn scan_prefabs(
+        &self,
+        fbx_path: &str,
+        limits: &Limits,
+    ) -> Result<vrctom::vrm::PrefabCandidates, CoreError> {
+        find_prefab_candidates(&self.package, &self.index, fbx_path, &derive_limits(limits))
+            .map_err(|error| {
+                CoreError::new(
+                    Stage::Physics,
+                    format!("Prefab候補の走査に失敗した: {error}"),
+                )
+                .with_path(fbx_path.to_owned())
+            })
+    }
+
+    /// 指定Prefabから物理sidecarを導出して中間モデルへ適用し、報告を返す。
+    ///
+    /// Prefab本文と `.meta` はパッケージと索引から読み、ファイルシステムに触れない。
+    /// 導出・sidecar読み取り・適用のいずれかが失敗したら物理なしにせず失敗する。
+    /// 成功時は `built` のノード列と制約列を更新する。
+    #[allow(clippy::too_many_arguments)]
+    fn apply_prefab_physics(
+        &self,
+        fbx_path: &str,
+        prefab_path: &str,
+        selection: &'static str,
+        fbx_file: &FbxFile<'_>,
+        fbx_bytes: &[u8],
+        humanoid: &HumanoidBones,
+        limits: &Limits,
+        built: &mut vrctom::conversion::BuiltModel,
+    ) -> Result<PhysicsReport, CoreError> {
+        let prefab_bytes = self.package.read(prefab_path).ok_or_else(|| {
+            CoreError::new(
+                Stage::Physics,
+                format!("パッケージ内にPrefabが見つからない: {prefab_path}"),
+            )
+            .with_path(fbx_path.to_owned())
+        })?;
+        let parsed = vrctom::unity::SerializedFile::parse(
+            prefab_bytes,
+            &ParseOptions::new().with_max_file_bytes(limits.max_prefab_bytes),
+        )
+        .map_err(|error| {
+            CoreError::new(Stage::Physics, format!("Prefabの解析に失敗した: {error}"))
+                .with_path(fbx_path.to_owned())
+        })?;
+        let source = PrefabDeriveSource {
+            fbx_bytes,
+            fbx: fbx_file,
+            source: &self.package,
+            index: &self.index,
+            prefab: &parsed,
+            prefab_label: prefab_path,
+            fbx_asset_path: fbx_path,
+            limits: derive_limits(limits),
+        };
+        let derived = derive_physics_sidecar_with(&source).map_err(|error| {
+            CoreError::new(Stage::Physics, format!("物理の導出に失敗した: {error}"))
+                .with_path(fbx_path.to_owned())
+        })?;
+        let sidecar =
+            PhysicsSidecar::parse(&derived.json, &PhysicsLimits::new()).map_err(|error| {
+                CoreError::new(
+                    Stage::Physics,
+                    format!("物理sidecarの読み取りに失敗した: {error}"),
+                )
+                .with_path(fbx_path.to_owned())
+            })?;
+        let applied = apply_physics_sidecar(
+            &mut built.model,
+            &sidecar,
+            fbx_bytes,
+            humanoid,
+            &SpringCompileOptions::new(),
+        )
+        .map_err(|error| {
+            CoreError::new(Stage::Physics, format!("物理の適用に失敗した: {error}"))
+                .with_path(fbx_path.to_owned())
+        })?;
+        // 選択理由は解決済みであり、件数は適用報告そのままである。
+        Ok(PhysicsReport {
+            prefab: Some(prefab_path.to_owned()),
+            selection: selection.to_owned(),
+            springs: applied.spring_count,
+            joints: applied.joint_count,
+            colliders: applied.collider_count,
+            groups: applied.group_count,
+            tpose_applied: applied.tpose_applied,
+            tpose_skipped: applied.tpose_skipped.len(),
+            look_at: applied.look_at.as_ref().map(|look| look.look_type.clone()),
+        })
     }
 
     /// 出力パスからFBX実体を取り出す。ファイル項目に無い場合と
@@ -490,6 +817,40 @@ fn web_unpack_options(limits: &Limits) -> UnpackOptions {
         .with_max_entries(limits.max_entries)
 }
 
+/// `Limits` から物理導出の上限を作る。
+///
+/// 主FBXと追加FBXは単一FBXの予算（`max_fbx_bytes`）を共有し、
+/// Prefab本文と依存合計は専用の上限を使う。
+fn derive_limits(limits: &Limits) -> PhysicsDeriveLimits {
+    PhysicsDeriveLimits::new()
+        .with_max_main_fbx_bytes(limits.max_fbx_bytes)
+        .with_max_extra_fbx_bytes(limits.max_fbx_bytes)
+        .with_max_prefab_bytes(limits.max_prefab_bytes)
+        .with_max_total_bytes(limits.max_physics_total_bytes)
+}
+
+/// 解析不能Prefabの記録を警告文にする。候補の有無とは別に残し、黙って捨てない。
+fn unreadable_warning(unreadable: &[vrctom::vrm::PrefabScanIssue]) -> String {
+    let paths: Vec<&str> = unreadable.iter().map(|issue| issue.path.as_str()).collect();
+    format!(
+        "読めなかったPrefabが{}件ある: {}",
+        unreadable.len(),
+        paths.join(", "),
+    )
+}
+
+/// 物理指定の解決結果。使うPrefabと選択理由の組である。
+#[derive(Debug, Clone)]
+enum PhysicsPlan {
+    /// 物理を使わない。選択理由（`"none"`・`"undetected"`）を持つ。
+    Skip { selection: &'static str },
+    /// 指定Prefabを使う。選択理由（`"auto"`・`"explicit"`）を持つ。
+    Apply {
+        prefab: String,
+        selection: &'static str,
+    },
+}
+
 /// 出力パスのファイル名の拡張子がFBXかどうかを返す。
 ///
 /// バイト位置ではなく最後の `/` 以降のファイル名を `rsplit_once('.')` で
@@ -546,6 +907,64 @@ struct RawOptions {
     /// 表情指定。`"vrc"` だけがVRChat向け8件になり、それ以外は既定（無し）である。
     #[serde(default)]
     expressions: Option<String>,
+    /// 物理指定。キー無し・nullは `"auto"` と同じである。
+    #[serde(default, deserialize_with = "de_physics_selection")]
+    physics: PhysicsSelection,
+}
+
+/// 物理指定の解釈結果。
+///
+/// `"auto"`（既定）は候補1件なら自動選択するが、解析不能Prefabが1件でもあれば
+/// 失敗し、複数なら失敗、候補0件かつ解析不能0件のときだけ警告して物理なしにする。
+/// `{"prefab": "..."}` は明示選択であり、候補外は失敗する。
+/// `"none"` は警告も出さず物理なしである。キー無し・nullは `"auto"` として解釈する
+/// （入力形の互換であり、過去の呼び出しを同じ意味で受け付けるための扱いである）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum PhysicsSelection {
+    /// 自動（既定）。キー無し・null・`"auto"` である。
+    #[default]
+    Auto,
+    /// 物理なし。`"none"` である。
+    None,
+    /// 明示選択。`{"prefab": "Assets/..."}` である。
+    Explicit(String),
+}
+
+/// 物理指定のJSONを解釈する。キー無しは呼び出し側の `default` で `auto` になる。
+fn de_physics_selection<'de, D>(deserializer: D) -> Result<PhysicsSelection, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Null => Ok(PhysicsSelection::Auto),
+        serde_json::Value::String(text) => match text.as_str() {
+            "auto" => Ok(PhysicsSelection::Auto),
+            "none" => Ok(PhysicsSelection::None),
+            _ => Err(serde::de::Error::custom(format!(
+                "物理指定を読めない: {text:?}（\"auto\"・\"none\"のいずれか）"
+            ))),
+        },
+        serde_json::Value::Object(map) => {
+            // `{"prefab": "..."}` だけを受け付け、余計なキーは拒否する。
+            if map.len() != 1 || !map.contains_key("prefab") {
+                return Err(serde::de::Error::custom(
+                    "物理指定を読めない（{\"prefab\": \"Assets/...\"}の形）",
+                ));
+            }
+            match map.get("prefab") {
+                Some(serde_json::Value::String(path)) if !path.trim().is_empty() => {
+                    Ok(PhysicsSelection::Explicit(path.clone()))
+                }
+                _ => Err(serde::de::Error::custom(
+                    "物理指定のprefabは空でないパス文字列である",
+                )),
+            }
+        }
+        _ => Err(serde::de::Error::custom(
+            "物理指定を読めない（\"auto\"・\"none\"・{\"prefab\": \"Assets/...\"}のいずれか）",
+        )),
+    }
 }
 
 /// 解釈済みの変換オプション。
@@ -554,6 +973,7 @@ struct ResolvedOptions {
     name: Option<String>,
     authors: Vec<String>,
     expressions_vrc: bool,
+    physics: PhysicsSelection,
 }
 
 impl ResolvedOptions {
@@ -602,7 +1022,52 @@ fn parse_options(options_json: &str) -> Result<ResolvedOptions, CoreError> {
         name: raw.name,
         authors: raw.authors.unwrap_or_default(),
         expressions_vrc: raw.expressions.as_deref() == Some("vrc"),
+        physics: raw.physics,
     })
+}
+
+/// UIへ返す物理の構造化情報。
+///
+/// `warnings` とは重複しない。候補0件などの警告文は `Report.warnings` にだけ入り、
+/// ここでは選択理由（`selection`）と件数で表す。物理なしの場合は件数が0であり、
+/// `prefab` と `look_at` は `null` になる。
+#[derive(Debug, Clone, Serialize)]
+struct PhysicsReport {
+    /// 使ったPrefabパス（`Assets/...`）。物理なしの場合は `null` である。
+    prefab: Option<String>,
+    /// 選択理由。`"auto"`・`"explicit"`・`"none"`・`"undetected"` のいずれかである。
+    selection: String,
+    /// 出力したspring数。
+    springs: usize,
+    /// 出力したjoint総数。
+    joints: usize,
+    /// 出力したcollider数。
+    colliders: usize,
+    /// 出力したcolliderグループ数。
+    groups: usize,
+    /// T-poseで上書きした骨数。
+    tpose_applied: usize,
+    /// T-poseで飛ばした骨数。
+    tpose_skipped: usize,
+    /// 視線の種別（`"bone"`・`"expression"`）。無い場合は `null` である。
+    look_at: Option<String>,
+}
+
+impl PhysicsReport {
+    /// 物理なしの報告を作る。選択理由だけが異なる。
+    fn skipped(selection: &'static str) -> Self {
+        Self {
+            prefab: None,
+            selection: selection.to_owned(),
+            springs: 0,
+            joints: 0,
+            colliders: 0,
+            groups: 0,
+            tpose_applied: 0,
+            tpose_skipped: 0,
+            look_at: None,
+        }
+    }
 }
 
 /// UIへ返すレポート。
@@ -617,6 +1082,7 @@ struct Report {
     images: usize,
     expressions: usize,
     warnings: Vec<String>,
+    physics: PhysicsReport,
 }
 
 #[cfg(test)]
@@ -1374,11 +1840,13 @@ mod tests {
         let report: serde_json::Value =
             serde_json::from_str(&converted.report_json).expect("レポートはJSONである");
         // 材質の置換表が無いため既存の材質警告が残り、対応表の警告は無い。
+        // 候補0件の物理警告が末尾に付く。
         assert_eq!(
             report["warnings"],
             serde_json::json!([
                 "FBXに材質の置換表がないため材質を読まない",
                 "材質を読めなかったため灰色で出力する",
+                "対応Prefabを検出できないためPrefab由来の物理なし",
             ]),
         );
     }
@@ -1404,7 +1872,16 @@ mod tests {
             serde_json::json!([
                 "FBXに材質の置換表がないため材質を読まない",
                 "材質を読めなかったため灰色で出力する",
+                "対応Prefabを検出できないためPrefab由来の物理なし",
             ]),
+        );
+        assert_eq!(
+            report["physics"]["selection"],
+            serde_json::json!("undetected")
+        );
+        assert!(
+            report["physics"]["prefab"].is_null(),
+            "物理なしはnullである"
         );
     }
 
@@ -1461,6 +1938,7 @@ mod tests {
                 "FBXに材質の置換表がないため材質を読まない",
                 "材質を読めなかったため灰色で出力する",
                 "未知のhumanNameのため対応を省く: MysteryBone",
+                "対応Prefabを検出できないためPrefab由来の物理なし",
             ]),
         );
     }
@@ -1590,7 +2068,7 @@ mod tests {
             serde_json::from_str(&converted.report_json).expect("レポートはJSONである");
         assert_eq!(report["expressions"], serde_json::json!(2));
         let warnings = report["warnings"].as_array().expect("warningsは配列である");
-        assert_eq!(warnings.len(), 2 + 6, "材質2件＋欠落6件である");
+        assert_eq!(warnings.len(), 2 + 6 + 1, "材質2件＋欠落6件＋物理1件である");
         assert_eq!(
             warnings[0],
             serde_json::json!("FBXに材質の置換表がないため材質を読まない")
@@ -1599,7 +2077,7 @@ mod tests {
             warnings[1],
             serde_json::json!("材質を読めなかったため灰色で出力する")
         );
-        for (警告, 欠落) in warnings[2..].iter().zip([
+        for (警告, 欠落) in warnings[2..8].iter().zip([
             "vrc.v_ou",
             "vrc.v_e",
             "vrc.v_oh",
@@ -1612,6 +2090,11 @@ mod tests {
                 "欠落名を含む: {警告}"
             );
         }
+        assert_eq!(
+            warnings[8],
+            serde_json::json!("対応Prefabを検出できないためPrefab由来の物理なし"),
+            "末尾は物理の警告である",
+        );
     }
 
     #[test]
@@ -1631,7 +2114,12 @@ mod tests {
             serde_json::from_str(&converted.report_json).expect("レポートはJSONである");
         assert_eq!(report["expressions"], serde_json::json!(0));
         let warnings = report["warnings"].as_array().expect("warningsは配列である");
-        assert_eq!(warnings.len(), 2 + 8, "材質2件＋欠落8件である");
+        assert_eq!(warnings.len(), 2 + 8 + 1, "材質2件＋欠落8件＋物理1件である");
+        assert_eq!(
+            warnings[10],
+            serde_json::json!("対応Prefabを検出できないためPrefab由来の物理なし"),
+            "末尾は物理の警告である",
+        );
     }
 
     #[test]
@@ -1654,8 +2142,8 @@ mod tests {
             .collect();
         assert_eq!(
             warnings.len(),
-            2 + 7 + 1,
-            "材質2件＋欠落7件＋対応表1件である"
+            2 + 7 + 1 + 1,
+            "材質2件＋欠落7件＋対応表1件＋物理1件である"
         );
         assert_eq!(warnings[0], "FBXに材質の置換表がないため材質を読まない");
         assert_eq!(warnings[1], "材質を読めなかったため灰色で出力する");
@@ -1666,6 +2154,10 @@ mod tests {
             "3件目からはモデル生成警告である: {warnings:?}"
         );
         assert_eq!(warnings[9], "未知のhumanNameのため対応を省く: MysteryBone");
+        assert_eq!(
+            warnings[10], "対応Prefabを検出できないためPrefab由来の物理なし",
+            "末尾は物理の警告である",
+        );
     }
 
     /// 同率2メッシュの表情FBXを組み立てる。先頭と後続の差分を変えられる。
@@ -1790,7 +2282,11 @@ mod tests {
             .iter()
             .map(|警告| 警告.as_str().expect("警告は文字列である"))
             .collect();
-        assert_eq!(warnings.len(), 2 + 1 + 7, "材質2件＋選択1件＋欠落7件である");
+        assert_eq!(
+            warnings.len(),
+            2 + 1 + 7 + 1,
+            "材質2件＋選択1件＋欠落7件＋物理1件である"
+        );
         assert_eq!(warnings[0], "FBXに材質の置換表がないため材質を読まない");
         assert_eq!(warnings[1], "材質を読めなかったため灰色で出力する");
         assert!(
@@ -1799,10 +2295,635 @@ mod tests {
             warnings[2]
         );
         assert!(
-            warnings[3..]
+            warnings[3..10]
                 .iter()
                 .all(|警告| 警告.contains("表情ターゲットを適用しない")),
             "4件目からは欠落警告である: {warnings:?}"
+        );
+        assert_eq!(
+            warnings[10], "対応Prefabを検出できないためPrefab由来の物理なし",
+            "末尾は物理の警告である",
+        );
+    }
+
+    /// 対象FBXを指す `PrefabInstance` だけを持つ最小Prefabを組み立てる。
+    ///
+    /// 候補検出は構造化された参照だけを見るため、姿勢や追加物は要らない。
+    /// `fbx_guid` は対象FBXの32桁hexである。
+    fn 参照prefabを組み立てる(fbx_guid: &str) -> Vec<u8> {
+        format!(
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1001 &100100000\nPrefabInstance:\n  m_ObjectHideFlags: 0\n  m_SourcePrefab: {{fileID: 100100000, guid: {fbx_guid}, type: 2}}\n"
+        )
+        .into_bytes()
+    }
+
+    /// 直接記述の `SkinnedMeshRenderer` だけを持つ最小Prefabを組み立てる。
+    ///
+    /// `mesh_guid` が指すFBXのメッシュを描画する設定であり、候補検出の
+    /// 直接記述経路の確認に使う。階層や対応表は要らない。
+    fn 直接記述prefabを組み立てる(mesh_guid: &str) -> Vec<u8> {
+        format!(
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &100000\nGameObject:\n  m_ObjectHideFlags: 0\n  m_Name: Body\n  m_IsActive: 1\n  m_Component: []\n--- !u!137 &13700000\nSkinnedMeshRenderer:\n  m_ObjectHideFlags: 0\n  m_GameObject: {{fileID: 100000}}\n  m_Enabled: 1\n  m_Mesh: {{fileID: 4300000, guid: {mesh_guid}, type: 2}}\n  m_Materials: []\n  m_Bones: []\n  m_RootBone: {{fileID: 0}}\n"
+        )
+        .into_bytes()
+    }
+
+    /// `.prefab` の最小metaを組み立てる。GUIDはtar側と合わせる。
+    fn prefab_metaを組み立てる(n: u128) -> Vec<u8> {
+        file_meta(n, "PrefabImporter", "  externalObjects: {}\n")
+    }
+
+    /// 候補検出用の小さなパッケージを作る。FBX実体はダミーであり、
+    /// 候補走査（FBX解析なし）までの確認に使う。
+    fn 候補走査用パッケージを作る(追加: Vec<Member>) -> Vec<u8> {
+        let mut members = vec![
+            Member::Pathname {
+                guid: guid(1),
+                content: b"Assets/Model.fbx".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(1),
+                content: b"dummy-fbx".to_vec(),
+            },
+            Member::Meta {
+                guid: guid(1),
+                content: file_meta(1, "ModelImporter", "  externalObjects: {}\n"),
+            },
+        ];
+        members.extend(追加);
+        package_bytes(&members)
+    }
+
+    #[test]
+    fn PrefabInstance参照のPrefabを候補として検出する() {
+        // 構造化された参照（`m_SourcePrefab`）で対象FBXを指すPrefabは候補になる。
+        let bytes = 候補走査用パッケージを作る(vec![
+            Member::Pathname {
+                guid: guid(2),
+                content: b"Assets/Avatar.prefab".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(2),
+                content: 参照prefabを組み立てる(&guid(1)),
+            },
+            Member::Meta {
+                guid: guid(2),
+                content: prefab_metaを組み立てる(2),
+            },
+        ]);
+        let package = Package::open(&bytes).expect("候補走査用パッケージは開ける");
+        let report = package
+            .prefab_candidates("Assets/Model.fbx")
+            .expect("走査は成功する");
+        // 対象FBXの特定と候補の報告を確認する。
+        assert_eq!(report.fbx, "Assets/Model.fbx");
+        assert_eq!(report.guid, guid(1));
+        assert_eq!(report.candidates, vec!["Assets/Avatar.prefab".to_owned()]);
+        assert!(report.unreadable.is_empty(), "読めるPrefabに診断は無い");
+        let json = package
+            .prefab_candidates_json("Assets/Model.fbx")
+            .expect("JSON化は成功する");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("JSONは読める");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "fbx": "Assets/Model.fbx",
+                "guid": guid(1),
+                "candidates": ["Assets/Avatar.prefab"],
+                "unreadable": [],
+            }),
+        );
+    }
+
+    #[test]
+    fn 直接記述のメッシュ参照も候補になる() {
+        // `SkinnedMeshRenderer.m_Mesh` が対象FBXのGUIDを指すPrefabも候補になる。
+        let bytes = 候補走査用パッケージを作る(vec![
+            Member::Pathname {
+                guid: guid(2),
+                content: b"Assets/Avatar.prefab".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(2),
+                content: 直接記述prefabを組み立てる(&guid(1)),
+            },
+            Member::Meta {
+                guid: guid(2),
+                content: prefab_metaを組み立てる(2),
+            },
+        ]);
+        let package = Package::open(&bytes).expect("候補走査用パッケージは開ける");
+        let report = package
+            .prefab_candidates("Assets/Model.fbx")
+            .expect("走査は成功する");
+        assert_eq!(report.candidates, vec!["Assets/Avatar.prefab".to_owned()]);
+        assert!(report.unreadable.is_empty(), "読めるPrefabに診断は無い");
+    }
+
+    #[test]
+    fn 参照なしPrefabは候補にならない() {
+        // 対象外FBXだけを指すPrefabは候補に入らない。失敗にもならない。
+        let bytes = 候補走査用パッケージを作る(vec![
+            Member::Pathname {
+                guid: guid(2),
+                content: b"Assets/Avatar.prefab".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(2),
+                content: 直接記述prefabを組み立てる(&guid(7)),
+            },
+            Member::Meta {
+                guid: guid(2),
+                content: prefab_metaを組み立てる(2),
+            },
+        ]);
+        let package = Package::open(&bytes).expect("候補走査用パッケージは開ける");
+        let report = package
+            .prefab_candidates("Assets/Model.fbx")
+            .expect("走査は成功する");
+        assert!(report.candidates.is_empty(), "参照なしは候補にならない");
+        assert!(report.unreadable.is_empty(), "読めるPrefabに診断は無い");
+    }
+
+    #[test]
+    fn 複数参照は複数件になりパス順になる() {
+        // 2件の参照Prefabは両方とも候補になり、出力パス昇順で並ぶ。
+        // 追加順を逆にして決定的な順序であることを確かめる。
+        let bytes = 候補走査用パッケージを作る(vec![
+            Member::Pathname {
+                guid: guid(3),
+                content: b"Assets/B.prefab".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(3),
+                content: 参照prefabを組み立てる(&guid(1)),
+            },
+            Member::Meta {
+                guid: guid(3),
+                content: prefab_metaを組み立てる(3),
+            },
+            Member::Pathname {
+                guid: guid(2),
+                content: b"Assets/A.prefab".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(2),
+                content: 参照prefabを組み立てる(&guid(1)),
+            },
+            Member::Meta {
+                guid: guid(2),
+                content: prefab_metaを組み立てる(2),
+            },
+        ]);
+        let package = Package::open(&bytes).expect("候補走査用パッケージは開ける");
+        let report = package
+            .prefab_candidates("Assets/Model.fbx")
+            .expect("走査は成功する");
+        assert_eq!(
+            report.candidates,
+            vec!["Assets/A.prefab".to_owned(), "Assets/B.prefab".to_owned(),],
+            "候補はパス昇順である",
+        );
+        assert!(report.unreadable.is_empty(), "読めるPrefabに診断は無い");
+    }
+
+    #[test]
+    fn 解析不能Prefabは診断に残し候補検出を続ける() {
+        // 壊れたPrefabは候補検出全体を失敗させず、診断に残して続ける。
+        // 握りつぶして0件扱いにしないことの回帰である。
+        let bytes = 候補走査用パッケージを作る(vec![
+            Member::Pathname {
+                guid: guid(2),
+                content: b"Assets/Avatar.prefab".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(2),
+                content: 参照prefabを組み立てる(&guid(1)),
+            },
+            Member::Meta {
+                guid: guid(2),
+                content: prefab_metaを組み立てる(2),
+            },
+            Member::Pathname {
+                guid: guid(4),
+                content: b"Assets/Broken.prefab".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(4),
+                content: b"this is not unity yaml".to_vec(),
+            },
+            Member::Meta {
+                guid: guid(4),
+                content: prefab_metaを組み立てる(4),
+            },
+        ]);
+        let package = Package::open(&bytes).expect("候補走査用パッケージは開ける");
+        let report = package
+            .prefab_candidates("Assets/Model.fbx")
+            .expect("壊れたPrefabがあっても走査は成功する");
+        assert_eq!(report.candidates, vec!["Assets/Avatar.prefab".to_owned()]);
+        assert_eq!(report.unreadable.len(), 1, "壊れたPrefabは1件記録する");
+        assert_eq!(report.unreadable[0].path, "Assets/Broken.prefab");
+        assert!(
+            !report.unreadable[0].reason.is_empty(),
+            "理由が空では診断にならない",
+        );
+    }
+
+    #[test]
+    fn 存在しないFBXの候補走査は段階付きで失敗する() {
+        // FBXパス不正と索引不在は区別して段階付きで返す。
+        let package = Package::open(&候補走査用パッケージを作る(Vec::new()))
+            .expect("候補走査用パッケージは開ける");
+        let error = package
+            .prefab_candidates("Model.fbx")
+            .expect_err("Assets配下にないパスは失敗する");
+        assert_eq!(error.stage(), Stage::Fbx);
+        assert_eq!(error.path(), Some("Model.fbx"));
+        let error = package
+            .prefab_candidates("Assets/Missing.fbx")
+            .expect_err("索引に無いFBXは失敗する");
+        assert_eq!(error.stage(), Stage::Package);
+        assert_eq!(error.path(), Some("Assets/Missing.fbx"));
+    }
+
+    #[test]
+    fn 物理指定の既定はautoで不正形はoptions段階で失敗する() {
+        // キー無し・nullは後方互換のautoであり、不正形は解釈で失敗する。
+        assert_eq!(
+            parse_options("{}").expect("空は読める").physics,
+            PhysicsSelection::Auto
+        );
+        assert_eq!(
+            parse_options(r#"{"physics":null}"#)
+                .expect("nullは読める")
+                .physics,
+            PhysicsSelection::Auto,
+        );
+        assert_eq!(
+            parse_options(r#"{"physics":"auto"}"#)
+                .expect("autoは読める")
+                .physics,
+            PhysicsSelection::Auto,
+        );
+        assert_eq!(
+            parse_options(r#"{"physics":"none"}"#)
+                .expect("noneは読める")
+                .physics,
+            PhysicsSelection::None,
+        );
+        assert_eq!(
+            parse_options(r#"{"physics":{"prefab":"Assets/X.prefab"}}"#)
+                .expect("明示は読める")
+                .physics,
+            PhysicsSelection::Explicit("Assets/X.prefab".to_owned()),
+        );
+        for json in [
+            r#"{"physics":"bogus"}"#,
+            r#"{"physics":42}"#,
+            r#"{"physics":true}"#,
+            r#"{"physics":{}}"#,
+            r#"{"physics":{"prefab":""}}"#,
+            r#"{"physics":{"prefab":"  "}}"#,
+            r#"{"physics":{"prefab":42}}"#,
+            r#"{"physics":{"other":"Assets/X.prefab"}}"#,
+            r#"{"physics":{"prefab":"Assets/X.prefab","extra":1}}"#,
+            r#"{"physics":[]}"#,
+        ] {
+            let error = parse_options(json).expect_err(&format!("不正形は失敗する: {json}"));
+            assert_eq!(error.stage(), Stage::Options, "入力: {json}");
+            assert_eq!(error.stage().as_str(), "options");
+        }
+    }
+
+    #[test]
+    fn 物理noneは警告を積まず物理なしで変換できる() {
+        // 明示のnoneは候補走査をせず、警告も出さず物理なしで変換する。
+        let fbx = 手別名fbxを組み立てる("LeftHand", "RightHand");
+        let bytes = 合成fbxパッケージ(
+            fbx,
+            file_meta(1, "ModelImporter", "  externalObjects: {}\n"),
+        );
+        let package = Package::open(&bytes).expect("合成パッケージは開ける");
+        let converted = package
+            .convert("Assets/Model.fbx", r#"{"physics":"none"}"#)
+            .expect("noneは変換できる");
+        成功の基本形を確かめる(&converted);
+        let report: serde_json::Value =
+            serde_json::from_str(&converted.report_json).expect("レポートはJSONである");
+        assert_eq!(
+            report["warnings"],
+            serde_json::json!([
+                "FBXに材質の置換表がないため材質を読まない",
+                "材質を読めなかったため灰色で出力する",
+            ]),
+            "noneは物理の警告を積まない",
+        );
+        assert_eq!(report["physics"]["selection"], serde_json::json!("none"));
+        assert!(
+            report["physics"]["prefab"].is_null(),
+            "物理なしはnullである"
+        );
+        assert_eq!(report["physics"]["springs"], serde_json::json!(0));
+        assert!(
+            report["physics"]["look_at"].is_null(),
+            "視線なしはnullである"
+        );
+    }
+
+    #[test]
+    fn 明示Prefabが候補外ならphysics段階で失敗する() {
+        // 候補に含まれない指定は黙って物理なしにせず、物理段階で失敗する。
+        let fbx = 手別名fbxを組み立てる("LeftHand", "RightHand");
+        let bytes = 合成fbxパッケージ(
+            fbx,
+            file_meta(1, "ModelImporter", "  externalObjects: {}\n"),
+        );
+        let package = Package::open(&bytes).expect("合成パッケージは開ける");
+        let error = package
+            .convert(
+                "Assets/Model.fbx",
+                r#"{"physics":{"prefab":"Assets/Other.prefab"}}"#,
+            )
+            .expect_err("候補外の明示は失敗する");
+        assert_eq!(error.stage(), Stage::Physics);
+        assert_eq!(error.stage().as_str(), "physics");
+        assert_eq!(error.path(), Some("Assets/Model.fbx"));
+        assert!(
+            error.message().contains("Assets/Other.prefab"),
+            "指定パスを含む: {}",
+            error.message(),
+        );
+    }
+
+    /// 解決確認用の小さなパッケージを作る。候補1件と解析不能1件を含む。
+    fn 解決確認用パッケージを作る() -> Package {
+        let bytes = 候補走査用パッケージを作る(vec![
+            Member::Pathname {
+                guid: guid(2),
+                content: b"Assets/Avatar.prefab".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(2),
+                content: 参照prefabを組み立てる(&guid(1)),
+            },
+            Member::Meta {
+                guid: guid(2),
+                content: prefab_metaを組み立てる(2),
+            },
+            Member::Pathname {
+                guid: guid(4),
+                content: b"Assets/Broken.prefab".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(4),
+                content: b"this is not unity yaml".to_vec(),
+            },
+            Member::Meta {
+                guid: guid(4),
+                content: prefab_metaを組み立てる(4),
+            },
+        ]);
+        Package::open(&bytes).expect("解決確認用パッケージは開ける")
+    }
+
+    /// 解決確認用の変換オプションを作る。
+    fn 解決確認用オプション(physics: PhysicsSelection) -> ResolvedOptions {
+        ResolvedOptions {
+            name: None,
+            authors: Vec::new(),
+            expressions_vrc: false,
+            physics,
+        }
+    }
+
+    #[test]
+    fn 候補1件でも解析不能があれば自動確定せず失敗する() {
+        // `unreadable` がある場合、唯一候補でも自動で選ばない。
+        // 見えていない参照が候補判定を変えた可能性があり、先勝ちにしない。
+        let package = 解決確認用パッケージを作る();
+        let options = 解決確認用オプション(PhysicsSelection::Auto);
+        let mut warnings = Vec::new();
+        let error = package
+            .resolve_physics_prefab("Assets/Model.fbx", &options, &Limits::new(), &mut warnings)
+            .expect_err("解析不能があれば自動確定は失敗する");
+        assert_eq!(error.stage(), Stage::Physics);
+        assert_eq!(error.stage().as_str(), "physics");
+        assert_eq!(error.path(), Some("Assets/Model.fbx"));
+        assert!(
+            error.message().contains("Assets/Broken.prefab"),
+            "対象パスを含む: {}",
+            error.message(),
+        );
+        assert!(
+            error.message().contains("自動で選ばない"),
+            "自動確定しない理由を持つ: {}",
+            error.message(),
+        );
+    }
+
+    #[test]
+    fn 候補0件かつ解析不能0件のときだけ警告して物理なしになる() {
+        // Prefabが一つも無い場合は警告を積んで `undetected` で続ける。
+        let bytes = 候補走査用パッケージを作る(Vec::new());
+        let package = Package::open(&bytes).expect("候補走査用パッケージは開ける");
+        let options = 解決確認用オプション(PhysicsSelection::Auto);
+        let mut warnings = Vec::new();
+        let plan = package
+            .resolve_physics_prefab("Assets/Model.fbx", &options, &Limits::new(), &mut warnings)
+            .expect("0件かつ解析不能0件は物理なしで続ける");
+        match plan {
+            PhysicsPlan::Skip { selection } => assert_eq!(selection, "undetected"),
+            PhysicsPlan::Apply { .. } => panic!("0件で適用はしない"),
+        }
+        assert_eq!(
+            warnings,
+            vec!["対応Prefabを検出できないためPrefab由来の物理なし".to_owned()],
+        );
+    }
+
+    #[test]
+    fn 明示選択は候補にある場合も解析不能を警告に残す() {
+        // 明示の対象が候補にある場合は選択を通すが、他の解析不能Prefabの
+        // 情報は黙って捨てず警告として残す。
+        let package = 解決確認用パッケージを作る();
+        let options = 解決確認用オプション(PhysicsSelection::Explicit(
+            "Assets/Avatar.prefab".to_owned(),
+        ));
+        let mut warnings = Vec::new();
+        let plan = package
+            .resolve_physics_prefab("Assets/Model.fbx", &options, &Limits::new(), &mut warnings)
+            .expect("候補にある明示は通す");
+        match plan {
+            PhysicsPlan::Apply { prefab, selection } => {
+                assert_eq!(prefab, "Assets/Avatar.prefab");
+                assert_eq!(selection, "explicit");
+            }
+            PhysicsPlan::Skip { .. } => panic!("明示で物理なしにはしない"),
+        }
+        assert_eq!(warnings.len(), 1, "解析不能の警告を残す");
+        assert!(
+            warnings[0].contains("Assets/Broken.prefab"),
+            "解析不能の対象パスを含む: {}",
+            warnings[0],
+        );
+    }
+
+    /// GLBのJSON塊を取り出す。4バイト境界の詰めを除いてJSONとして読む。
+    ///
+    /// 実fixtureの統合確認用であり、容器の検証は変換成功の基本形に任せる。
+    fn 実fixtureのjsonを取り出す(バイト列: &[u8]) -> serde_json::Value {
+        assert!(バイト列.len() >= 20, "GLBはヘッダとJSON塊長を持つ");
+        assert_eq!(&バイト列[0..4], b"glTF", "GLBマジックがある");
+        let json長 =
+            u32::from_le_bytes(バイト列[12..16].try_into().expect("塊長は4バイトである")) as usize;
+        assert_eq!(
+            u32::from_le_bytes(バイト列[16..20].try_into().expect("塊種は4バイトである")),
+            0x4E4F534A,
+            "JSON塊の種別はJSONである",
+        );
+        let json = &バイト列[20..20 + json長];
+        // 末尾の詰め（空白・NUL）はJSONとして読める範囲に含まない。
+        let 終端 = json
+            .iter()
+            .rposition(|b| *b != b' ' && *b != 0)
+            .map(|位置| 位置 + 1)
+            .unwrap_or(0);
+        serde_json::from_slice(&json[..終端]).expect("JSON塊はJSONとして読める")
+    }
+
+    /// 実fixture（`.unitypackage`）で候補検出から変換までを通す。
+    ///
+    /// `VRCTOM_UNITYPACKAGE_FIXTURE` が指すパッケージだけを読み、未設定なら跳ばす。
+    /// 既存の統合試験の慣習に合わせ、相対指定はリポジトリルート基準に解決する。
+    /// 実行例: `VRCTOM_UNITYPACKAGE_FIXTURE=$PWD/fixtures/unitypackages/Milfy.unitypackage cargo nextest run -p vrctom-wasm`
+    #[test]
+    fn 実fixtureで候補検出から物理付き変換まで通る() {
+        let Ok(path) = std::env::var("VRCTOM_UNITYPACKAGE_FIXTURE") else {
+            eprintln!("VRCTOM_UNITYPACKAGE_FIXTURE未設定のため実fixture変換を跳ばす");
+            return;
+        };
+        let fixture = std::path::PathBuf::from(path);
+        let fixture = if fixture.is_absolute() {
+            fixture
+        } else {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(|parent| parent.parent())
+                .expect("CARGO_MANIFEST_DIRに二つ上の親がある")
+                .join(fixture)
+        };
+        let bytes = std::fs::read(&fixture).expect("実fixtureは読める");
+        let package = Package::open(&bytes).expect("実fixtureは開ける");
+        // 候補のあるFBXを1件選ぶ。自動解決の分岐（1件・複数）をここで確定する。
+        let mut 対象: Option<(String, String)> = None;
+        for entry in package.fbx_candidates() {
+            let report = package
+                .prefab_candidates(&entry.path)
+                .expect("候補走査は成功する");
+            if !report.candidates.is_empty() {
+                let 選択 = report.candidates[0].clone();
+                eprintln!(
+                    "候補検出: {} -> {}（全{}件）",
+                    entry.path,
+                    選択,
+                    report.candidates.len()
+                );
+                for 診断 in &report.unreadable {
+                    eprintln!("走査診断: {}: {}", 診断.path, 診断.reason);
+                }
+                対象 = Some((entry.path.clone(), 選択));
+                break;
+            }
+        }
+        let Some((fbxパス, 選択prefab)) = 対象 else {
+            panic!("実fixtureに対象FBXを参照するPrefabが無い");
+        };
+        // 候補1件なら既定（auto）で変換し、複数なら先頭を明示して変換する。
+        // どちらも report の physics が成功した物理を指すことを確かめる。
+        let 候補数 = package
+            .prefab_candidates(&fbxパス)
+            .expect("候補走査は成功する")
+            .candidates
+            .len();
+        let options = if 候補数 == 1 {
+            "{}".to_owned()
+        } else {
+            format!(r#"{{"physics":{{"prefab":{選択prefab:?}}}}}"#)
+        };
+        eprintln!("変換指定: {options}");
+        let converted = package
+            .convert(&fbxパス, &options)
+            .expect("実fixtureの変換は成功する");
+        assert_eq!(&converted.vrm[..4], b"glTF", "GLBマジックがある");
+        let report: serde_json::Value =
+            serde_json::from_str(&converted.report_json).expect("レポートはJSONである");
+        assert_eq!(
+            report["physics"]["prefab"],
+            serde_json::json!(選択prefab),
+            "使ったPrefabを報告する",
+        );
+        let springs = report["physics"]["springs"]
+            .as_u64()
+            .expect("springsは数値である");
+        assert!(springs > 0, "物理付き変換はspringを持つ");
+        let json = 実fixtureのjsonを取り出す(&converted.vrm);
+        let 使用拡張 = json["extensionsUsed"]
+            .as_array()
+            .expect("extensionsUsedは配列である");
+        assert!(
+            使用拡張
+                .iter()
+                .any(|値| 値.as_str() == Some("VRMC_springBone")),
+            "VRMC_springBoneを使う",
+        );
+        let 拡張 = &json["extensions"]["VRMC_springBone"];
+        let 出力springs = 拡張["springs"].as_array().expect("springsは配列である");
+        assert!(
+            !出力springs.is_empty(),
+            "拡張名だけでなくspringが非空である"
+        );
+        assert_eq!(
+            出力springs.len() as u64,
+            springs,
+            "レポート件数と出力件数が一致する",
+        );
+        let ノード数 = json["nodes"].as_array().expect("nodesは配列である").len();
+        assert_eq!(
+            report["nodes"].as_u64(),
+            Some(ノード数 as u64),
+            "ノード数は物理適用後の実モデルである",
+        );
+        // jointとcolliderの参照先は出力ノードの範囲内である。
+        for spring in 出力springs {
+            for joint in spring["joints"].as_array().expect("jointsは配列である") {
+                let node = joint["node"].as_u64().expect("nodeは数値である") as usize;
+                assert!(
+                    node < ノード数,
+                    "jointの参照先は範囲内である: {node} < {ノード数}",
+                );
+            }
+        }
+        for collider in 拡張
+            .get("colliders")
+            .and_then(|値| 値.as_array())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        {
+            let node = collider["node"].as_u64().expect("nodeは数値である") as usize;
+            assert!(
+                node < ノード数,
+                "colliderの参照先は範囲内である: {node} < {ノード数}",
+            );
+        }
+        eprintln!(
+            "実測: springs={springs} joints={} colliders={} groups={} tpose_applied={} tpose_skipped={} look_at={} nodes={ノード数}",
+            report["physics"]["joints"].as_u64().unwrap_or(0),
+            report["physics"]["colliders"].as_u64().unwrap_or(0),
+            report["physics"]["groups"].as_u64().unwrap_or(0),
+            report["physics"]["tpose_applied"].as_u64().unwrap_or(0),
+            report["physics"]["tpose_skipped"].as_u64().unwrap_or(0),
+            report["physics"]["look_at"].as_str().unwrap_or("null"),
         );
     }
 }

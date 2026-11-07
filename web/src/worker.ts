@@ -9,9 +9,11 @@ import {
   isMainToWorkerMessage,
   parseConversionReport,
   parseFbxCandidates,
+  parsePrefabCandidatesReport,
 } from "./conversion-client.js";
 import type {
   MainToWorkerMessage,
+  PhysicsOption,
   WorkerToMainMessage,
 } from "./conversion-client.js";
 
@@ -103,6 +105,26 @@ async function handleOpen(id: number, bytes: ArrayBuffer): Promise<void> {
 }
 
 /**
+ * 変換設定の物理指定をwasm側のJSON形へ写す。
+ *
+ * 省略時は`auto`と同じである。明示のPrefabパスはそのまま渡し、
+ * wasm側（`core.rs`）で候補一致を検証する。UI側の選択検証を迂回しても
+ * core側の検証で失敗することを前提とし、ここでは形だけ整える。
+ *
+ * @param physics - UI側の物理指定。省略時は`auto`になる。
+ * @returns wasm側の`physics`キーに入れる値。
+ */
+function toWasmPhysics(physics: PhysicsOption | undefined): string | { prefab: string } {
+  if (physics === undefined || physics === "auto") {
+    return "auto";
+  }
+  if (physics === "none") {
+    return "none";
+  }
+  return { prefab: physics.prefab };
+}
+
+/**
  * 選んだFBXを変換し、VRMとレポートを返す。直前に重い処理の段階を知らせる。
  *
  * VRMバイト列は転送で渡す。`Converted`は使い終わったら破棄する。
@@ -122,6 +144,7 @@ async function handleConvert(id: number, request: ConvertRequest): Promise<void>
       name: request.options.name,
       authors: [...request.options.authors],
       expressions: request.options.expressions ? "vrc" : "none",
+      physics: toWasmPhysics(request.options.physics),
     });
     const converted = currentPackage.convert(request.fbxPath, optionsJson);
     try {
@@ -134,10 +157,36 @@ async function handleConvert(id: number, request: ConvertRequest): Promise<void>
           : // 部分ビューの場合だけ転送できる範囲を切り出す。
             source.slice().buffer;
       const raw: unknown = JSON.parse(converted.report);
+      // wasm境界の検証で`camelCase`へ写して送る。client側はWorker→client境界の
+      // 検証で受け直すため、ここでwasm境界の検証を済ませておく。
       post({ type: "converted", id, vrm, report: parseConversionReport(raw) }, [vrm]);
     } finally {
       converted.free();
     }
+  } catch (error) {
+    post(toErrorMessage(id, error));
+  }
+}
+
+/**
+ * 対象FBXのPrefab候補を取り出して返す。直前に重い処理の段階を知らせる。
+ *
+ * 候補の読み取り自体は軽いが、走査はPrefab本文を読むため段階を知らせる。
+ * パッケージ未開封の要求は変換と同様に`package`段階の失敗で返す。
+ *
+ * @param id - 要求の`id`。
+ * @param fbxPath - 対象FBXの出力パス（`Assets/...`）。
+ */
+async function handlePrefabCandidates(id: number, fbxPath: string): Promise<void> {
+  post({ type: "progress", id, stage: "package" });
+  try {
+    await ensureInit();
+    if (currentPackage === null) {
+      post({ type: "error", id, stage: "package", message: "パッケージが開かれていないため候補を取り出せない" });
+      return;
+    }
+    const raw: unknown = JSON.parse(currentPackage.prefabCandidates(fbxPath));
+    post({ type: "prefabCandidates", id, report: parsePrefabCandidatesReport(raw) });
   } catch (error) {
     post(toErrorMessage(id, error));
   }
@@ -154,6 +203,9 @@ function handleMessage(data: unknown): void {
       break;
     case "convert":
       void handleConvert(data.id, data);
+      break;
+    case "prefabCandidates":
+      void handlePrefabCandidates(data.id, data.fbxPath);
       break;
     case "cancel":
       break;

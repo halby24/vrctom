@@ -26,6 +26,7 @@ mod material;
 pub(crate) mod matrix;
 mod mesh;
 pub mod physics;
+mod physics_apply;
 pub mod physics_prefab;
 pub mod prefab;
 mod prefab_baseline;
@@ -59,7 +60,14 @@ pub use physics::{
     VrmSpringCollider, VrmSpringColliderExtension, VrmSpringColliderGroup, VrmSpringColliderShape,
     VrmSpringJoint, VrmSpringJointLimit, ZeroLengthJoint, apply_humanoid_t_pose, compile_springs,
 };
-pub use physics_prefab::{DerivedSidecar, PrefabDeriveInput, derive_physics_sidecar};
+pub use physics_apply::{
+    LookAtAppliedSummary, LookAtRangeSummary, LostNodeSummary, PhysicsApplyError,
+    PhysicsApplyReport, SkippedBoneSummary, TposeSkippedEntry, apply_physics_sidecar,
+};
+pub use physics_prefab::{
+    DerivedSidecar, PhysicsDeriveLimits, PrefabCandidates, PrefabDeriveInput, PrefabDeriveSource,
+    PrefabScanIssue, derive_physics_sidecar, derive_physics_sidecar_with, find_prefab_candidates,
+};
 pub use prefab::{
     PrefabBaseMaterial, PrefabHierarchyNode, PrefabMeshView, PrefabMode, PrefabPlan,
     apply_prefab_plan, plan_prefab_assignment, prefab_base_materials, prefab_hierarchy_paths,
@@ -105,7 +113,8 @@ const DEFAULT_MAX_MORPH_BYTES: usize = 512 << 20;
 ///
 /// 読み取り済みの値から作る所有データであり、入力バイト列は保持しない。
 /// 表情（モーフターゲットとその束ね）を持つ。材質の見た目は持たない。
-/// スプリングは [`VrmSpringBones`] に持ち、今回は空のまま置く。書き出しはしない。
+/// スプリングは [`VrmSpringBones`] に持ち、生成直後は空である。非空なら書き出し層が
+/// `VRMC_springBone` を出し、詰めるのはCLIとWebが共有する物理適用の役目である。
 #[derive(Debug, Clone)]
 pub struct VrmModel {
     /// シーンルートに掛ける行列。単位換算だけを含む。
@@ -118,7 +127,8 @@ pub struct VrmModel {
     pub meshes: Vec<VrmMesh>,
     /// 表情。要求が無い場合は空である。
     pub expressions: VrmExpressions,
-    /// スプリング。今回は空であり、書き出しはしない。
+    /// スプリング。生成直後は空であり、非空なら書き出し層が出す。
+    /// 物理適用（CLIとWebが共有する `apply_physics_sidecar`）が詰める。
     pub spring_bones: VrmSpringBones,
     /// ノード制約列。空の場合は拡張を書かない。
     pub node_constraints: Vec<VrmNodeConstraint>,

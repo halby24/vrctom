@@ -61,6 +61,7 @@ UI を止めないため、Web Worker 内で呼び出してください。
 |---|---|
 | `new WebPackage(bytes)` | パッケージを検証・展開・索引化する。失敗したら例外 |
 | `pkg.fbxCandidates()` | FBX 候補を JSON 文字列で返す（パス昇順） |
+| `pkg.prefabCandidates(fbxPath)` | 対象 FBX を参照する Prefab 候補を JSON 文字列で返す |
 | `pkg.convert(fbxPath, optionsJson)` | 選んだ FBX を VRM に変換する |
 | `converted.takeVrm()` | GLB バイト列を複製せず取り出す。呼び出し後は空になる |
 | `converted.vrm` | GLB バイト列を複製して返す（互換用） |
@@ -83,6 +84,13 @@ UI を止めないため、Web Worker 内で呼び出してください。
 - `name` … 空・未指定なら FBX のファイル名（拡張子を除く）になる
 - `authors` … 空要素を除き、残らなければ `["unknown"]` になる
 - `expressions` … `"vrc"` のときだけ VRChat 向けの 8 表情を作る
+- `physics` … 省略時は `"auto"`。候補1件なら自動で使い、0件なら警告して物理なし
+  （レポートの`selection`は`"undetected"`）になる。次の場合は`auto`のまま変換すると
+  `stage=physics`で失敗する：候補が複数ある、解析できないPrefabがある。
+  失敗時は`{"prefab": "Assets/.../X.prefab"}`で明示選択するか、`"none"`で物理なしにする。
+  従来`{}`や`{"name": ...}`だけで成功した呼び出しも、候補の状態によっては失敗する。
+  明示選択は候補一致が必須であり、候補外や読めない指定は失敗する。
+  `"none"`は警告なしで物理なしになる
 
 ## レポート
 
@@ -96,11 +104,24 @@ UI を止めないため、Web Worker 内で呼び出してください。
   "materials": 3,
   "images": 4,
   "expressions": 8,
-  "warnings": ["材質を読めなかったため灰色で出力する"]
+  "warnings": ["材質を読めなかったため灰色で出力する"],
+  "physics": {
+    "prefab": "Assets/Avatar.prefab",
+    "selection": "auto",
+    "springs": 2,
+    "joints": 6,
+    "colliders": 3,
+    "groups": 1,
+    "tpose_applied": 4,
+    "tpose_skipped": 1,
+    "look_at": "bone"
+  }
 }
 ```
 
 警告は `warnings` に入り、変換の失敗とは区別されます。
+`physics` の `selection` は `"auto"`・`"explicit"`・`"none"`・`"undetected"` のいずれかであり、
+`prefab` と `look_at` は物理なしの場合に `null` になります。
 
 ## エラー
 
@@ -114,6 +135,7 @@ UI を止めないため、Web Worker 内で呼び出してください。
 | `model` | 中間モデルの生成 |
 | `material` | 材質・画像の読み取り |
 | `export` | VRM の書き出し |
+| `physics` | Prefab物理（候補走査・導出・適用） |
 
 ```ts
 try {
@@ -138,6 +160,8 @@ try {
 | 画像 1 枚 | 32 MiB |
 | 画像合計 | 256 MiB |
 | 画像 1 枚の画素数 | 4096² |
+| Prefab本文 1 件 | 64 MiB |
+| 物理の依存資産合計 | 512 MiB |
 | VRM 出力 | 512 MiB |
 
 上限は JS から変更できません。
@@ -145,7 +169,7 @@ try {
 ## 制限
 
 - 入力は `.unitypackage` のみです。FBX 単体は受け付けません。
-- Prefab 由来の材質割当・有効状態・物理（揺れ）は反映しません。
+- Prefab 由来の材質割当・有効状態は反映しません。物理（揺れ）は Prefab から自動導出します。
 - 生成した VRM が第三者製の validator をすべて通ることは保証しません。
 - 現行版は `0.x` であり、API は変更される可能性があります。
 

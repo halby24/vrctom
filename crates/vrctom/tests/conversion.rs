@@ -420,6 +420,26 @@ fn build_modelの中間結果でexport_modelがto_vrmと同じバイト列を返
     );
 }
 
+#[test]
+fn 解析済みfbxからのbuild_model_from_fbxはbuild_modelと同じ結果を返す() {
+    use vrctom::conversion::build_model_from_fbx;
+    let bytes = 書き出し可能なfbxを組み立てる();
+    let 直接 = build_model(&bytes, &FbxOptions::new(), &VrmOptions::new())
+        .expect("必須骨を持つFBXは中間モデルを作れる");
+    let 解析 = FbxFile::parse(&bytes, &FbxOptions::new()).expect("組み立てたFBXは読める");
+    let 再利用 = build_model_from_fbx(&解析, &VrmOptions::new())
+        .expect("解析済みFBXからも中間モデルを作れる");
+    // ノード数・メッシュ数・警告・頂点数が一致し、二重解析を避けても同じになる。
+    assert_eq!(再利用.report, 直接.report);
+    assert_eq!(再利用.model.nodes.len(), 直接.model.nodes.len());
+    assert_eq!(再利用.model.meshes.len(), 直接.model.meshes.len());
+    for (再利用ノード, 直接ノード) in 再利用.model.nodes.iter().zip(直接.model.nodes.iter())
+    {
+        assert_eq!(再利用ノード.name, 直接ノード.name);
+        assert_eq!(再利用ノード.local, 直接ノード.local);
+    }
+}
+
 impl Props {
     /// 倍精度浮動小数点のプロパティを書く。
     fn d(&mut self, v: f64) {

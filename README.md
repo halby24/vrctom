@@ -125,7 +125,7 @@ npm pack ./crates/vrctom-wasm/pkg --dry-run
 - Matcap合成・デカール・lilToon材質拡張は未対応である。
 - 2019.3より前のFBX取り込み方式（`.meta` の `fileIDToRecycleName`）は未対応である。
 - WebアプリはデスクトップのChromeを想定し、モバイルは対象外である。
-  Prefabの材質割当・有効状態・物理は反映しない（CLIの `--prefab` は反映する）。
+  Prefabの材質割当・有効状態は反映しない（CLIの `--prefab` は反映する）。物理はPrefabから自動導出し、候補が複数あるときは利用者が選ぶ。候補がなければ物理なしで警告する。
 
 ## 開発
 

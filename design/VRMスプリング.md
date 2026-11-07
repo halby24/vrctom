@@ -329,10 +329,23 @@ flowchart LR
 実変換は `--prefab` からの導出だけを使う。
 
 Unityを回さずに `--prefab` から同じsidecarをRustだけで導出する。
-入口は `vrm::physics_prefab::derive_physics_sidecar` であり、
+入口は `vrm::physics_prefab::derive_physics_sidecar_with`（ターゲット非依存の
+共通本体）であり、`AssetSource` と `AssetIndex` を渡す。CLIは
+`FsAssetSource`、Webはメモリ内パッケージを渡す。`derive_physics_sidecar` は
+native向けの互換入口であり、wasmでは使わない。
 FBXバイト列・Assets配置（`.meta` 読み取り用）・Prefab文書から組み立てる。
 出力は既存sidecarと同一スキーマ（`format: vrctom.physics`, `schemaVersion: 1`）であり、
 `generator` と `capture` の採取メタ以外はフィールド単位で一致させる。
+
+### Webでの利用
+
+Web（`.unitypackage`→wasm）でもPrefabから同じ導出を通し、
+`apply_physics_sidecar`（解決→T-pose→lookAt→スプリング生成）で適用する。
+CLIと適用順序は同じであり、CLIの表示・終了コードは従来どおりである。
+候補検出（`find_prefab_candidates`）は `PrefabInstance.m_SourcePrefab`・
+直接記述Prefabの `SkinnedMeshRenderer.m_Mesh` だけを見て、GUID文字列の
+部分一致検索はしない。読めないPrefabは診断に残し、0件扱いにしない。
+選択規則と失敗時の扱いは [`Webアプリ`](Webアプリ.md) に譲る。
 
 情報源と対応付けは次のとおりである。
 

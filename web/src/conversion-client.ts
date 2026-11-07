@@ -16,6 +16,57 @@ export interface FbxCandidate {
   readonly size: number;
 }
 
+/** Prefab走査で読めなかった1件。候補とは別に報告する。 */
+export interface PrefabScanIssue {
+  /** 出力パス（`Assets/...`）。 */
+  readonly path: string;
+  /** 読めなかった理由の日本語診断。 */
+  readonly reason: string;
+}
+
+/** 対象FBXを参照するPrefabの走査結果。候補はパス昇順である。 */
+export interface PrefabCandidatesReport {
+  /** 対象FBXの出力パス（`Assets/...`）。 */
+  readonly fbx: string;
+  /** 対象FBXのGUID。 */
+  readonly guid: string;
+  /** 対象FBXを参照するPrefabの出力パス列。 */
+  readonly candidates: readonly string[];
+  /** 走査中に解析できなかったPrefabの記録列。 */
+  readonly unreadable: readonly PrefabScanIssue[];
+}
+
+/** 物理の使い分け。未指定は`auto`と同じである。 */
+export type PhysicsOption = "auto" | "none" | { readonly prefab: string };
+
+/** レポート側の物理の選択理由。 */
+export type PhysicsSelection = "auto" | "explicit" | "none" | "undetected";
+
+/** レポート側の視線の種別。無い場合は`null`になる。 */
+export type PhysicsLookAt = "bone" | "expression";
+
+/** 変換結果に含まれる物理の構造化情報。 */
+export interface PhysicsReport {
+  /** 使ったPrefabパス。物理なしの場合は`null`である。 */
+  readonly prefab: string | null;
+  /** 選択理由。 */
+  readonly selection: PhysicsSelection;
+  /** 出力したspring数。 */
+  readonly springs: number;
+  /** 出力したjoint総数。 */
+  readonly joints: number;
+  /** 出力したcollider数。 */
+  readonly colliders: number;
+  /** 出力したcolliderグループ数。 */
+  readonly groups: number;
+  /** T-poseで上書きした骨数。 */
+  readonly tposeApplied: number;
+  /** T-poseで飛ばした骨数。 */
+  readonly tposeSkipped: number;
+  /** 視線の種別。無い場合は`null`である。 */
+  readonly lookAt: PhysicsLookAt | null;
+}
+
 /** 変換設定。UIの入力欄と対応する。 */
 export interface ConvertOptions {
   /** 作品名。空ならFBXのstemに倒す（wasm側で行う）。 */
@@ -24,6 +75,13 @@ export interface ConvertOptions {
   readonly authors: readonly string[];
   /** VRChat向け表情を生成するか。 */
   readonly expressions: boolean;
+  /**
+   * 物理の使い分け。省略時は`auto`と同じである。
+   *
+   * `auto`は候補1件なら自動選択、複数なら失敗、0件なら物理なしになる。
+   * 明示のPrefabパスは候補一致が必須であり、`none`は物理なしである。
+   */
+  readonly physics?: PhysicsOption;
 }
 
 /** 変換結果のレポート。wasm側のJSONと対応する。 */
@@ -46,6 +104,8 @@ export interface ConversionReport {
   readonly expressions: number;
   /** 警告文。失敗とは区別する。 */
   readonly warnings: readonly string[];
+  /** 物理の構造化情報。件数と選択理由を持つ。 */
+  readonly physics: PhysicsReport;
 }
 
 /** 変換結果。VRMバイト列とレポートを持つ。 */
@@ -60,19 +120,21 @@ export interface ConversionResult {
 export type MainToWorkerMessage =
   | { readonly type: "open"; readonly id: number; readonly bytes: ArrayBuffer }
   | { readonly type: "convert"; readonly id: number; readonly fbxPath: string; readonly options: ConvertOptions }
+  | { readonly type: "prefabCandidates"; readonly id: number; readonly fbxPath: string }
   | { readonly type: "cancel"; readonly id: number };
 
 /** worker→mainの応答。`id`は要求のものと一致する。 */
 export type WorkerToMainMessage =
   | { readonly type: "opened"; readonly id: number; readonly candidates: readonly FbxCandidate[] }
   | { readonly type: "converted"; readonly id: number; readonly vrm: ArrayBuffer; readonly report: ConversionReport }
+  | { readonly type: "prefabCandidates"; readonly id: number; readonly report: PrefabCandidatesReport }
   | { readonly type: "error"; readonly id: number; readonly stage: string; readonly message: string; readonly path?: string }
   | { readonly type: "progress"; readonly id: number; readonly stage: string };
 
 /**
  * 変換の失敗。wasm側の段階・文面・対象パスを持ち歩く。
  *
- * 段階は`package`・`options`・`fbx`・`model`・`material`・`export`のいずれかであり、
+ * 段階は`package`・`options`・`fbx`・`model`・`material`・`export`・`physics`のいずれかであり、
  * `cancel`は利用者の中断、`worker`はWorker自体の異常を表す。
  */
 export class ConversionError extends Error {
@@ -128,17 +190,45 @@ export function parseFbxCandidates(value: unknown): FbxCandidate[] {
 }
 
 /**
- * レポートのJSON値を検証して返す。
+ * レポートのJSON値を検証して返す（wasm境界用）。
+ *
+ * wasm側は`snake_case`（`tpose_applied`・`look_at`）で送る。Workerが受信直後に
+ * 検証して`camelCase`へ写すための入口であり、Worker→client境界の検証には
+ * {@link parseClientConversionReport}を使う。二つの境界を混同しない。
  *
  * @param value - `Converted.report`のJSONを解釈した値。
  * @returns 検証済みのレポート。
  * @throws `ConversionError` — 必要な項目が欠けている場合。
  */
 export function parseConversionReport(value: unknown): ConversionReport {
+  return parseConversionReportWith(value, parsePhysicsReport);
+}
+
+/**
+ * レポートの検証済み値を受け取り直して検証して返す（Worker→client境界用）。
+ *
+ * Workerは{@link parseConversionReport}で`camelCase`へ写した済みの値を送るため、
+ * ここでは`camelCase`（`tposeApplied`・`lookAt`）を受け付ける。wasm由来の
+ * `snake_case`は受け付けず、境界の取り違えを検証で検出する。
+ * 受け取る値は`unknown`として扱い、利用前に検証する。
+ *
+ * @param value - Workerから受信したレポートの値。
+ * @returns 検証済みのレポート。
+ * @throws `ConversionError` — 必要な項目が欠けている場合。
+ */
+export function parseClientConversionReport(value: unknown): ConversionReport {
+  return parseConversionReportWith(value, parseClientPhysicsReport);
+}
+
+/** レポート本体の検証を共有し、物理の写しだけを差し替える。 */
+function parseConversionReportWith(
+  value: unknown,
+  parsePhysics: (physics: unknown) => PhysicsReport,
+): ConversionReport {
   if (!isRecord(value)) {
     throw new ConversionError("export", "レポートの読み取りに失敗した");
   }
-  const { fbx, bytes, nodes, meshes, skins, materials, images, expressions, warnings } = value;
+  const { fbx, bytes, nodes, meshes, skins, materials, images, expressions, warnings, physics } = value;
   if (
     typeof fbx !== "string" ||
     !isCount(bytes) ||
@@ -153,7 +243,183 @@ export function parseConversionReport(value: unknown): ConversionReport {
   ) {
     throw new ConversionError("export", "レポートの読み取りに失敗した");
   }
-  return { fbx, bytes, nodes, meshes, skins, materials, images, expressions, warnings: [...warnings] };
+  return {
+    fbx,
+    bytes,
+    nodes,
+    meshes,
+    skins,
+    materials,
+    images,
+    expressions,
+    warnings: [...warnings],
+    physics: parsePhysics(physics),
+  };
+}
+
+/**
+ * 物理の報告値を検証して返す（wasm境界用）。
+ *
+ * wasm側は`snake_case`（`tpose_applied`・`look_at`）で送るため、
+ * ここで`camelCase`へ写す。欠落や選択理由の崩れは許さない。
+ * Worker→client境界の検証には{@link parseClientPhysicsReport}を使う。
+ *
+ * @param value - レポート内の`physics`の値。
+ * @returns 検証済みの物理報告。
+ * @throws `ConversionError` — 必要な項目が欠けている場合。
+ */
+export function parsePhysicsReport(value: unknown): PhysicsReport {
+  if (!isRecord(value)) {
+    throw new ConversionError("export", "レポートの読み取りに失敗した");
+  }
+  const {
+    prefab,
+    selection,
+    springs,
+    joints,
+    colliders,
+    groups,
+    tpose_applied: tposeApplied,
+    tpose_skipped: tposeSkipped,
+    look_at: lookAt,
+  } = value;
+  return finishPhysicsReport(
+    prefab,
+    selection,
+    springs,
+    joints,
+    colliders,
+    groups,
+    tposeApplied,
+    tposeSkipped,
+    lookAt,
+  );
+}
+
+/**
+ * 物理の検証済み値を受け取り直して検証して返す（Worker→client境界用）。
+ *
+ * Workerは{@link parsePhysicsReport}で`camelCase`へ写した済みの値を送るため、
+ * ここでは`camelCase`（`tposeApplied`・`lookAt`）を受け付ける。wasm由来の
+ * `snake_case`は受け付けず、境界の取り違えを検証で検出する。
+ *
+ * @param value - Workerから受信した`physics`の値。
+ * @returns 検証済みの物理報告。
+ * @throws `ConversionError` — 必要な項目が欠けている場合。
+ */
+export function parseClientPhysicsReport(value: unknown): PhysicsReport {
+  if (!isRecord(value)) {
+    throw new ConversionError("export", "レポートの読み取りに失敗した");
+  }
+  const {
+    prefab,
+    selection,
+    springs,
+    joints,
+    colliders,
+    groups,
+    tposeApplied,
+    tposeSkipped,
+    lookAt,
+  } = value;
+  return finishPhysicsReport(
+    prefab,
+    selection,
+    springs,
+    joints,
+    colliders,
+    groups,
+    tposeApplied,
+    tposeSkipped,
+    lookAt,
+  );
+}
+
+/** 物理の共通制約を検証し、報告の形にまとめる。キーの写しは呼び出し側が行う。 */
+function finishPhysicsReport(
+  prefab: unknown,
+  selection: unknown,
+  springs: unknown,
+  joints: unknown,
+  colliders: unknown,
+  groups: unknown,
+  tposeApplied: unknown,
+  tposeSkipped: unknown,
+  lookAt: unknown,
+): PhysicsReport {
+  if (
+    !(typeof prefab === "string" || prefab === null) ||
+    (typeof prefab === "string" && prefab === "") ||
+    (selection !== "auto" && selection !== "explicit" && selection !== "none" && selection !== "undetected") ||
+    !isCount(springs) ||
+    !isCount(joints) ||
+    !isCount(colliders) ||
+    !isCount(groups) ||
+    !isCount(tposeApplied) ||
+    !isCount(tposeSkipped) ||
+    !(lookAt === null || lookAt === "bone" || lookAt === "expression")
+  ) {
+    throw new ConversionError("export", "レポートの読み取りに失敗した");
+  }
+  return {
+    prefab,
+    selection,
+    springs,
+    joints,
+    colliders,
+    groups,
+    tposeApplied,
+    tposeSkipped,
+    lookAt,
+  };
+}
+
+/**
+ * Prefab候補の報告値を検証して返す。
+ *
+ * @param value - `prefabCandidates()`のJSONを解釈した値。
+ * @returns 検証済みの候補報告。
+ * @throws `ConversionError` — 必要な項目が欠けている場合。
+ */
+export function parsePrefabCandidatesReport(value: unknown): PrefabCandidatesReport {
+  if (!isRecord(value)) {
+    throw new ConversionError("physics", "Prefab候補の読み取りに失敗した");
+  }
+  const { fbx, guid, candidates, unreadable } = value;
+  if (typeof fbx !== "string" || fbx === "" || typeof guid !== "string" || guid === "") {
+    throw new ConversionError("physics", "Prefab候補の読み取りに失敗した");
+  }
+  if (
+    !Array.isArray(candidates) ||
+    !candidates.every((entry): entry is string => typeof entry === "string" && entry !== "")
+  ) {
+    throw new ConversionError("physics", "Prefab候補の読み取りに失敗した");
+  }
+  if (!Array.isArray(unreadable)) {
+    throw new ConversionError("physics", "Prefab候補の読み取りに失敗した");
+  }
+  const issues: PrefabScanIssue[] = [];
+  for (const entry of unreadable) {
+    if (!isRecord(entry) || typeof entry["path"] !== "string" || entry["path"] === "" || typeof entry["reason"] !== "string" || entry["reason"] === "") {
+      throw new ConversionError("physics", "Prefab候補の読み取りに失敗した");
+    }
+    issues.push({ path: entry["path"], reason: entry["reason"] });
+  }
+  return { fbx, guid, candidates: [...candidates], unreadable: issues };
+}
+
+/** 物理指定の値が送受信できる形かを確かめる。省略時は呼び出し側で`auto`に倒す。 */
+function isPhysicsOption(value: unknown): value is PhysicsOption {
+  if (value === undefined) {
+    return true;
+  }
+  if (value === "auto" || value === "none") {
+    return true;
+  }
+  if (isRecord(value) && typeof value["prefab"] === "string" && value["prefab"] !== "") {
+    return Object.keys(value).length === 1;
+  }
+  return false;
 }
 
 /**
@@ -178,9 +444,12 @@ export function isMainToWorkerMessage(value: unknown): value is MainToWorkerMess
         typeof options["name"] === "string" &&
         Array.isArray(options["authors"]) &&
         options["authors"].every((entry): entry is string => typeof entry === "string") &&
-        typeof options["expressions"] === "boolean"
+        typeof options["expressions"] === "boolean" &&
+        isPhysicsOption(options["physics"])
       );
     }
+    case "prefabCandidates":
+      return typeof value["fbxPath"] === "string" && value["fbxPath"] !== "";
     case "cancel":
       return true;
     default:
@@ -189,8 +458,11 @@ export function isMainToWorkerMessage(value: unknown): value is MainToWorkerMess
 }
 
 /**
- * worker→mainの応答値を検証する。`converted`のレポートはここでは検証せず、
- * 解決時に{@link parseConversionReport}で検証する。
+ * worker→mainの応答値を検証する。`converted`・`prefabCandidates`のレポートは
+ * ここでは検証せず、解決時に{@link parseClientConversionReport}・
+ * {@link parsePrefabCandidatesReport}で検証する。`converted`の検証は
+ * Worker→client境界の`camelCase`用であり、wasm境界の
+ * {@link parseConversionReport}とは別である。
  *
  * @param value - 受信した値。
  * @returns 応答として扱える場合に真。
@@ -204,6 +476,8 @@ function isWorkerToMainMessage(value: unknown): value is WorkerToMainMessage {
       return Array.isArray(value["candidates"]);
     case "converted":
       return value["vrm"] instanceof ArrayBuffer;
+    case "prefabCandidates":
+      return isRecord(value["report"]);
     case "error":
       return (
         typeof value["stage"] === "string" &&
@@ -228,6 +502,12 @@ type PendingRequest =
   | {
       readonly kind: "convert";
       readonly resolve: (result: ConversionResult) => void;
+      readonly reject: (error: ConversionError) => void;
+      readonly onProgress?: (stage: string) => void;
+    }
+  | {
+      readonly kind: "prefabCandidates";
+      readonly resolve: (report: PrefabCandidatesReport) => void;
       readonly reject: (error: ConversionError) => void;
       readonly onProgress?: (stage: string) => void;
     };
@@ -309,6 +589,25 @@ export class ConversionClient {
   }
 
   /**
+   * 対象FBXを参照するPrefab候補を取り出す。
+   *
+   * @param fbxPath - 対象FBXの出力パス（`Assets/...`）。
+   * @param onProgress - 重い処理の直前に段階を受け取る場合に渡す。
+   * @returns 候補報告（候補はパス昇順）。呼び出し側が所有する。
+   * @throws `ConversionError` — 走査の失敗・中断・Worker異常の場合。
+   */
+  prefabCandidates(fbxPath: string, onProgress?: (stage: string) => void): Promise<PrefabCandidatesReport> {
+    this.ensureAlive();
+    const id = this.nextId;
+    this.nextId += 1;
+    return new Promise<PrefabCandidatesReport>((resolve, reject) => {
+      const request: PendingRequest = { kind: "prefabCandidates", resolve, reject };
+      this.pending.set(id, onProgress === undefined ? request : { ...request, onProgress });
+      this.worker.postMessage({ type: "prefabCandidates", id, fbxPath } satisfies MainToWorkerMessage);
+    });
+  }
+
+  /**
    * Workerを破棄し、待ち合わせ中の要求を中断として失敗させる。
    *
    * 変換側に専用の中断手順はなく、破棄が中断を兼ねる。呼び出し側は中断を
@@ -369,8 +668,21 @@ export class ConversionClient {
         }
         this.pending.delete(data.id);
         try {
-          // レポートはパース済みに近い形（検証済みオブジェクト）で渡す。
-          request.resolve({ vrm: data.vrm, report: parseConversionReport(data.report) });
+          // Workerはwasm境界で検証して`camelCase`へ写した済みの値を送るため、
+          // ここではWorker→client境界の検証で受け直す。wasm境界の検証を
+          // 重ねると`snake_case`要求に当たり成功応答が失敗になる。
+          request.resolve({ vrm: data.vrm, report: parseClientConversionReport(data.report) });
+        } catch (error) {
+          request.reject(toConversionError(error));
+        }
+        break;
+      case "prefabCandidates":
+        if (request.kind !== "prefabCandidates") {
+          return;
+        }
+        this.pending.delete(data.id);
+        try {
+          request.resolve(parsePrefabCandidatesReport(data.report));
         } catch (error) {
           request.reject(toConversionError(error));
         }

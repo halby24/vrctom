@@ -1,47 +1,41 @@
 //! Prefab・FBX・`.fbx.meta` から物理sidecarをUnityなしで導出する。
 //!
-//! 入口は [`derive_physics_sidecar`] であり、FBXバイト列・Assets配置・
-//! Prefab文書からUnityヘルパと同一内容のsidecar JSONを組み立てる。
+//! 入口は [`derive_physics_sidecar_with`]（ターゲット非依存の共通本体）と
+//! [`derive_physics_sidecar`]（ファイルシステム経由の互換ラッパー）である。
+//! 共通本体は索引と読み手だけで組み立て、FBXバイト列・Prefab文書から
+//! Unityヘルパと同一内容のsidecar JSONを組み立てる。
 //! 型判定はスクリプトfileIDのMD4計算で行い、`(guid, fileID)` の表を持たない。
 //! 旧方式（2019.3より前の取り込みfileID）・参照切れ・未知型は黙って落とさず失敗する。
 
-#[cfg(not(target_arch = "wasm32"))]
 use std::collections::{HashMap, HashSet};
 
-#[cfg(not(target_arch = "wasm32"))]
 use yaml_serde::Value;
 
 use super::error::{VrmError, VrmErrorKind};
 use crate::fbx::FbxFile;
-#[cfg(not(target_arch = "wasm32"))]
 use crate::fbx::{FbxOptions, LocalTransform};
 use crate::unity::SerializedFile;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::unity::{AssetMeta, FileId, TypedObject};
+use crate::unity::{
+    AssetIndex, AssetKind, AssetMeta, AssetSource, FileId, ParseOptions, TypedObject,
+};
 
 /// 参照ローカル1件。位置・回転・拡大率と出所（`bind`・`scene` 等）の組である。
 /// 戻り値や引数の型が長くなるため別名にする。
-#[cfg(not(target_arch = "wasm32"))]
 type ReferenceLocal = ([f64; 3], [f64; 4], [f64; 3], &'static str);
 
 /// float32のTRS1件。分解・合成の中間形である。
-#[cfg(not(target_arch = "wasm32"))]
 type TrsF32 = ([f32; 3], [f32; 4], [f32; 3]);
 
 /// float64のTRS1件。skeletonのT-pose等の中間形である。
-#[cfg(not(target_arch = "wasm32"))]
 type TrsF64 = ([f64; 3], [f64; 4], [f64; 3]);
 
 /// 視線の1方向。linked・左・右の組である。
-#[cfg(not(target_arch = "wasm32"))]
 type EyePose = ([bool; 1], [f64; 4], [f64; 4]);
 
-#[cfg(not(target_arch = "wasm32"))]
 /// MD4の既知ベクタ（空文字）。依存の取り違えを検出する。単体テストで使う。
 #[allow(dead_code)]
 const MD4_EMPTY: &str = "31d6cfe0d16ae931b73c59d7e0c089c0";
 
-#[cfg(not(target_arch = "wasm32"))]
 /// MD4ハッシュを求める。RFC 1320の純Rust実装であり、外部依存を増やさない。
 fn md4(message: &[u8]) -> [u8; 16] {
     fn rol(x: u32, n: u32) -> u32 {
@@ -164,7 +158,6 @@ fn md4(message: &[u8]) -> [u8; 16] {
     out
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 /// テスト用の16進表示。単体テストで使う。
 #[allow(dead_code)]
 fn md4_hex(message: &[u8]) -> String {
@@ -178,7 +171,6 @@ fn md4_hex(message: &[u8]) -> String {
     out
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 /// スクリプトfileIDをMD4で計算する。
 fn script_file_id(namespace: &str, class_name: &str) -> i32 {
     let mut input = Vec::with_capacity(4 + namespace.len() + class_name.len());
@@ -189,7 +181,6 @@ fn script_file_id(namespace: &str, class_name: &str) -> i32 {
     i32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]])
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 /// VRChatのDLLとみなすGUID集合。
 const VRCHAT_DLL_GUIDS: &[&str] = &[
     "2a2c05204084d904aa4945ccff20d8e5",
@@ -199,7 +190,6 @@ const VRCHAT_DLL_GUIDS: &[&str] = &[
     "4ecd63eff847044b68db9453ce219299",
 ];
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KnownScript {
     PhysBone,
@@ -216,7 +206,6 @@ enum KnownScript {
     LookAtConstraint,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn script_identity(kind: KnownScript) -> (&'static str, &'static str) {
     match kind {
         KnownScript::PhysBone => ("VRC.SDK3.Dynamics.PhysBone.Components", "VRCPhysBone"),
@@ -258,7 +247,6 @@ fn script_identity(kind: KnownScript) -> (&'static str, &'static str) {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScriptJudgment {
     Known(KnownScript),
@@ -266,7 +254,6 @@ enum ScriptJudgment {
     External,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn judge_script(guid: &str, file_id: i32) -> ScriptJudgment {
     let guid_lower = guid.to_ascii_lowercase();
     if !VRCHAT_DLL_GUIDS.contains(&guid_lower.as_str()) {
@@ -294,13 +281,17 @@ fn judge_script(guid: &str, file_id: i32) -> ScriptJudgment {
     ScriptJudgment::UnknownDll
 }
 
-/// 導出時の入力。
+/// 導出時の入力（ファイルシステム経由の互換入口）。
+///
+/// 新規のWeb経路は [`PrefabDeriveSource`] と [`derive_physics_sidecar_with`] を使う。
+/// 既存CLIと既存テストの呼び出しを壊さないための互換ラッパーであり、
+/// nativeでは正規化・走査してから共通本体へ委ねる。
 pub struct PrefabDeriveInput<'a> {
     /// 入力FBXのバイト列。SHA-256照合に使う。
     pub fbx_bytes: &'a [u8],
     /// 読み取り済みFBX。階層とbind行列に使う。
     pub fbx: &'a FbxFile<'a>,
-    /// `Assets` を含むプロジェクトのルート。`.meta` の読み取りに使う。
+    /// `Assets` を含むプロジェクトのルート。索引走査に使う。
     pub assets_root: &'a std::path::Path,
     /// 対象Prefabの文書列。
     pub prefab: &'a SerializedFile,
@@ -308,6 +299,116 @@ pub struct PrefabDeriveInput<'a> {
     pub prefab_label: &'a str,
     /// 入力FBXの資産相対パス（`Assets/...` 形式）。
     pub fbx_asset_path: &'a str,
+}
+
+/// 導出時の読み取り上限。
+///
+/// 既定値（[`PhysicsDeriveLimits::new`]・`Default`）はWeb向けの目安であり、
+/// Web経路（`vrctom-wasm` の `Limits` から `derive_limits` で作る値）と
+/// 整合する。native互換の既存入口（[`derive_physics_sidecar`]）には
+/// 従来相当の [`PhysicsDeriveLimits::native`] を使い、既定値をそのまま
+/// nativeに適用しない。従来のnative読み取りは上限を設けていなかったため、
+/// native互換は主FBX・副FBXをFBX読み取り層の既定（1GiB相当）に合わせ、
+/// Prefab本文と依存合計には上限を設けない。
+/// 上限の変更は `with_` で始まるメソッドで行う。
+#[derive(Debug, Clone)]
+pub struct PhysicsDeriveLimits {
+    max_main_fbx_bytes: u64,
+    max_extra_fbx_bytes: u64,
+    max_prefab_bytes: u64,
+    max_total_bytes: u64,
+}
+
+impl PhysicsDeriveLimits {
+    /// Web向け既定の上限を作る。
+    ///
+    /// 主FBXと副FBXはWebの単一FBX予算（`vrctom-wasm` の `Limits::max_fbx_bytes`
+    /// である128MiB）、Prefab本文は実体（Milfyで約300KB）に2桁の余裕を持たせた
+    /// 64MiB、依存資産合計はWebの入出力規模（512MiB）に合わせた512MiBである。
+    /// 実測の依存合計（主FBX約17MB＋副FBX約300KB＋Prefab約300KB）は既定に十分収まり、
+    /// Web経路では従来の無制限なnative読み取りと同一結果になる。
+    /// native互換の既存入口には [`PhysicsDeriveLimits::native`] を使う。
+    pub fn new() -> Self {
+        Self {
+            max_main_fbx_bytes: 128 * 1024 * 1024,
+            max_extra_fbx_bytes: 128 * 1024 * 1024,
+            max_prefab_bytes: 64 * 1024 * 1024,
+            max_total_bytes: 512 * 1024 * 1024,
+        }
+    }
+
+    /// native互換の既存入口向けの上限を作る。
+    ///
+    /// 従来のnative読み取りは上限を設けていなかったため、主FBXと副FBXは
+    /// FBX読み取り層の既定（`crate::fbx::FbxOptions` の1GiB相当）を下回らず、
+    /// Prefab本文と依存合計には上限を設けない。FBX解析層自体の1GiB上限は
+    /// 別に残るため、従来扱えた入力が導出の上限で先に失敗しない。
+    /// 新規のWeb経路には [`PhysicsDeriveLimits::new`] を使う。
+    pub fn native() -> Self {
+        Self {
+            // `FbxOptions::default` の `DEFAULT_MAX_FILE_BYTES`（1GiB）と同値である。
+            max_main_fbx_bytes: 1 << 30,
+            max_extra_fbx_bytes: 1 << 30,
+            max_prefab_bytes: u64::MAX,
+            max_total_bytes: u64::MAX,
+        }
+    }
+
+    /// 主FBXバイト列の上限（バイト数）を変更する。
+    pub fn with_max_main_fbx_bytes(mut self, bytes: u64) -> Self {
+        self.max_main_fbx_bytes = bytes;
+        self
+    }
+
+    /// 追加・副FBX1件の上限（バイト数）を変更する。
+    pub fn with_max_extra_fbx_bytes(mut self, bytes: u64) -> Self {
+        self.max_extra_fbx_bytes = bytes;
+        self
+    }
+
+    /// Prefab本文1件の上限（バイト数）を変更する。
+    pub fn with_max_prefab_bytes(mut self, bytes: u64) -> Self {
+        self.max_prefab_bytes = bytes;
+        self
+    }
+
+    /// 依存資産（追加FBX・副Prefab・副FBX）の合計上限（バイト数）を変更する。
+    pub fn with_max_total_bytes(mut self, bytes: u64) -> Self {
+        self.max_total_bytes = bytes;
+        self
+    }
+}
+
+impl Default for PhysicsDeriveLimits {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 導出時の入力（ターゲット非依存の共通入口）。
+///
+/// `source` は `Assets` 直下基準の相対パスで読む読み手であり、
+/// `index` は同じ配置から作った索引である。
+/// `assets_root` は持たず、ファイルシステムに触れない。
+pub struct PrefabDeriveSource<'a> {
+    /// 入力FBXのバイト列。SHA-256照合に使う。
+    pub fbx_bytes: &'a [u8],
+    /// 読み取り済みFBX。階層とbind行列に使う。
+    pub fbx: &'a FbxFile<'a>,
+    /// `Assets` 直下基準で読む読み手。
+    pub source: &'a dyn AssetSource,
+    /// 同じ配置から作った索引。`.meta` の正とする。
+    pub index: &'a AssetIndex,
+    /// 対象Prefabの文書列。
+    pub prefab: &'a SerializedFile,
+    /// 診断用のPrefab表示名。
+    pub prefab_label: &'a str,
+    /// 入力FBXの資産相対パス（`Assets/...` 形式）。
+    pub fbx_asset_path: &'a str,
+    /// 読み取り上限。Web経路は `vrctom-wasm` の `derive_limits` がWeb向けの
+    /// 上限を渡す。直接作る場合は [`PhysicsDeriveLimits::new`]（Web向け既定）と
+    /// [`PhysicsDeriveLimits::native`]（native互換）を使い分ける。
+    pub limits: PhysicsDeriveLimits,
 }
 
 /// 導出結果。
@@ -322,14 +423,162 @@ pub struct DerivedSidecar {
     pub unmatched_nodes: Vec<String>,
 }
 
+/// Prefabから物理sidecarを導出する（互換入口）。
+///
+/// nativeでは正規化・走査してから共通本体へ委ね、既存CLIと既存テストの
+/// 呼び出しを保つ。wasmではファイル走査ができないため明示的に失敗する。
+/// Webは [`derive_physics_sidecar_with`] を使う。
 pub fn derive_physics_sidecar(input: &PrefabDeriveInput<'_>) -> Result<DerivedSidecar, VrmError> {
     derive_inner(input)
+}
+
+/// Prefabから物理sidecarを導出する（ターゲット非依存の共通入口）。
+///
+/// `source` と `index` が同じ配置を指すことを呼び出し側が保証する。
+/// 上限超過は [`VrmErrorKind::LimitExceeded`] で失敗する。
+pub fn derive_physics_sidecar_with(
+    input: &PrefabDeriveSource<'_>,
+) -> Result<DerivedSidecar, VrmError> {
+    derive_common(input)
+}
+
+/// Prefab走査で読めなかった1件の記録。
+///
+/// 解析の失敗を握りつぶして0件扱いにしないため、パスと理由を残す。
+/// 候補の有無とは別に報告し、呼び出し側が警告や失敗の診断に使う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefabScanIssue {
+    /// 出力パス（`Assets/...`）。
+    pub path: String,
+    /// 読めなかった理由の日本語診断。
+    pub reason: String,
+}
+
+/// 対象FBXを参照するPrefabの走査結果。
+///
+/// `candidates` は出力パス（`Assets/...`）の昇順であり、重複しない。
+/// `unreadable` は走査中に出会った解析不能Prefabの記録である。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefabCandidates {
+    /// 対象FBXの資産パス（入力の `Assets/...` 形式そのまま）。
+    pub fbx_asset_path: String,
+    /// 対象FBXのGUID（索引の記録）。
+    pub fbx_guid: String,
+    /// 対象FBXを参照するPrefabの出力パス列（`Assets/...`、昇順）。
+    pub candidates: Vec<String>,
+    /// 走査中に解析できなかったPrefabの記録列（パス昇順）。
+    pub unreadable: Vec<PrefabScanIssue>,
+}
+
+/// 対象FBXを参照するPrefabを索引と読み手だけで探す。
+///
+/// 判定は構造化された参照だけを使い、GUID文字列の部分一致検索はしない。
+/// `PrefabInstance.m_SourcePrefab` が対象FBXを指すものと、直接記述Prefabの
+/// `SkinnedMeshRenderer.m_Mesh` が対象FBXのGUIDを指すものを候補にする。
+/// 走査対象は `.prefab` のみであり、フォルダや他種別は読まない。
+/// 読み取り上限（Prefab本文・走査合計）を守り、上限超過の切り詰めはしない。
+/// 解析できなかったPrefabは `unreadable` に記録し、候補から黙って落とさない。
+/// 返り値の順序は決定的であり、索引の挿入順には依存しない。
+///
+/// # Errors
+///
+/// 対象FBXが索引に無い場合と、走査の合計読み取り量が上限を超えた場合に返す。
+pub fn find_prefab_candidates(
+    source: &dyn AssetSource,
+    index: &AssetIndex,
+    fbx_asset_path: &str,
+    limits: &PhysicsDeriveLimits,
+) -> Result<PrefabCandidates, VrmError> {
+    let indexed = normalize_index_path(fbx_asset_path);
+    let Some(record) = index.get_by_path(indexed) else {
+        return Err(VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!(
+                "Prefab走査のFBXが索引にない: {}",
+                crate::escape_diag(fbx_asset_path),
+            ),
+        ));
+    };
+    let fbx_guid = record.meta.guid().as_str().to_owned();
+    // 走査の合計読み取り量を数える。個別上限は読み手の `limit` で抑える。
+    let mut budget = DeriveBudget::new(limits.max_total_bytes);
+    let parse_options = ParseOptions::new().with_max_file_bytes(limits.max_prefab_bytes);
+    let mut candidates = Vec::new();
+    let mut unreadable = Vec::new();
+    for entry in index.entries() {
+        // 種別がPrefabの記録だけを走査する。拡張子違いやフォルダは読まない。
+        if entry.kind != AssetKind::Prefab {
+            continue;
+        }
+        let output = format!("Assets/{}", entry.path);
+        // 読み取りの失敗は記録して次へ進み、合計超過だけ全体を打ち切る。
+        // 超過分の確保はせず、途中の候補で成功扱いにしない。
+        let bytes = match source.read_limited(&entry.path, limits.max_prefab_bytes) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                unreadable.push(PrefabScanIssue {
+                    path: output,
+                    reason: format!("Prefabを読めない: {error}"),
+                });
+                continue;
+            }
+        };
+        // 合計超過は途中の候補で成功扱いにせず、走査全体を打ち切る。
+        budget.consume(bytes.len(), "Prefab走査", &output)?;
+        // Prefab本文の型付き読み取り。失敗は記録して次へ進む。
+        let parsed = match SerializedFile::parse(&bytes, &parse_options) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                unreadable.push(PrefabScanIssue {
+                    path: output,
+                    reason: format!("PrefabのYAMLを読めない: {error}"),
+                });
+                continue;
+            }
+        };
+        match parse_prefab_docs(&parsed, &output) {
+            Ok(typed) => {
+                if prefab_refers_to_fbx(&typed, &fbx_guid) {
+                    candidates.push(output);
+                }
+            }
+            Err(error) => unreadable.push(PrefabScanIssue {
+                path: output,
+                reason: format!("Prefabの文書を読めない: {error}"),
+            }),
+        }
+    }
+    candidates.sort();
+    unreadable.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(PrefabCandidates {
+        fbx_asset_path: fbx_asset_path.to_owned(),
+        fbx_guid,
+        candidates,
+        unreadable,
+    })
+}
+
+/// Prefabが対象FBXを構造化された参照で指すかを返す。
+///
+/// `PrefabInstance.m_SourcePrefab` の一致と、直接記述の
+/// `SkinnedMeshRenderer.m_Mesh` のGUID一致を見る。
+/// GUID文字列の部分一致検索はしない。
+fn prefab_refers_to_fbx(parsed: &ParsedPrefab, fbx_guid: &str) -> bool {
+    if !find_instances(parsed, fbx_guid).is_empty() {
+        return true;
+    }
+    parsed.smrs.iter().any(|smr| {
+        smr.mesh_guid
+            .as_deref()
+            .is_some_and(|guid| guid.eq_ignore_ascii_case(fbx_guid))
+    })
 }
 
 // 以下、導出の本体。読みやすさのため小さな関数に分ける。
 
 fn derive_inner(input: &PrefabDeriveInput<'_>) -> Result<DerivedSidecar, VrmError> {
     // wasmではファイル走査ができないため明示的に失敗する。
+    // Webは共通入口（`derive_physics_sidecar_with`）を使う。
     #[cfg(target_arch = "wasm32")]
     {
         let _ = input;
@@ -344,6 +593,8 @@ fn derive_inner(input: &PrefabDeriveInput<'_>) -> Result<DerivedSidecar, VrmErro
     }
 }
 
+/// ファイルシステム経由の互換導出。走査と読み手の組み立てだけを担い、
+/// 本体はターゲット非依存の共通入口へ委ねる。
 #[cfg(not(target_arch = "wasm32"))]
 fn derive_native(input: &PrefabDeriveInput<'_>) -> Result<DerivedSidecar, VrmError> {
     use crate::unity::{IndexOptions, scan_directory};
@@ -374,15 +625,45 @@ fn derive_native(input: &PrefabDeriveInput<'_>) -> Result<DerivedSidecar, VrmErr
             format!("材質の索引化に失敗した: {e}"),
         )
     })?;
+    let fs_source = crate::unity::FsAssetSource::new(&canonical_assets);
+    let source_input = PrefabDeriveSource {
+        fbx_bytes: input.fbx_bytes,
+        fbx: input.fbx,
+        source: &fs_source,
+        index: &index,
+        prefab: input.prefab,
+        prefab_label: label,
+        fbx_asset_path: input.fbx_asset_path,
+        // 既存互換入口は従来相当（上限なしに近いnative向け）で動かす。
+        // Web向け既定（主FBX 128MiB等）をここに適用すると、従来1GiBまで
+        // 扱えた入力が導出の上限で先に失敗する。Web経路は `core.rs` の
+        // `derive_limits` がWeb上限を渡すため、ここではnative向けを使う。
+        limits: PhysicsDeriveLimits::native(),
+    };
+    // `index` と `fs_source` はこの場で作り、共通本体の借用内に収める。
+    derive_common(&source_input)
+}
+
+/// 共通導出本体。ファイルシステムに触れず、索引と読み手だけで組み立てる。
+fn derive_common(input: &PrefabDeriveSource<'_>) -> Result<DerivedSidecar, VrmError> {
+    let label = input.prefab_label;
+    // 主FBXの大きさを上限で確かめる。入力済みバイト列の長さで判定し、
+    // 上限内の場合だけ後段へ進む。上限超過の複製は起きない。
+    if input.fbx_bytes.len() as u64 > input.limits.max_main_fbx_bytes {
+        return Err(VrmError::new(
+            VrmErrorKind::LimitExceeded,
+            format!(
+                "主FBXが上限を超えた: {}バイト（上限{}バイト）",
+                input.fbx_bytes.len(),
+                input.limits.max_main_fbx_bytes,
+            ),
+        ));
+    }
     // 入力FBXのGUIDと置換表を索引から引く。
     // 索引のパスはAssets相対（`PLUSONE/...`）であり、`Assets/` 接頭辞は付けない。
     // 呼び出し側が `Assets/...` 形で渡した場合は接頭辞を落として引く。
-    let indexed_path = input
-        .fbx_asset_path
-        .strip_prefix("Assets/")
-        .or_else(|| input.fbx_asset_path.strip_prefix("Assets\\"))
-        .unwrap_or(input.fbx_asset_path);
-    let Some(record) = index.get_by_path(indexed_path) else {
+    let indexed_path = normalize_index_path(input.fbx_asset_path);
+    let Some(record) = input.index.get_by_path(indexed_path) else {
         return Err(VrmError::new(
             VrmErrorKind::InvalidPrefab,
             format!(
@@ -401,26 +682,12 @@ fn derive_native(input: &PrefabDeriveInput<'_>) -> Result<DerivedSidecar, VrmErr
     // 1件あればインスタンス経路、0件（文書が直接記述）なら直接経路、
     // 複数は先勝ちにせず失敗する。
     let instances = find_instances(&parsed, &fbx_guid);
+    // 依存資産の合計読み取り量を数える。上限超過は切り詰めず失敗する。
+    let mut budget = DeriveBudget::new(input.limits.max_total_bytes);
     if instances.len() == 1 {
-        derive_instance_native(
-            input,
-            label,
-            &index,
-            &canonical_assets,
-            &parsed,
-            &milfy_hier,
-            &fbx_guid,
-        )
+        derive_instance_common(input, label, &parsed, &milfy_hier, &fbx_guid, &mut budget)
     } else if parsed.instances.is_empty() {
-        derive_direct_native(
-            input,
-            label,
-            &index,
-            &canonical_assets,
-            &parsed,
-            &milfy_hier,
-            &fbx_guid,
-        )
+        derive_direct_common(input, label, &parsed, &milfy_hier, &fbx_guid, &mut budget)
     } else {
         Err(VrmError::new(
             VrmErrorKind::InvalidPrefab,
@@ -433,38 +700,111 @@ fn derive_native(input: &PrefabDeriveInput<'_>) -> Result<DerivedSidecar, VrmErr
     }
 }
 
-/// FBXの `.meta` を読み取り、取り込み方式を確かめる。
-/// 索引と同じくAssets相対で引く。`Assets/` 接頭辞は落とす。
-#[cfg(not(target_arch = "wasm32"))]
-fn read_fbx_meta(
-    input: &PrefabDeriveInput<'_>,
-    canonical_assets: &std::path::Path,
+/// `Assets/...` 形の資産パスを索引用の相対パスに直す。
+///
+/// 索引は `Assets` 直下基準の `/` 区切りであり、`Assets/` 接頭辞は付けない。
+/// `Assets/`・`Assets\` の接頭辞だけを落とし、それ以外はそのまま使う。
+/// 空や区切り違いの正規化は行わず、所在不明は呼び出し側が索引不一致として扱う。
+fn normalize_index_path(asset_path: &str) -> &str {
+    asset_path
+        .strip_prefix("Assets/")
+        .or_else(|| asset_path.strip_prefix("Assets\\"))
+        .unwrap_or(asset_path)
+}
+
+/// 依存資産の合計読み取り量の予算。
+///
+/// 個別上限は `AssetSource::read_limited` の `limit` で抑え、
+/// 合計は読み取りのたびに加算して確かめる。超過分を確保せず失敗する。
+struct DeriveBudget {
+    max_total: u64,
+    used: u64,
+}
+
+impl DeriveBudget {
+    fn new(max_total: u64) -> Self {
+        Self { max_total, used: 0 }
+    }
+
+    /// 読み取ったバイト数を加算し、上限超過を確かめる。
+    fn consume(&mut self, bytes: usize, what: &str, label: &str) -> Result<(), VrmError> {
+        self.used = self.used.saturating_add(bytes as u64);
+        if self.used > self.max_total {
+            return Err(VrmError::new(
+                VrmErrorKind::LimitExceeded,
+                format!(
+                    "{what}の合計が上限を超えた: {}バイト（上限{}バイト）（{}）",
+                    self.used,
+                    self.max_total,
+                    crate::escape_diag(label),
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// 資産1件を上限付きで読む。入出力失敗を導出エラーへ写す.
+///
+/// `limit` を超える内容は切り詰めず [`VrmErrorKind::LimitExceeded`] で失敗し、
+/// 存在しない場合は [`VrmErrorKind::InvalidPrefab`] で失敗する。
+/// 読み取り後は合計予算へ加算する。
+fn read_asset_limited(
+    source: &dyn AssetSource,
+    path: &str,
+    limit: u64,
+    budget: &mut DeriveBudget,
+    what: &str,
+    label: &str,
+) -> Result<Vec<u8>, VrmError> {
+    let bytes = source
+        .read_limited(path, limit)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => VrmError::new(
+                VrmErrorKind::InvalidPrefab,
+                format!("{what}が索引にない: {}: {e}", crate::escape_diag(path),),
+            ),
+            std::io::ErrorKind::InvalidData => VrmError::new(
+                VrmErrorKind::LimitExceeded,
+                format!(
+                    "{what}が上限を超えた: {path}（上限{limit}バイト）（{}）",
+                    crate::escape_diag(label),
+                ),
+            ),
+            _ => VrmError::new(
+                VrmErrorKind::InvalidPrefab,
+                format!("{what}を読めない: {e}"),
+            ),
+        })?;
+    budget.consume(bytes.len(), what, label)?;
+    Ok(bytes)
+}
+
+/// FBXの `.meta` を索引から引き、取り込み方式を確かめる。
+///
+/// 従来nativeは `.meta` をファイルから読み直していたが、メモリ経路と同一結果にするため
+/// 索引の記録（`.meta` の正）を複製して使う。再読による食い違いを残さない。
+fn fbx_meta_from_index(
+    index: &AssetIndex,
+    fbx_asset_path: &str,
     label: &str,
 ) -> Result<AssetMeta, VrmError> {
-    let indexed_path = input
-        .fbx_asset_path
-        .strip_prefix("Assets/")
-        .or_else(|| input.fbx_asset_path.strip_prefix("Assets\\"))
-        .unwrap_or(input.fbx_asset_path);
-    let meta_path = canonical_assets.join(indexed_path);
-    let meta_bytes = std::fs::read(format!("{}.meta", meta_path.display())).map_err(|e| {
-        VrmError::new(
+    let indexed_path = normalize_index_path(fbx_asset_path);
+    let Some(record) = index.get_by_path(indexed_path) else {
+        return Err(VrmError::new(
             VrmErrorKind::InvalidPrefab,
-            format!("FBXの.metaを読めない: {e}"),
-        )
-    })?;
-    let meta = AssetMeta::parse(&meta_bytes).map_err(|e| {
-        VrmError::new(
-            VrmErrorKind::InvalidPrefab,
-            format!("FBXの.metaを読めない: {e}"),
-        )
-    })?;
+            format!(
+                "Prefab割当のFBXが索引にない: {}",
+                crate::escape_diag(fbx_asset_path),
+            ),
+        ));
+    };
+    let meta = record.meta.clone();
     check_file_ids_generation(&meta, label)?;
     Ok(meta)
 }
 
 /// sidecarの参照元FBX1件。`sourceModels` の組み立てに使う。
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 struct SourceModelEntry {
     id: String,
@@ -473,12 +813,11 @@ struct SourceModelEntry {
     asset_path: String,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 impl SourceModelEntry {
     /// 入力FBXの項目を作る。SHA-256は入力バイト列から求める。
-    fn from_input(input: &PrefabDeriveInput<'_>, model_id: &str, fbx_guid: &str) -> Self {
+    fn from_bytes(fbx_bytes: &[u8], fbx_asset_path: &str, model_id: &str, fbx_guid: &str) -> Self {
         use sha2::Digest;
-        let digest = sha2::Sha256::digest(input.fbx_bytes);
+        let digest = sha2::Sha256::digest(fbx_bytes);
         let mut sha = String::with_capacity(64);
         for byte in digest {
             sha.push(char::from_digit(u32::from(byte >> 4), 16).expect("hexである"));
@@ -488,26 +827,33 @@ impl SourceModelEntry {
             id: model_id.to_owned(),
             sha256: sha,
             asset_guid: fbx_guid.to_owned(),
-            asset_path: input.fbx_asset_path.to_owned(),
+            asset_path: fbx_asset_path.to_owned(),
         }
     }
 }
 
 /// インスタンス経路の導出。PrefabInstanceが1件ある場合に使う。
-#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
-fn derive_instance_native(
-    input: &PrefabDeriveInput<'_>,
+fn derive_instance_common(
+    input: &PrefabDeriveSource<'_>,
     label: &str,
-    index: &crate::unity::AssetIndex,
-    canonical_assets: &std::path::Path,
     parsed: &ParsedPrefab,
     milfy_hier: &FbxHierarchy,
     fbx_guid: &str,
+    budget: &mut DeriveBudget,
 ) -> Result<DerivedSidecar, VrmError> {
     // ネストした副階層の解決。主FBX以外のインスタンス（副Prefab）の
-    // 実体をAssetsから読み、副FBXと合わせて graft の材料を作る。
-    let phone = resolve_phone_subtree(index, canonical_assets, parsed, fbx_guid, label)?;
+    // 実体を読み手から読み、副FBXと合わせて graft の材料を作る。
+    let phone = resolve_phone_subtree(
+        input.index,
+        input.source,
+        input.limits.max_prefab_bytes,
+        input.limits.max_extra_fbx_bytes,
+        budget,
+        parsed,
+        fbx_guid,
+        label,
+    )?;
     // 1930年代方式ではなく、2019.3以降のXXH64方式であることを確かめる。
     // fileIDの一致で解決できない対象があれば旧方式として失敗する。
     // 主インスタンスの改変内容のうち、姿勢の上書きは対象ノードの
@@ -534,12 +880,14 @@ fn derive_instance_native(
     )?;
     // 成分の判別と収集。
     let collector = collect_components(parsed, &tree, &phone, fbx_guid, label)?;
-    // humanoid・lookAtのための.meta読み取り。
-    let meta = read_fbx_meta(input, canonical_assets, label)?;
+    // humanoid・lookAtのための.metaは索引の記録を正とする。
+    // 再読せず複製して使うため、nativeとメモリで同一結果になる。
+    let meta = fbx_meta_from_index(input.index, input.fbx_asset_path, label)?;
     // sourceModelsは主FBXと副FBX（ある場合）を資産パス順に並べる。
     // Unityの `SortedDictionary` と同じ決定性規則である。
-    let mut sources = vec![SourceModelEntry::from_input(
-        input,
+    let mut sources = vec![SourceModelEntry::from_bytes(
+        input.fbx_bytes,
+        input.fbx_asset_path,
         &model_id_main,
         fbx_guid,
     )];
@@ -553,7 +901,6 @@ fn derive_instance_native(
     }
     // sidecar JSONの組み立て。
     emit_sidecar(
-        input,
         &tree,
         &locals,
         &collector,
@@ -571,16 +918,14 @@ fn derive_instance_native(
 /// `m_Mesh` のfileID（`Type:Mesh->{モデル名}0`）で取る。
 /// 対応が取れないノードはTransformのみで出力するが、物理に参照される
 /// ものがあれば明示的に失敗させる。黙って落とさず件数を報告する。
-#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
-fn derive_direct_native(
-    input: &PrefabDeriveInput<'_>,
+fn derive_direct_common(
+    input: &PrefabDeriveSource<'_>,
     label: &str,
-    index: &crate::unity::AssetIndex,
-    canonical_assets: &std::path::Path,
     parsed: &ParsedPrefab,
     milfy_hier: &FbxHierarchy,
     fbx_guid: &str,
+    budget: &mut DeriveBudget,
 ) -> Result<DerivedSidecar, VrmError> {
     // 参照メッシュのGUIDごとにFBXを読み取り、所有側へ写す。
     // 入力FBXは読み取り済みのものを使い、他は索引から探して読む。
@@ -595,7 +940,14 @@ fn derive_direct_native(
             if !seen.insert(guid.to_owned()) {
                 continue;
             }
-            extra_fbx.push(load_extra_fbx(index, canonical_assets, guid, label)?);
+            extra_fbx.push(load_extra_fbx(
+                input.index,
+                input.source,
+                input.limits.max_extra_fbx_bytes,
+                budget,
+                guid,
+                label,
+            )?);
         }
     }
     // ノード階層の組み立て。FBXとの対応付けもここで行う。
@@ -634,11 +986,12 @@ fn derive_direct_native(
     // 物理に参照される未対応ノードがあれば失敗させる。
     // 平面colliderだけの参照は平面経路が直接扱うため除く。
     check_direct_physics_refs(&build.tree, &collector, label)?;
-    // humanoid・lookAtのための.meta読み取り。
-    let meta = read_fbx_meta(input, canonical_assets, label)?;
+    // humanoid・lookAtのための.metaは索引の記録を正とする。
+    let meta = fbx_meta_from_index(input.index, input.fbx_asset_path, label)?;
     // sourceModelsはメッシュのGUIDから埋める。入力FBXと参照FBXを資産パス順に並べる。
-    let mut sources = vec![SourceModelEntry::from_input(
-        input,
+    let mut sources = vec![SourceModelEntry::from_bytes(
+        input.fbx_bytes,
+        input.fbx_asset_path,
         &model_id_main,
         fbx_guid,
     )];
@@ -652,7 +1005,6 @@ fn derive_direct_native(
     }
     // sidecar JSONの組み立て。
     emit_sidecar(
-        input,
         &build.tree,
         &locals,
         &collector,
@@ -668,7 +1020,6 @@ fn derive_direct_native(
 /// 直接記述のPrefabが参照する入力以外のFBX1件の所有側の写し。
 /// 階層の組み立てと出所の特定に使う。bind計算には使わない
 /// （参照姿勢が `scene` のため）。
-#[cfg(not(target_arch = "wasm32"))]
 struct ExtraFbx {
     guid: String,
     asset_path: String,
@@ -682,7 +1033,6 @@ struct ExtraFbx {
 }
 
 /// 参照FBXのモデル1件の所有側の写し。
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 struct ExtraFbxModel {
     name: String,
@@ -692,10 +1042,12 @@ struct ExtraFbxModel {
 }
 
 /// 参照FBXを索引から探して読み取り、所有側へ写す。
-#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
 fn load_extra_fbx(
-    index: &crate::unity::AssetIndex,
-    canonical_assets: &std::path::Path,
+    index: &AssetIndex,
+    source: &dyn AssetSource,
+    max_bytes: u64,
+    budget: &mut DeriveBudget,
     guid: &str,
     label: &str,
 ) -> Result<ExtraFbx, VrmError> {
@@ -727,13 +1079,7 @@ fn load_extra_fbx(
             ),
         ));
     }
-    let full = canonical_assets.join(&record.path);
-    let bytes = std::fs::read(&full).map_err(|e| {
-        VrmError::new(
-            VrmErrorKind::InvalidPrefab,
-            format!("参照FBXを読めない: {e}"),
-        )
-    })?;
+    let bytes = read_asset_limited(source, &record.path, max_bytes, budget, "参照FBX", label)?;
     let asset_path = format!("Assets/{}", record.path);
     let sha256 = {
         use sha2::Digest;
@@ -840,7 +1186,6 @@ fn load_extra_fbx(
 }
 
 /// 直接記述ツリーの組み立て結果。未対応ノード名の報告を含む。
-#[cfg(not(target_arch = "wasm32"))]
 struct DirectBuild {
     tree: Vec<TreeNode>,
     /// FBXと対応が取れなかったノード名。Transformのみで出力した記録である。
@@ -854,7 +1199,6 @@ struct DirectBuild {
 /// 先に確定し、残りを名前経路で結ぶ。名前経路は入力FBXを優先し、参照FBXも使う。
 /// 対応が取れないノードは `source: null` のTransformのみで出し、名前を報告する。
 /// アバタールート名はルートGameObjectの名前を使う。
-#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 fn build_direct_tree(
     parsed: &ParsedPrefab,
@@ -1249,7 +1593,6 @@ fn build_direct_tree(
 /// 物理（PhysBone・非平面collider・制約）が参照していれば失敗させる。
 /// 平面colliderだけの参照は平面経路が直接扱うため除く。
 /// 対応が取れていないノード自体はTransformのみで出力し、件数を報告する。
-#[cfg(not(target_arch = "wasm32"))]
 fn check_direct_physics_refs(
     tree: &[TreeNode],
     collector: &Collected,
@@ -1297,7 +1640,6 @@ fn check_direct_physics_refs(
     Ok(())
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn check_file_ids_generation(meta: &AssetMeta, label: &str) -> Result<(), VrmError> {
     let settings = meta.importer().settings.as_mapping().ok_or_else(|| {
         VrmError::new(
@@ -1325,7 +1667,6 @@ fn check_file_ids_generation(meta: &AssetMeta, label: &str) -> Result<(), VrmErr
 }
 
 /// 主インスタンスの改変内容のうち、参照姿勢に効く上書きの集計。
-#[cfg(not(target_arch = "wasm32"))]
 struct MainInstanceOverlays {
     /// FBXのTransform fileIDごとの姿勢上書き。
     /// 位置・回転・拡大率の成分だけを持ち、無い成分は `None` である。
@@ -1339,7 +1680,6 @@ struct MainInstanceOverlays {
 }
 
 /// 姿勢1件の成分別上書き。`None` の成分はFBXの値をそのまま使う。
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone, Default)]
 struct TrsOverride {
     position: [Option<f64>; 3],
@@ -1349,7 +1689,6 @@ struct TrsOverride {
 
 /// 主インスタンスの改変内容を集める。姿勢の上書きは
 /// 対象ノードのローカル変換へ適用し、構造変更は明示的に失敗させる。
-#[cfg(not(target_arch = "wasm32"))]
 fn collect_main_instance_overlays(
     parsed: &ParsedPrefab,
     hier: &FbxHierarchy,
@@ -1433,7 +1772,6 @@ fn collect_main_instance_overlays(
 
 /// 主インスタンスの改変1件を振り分ける。姿勢・有効・改名は集計し、
 /// 描画系の欄は無視し、構造変更と対象不明は明示的に失敗させる。
-#[cfg(not(target_arch = "wasm32"))]
 struct MainModTables<'a> {
     parsed: &'a ParsedPrefab,
     tr_to_fbx: &'a HashMap<FileId, usize>,
@@ -1443,7 +1781,6 @@ struct MainModTables<'a> {
     import_go: FileId,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 fn classify_main_mod(
     tables: &MainModTables<'_>,
@@ -1551,7 +1888,6 @@ fn classify_main_mod(
 
 /// 姿勢の成分上書き1件を重ねる。`kind` は0=位置・1=回転・2=拡大率である。
 /// 取り込み根の初期化は参照に効かないため無視する。
-#[cfg(not(target_arch = "wasm32"))]
 fn apply_trs_component(
     overlays: &mut MainInstanceOverlays,
     tables: &MainModTables<'_>,
@@ -1604,13 +1940,11 @@ fn apply_trs_component(
 
 /// 描画設定の取り込みfileIDかどうかを判定する。
 /// `m_IsActive` の対象が成分かゲームオブジェクトかの区別に使う。
-#[cfg(not(target_arch = "wasm32"))]
 fn is_renderer_fid(renderer_fids: &HashSet<FileId>, fid: FileId) -> bool {
     renderer_fids.contains(&fid)
 }
 
 /// 直接記述のSkinnedMeshRenderer1件。FBXとの対応付けに使う。
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 struct ParsedSmr {
     /// 所属ゲームオブジェクトのfileID。
@@ -1622,7 +1956,6 @@ struct ParsedSmr {
 }
 
 // Prefab文書の型付き読み取り結果。
-#[cfg(not(target_arch = "wasm32"))]
 struct ParsedPrefab {
     monos: Vec<ParsedMono>,
     /// 直接記述のSkinnedMeshRenderer列。FBX対応付けに使う。
@@ -1638,7 +1971,6 @@ struct ParsedPrefab {
 
 /// Unityネイティブの回転制約1件。VRC制約ではなく `RotationConstraint`
 /// 文書（classID `1818360609`）から読む。sidecarの `unity` 系制約になる。
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 struct ParsedNativeRotation {
     /// 文書fileID。
@@ -1661,7 +1993,6 @@ struct ParsedNativeRotation {
     sources: Vec<(FileId, f64)>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 struct StrippedRef {
     source_fid: FileId,
@@ -1670,14 +2001,12 @@ struct StrippedRef {
     instance: FileId,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 struct LocalGo {
     name: String,
     active: bool,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // スマホ graft 保留中の保持項目であり、次単位で配線する。
 struct LocalTr {
@@ -1691,7 +2020,6 @@ struct LocalTr {
     scale: [f64; 3],
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 struct ParsedMono {
     doc: FileId,
@@ -1705,7 +2033,6 @@ struct ParsedMono {
     extra: yaml_serde::Mapping,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // スマホ graft 保留中の保持項目であり、次単位で配線する。
 struct ParsedInstance {
@@ -1716,7 +2043,6 @@ struct ParsedInstance {
     added_objects: Vec<AddedObject>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // スマホ graft 保留中の保持項目であり、次単位で配線する。
 struct PrefabMod {
@@ -1727,14 +2053,12 @@ struct PrefabMod {
     obj_ref: Option<ParsedRef>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 struct ParsedRef {
     fid: FileId,
     guid: Option<String>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // スマホ graft 保留中の保持項目であり、次単位で配線する。
 struct AddedObject {
@@ -1743,7 +2067,6 @@ struct AddedObject {
     object: FileId,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn parse_ref_value(value: &Value) -> Result<ParsedRef, VrmError> {
     let mapping = value
         .as_mapping()
@@ -1767,12 +2090,10 @@ fn parse_ref_value(value: &Value) -> Result<ParsedRef, VrmError> {
     Ok(ParsedRef { fid, guid })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn parse_prefab_docs(prefab: &SerializedFile, label: &str) -> Result<ParsedPrefab, VrmError> {
     parse_prefab_docs_inner(prefab, label)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn parse_prefab_docs_from_bytes(bytes: &[u8], label: &str) -> Result<ParsedPrefab, VrmError> {
     use crate::unity::ParseOptions;
     let parsed = SerializedFile::parse(bytes, &ParseOptions::new()).map_err(|e| {
@@ -1787,7 +2108,6 @@ fn parse_prefab_docs_from_bytes(bytes: &[u8], label: &str) -> Result<ParsedPrefa
     parse_prefab_docs_inner(&parsed, label)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn parse_prefab_docs_inner(prefab: &SerializedFile, label: &str) -> Result<ParsedPrefab, VrmError> {
     let mut monos = Vec::new();
     let mut smrs = Vec::new();
@@ -2036,7 +2356,6 @@ fn parse_prefab_docs_inner(prefab: &SerializedFile, label: &str) -> Result<Parse
 }
 
 /// Unityネイティブの回転制約1件を原文書から読む。
-#[cfg(not(target_arch = "wasm32"))]
 fn parse_native_rotation(
     doc: &crate::unity::Document,
     label: &str,
@@ -2167,7 +2486,6 @@ fn parse_native_rotation(
     })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn find_instances<'p>(parsed: &'p ParsedPrefab, fbx_guid: &str) -> Vec<&'p ParsedInstance> {
     parsed
         .instances
@@ -2177,7 +2495,6 @@ fn find_instances<'p>(parsed: &'p ParsedPrefab, fbx_guid: &str) -> Vec<&'p Parse
 }
 
 // FBX階層（ソート付き）。
-#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)] // スマホ graft 保留中の保持項目であり、次単位で配線する。
 struct FbxHierarchy {
     paths: Vec<String>,
@@ -2187,7 +2504,6 @@ struct FbxHierarchy {
     path_at: HashMap<FileId, String>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn build_fbx_hierarchy(file: &FbxFile<'_>, label: &str) -> Result<FbxHierarchy, VrmError> {
     use std::collections::HashMap;
     let models = file.models();
@@ -2290,7 +2606,6 @@ fn build_fbx_hierarchy(file: &FbxFile<'_>, label: &str) -> Result<FbxHierarchy, 
 }
 
 /// Transformの取り込みfileIDを作る。`Type:Transform->//RootNode/root/{path}/Transform0` である。
-#[cfg(not(target_arch = "wasm32"))]
 fn transform_file_id(hierarchy_path: &str) -> FileId {
     let text = if hierarchy_path.is_empty() {
         "Type:Transform->//RootNode/root/Transform0".to_owned()
@@ -2302,7 +2617,6 @@ fn transform_file_id(hierarchy_path: &str) -> FileId {
 
 // KumaPhone相当の副階層。Milfy.prefab内の2件目のインスタンス（副Prefab）と、
 // その実体が指すSmartPhone.fbxを組み合わせた graft の材料である。
-#[cfg(not(target_arch = "wasm32"))]
 struct PhoneSubtree {
     /// 副PrefabのGUID（小文字）。Milfy側の解決と graft 対象の判定に使う。
     guid: String,
@@ -2328,7 +2642,6 @@ struct PhoneSubtree {
 
 /// SmartPhone.fbxのモデル1件の所有側の写し。階層の組み立てに使う。
 /// 継承方式は主階層と同じく素朴な親子積で扱い、区別しない。
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 struct PhoneModel {
     name: String,
@@ -2339,10 +2652,13 @@ struct PhoneModel {
 // ネストした副階層を解決する。Milfy.prefab内の主FBX以外のインスタンスが対象である。
 // 主FBXへの参照と副Prefabへの参照がちょうど1件ずつあることを確かめ、
 // それ以外（複数・FBX直置き等）は黙って選ばず明示的に失敗する。
-#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
 fn resolve_phone_subtree(
-    index: &crate::unity::AssetIndex,
-    canonical_assets: &std::path::Path,
+    index: &AssetIndex,
+    source: &dyn AssetSource,
+    max_prefab_bytes: u64,
+    max_fbx_bytes: u64,
+    budget: &mut DeriveBudget,
     parsed: &ParsedPrefab,
     main_fbx_guid: &str,
     label: &str,
@@ -2403,13 +2719,14 @@ fn resolve_phone_subtree(
             ),
         ));
     }
-    let full = canonical_assets.join(&record.path);
-    let prefab_bytes = std::fs::read(&full).map_err(|e| {
-        VrmError::new(
-            VrmErrorKind::InvalidPrefab,
-            format!("副Prefabを読めない: {e}"),
-        )
-    })?;
+    let prefab_bytes = read_asset_limited(
+        source,
+        &record.path,
+        max_prefab_bytes,
+        budget,
+        "副Prefab",
+        label,
+    )?;
     // 副Prefab内のSmartPhone.fbx相当を探す。FBXインスタンス1件に限る。
     let phone_parsed = parse_prefab_docs_from_bytes(&prefab_bytes, label)?;
     let mut phone_instances: Vec<&ParsedInstance> = phone_parsed
@@ -2459,9 +2776,14 @@ fn resolve_phone_subtree(
             ),
         ));
     }
-    let fbx_full = canonical_assets.join(&fbx_record.path);
-    let fbx_bytes = std::fs::read(&fbx_full)
-        .map_err(|e| VrmError::new(VrmErrorKind::InvalidPrefab, format!("副FBXを読めない: {e}")))?;
+    let fbx_bytes = read_asset_limited(
+        source,
+        &fbx_record.path,
+        max_fbx_bytes,
+        budget,
+        "副FBX",
+        label,
+    )?;
     let fbx_asset_path = format!("Assets/{}", fbx_record.path);
     let fbx_sha256 = {
         use sha2::Digest;
@@ -2491,7 +2813,6 @@ fn resolve_phone_subtree(
 }
 
 /// 副FBXのモデル列を所有側へ写す。階層の組み立てだけに使う。
-#[cfg(not(target_arch = "wasm32"))]
 fn read_phone_models(bytes: &[u8], label: &str) -> Result<Vec<PhoneModel>, VrmError> {
     let file = FbxFile::parse(bytes, &FbxOptions::default()).map_err(|e| {
         VrmError::new(
@@ -2524,7 +2845,6 @@ fn read_phone_models(bytes: &[u8], label: &str) -> Result<Vec<PhoneModel>, VrmEr
 
 /// 副FBXの子列とルート列を名前順に並べる。主FBXの取り込み順と同じ規則
 /// （小文字化した名前優先・同点はバイト順）であり、Unityの表示順と一致させる。
-#[cfg(not(target_arch = "wasm32"))]
 fn sort_phone_hierarchy(
     models: &[PhoneModel],
     label: &str,
@@ -2569,7 +2889,6 @@ fn sort_phone_hierarchy(
 }
 
 /// YAML値からf64を読む。整数も受け付ける。Unityのfloat32へ量子化して返す。
-#[cfg(not(target_arch = "wasm32"))]
 fn read_f64_value(value: &Value, what: &str, label: &str) -> Result<f64, VrmError> {
     match value {
         Value::Number(n) => n.as_f64().map(quantize_f32).ok_or_else(|| {
@@ -2586,7 +2905,6 @@ fn read_f64_value(value: &Value, what: &str, label: &str) -> Result<f64, VrmErro
 }
 
 /// YAML値からboolを読む。0/1も受け付ける。
-#[cfg(not(target_arch = "wasm32"))]
 fn read_bool_value(value: &Value, what: &str, label: &str) -> Result<bool, VrmError> {
     match value {
         Value::Bool(b) => Ok(*b),
@@ -2606,7 +2924,6 @@ fn read_bool_value(value: &Value, what: &str, label: &str) -> Result<bool, VrmEr
 }
 
 /// `{x, y, z}` 形を読む。
-#[cfg(not(target_arch = "wasm32"))]
 fn read_xyz_value(value: &Value, what: &str, label: &str) -> Result<[f64; 3], VrmError> {
     let mapping = value.as_mapping().ok_or_else(|| {
         VrmError::new(
@@ -2628,7 +2945,6 @@ fn read_xyz_value(value: &Value, what: &str, label: &str) -> Result<[f64; 3], Vr
 }
 
 /// `{x, y, z, w}` 形を読む。
-#[cfg(not(target_arch = "wasm32"))]
 fn read_xyzw_value(value: &Value, what: &str, label: &str) -> Result<[f64; 4], VrmError> {
     let mapping = value.as_mapping().ok_or_else(|| {
         VrmError::new(
@@ -2650,7 +2966,6 @@ fn read_xyzw_value(value: &Value, what: &str, label: &str) -> Result<[f64; 4], V
 }
 
 // 最終ツリーの1節点。
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 struct TreeNode {
     name: String,
@@ -2677,7 +2992,6 @@ struct TreeNode {
     local_tr: Option<FileId>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 struct TreeSource {
     model_id: String,
@@ -2687,7 +3001,6 @@ struct TreeSource {
 }
 
 /// ツリー組み立ての入力。引数の肥大化を避けるための束ねである。
-#[cfg(not(target_arch = "wasm32"))]
 struct TreeAssembly<'a> {
     fbx: &'a FbxFile<'a>,
     hier: &'a FbxHierarchy,
@@ -2699,7 +3012,6 @@ struct TreeAssembly<'a> {
     label: &'a str,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn assemble_tree(input: &TreeAssembly<'_>) -> Result<Vec<TreeNode>, VrmError> {
     // 副階層がある場合はMilfy相当の graft 方式、無い場合は汎用方式で組み立てる。
     // 汎用方式はFBX階層とPrefabの追加物を `m_Father`・`m_Children` で結び、
@@ -2735,7 +3047,6 @@ fn assemble_tree(input: &TreeAssembly<'_>) -> Result<Vec<TreeNode>, VrmError> {
 /// ものとして扱い（`compute_reference_locals` で反映する）、有効状態と
 /// 改名はここで反映する。アバタールートは取り込み根であり、
 /// sidecarには含めない（Unityヘルパと同順）。
-#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 fn build_general_tree(
     fbx: &FbxFile<'_>,
@@ -3124,7 +3435,6 @@ fn build_general_tree(
     // ここでは配置の有無だけを確かめる。
     Ok(nodes)
 }
-#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 fn build_milfy_tree(
     fbx: &FbxFile<'_>,
@@ -3433,14 +3743,12 @@ fn build_milfy_tree(
 }
 
 /// DFS展開フレームの種別。副階層の graft は親が確定してから行う。
-#[cfg(not(target_arch = "wasm32"))]
 enum FrameKind {
     Fbx(usize),
     Added(FileId),
     Graft { parent: usize },
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 struct BuildFrame {
     kind: FrameKind,
     parent: Option<usize>,
@@ -3449,7 +3757,6 @@ struct BuildFrame {
 
 /// 追加物が副階層の graft 起点かどうかを判定する。strippedで副Prefab由来であり、
 /// 副Prefab根のTransformに対応するものだけを graft 対象にする。
-#[cfg(not(target_arch = "wasm32"))]
 fn is_graft_object(parsed: &ParsedPrefab, phone: &Option<PhoneSubtree>, object: FileId) -> bool {
     let Some(phone) = phone.as_ref() else {
         return false;
@@ -3465,7 +3772,6 @@ fn is_graft_object(parsed: &ParsedPrefab, phone: &Option<PhoneSubtree>, object: 
 
 /// 資産パス（`Assets/` 付き）からモデルIDを求める。stemの小文字である。
 /// 主FBXの既存規則（`.fbx` のみ剥がす）と同一にする。
-#[cfg(not(target_arch = "wasm32"))]
 fn model_id_from_asset_path(asset_path: &str) -> String {
     asset_path
         .rsplit('/')
@@ -3478,7 +3784,6 @@ fn model_id_from_asset_path(asset_path: &str) -> String {
 }
 
 /// 副Prefab根の基準点。graft根の改変対象と追加物の親先の特定に使う。
-#[cfg(not(target_arch = "wasm32"))]
 struct PhoneAnchors {
     /// 副Prefab内の取り込み根Transform（KumaPhone側のstripped文書）。
     kuma_root_tr: FileId,
@@ -3488,7 +3793,6 @@ struct PhoneAnchors {
 
 /// 副Prefab根の基準点を求める。取り込み根に対応するstrippedが1件ずつあるはずであり、
 /// それ以外（複数・欠落）は明示的に失敗する。
-#[cfg(not(target_arch = "wasm32"))]
 fn phone_anchors(phone: &PhoneSubtree, label: &str) -> Result<PhoneAnchors, VrmError> {
     let import_tr = transform_file_id("");
     let import_go = crate::unity::game_object_file_id("");
@@ -3526,7 +3830,6 @@ fn phone_anchors(phone: &PhoneSubtree, label: &str) -> Result<PhoneAnchors, VrmE
 }
 
 /// Milfy側の副Prefabインスタンスを1件に定める。
-#[cfg(not(target_arch = "wasm32"))]
 fn find_kuma_instance<'p>(
     parsed: &'p ParsedPrefab,
     phone: &PhoneSubtree,
@@ -3551,7 +3854,6 @@ fn find_kuma_instance<'p>(
 }
 
 /// Milfy側の graft 起点を1件に定める。副Prefab根に対応するstrippedである。
-#[cfg(not(target_arch = "wasm32"))]
 fn find_graft_object(
     parsed: &ParsedPrefab,
     phone: &PhoneSubtree,
@@ -3591,7 +3893,6 @@ fn find_graft_object(
 
 /// 副階層全体を graft する。親ノードの下に graft 根・副FBX部・副Prefab追加物を足す。
 /// IDは追加順（DFS順）に `n:N` で決まり、呼び出し側の順序が正解と一致する。
-#[cfg(not(target_arch = "wasm32"))]
 fn build_graft_subtree(
     nodes: &mut Vec<TreeNode>,
     parent: usize,
@@ -3772,7 +4073,6 @@ fn build_graft_subtree(
 }
 
 /// graftのDFSフレーム。副FBX節点と副Prefab追加物を統一的に辿る。
-#[cfg(not(target_arch = "wasm32"))]
 enum GraftFrame {
     Fbx {
         model: usize,
@@ -3788,7 +4088,6 @@ enum GraftFrame {
 }
 
 /// 副Prefabの追加物1件をツリーに出し、子（`m_Children` 順）を積む。
-#[cfg(not(target_arch = "wasm32"))]
 fn graft_added_node(
     nodes: &mut Vec<TreeNode>,
     parent: usize,
@@ -3844,7 +4143,6 @@ fn graft_added_node(
 /// graft根の名前・ローカルTRS・有効状態を層化して求める。
 /// 基準値（副Prefab名・単位TRS・有効）の上に副Prefab内改変・Milfy側改変を重ねる。
 /// 物理に効く欄の想定外の改変は明示的に失敗し、描画系は無視する。
-#[cfg(not(target_arch = "wasm32"))]
 fn graft_root_state(
     phone: &PhoneSubtree,
     kuma: &ParsedInstance,
@@ -3962,7 +4260,6 @@ fn graft_root_state(
 /// 物理に効く改変欄かどうかを判定する。姿勢・名前・有効・参照が該当し、
 /// 見かけの欄（`m_LocalEulerAnglesHint`）と描画系は含まない。
 /// 想定外の対象への改変は明示的に失敗させるために使う。
-#[cfg(not(target_arch = "wasm32"))]
 fn is_physics_path(path: &str) -> bool {
     path.starts_with("m_LocalPosition.")
         || path.starts_with("m_LocalRotation.")
@@ -3974,7 +4271,6 @@ fn is_physics_path(path: &str) -> bool {
 }
 
 /// graft根のTRS改変1件を重ねる。`m_Local*` 以外は呼び出し側で振り分ける。
-#[cfg(not(target_arch = "wasm32"))]
 fn apply_root_trs_mod(
     pos: &mut [f64; 3],
     rot: &mut [f64; 4],
@@ -4012,7 +4308,6 @@ fn apply_root_trs_mod(
 }
 
 /// 想定外の改変の失敗を作る。黙って無視しない。
-#[cfg(not(target_arch = "wasm32"))]
 fn unexpected_mod(label: &str, m: &PrefabMod, what: &str) -> VrmError {
     VrmError::new(
         VrmErrorKind::InvalidPrefab,
@@ -4025,7 +4320,6 @@ fn unexpected_mod(label: &str, m: &PrefabMod, what: &str) -> VrmError {
 }
 
 /// 改変の数値を読む。Prefab値はUnityのfloat32へ量子化する。
-#[cfg(not(target_arch = "wasm32"))]
 fn mod_f64_value(m: &PrefabMod, label: &str) -> Result<f64, VrmError> {
     let Some(value) = m.value.as_ref() else {
         return Err(VrmError::new(
@@ -4041,7 +4335,6 @@ fn mod_f64_value(m: &PrefabMod, label: &str) -> Result<f64, VrmError> {
 }
 
 /// 改変の文字列を読む。
-#[cfg(not(target_arch = "wasm32"))]
 fn mod_string_value(m: &PrefabMod, label: &str) -> Result<String, VrmError> {
     match m.value.as_ref() {
         Some(Value::String(s)) => Ok(s.clone()),
@@ -4057,7 +4350,6 @@ fn mod_string_value(m: &PrefabMod, label: &str) -> Result<String, VrmError> {
 }
 
 /// 改変の真偽値を読む。0/1も受け付ける。
-#[cfg(not(target_arch = "wasm32"))]
 fn mod_bool_value(m: &PrefabMod, label: &str) -> Result<bool, VrmError> {
     let Some(value) = m.value.as_ref() else {
         return Err(VrmError::new(
@@ -4075,7 +4367,6 @@ fn mod_bool_value(m: &PrefabMod, label: &str) -> Result<bool, VrmError> {
 /// Milfy側の副Prefab改変のうち、成分文書を対象にする重ね合わせ表を作る。
 /// 制約の参照先（`Sources.*`）だけを扱う。成分文書への他の改変や、
 /// 副Prefabのローカル節点への物理に効く改変は未対応として失敗する。
-#[cfg(not(target_arch = "wasm32"))]
 fn phone_source_overlays(
     parsed: &ParsedPrefab,
     phone: &Option<PhoneSubtree>,
@@ -4135,7 +4426,6 @@ fn phone_source_overlays(
 /// 制約の参照先の重ね合わせを適用する。`Sources.source{i}.SourceTransform` と
 /// `Sources.source{i}.Weight` だけを扱い、他は明示的に失敗する。
 /// 対象の入れ物がなければ失敗し、黙って足さない。
-#[cfg(not(target_arch = "wasm32"))]
 fn overlay_constraint_sources(
     extra: &yaml_serde::Mapping,
     mods: &[PrefabMod],
@@ -4213,7 +4503,6 @@ fn overlay_constraint_sources(
 }
 
 /// FBXノードの出所を組み立てる。
-#[cfg(not(target_arch = "wasm32"))]
 fn fbx_source_of(
     hier: &FbxHierarchy,
     fbx_index: usize,
@@ -4237,7 +4526,6 @@ fn fbx_source_of(
 }
 
 /// Prefab表示名からアバタールート名を求める。`Milfy.prefab` → `Milfy` である。
-#[cfg(not(target_arch = "wasm32"))]
 fn avatar_name_from_label(label: &str) -> String {
     // `path/to/Milfy.prefab` または `Milfy.prefab` のstemを使う。
     // 区切りは `/` と `\` の両方に対応する。
@@ -4250,7 +4538,6 @@ fn avatar_name_from_label(label: &str) -> String {
         .to_owned()
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)] // 所有モデルの索引は検証用に保持し、現状は名前だけを使う。
 struct BindSelection {
     /// bind対象のFBXモデル索引集合。参照元メッシュのスキン関節である。
@@ -4261,7 +4548,6 @@ struct BindSelection {
     source_mesh_name: String,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn select_bind(
     fbx: &FbxFile<'_>,
     hier: &FbxHierarchy,
@@ -4373,7 +4659,6 @@ fn select_bind(
     })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 fn compute_reference_locals(
     fbx: &FbxFile<'_>,
@@ -4594,7 +4879,6 @@ fn compute_reference_locals(
 
 /// FBXのローカル変換からsceneローカルTRS（float32）を求める。
 /// `local_matrix` の分解であり、Unityの取り込みTRSと同じ手順である。
-#[cfg(not(target_arch = "wasm32"))]
 fn scene_trs_from_local_transform(
     transform: &LocalTransform,
     node_name: &str,
@@ -4626,7 +4910,6 @@ fn scene_trs_from_local_transform(
 /// FBXの右手系からUnityの左手系への写像である。TRS行列の写像は
 /// `fbx_trs_to_unity` と一致するが、一般行列の回転抽出は写像後に行う。
 /// Unityはbind差分を行列で求めてから分解するため、こちらに合わせる。
-#[cfg(not(target_arch = "wasm32"))]
 fn mirror_matrix_f32(m: &[f32; 16]) -> [f32; 16] {
     let mut out = *m;
     out[1] = -out[1];
@@ -4639,7 +4922,6 @@ fn mirror_matrix_f32(m: &[f32; 16]) -> [f32; 16] {
 
 /// FBXの右手系TRSをUnityの左手系TRSへ写す。実測（Milfy）で位置Xと回転Y/Zの符号が反転するため。
 /// 位置はXだけを反転し、回転はY/Zだけを反転し、拡大率は変えない。恒等回転は保たれる。
-#[cfg(not(target_arch = "wasm32"))]
 fn fbx_trs_to_unity(p: [f32; 3], r: [f32; 4], s: [f32; 3]) -> ([f64; 3], [f64; 4], [f64; 3]) {
     (
         [-(p[0] as f64), p[1] as f64, p[2] as f64],
@@ -4650,13 +4932,11 @@ fn fbx_trs_to_unity(p: [f32; 3], r: [f32; 4], s: [f32; 3]) -> ([f64; 3], [f64; 4
 
 /// PrefabのYAML数値をUnityのfloat32として読み直す。`0.7` は `0.699999988...` になる。
 /// sidecarのJSON比較でUnity出力と一致させるための量子化である。
-#[cfg(not(target_arch = "wasm32"))]
 fn quantize_f32(value: f64) -> f64 {
     (value as f32) as f64
 }
 
 /// float32の単位行列。
-#[cfg(not(target_arch = "wasm32"))]
 fn f32_identity() -> [f32; 16] {
     [
         1.0, 0.0, 0.0, 0.0, //
@@ -4667,7 +4947,6 @@ fn f32_identity() -> [f32; 16] {
 }
 
 /// float32の行列積。列ベクトル規約である。
-#[cfg(not(target_arch = "wasm32"))]
 fn mul_f32(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
     let mut out = [0f32; 16];
     for row in 0..4 {
@@ -4683,7 +4962,6 @@ fn mul_f32(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
 }
 
 /// float32の逆行列。特異な場合は `None` を返す。
-#[cfg(not(target_arch = "wasm32"))]
 fn inverse_f32(m: &[f32; 16]) -> Option<[f32; 16]> {
     let mut a = [[0f32; 8]; 4];
     for row in 0..4 {
@@ -4727,7 +5005,6 @@ fn inverse_f32(m: &[f32; 16]) -> Option<[f32; 16]> {
 }
 
 /// float32のTRS合成。`T * R * S` の順である。
-#[cfg(not(target_arch = "wasm32"))]
 fn compose_trs_f32(p: [f32; 3], r: [f32; 4], s: [f32; 3]) -> [f32; 16] {
     let (x, y, z, w) = (r[0], r[1], r[2], r[3]);
     let (sx, sy, sz) = (s[0], s[1], s[2]);
@@ -4770,7 +5047,6 @@ fn compose_trs_f32(p: [f32; 3], r: [f32; 4], s: [f32; 3]) -> [f32; 16] {
 }
 
 /// Unityの `DecomposeBindLocal` と同順のfloat32分解。鏡像はX軸に寄せる。
-#[cfg(not(target_arch = "wasm32"))]
 fn decompose_bind_local_f32(m: &[f32; 16]) -> Result<TrsF32, ()> {
     let position = [m[12], m[13], m[14]];
     let x = [m[0], m[1], m[2]];
@@ -4827,7 +5103,6 @@ fn decompose_bind_local_f32(m: &[f32; 16]) -> Result<TrsF32, ()> {
 /// 対角和が正の場合はそこから求め、そうでなければ最大の対角成分を持つ分岐を選ぶ。
 /// 平方根を成分ごとに取る方式とは180度付近の符号が変わるため、こちらに合わせる。
 /// 取り出し後の符号はUnityの行列と一致し、再合成で元に戻る。
-#[cfg(not(target_arch = "wasm32"))]
 fn quat_from_rotation_matrix_f32(cols: [[f32; 3]; 3]) -> [f32; 4] {
     // 列ベクトルを行列要素に直す。m[row][col] = cols[col][row] である。
     let m00 = cols[0][0];
@@ -4871,7 +5146,6 @@ fn quat_from_rotation_matrix_f32(cols: [[f32; 3]; 3]) -> [f32; 4] {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 struct Collected {
     ignored: Vec<String>,
     phys_bones: Vec<CollectedBone>,
@@ -4881,7 +5155,6 @@ struct Collected {
 }
 
 /// PhysBone1件の収集結果。sidecar DTOへの変換前の中間形である。
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 struct CollectedBone {
     /// 文書順。同一ノード上の順序決定に使う。
@@ -4920,7 +5193,6 @@ struct CollectedBone {
 }
 
 /// collider1件の収集結果。
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 struct CollectedCollider {
     doc: FileId,
@@ -4940,7 +5212,6 @@ struct CollectedCollider {
 }
 
 /// 制約1件の収集結果。
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 struct CollectedConstraint {
     /// 文書順。同一ノード上の順序決定に使う。
@@ -4961,7 +5232,6 @@ struct CollectedConstraint {
 }
 
 /// AvatarDescriptorの収集結果。視線に使う。
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 struct CollectedDescriptor {
     #[allow(dead_code)]
@@ -4972,7 +5242,6 @@ struct CollectedDescriptor {
     eyes: EyePoses,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 struct EyePoses {
     straight: ([bool; 1], [f64; 4], [f64; 4]),
@@ -4983,7 +5252,6 @@ struct EyePoses {
 }
 
 /// AnimationCurveの中間形。sidecarのCurve形式に直結する。
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 struct CollectedCurve {
     value: f64,
@@ -4992,7 +5260,6 @@ struct CollectedCurve {
     post_wrap: u32,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 struct CollectedKey {
     time: f64,
@@ -5003,7 +5270,6 @@ struct CollectedKey {
     out_weight: f64,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn collect_components(
     parsed: &ParsedPrefab,
     tree: &[TreeNode],
@@ -5384,7 +5650,6 @@ fn collect_components(
 
 /// ノードのactiveInHierarchyを求める。FBX由来は真、追加物はprefabのactiveである。
 /// 副階層の graft 根はMilfy側の改変で無効であり、子孫はすべて無効になる。
-#[cfg(not(target_arch = "wasm32"))]
 fn node_active(tree: &[TreeNode], node: usize, parsed: &ParsedPrefab) -> bool {
     let mut current = Some(node);
     while let Some(index) = current {
@@ -5411,7 +5676,6 @@ fn node_active(tree: &[TreeNode], node: usize, parsed: &ParsedPrefab) -> bool {
 }
 
 /// AvatarDescriptorを読む。視線に使う。
-#[cfg(not(target_arch = "wasm32"))]
 fn parse_descriptor(
     mono: &ParsedMono,
     tr_to_node: &HashMap<FileId, usize>,
@@ -5489,7 +5753,6 @@ fn parse_descriptor(
 }
 
 /// 視線の1方向を読む。`{linked, left:{x,y,z,w}, right:{...}}` である。
-#[cfg(not(target_arch = "wasm32"))]
 fn read_eye_pose(value: &Value, doc: FileId, label: &str) -> Result<EyePose, VrmError> {
     let mapping = value.as_mapping().ok_or_else(|| {
         VrmError::new(
@@ -5517,7 +5780,6 @@ fn read_eye_pose(value: &Value, doc: FileId, label: &str) -> Result<EyePose, Vrm
 }
 
 /// collider1件をMonoBehaviourから読む。
-#[cfg(not(target_arch = "wasm32"))]
 fn parse_collider(
     mono: &ParsedMono,
     component_node: usize,
@@ -5587,7 +5849,6 @@ fn parse_collider(
 }
 
 /// VRC制約1件を読む。Unity制約は対象外として失敗する。
-#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 fn parse_vrc_constraint(
     mono: &ParsedMono,
@@ -5760,7 +6021,6 @@ fn parse_vrc_constraint(
 }
 
 /// PhysBone1件をMonoBehaviourから読む。参照はtree索引で解決する。
-#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 fn parse_phys_bone(
     mono: &ParsedMono,
@@ -6006,7 +6266,6 @@ fn parse_phys_bone(
 }
 
 /// MonoBehaviourのextraからf64を読む。欠落時は失敗する。
-#[cfg(not(target_arch = "wasm32"))]
 fn extra_f64(
     extra: &yaml_serde::Mapping,
     key: &str,
@@ -6026,7 +6285,6 @@ fn extra_f64(
 }
 
 /// extraからbool（0/1）を読む。
-#[cfg(not(target_arch = "wasm32"))]
 fn extra_bool(
     extra: &yaml_serde::Mapping,
     key: &str,
@@ -6046,7 +6304,6 @@ fn extra_bool(
 }
 
 /// extraから `{x, y, z}` を読む。
-#[cfg(not(target_arch = "wasm32"))]
 fn extra_vec3(
     extra: &yaml_serde::Mapping,
     key: &str,
@@ -6066,7 +6323,6 @@ fn extra_vec3(
 }
 
 /// AnimationCurveをsidecar形式で読む。
-#[cfg(not(target_arch = "wasm32"))]
 fn read_curve(
     extra: &yaml_serde::Mapping,
     value_key: &str,
@@ -6079,7 +6335,6 @@ fn read_curve(
 }
 
 /// 制限回転の軸別カーブを読む。値は既定の1である。
-#[cfg(not(target_arch = "wasm32"))]
 fn read_limit_curve(
     extra: &yaml_serde::Mapping,
     curve_key: &str,
@@ -6090,7 +6345,6 @@ fn read_limit_curve(
 }
 
 /// AnimationCurve本体を読む。Prefabの2（Loop）は8（ClampForever）に読み替える。
-#[cfg(not(target_arch = "wasm32"))]
 fn read_curve_body(
     extra: &yaml_serde::Mapping,
     curve_key: &str,
@@ -6184,10 +6438,8 @@ fn read_curve_body(
     })
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
 fn emit_sidecar(
-    input: &PrefabDeriveInput<'_>,
     tree: &[TreeNode],
     locals: &[ReferenceLocal],
     collector: &Collected,
@@ -6430,7 +6682,6 @@ fn emit_sidecar(
             })
         }
     };
-    let _ = input;
     // humanoidは.metaから組み立てる。
     let humanoid_json = build_humanoid_json(meta, tree, model_id, label)?;
     // sourceModelsは資産パス順に並べる。
@@ -6516,7 +6767,6 @@ fn emit_sidecar(
 }
 
 /// humanoidのT-poseを.metaから組み立てる。
-#[cfg(not(target_arch = "wasm32"))]
 fn build_humanoid_json(
     meta: &AssetMeta,
     tree: &[TreeNode],
@@ -6647,7 +6897,6 @@ fn build_humanoid_json(
 /// JSON内の `-0.0` を `+0.0` に正規化する。Unityの出力に `-0.0` は現れない。
 /// Prefabの `-0` 表記や行列演算の符号付きゼロが対象である。
 /// 呼び出し側の数値比較では区別できないが、バイト一致には効く。
-#[cfg(not(target_arch = "wasm32"))]
 fn normalize_neg_zero(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Number(n) => {
@@ -6672,7 +6921,6 @@ fn normalize_neg_zero(value: &mut serde_json::Value) {
 }
 
 /// カーブをsidecar JSON形式にする。
-#[cfg(not(target_arch = "wasm32"))]
 fn curve_json(curve: &CollectedCurve) -> serde_json::Value {
     let keys: Vec<serde_json::Value> = curve
         .keys
@@ -6760,7 +7008,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn カーブの再現は実データと一致する() {
         // Milfy.prefabのBreast用radiusCurve（2キー）を読み、sidecarのpb:8と突き合わせる。
@@ -6831,7 +7078,6 @@ mod tests {
         assert!((curve.keys[1].time - quantize_f32(0.9958191)).abs() < 1e-12);
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn 行列の分解は単位と鏡像を保つ() {
         // 単位行列はそのまま戻る。
@@ -6850,7 +7096,6 @@ mod tests {
         let _ = r;
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn 未知の_dll型は明示的に失敗する() {
         // VRChatのDLL GUIDだが既知クラスと一致しないfileIDは、黙って無視せず失敗させる。
@@ -6861,7 +7106,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn 参照にfile_idが無ければ失敗する() {
         // Prefabの参照解決はfileID必須であり、欠落は参照切れとして失敗させる。
@@ -6874,7 +7118,6 @@ mod tests {
         assert!(parse_ref_value(&value).is_err());
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn 旧取り込み方式は明示的に失敗する() {
         // 2019.3より前のFBX取り込み（fileIdsGeneration=1）は旧fileID体系のため未対応として失敗させる。
@@ -6884,7 +7127,6 @@ mod tests {
         assert!(check_file_ids_generation(&meta, "test").is_err());
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn 回転の抽出は鏡像の適用順序で符号が定まる() {
         // 単位行列は恒等四元数に戻る。
@@ -6929,7 +7171,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn 表示名の両端の引用符を落として幹を求める() {
         // CLIは表示名を `format!("{path:?}")` で作るため `"` が付く。
@@ -6938,7 +7179,6 @@ mod tests {
         assert_eq!(avatar_name_from_label("Milfy"), "Milfy");
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn 物理に効く改変欄を判定できる() {
         assert!(is_physics_path("m_LocalPosition.x"));
@@ -6961,7 +7201,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn 主階層の姿勢上書きは集計し対象不明は失敗する() {
         // 取り込み根の初期化は想定内であり通す。
@@ -7045,7 +7284,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn 制約の参照先の重ね合わせは入れ物の不足で失敗する() {
         // 存在しない `source9` への差し替えは黙って足さず失敗させる。
@@ -7063,7 +7301,6 @@ mod tests {
         assert!(overlay_constraint_sources(&extra, &mods, "test").is_err());
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn 制約の参照先の重ね合わせは変換と重みを差し替える() {
         // `source0` の参照と重みを差し替え、他は保つ。
@@ -7147,7 +7384,6 @@ mod tests {
     }
 
     /// 主FBX由来のノード1件を作る。副階層の場合は `model_id` を変える。
-    #[cfg(not(target_arch = "wasm32"))]
     fn 試験ノード(名前: &str, model_id: &str) -> TreeNode {
         TreeNode {
             name: 名前.to_owned(),
@@ -7169,7 +7405,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn humanoidの順序と内容が共通表で変わらない() {
         // Wol風の対応（空白入りhuman名・Jaw・skeleton付き・欠落混じり）で組み立てる。
@@ -7219,7 +7454,6 @@ mod tests {
         assert_eq!(取り出し(1)["tPose"], serde_json::Value::Null);
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn タブ含みhuman名は旧挙動どおり骨を出さない() {
         // 物理側の正規化はASCII半角空白だけを除去する旧挙動である。
@@ -7239,5 +7473,95 @@ mod tests {
             })
             .collect();
         assert_eq!(名前, vec!["Hips"], "タブ含みは旧挙動で省く");
+    }
+
+    #[test]
+    fn 資産パスの接頭辞は索引基準に直る() {
+        // 索引は `Assets` 直下基準であり、`Assets/` 接頭辞だけを落とす。
+        // 呼び出し側が `Assets/...` 形で渡しても索引不一致にしない。
+        assert_eq!(
+            normalize_index_path("Assets/PLUSONE/x.fbx"),
+            "PLUSONE/x.fbx"
+        );
+        assert_eq!(
+            normalize_index_path("Assets\\PLUSONE/x.fbx"),
+            "PLUSONE/x.fbx"
+        );
+        assert_eq!(normalize_index_path("PLUSONE/x.fbx"), "PLUSONE/x.fbx");
+        // 空や接頭辞だけの正規化は行わず、所在不明は呼び出し側が索引不一致として扱う。
+        assert_eq!(normalize_index_path(""), "");
+        assert_eq!(normalize_index_path("Assets/"), "");
+    }
+
+    #[test]
+    fn 既定の上限はweb向けでありnative互換は従来相当になる() {
+        // 既定値（`new`・`default`）は `vrctom-wasm` の単一FBX予算（128MiB）に合わせた
+        // Web向けであり、実測（主FBX約17MB等）に十分収まる大きさである。
+        // native互換の既存入口には `native()` を使い、既定値をそのまま適用しない。
+        let limits = PhysicsDeriveLimits::default();
+        assert_eq!(limits.max_main_fbx_bytes, 128 * 1024 * 1024);
+        assert_eq!(limits.max_extra_fbx_bytes, 128 * 1024 * 1024);
+        assert_eq!(limits.max_prefab_bytes, 64 * 1024 * 1024);
+        assert_eq!(limits.max_total_bytes, 512 * 1024 * 1024);
+        // native互換はFBX読み取り層の既定（1GiB）を下回らず、Prefab本文と
+        // 依存合計には上限を設けない。従来扱えた入力が導出の上限で先に失敗しない。
+        let native = PhysicsDeriveLimits::native();
+        assert!(
+            native.max_main_fbx_bytes >= 1 << 30,
+            "主FBXはFBX読み取り層の既定（1GiB）を下回らない"
+        );
+        assert!(
+            native.max_extra_fbx_bytes >= 1 << 30,
+            "副FBXはFBX読み取り層の既定（1GiB）を下回らない"
+        );
+        assert_eq!(native.max_prefab_bytes, u64::MAX);
+        assert_eq!(native.max_total_bytes, u64::MAX);
+        // 変更は `with_` で始まるメソッドで行う。
+        let changed = PhysicsDeriveLimits::new().with_max_main_fbx_bytes(1);
+        assert_eq!(changed.max_main_fbx_bytes, 1);
+    }
+
+    /// 試験用のメモリ読み手。`Assets` 直下基準の相対パスで引く。
+    struct 試験読み手 {
+        表: std::collections::HashMap<String, Vec<u8>>,
+    }
+
+    impl crate::unity::AssetSource for 試験読み手 {
+        fn read_limited(&self, path: &str, limit: u64) -> std::io::Result<Vec<u8>> {
+            let Some(bytes) = self.表.get(path) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "試験読み手に無い",
+                ));
+            };
+            if bytes.len() as u64 > limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "試験読み手の上限を超えた",
+                ));
+            }
+            Ok(bytes.clone())
+        }
+    }
+
+    #[test]
+    fn 上限超過の読み取りは切り詰めず失敗する() {
+        // 個別上限の超過は切り詰めず `LimitExceeded` で失敗することを確かめる。
+        // 存在しない資産は `InvalidPrefab` であり、種別を混同しない。
+        let 読み手 = 試験読み手 {
+            表: [("a.fbx".to_owned(), vec![0u8; 8])].into_iter().collect(),
+        };
+        let mut 予算 = DeriveBudget::new(1024);
+        let 失敗 = read_asset_limited(&読み手, "a.fbx", 4, &mut 予算, "参照FBX", "test")
+            .expect_err("個別上限の超過は失敗する");
+        assert_eq!(失敗.kind(), VrmErrorKind::LimitExceeded);
+        let 失敗 = read_asset_limited(&読み手, "無い.fbx", 1024, &mut 予算, "参照FBX", "test")
+            .expect_err("存在しない資産は失敗する");
+        assert_eq!(失敗.kind(), VrmErrorKind::InvalidPrefab);
+        // 合計予算の超過も切り詰めず失敗する。
+        let mut 予算 = DeriveBudget::new(4);
+        let 失敗 = read_asset_limited(&読み手, "a.fbx", 1024, &mut 予算, "参照FBX", "test")
+            .expect_err("合計上限の超過は失敗する");
+        assert_eq!(失敗.kind(), VrmErrorKind::LimitExceeded);
     }
 }
