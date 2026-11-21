@@ -32,7 +32,7 @@ use super::renderers::{
 use crate::fbx::FbxFile;
 use crate::unity::{
     AssetIndex, FileId, GameObject, SerializedFile, SkinnedMeshRenderer, Transform, TypedObject,
-    game_object_file_id, mesh_file_id, skinned_mesh_renderer_file_id,
+    game_object_file_id, mesh_file_id, skinned_mesh_renderer_file_id, transform_file_id,
 };
 
 /// 対応付け用の中間メッシュ1件の要約。
@@ -199,6 +199,115 @@ pub fn prefab_hierarchy_paths(file: &FbxFile<'_>) -> Result<Vec<PrefabHierarchyN
     Ok(nodes)
 }
 
+/// 旧方式の取り込みfileIDの読み替え結果。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LegacyImportIdReport {
+    /// 新方式のfileIDへ書き換えた参照の数。
+    pub rewritten: usize,
+    /// 新方式へ写せなかった旧方式の対象（`classID:名前`）。重複は除く。
+    pub unresolved: Vec<String>,
+}
+
+/// Prefabやシーンが入力FBXのサブアセットを旧方式のfileIDで指す場合に、
+/// 2019.3以降の新方式（XXH64）のfileIDへ読み替える。
+///
+/// 旧方式（`.fbx.meta` の `fileIDToRecycleName`）は `classID × 100000 + 連番` を
+/// 名前と対応付ける。名前からFBXのModelを一意に引き、ゲームオブジェクト（1）・
+/// メッシュ（43）・描画設定（137）を新方式のfileIDへ写す。`//RootNode` は
+/// 取り込みルートである。それ以外の種類（Transformなど）は書き換えない。
+/// 名前が見つからない・複数のModelに当たる場合は書き換えず、報告に残す。
+/// 表が空の場合は何もしない。以降の割当・表情・基準姿勢・物理の解決は
+/// 新方式のfileIDだけを扱えばよい。
+///
+/// # Errors
+///
+/// FBXのモデル階層から階層パスを作れない場合に返す。
+pub fn modernize_legacy_import_ids(
+    prefab: &mut SerializedFile,
+    fbx_guid: &str,
+    recycle_names: &[(FileId, String)],
+    file: &FbxFile<'_>,
+) -> Result<LegacyImportIdReport, VrmError> {
+    let mut report = LegacyImportIdReport::default();
+    if recycle_names.is_empty() {
+        return Ok(report);
+    }
+    let nodes = prefab_hierarchy_paths(file)?;
+    let unique = |name: &str| -> Option<&PrefabHierarchyNode> {
+        let mut found = nodes.iter().filter(|node| node.name == name);
+        let first = found.next()?;
+        found.next().is_none().then_some(first)
+    };
+    // 旧fileID → 新fileID（写せない場合は `None` と対象名）。
+    let mut table: HashMap<FileId, Result<FileId, String>> = HashMap::new();
+    for (legacy, name) in recycle_names {
+        let class_id = legacy / 100_000;
+        let modern = match class_id {
+            1 if name == "//RootNode" => Some(game_object_file_id("")),
+            1 => unique(name).map(|node| game_object_file_id(&node.path)),
+            4 if name == "//RootNode" => Some(transform_file_id("")),
+            4 => unique(name).map(|node| transform_file_id(&node.path)),
+            43 => unique(name)
+                .filter(|node| node.has_mesh)
+                .map(|node| mesh_file_id(&node.name)),
+            137 => unique(name)
+                .filter(|node| node.has_mesh)
+                .map(|node| skinned_mesh_renderer_file_id(&node.path)),
+            _ => continue,
+        };
+        table.insert(*legacy, modern.ok_or_else(|| format!("{class_id}:{name}")));
+    }
+    fn walk(
+        value: &mut Value,
+        fbx_guid: &str,
+        table: &HashMap<FileId, Result<FileId, String>>,
+        report: &mut LegacyImportIdReport,
+    ) {
+        match value {
+            Value::Mapping(mapping) => {
+                let points_fbx = mapping
+                    .get("guid")
+                    .and_then(Value::as_str)
+                    .is_some_and(|guid| guid.eq_ignore_ascii_case(fbx_guid));
+                if points_fbx
+                    && let Some(legacy) = mapping.get("fileID").and_then(Value::as_i64)
+                    && let Some(entry) = table.get(&legacy)
+                {
+                    match entry {
+                        Ok(modern) => {
+                            mapping.insert(
+                                Value::String("fileID".to_owned()),
+                                Value::Number(yaml_serde::Number::from(*modern)),
+                            );
+                            report.rewritten += 1;
+                        }
+                        Err(name) => {
+                            if !report.unresolved.contains(name) {
+                                report.unresolved.push(name.clone());
+                            }
+                        }
+                    }
+                    return;
+                }
+                for (_, child) in mapping.iter_mut() {
+                    walk(child, fbx_guid, table, report);
+                }
+            }
+            Value::Sequence(items) => {
+                for item in items {
+                    walk(item, fbx_guid, table, report);
+                }
+            }
+            Value::Tagged(tagged) => walk(&mut tagged.value, fbx_guid, table, report),
+            _ => {}
+        }
+    }
+    for document in prefab.documents_mut() {
+        walk(document.raw_mut(), fbx_guid, &table, &mut report);
+    }
+    Ok(report)
+}
+
 /// `.fbx.meta` の置換表から基礎材質列を作る。
 ///
 /// `UnityEngine:Material` だけを残し、置換先がnullやGUIDなしの項目は
@@ -267,8 +376,9 @@ pub fn resolve_prefab_pool_paths(pool: &mut [RendererPoolEntry], index: &AssetIn
 /// 祖先の無効も子に効く。無効なものは出力しない。
 /// 先勝ちにせず、見つからない・重複する・数が合わない・材質参照が無い場合は
 /// 失敗し、対象の名前や件数を文面に含める。
-/// 旧方式（2019.3より前の取り込みfileID）のPrefabは新方式のIDと一致しない
-/// ため解決できず失敗する。理由は文面に残す。
+/// 旧方式（2019.3より前の取り込みfileID）のPrefabは、先に
+/// [`modernize_legacy_import_ids`] で新方式のIDへ読み替えておく。
+/// 読み替えていない旧方式のIDは新方式のIDと一致せず、解決できずに失敗する。
 ///
 /// # Errors
 ///

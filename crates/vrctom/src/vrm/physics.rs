@@ -1809,7 +1809,10 @@ impl VrmModel {
                 root_node: lookup_mapped(&node_map, &collider.root_node_id, &collider.id)?,
             });
         }
-        check_reference_locals(self, sidecar, &node_map, &aux_ids)?;
+        // 物理が1件も無い場合は比べる対象が無く、座標の取り違えも起きない。
+        if !phys_bones.is_empty() || !colliders.is_empty() {
+            check_reference_locals(self, sidecar, &node_map, &aux_ids)?;
+        }
         Ok(PhysicsResolution {
             matched_source_model: single.id.clone(),
             fbx_sha256: digest,

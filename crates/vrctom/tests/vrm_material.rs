@@ -4449,3 +4449,328 @@ fn 強度0の乗算はリムを暗くしない() {
         "原因の警告がある: {警告}"
     );
 }
+
+/// 最小FBXの節点（名前・プロパティ・子）。版7400の13バイト見出しで書く。
+struct Fbx節点 {
+    名前: &'static [u8],
+    プロパティ: Vec<u8>,
+    個数: u32,
+    子: Vec<Fbx節点>,
+}
+
+impl Fbx節点 {
+    fn new(名前: &'static [u8]) -> Self {
+        Self {
+            名前,
+            プロパティ: Vec::new(),
+            個数: 0,
+            子: Vec::new(),
+        }
+    }
+
+    fn l(mut self, 値: i64) -> Self {
+        self.プロパティ.push(b'L');
+        self.プロパティ.extend_from_slice(&値.to_le_bytes());
+        self.個数 += 1;
+        self
+    }
+
+    fn s(mut self, 値: &[u8]) -> Self {
+        self.プロパティ.push(b'S');
+        self.プロパティ
+            .extend_from_slice(&(値.len() as u32).to_le_bytes());
+        self.プロパティ.extend_from_slice(値);
+        self.個数 += 1;
+        self
+    }
+
+    fn 子付き(mut self, 子: Vec<Fbx節点>) -> Self {
+        self.子 = 子;
+        self
+    }
+
+    fn 書く(&self, buf: &mut Vec<u8>) {
+        let start = buf.len();
+        buf.extend_from_slice(&[0u8; 13]);
+        buf.extend_from_slice(self.名前);
+        buf.extend_from_slice(&self.プロパティ);
+        for 子 in &self.子 {
+            子.書く(buf);
+        }
+        if !self.子.is_empty() {
+            buf.extend_from_slice(&[0u8; 13]);
+        }
+        let end = buf.len() as u32;
+        buf[start..start + 4].copy_from_slice(&end.to_le_bytes());
+        buf[start + 4..start + 8].copy_from_slice(&self.個数.to_le_bytes());
+        buf[start + 8..start + 12].copy_from_slice(&(self.プロパティ.len() as u32).to_le_bytes());
+        buf[start + 12] = self.名前.len() as u8;
+    }
+}
+
+/// 材質（名前と拡散テクスチャのファイル名）だけを持つ最小FBXを作る。
+fn 材質だけのfbxを作る(材質: &[(&str, Option<&str>)]) -> Vec<u8> {
+    let mut 物体 = Vec::new();
+    let mut 接続 = Vec::new();
+    for (番号, (名前, テクスチャ)) in 材質.iter().enumerate() {
+        let id = 100 + 番号 as i64;
+        物体.push(
+            Fbx節点::new(b"Material")
+                .l(id)
+                .s(format!("{名前}\x00\x01Material").as_bytes())
+                .s(b""),
+        );
+        if let Some(ファイル) = テクスチャ {
+            let tex = 200 + 番号 as i64;
+            物体.push(
+                Fbx節点::new(b"Texture")
+                    .l(tex)
+                    .s(b"Tex\x00\x01Texture")
+                    .s(b"")
+                    .子付き(vec![Fbx節点::new(b"FileName").s(ファイル.as_bytes())]),
+            );
+            接続.push(Fbx節点::new(b"C").s(b"OP").l(tex).l(id).s(b"DiffuseColor"));
+        }
+    }
+    let mut buf = b"Kaydara FBX Binary  \x00\x1a\x00".to_vec();
+    buf.extend_from_slice(&7400u32.to_le_bytes());
+    Fbx節点::new(b"Objects").子付き(物体).書く(&mut buf);
+    Fbx節点::new(b"Connections").子付き(接続).書く(&mut buf);
+    buf.extend_from_slice(&[0u8; 13]);
+    buf
+}
+
+/// 置換表の無い旧版のFBXと `.meta` を書く。`設定` は `materials:` 欄の中身である。
+fn 旧版fbxを書く(root: &Path, 相対: &str, 材質: &[(&str, Option<&str>)], 設定: &str) {
+    資産を書く(root, 相対, &材質だけのfbxを作る(材質));
+    let 本文 = format!(
+        "fileFormatVersion: 2\nguid: {}\ntimeCreated: 1519744173\nlicenseType: Free\nModelImporter:\n  serializedVersion: 19\n  materials:\n{設定}",
+        guid(0x99)
+    );
+    資産を書く(root, &format!("{相対}.meta"), 本文.as_bytes());
+}
+
+/// 材質を最小の内容で書く。
+fn 単純な材質を書く(root: &Path, 相対: &str, guid: &str, 名前: &str) {
+    マテリアルを書く(
+        root,
+        相対,
+        guid,
+        名前,
+        Some(SHADER_OPAQUE),
+        &[],
+        &基本浮動小数(),
+        &基本色(),
+    );
+}
+
+#[test]
+fn 置換表が無い旧版fbxは名前で上位の材質フォルダを探す() {
+    let (_guard, root) = 作業域を作る();
+    旧版fbxを書く(
+        &root,
+        "Assets/Chara/Model.fbx",
+        &[
+            ("Body", None),
+            ("Skin", Some("C:\\work\\SkinTex.png")),
+            ("Missing", None),
+        ],
+        "    importMaterials: 1\n    materialName: 0\n    materialSearch: 1\n",
+    );
+    // 大文字小文字だけ違う名前も、WindowsやmacOSのUnityと同じく見つける。
+    単純な材質を書く(&root, "Assets/Materials/body.mat", &guid(0x11), "body");
+    // 拡散テクスチャがある材質はテクスチャ名で探す。
+    単純な材質を書く(
+        &root,
+        "Assets/Chara/Materials/SkinTex.mat",
+        &guid(0x12),
+        "SkinTex",
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Chara/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let materials = materials.expect("旧方式で材質が見つかる");
+    let slots: Vec<_> = materials
+        .entries()
+        .iter()
+        .map(|entry| (entry.slot.as_str(), entry.material.name.as_str()))
+        .collect();
+    assert_eq!(
+        slots,
+        vec![
+            ("Body", "body"),
+            ("Skin", "SkinTex"),
+            ("Missing", "Missing")
+        ]
+    );
+    assert!(materials.get("Body").expect("ある").mtoon.is_some());
+    assert!(materials.get("Missing").expect("ある").mtoon.is_none());
+    let warnings = report.warnings().join("\n");
+    assert!(warnings.contains("旧方式で材質を探した: Body: Materials/body.mat"));
+    assert!(warnings.contains("旧方式で材質が見つからないため灰色材質にする: Missing"));
+}
+
+#[test]
+fn 旧方式の同階層検索は上位を探さず内蔵材質は読まない() {
+    let (_guard, root) = 作業域を作る();
+    旧版fbxを書く(
+        &root,
+        "Assets/Chara/Model.fbx",
+        &[("Body", None)],
+        "    importMaterials: 1\n    materialName: 1\n    materialSearch: 0\n",
+    );
+    単純な材質を書く(&root, "Assets/Materials/Body.mat", &guid(0x11), "Body");
+    let (materials, _) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Chara/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let materials = materials.expect("スロットは灰色材質で残る");
+    assert!(materials.get("Body").expect("ある").mtoon.is_none());
+
+    // 2019.3以降のFBX内蔵材質（`materialLocation: 1`）は探さない。
+    旧版fbxを書く(
+        &root,
+        "Assets/Chara/Model.fbx",
+        &[("Body", None)],
+        "    materialImportMode: 2\n    materialName: 0\n    materialSearch: 1\n    materialLocation: 1\n",
+    );
+    let (materials, _) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Chara/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    assert!(materials.is_none());
+
+    // 材質を取り込まない設定では探さない。
+    旧版fbxを書く(
+        &root,
+        "Assets/Chara/Model.fbx",
+        &[("Body", None)],
+        "    importMaterials: 0\n",
+    );
+    let (materials, report) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Chara/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    assert!(materials.is_none());
+    assert!(
+        report
+            .warnings()
+            .join("\n")
+            .contains("材質を取り込まない設定")
+    );
+}
+
+#[test]
+fn flat_lit_toonをmtoonに写像する() {
+    let (_guard, root) = 作業域を作る();
+    let shader = guid(0x55);
+    資産を書く(
+        &root,
+        "Assets/Shader/Flat Lit Toon.shader",
+        b"Shader \"CubedParadox/Flat Lit Toon\"\n{\n}\n",
+    );
+    メタを書く(
+        &root,
+        "Assets/Shader/Flat Lit Toon.shader",
+        &shader,
+        "ShaderImporter",
+        "  defaultTextures: []\n",
+    );
+    let mat = guid(0x11);
+    let tex = guid(0x22);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some(&shader),
+        &[
+            ("_MainTex", 参照::割当(&tex)),
+            ("_EmissionMap", 参照::Null),
+            ("_ColorMask", 参照::Null),
+        ],
+        &[
+            ("_Mode", 1.0),
+            ("_Cutoff", 0.3),
+            ("_Shadow", 0.4),
+            ("_OutlineMode", 1.0),
+            ("_outline_width", 0.2),
+            ("_ZWrite", 1.0),
+        ],
+        &[
+            ("_Color", [1.0, 1.0, 1.0, 1.0]),
+            ("_EmissionColor", [0.0, 0.0, 0.0, 1.0]),
+            ("_outline_color", [0.5, 0.5, 0.5, 1.0]),
+        ],
+    );
+    テクスチャを書く(&root, "Assets/Textures/Body.png", &tex, PNG_1X1);
+    let (materials, _) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let materials = materials.expect("材質がある");
+    let material = materials.get("Body").expect("スロットで引ける");
+    assert_eq!(material.alpha_mode, VrmAlphaMode::Mask);
+    assert!((material.alpha_cutoff - 0.3).abs() < 1e-6);
+    assert!(!material.double_sided);
+    assert_eq!(material.base_color_factor, [1.0, 1.0, 1.0, 1.0]);
+    assert_eq!(material.base_color_image, Some(0));
+    assert_eq!(material.emissive_factor, [0.0, 0.0, 0.0]);
+    assert_eq!(material.emissive_image, None);
+    let mtoon = material.mtoon.as_ref().expect("MToonになる");
+    // 影側は基準色の `1 - _Shadow` 倍で、境界は硬い。
+    for channel in mtoon.shade_color_factor {
+        assert!((channel - 0.6).abs() < 1e-6);
+    }
+    assert_eq!(mtoon.shade_multiply_image, Some(0));
+    assert!((mtoon.shading_toony_factor - 0.95).abs() < 1e-6);
+    assert_eq!(
+        mtoon.outline_width_mode,
+        VrmOutlineWidthMode::WorldCoordinates
+    );
+    assert!((mtoon.outline_width_factor - 0.002).abs() < 1e-6);
+    // 線色は線形化する（sRGBの0.5は線形で約0.214）。
+    assert!((mtoon.outline_color_factor[0] - 0.214).abs() < 0.001);
+    assert_eq!(mtoon.outline_lighting_mix_factor, 1.0);
+}
+
+#[test]
+fn flat_lit_toonは既知のguidでも判定する() {
+    let (_guard, root) = 作業域を作る();
+    let mat = guid(0x11);
+    fbxメタを書く(&root, &guid(0x99), &[("Body", Some(&mat))]);
+    マテリアルを書く(
+        &root,
+        "Assets/Materials/Body.mat",
+        &mat,
+        "Body",
+        Some("4aee8da2849419148b1a8dab41bc3133"),
+        &[],
+        &[("_Shadow", 0.0)],
+        &[("_Color", [1.0, 1.0, 1.0, 1.0])],
+    );
+    let (materials, _) = VrmMaterials::load(
+        &root,
+        &root.join("Assets/Model.fbx"),
+        &MaterialOptions::new(),
+    )
+    .expect("読める");
+    let materials = materials.expect("材質がある");
+    let material = materials.get("Body").expect("ある");
+    assert_eq!(material.alpha_mode, VrmAlphaMode::Opaque);
+    let mtoon = material.mtoon.as_ref().expect("MToonになる");
+    assert_eq!(mtoon.shade_color_factor, [1.0, 1.0, 1.0]);
+    assert_eq!(mtoon.outline_width_mode, VrmOutlineWidthMode::None);
+}

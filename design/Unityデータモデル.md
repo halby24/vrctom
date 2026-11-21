@@ -44,6 +44,52 @@ block scalar内の `---` 風文字列との誤認を避けるためである。
 失敗させないためであり、構文解釈自体は変えない。
 数値化で復元できないGUIDは黙って壊さず失敗にする。
 
+## バイナリ保存形式
+
+Unity 2018以前の資産や、Asset Serializationを `Force Binary` にした資産は、
+`.mat`・`.prefab`・`.unity` を型木（type tree）付きのバイナリで保存する。
+`BinaryFile` は版17〜22（Unity 5.5〜2022系）を読み、オブジェクトを
+型木に従って汎用値 `BinaryValue` へ読む。`SerializedFile::parse` は先頭で
+バイナリを判定し、各オブジェクトをUnity YAMLと同じ形の汎用値に写した
+`Document` の列にする。以降の型付き読み取り・Prefab解決はYAMLと同じ経路を通る。
+
+- 見出しは大端、本文は見出しの端指定に従う。型木を持たないファイル
+  （ビルド済み）は `UnsupportedFormat` で読まない。
+- 型木の文字列は最上位ビットが立っていればUnityの共通文字列表を引く。
+- `metaFlag` の `0x4000` は読んだ後に4バイト境界へ揃える。
+- `PPtr` は `m_FileID`（0は同一ファイル、正は外部参照表の1始まりの位置）と
+  `m_PathID` を `ObjectRef` へ直す。外部参照のGUIDは各バイトの
+  下位4ビット・上位4ビットの順に16進で書いた文字列形式に直す。
+- `float` はYAMLの最短表記と同じ値になるよう、`f32` の最短10進表記を経由して広げる。
+- 配列長は残りバイト数で、汎用値の総数は上限で抑える。
+  壊れた入力は `InvalidBinary`、上限超過は `LimitExceeded` である。
+
+- YAMLの形への写像は、構造体をマッピング、配列をシーケンス、`PPtr` を
+  `{fileID, guid}`、鍵が文字列の `map` を `- 鍵: 値` のシーケンスにする。
+  真偽値は0/1の整数、型なしデータは16進文字列にする。
+- クラス名は型木の根の型名である。stripped型は根が `EditorExtension` になるため、
+  既知のclassIDの名前で補う。stripped型の印（またはPrefab対応先の欄だけを持つ形）を
+  `stripped` 文書とする。
+- 外部参照のGUIDが分からない参照は、同一ファイル内と取り違えないようnullにする。
+  組み込み資産（`library/unity default resources` など）はUnity YAMLと同じ固定GUIDにする。
+- バイナリ文書は本文の原文を持たない。
+
+## 旧版のPrefab表現
+
+Unity 2018.2以前（YAML・バイナリとも）は、Prefabインスタンスを `Prefab`（1001）で、
+対応先を `m_PrefabParentObject`、所属を `m_PrefabInternal` で書く。
+読み取り時に2018.3以降の名前へ揃え、以降の層は新しい名前だけを扱う。
+
+- `m_IsPrefabParent` が真の `Prefab` はPrefab資産自身の印であり、文書列から除く。
+- それ以外の `Prefab` は `PrefabInstance` とし、`m_ParentPrefab` を `m_SourcePrefab` と読む。
+- `m_PrefabParentObject` は `m_CorrespondingSourceObject` と読む。
+- `m_PrefabInternal` は資産自身の印を指す場合は `m_PrefabAsset`（`m_PrefabInstance` はnull）、
+  それ以外は `m_PrefabInstance` と読む。
+- 新しい名前の欄が既にある場合は書き換えない。
+
+`.unity`（シーン）は種別 `Scene` に分類する。Prefabインスタンスを含むため、
+Prefabと同じく変換の入口にできる。
+
 ## 索引と参照解決
 
 索引の正は `.meta` であり、本体の一括読み込み・自動キャッシュ・再帰ロードはしない。

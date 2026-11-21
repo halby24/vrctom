@@ -50,6 +50,8 @@ sequenceDiagram
 
 - 入力Fileを受け取り、ArrayBufferとしてWorkerへ渡す。
 - Worker内のwasmがパッケージを検証し、Prefab一覧（`prefabTargets`）を返す。
+  一覧には `.prefab` に加えてシーン（`.unity`）も含める。Prefabを持たない古い
+  アバターは、アバターを置いたシーンがPrefabインスタンスを持つためである。
 - Prefabごとの解決状態は次のいずれかである。
   判定は型付き参照だけを使い、GUID文字列の部分一致検索はしない。
 

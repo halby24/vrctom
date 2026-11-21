@@ -3555,3 +3555,68 @@ fn 狭幅レコードは従来どおり読める() {
     assert_eq!(parsed.models().len(), 2);
     assert_eq!(parsed.meshes().len(), 1);
 }
+
+/// `Texture` ノードを組み立てる。`file` が空なら `FileName` を書かない。
+fn texture_node(id: i64, name: &[u8], file: &[u8], relative: &[u8]) -> TNode {
+    let mut props = Props::default();
+    props.l(id);
+    props.s(name);
+    props.s(b"");
+    let mut children = Vec::new();
+    if !file.is_empty() {
+        children.push(str_child(b"FileName", file));
+    }
+    if !relative.is_empty() {
+        children.push(str_child(b"RelativeFilename", relative));
+    }
+    TNode::branch(b"Texture", props, children)
+}
+
+/// `OP`（子→親・属性）接続を組み立てる。
+fn conn_op(child: i64, parent: i64, property: &[u8]) -> TNode {
+    let mut props = Props::default();
+    props.s(b"OP");
+    props.l(child);
+    props.l(parent);
+    props.s(property);
+    TNode::leaf(b"C", props)
+}
+
+#[test]
+fn 材質の拡散テクスチャのファイル名をop接続から読む() {
+    let bytes = file(
+        7400,
+        vec![
+            objects(vec![
+                material(10, b"Skin\x00\x01Material"),
+                material(11, b"Hair\x00\x01Material"),
+                material(12, b"Eye\x00\x01Material"),
+                texture_node(20, b"SkinTex\x00\x01Texture", b"C:\\work\\Skin.png", b""),
+                texture_node(21, b"HairTex\x00\x01Texture", b"", b"tex/Hair.psd"),
+                texture_node(22, b"Normal\x00\x01Texture", b"Normal.png", b""),
+            ]),
+            connections(vec![
+                conn_op(20, 10, b"DiffuseColor"),
+                conn_op(21, 11, b"DiffuseColor"),
+                // 拡散色以外の属性への接続は使わない。
+                conn_op(22, 12, b"NormalMap"),
+                // 未知IDへの接続は無視する。
+                conn_op(99, 10, b"DiffuseColor"),
+            ]),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("読める");
+    let textures: Vec<_> = parsed
+        .materials()
+        .iter()
+        .map(|material| (material.name.as_str(), material.diffuse_texture.as_deref()))
+        .collect();
+    assert_eq!(
+        textures,
+        vec![
+            ("Skin", Some("C:\\work\\Skin.png")),
+            ("Hair", Some("tex/Hair.psd")),
+            ("Eye", None),
+        ]
+    );
+}

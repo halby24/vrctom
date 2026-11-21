@@ -6,7 +6,8 @@
 //! 対象文字列は種類で決まる。メッシュは所有モデルの名前だけから作り、
 //! 階層は含まない。ゲームオブジェクトとコンポーネントはモデル階層の
 //! パス（`/` 区切り）から作る。過去方式（`.meta` の `fileIDToRecycleName`）は
-//! 扱わず、解決できない場合は呼び出し側で失敗させる。
+//! ここでは扱わない。過去方式のPrefabは `vrm::modernize_legacy_import_ids` が
+//! この新方式のIDへ読み替える。
 
 use super::FileId;
 
@@ -44,6 +45,21 @@ pub fn skinned_mesh_renderer_file_id(hierarchy_path: &str) -> FileId {
     import_file_id(&format!(
         "Type:SkinnedMeshRenderer->//RootNode/root/{hierarchy_path}/SkinnedMeshRenderer0"
     ))
+}
+
+/// Transformのサブアセット fileID を作る。
+///
+/// 対象文字列は `Type:Transform->//RootNode/root/{階層パス}/Transform0` であり、
+/// 階層パスが空の場合は取り込みルート自身の `Type:Transform->//RootNode/root/Transform0`
+/// になる。
+pub fn transform_file_id(hierarchy_path: &str) -> FileId {
+    if hierarchy_path.is_empty() {
+        import_file_id("Type:Transform->//RootNode/root/Transform0")
+    } else {
+        import_file_id(&format!(
+            "Type:Transform->//RootNode/root/{hierarchy_path}/Transform0"
+        ))
+    }
 }
 
 /// 取り込み fileID の本体。XXH64（seed 0）を符号付き64bitへ写す。

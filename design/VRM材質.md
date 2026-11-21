@@ -37,8 +37,28 @@ Web専用の簡易写像は作らない。詳しくは [`Webアプリ`](Webア�
 
 FBXの材質スロット名は `.fbx.meta` の `externalObjects` が持つ
 `UnityEngine:Material` の置換表で `.mat` のGUIDに解決する。
-名前だけの一致では解決しない。置換表に無いスロットは、書き出し時に
-既定の灰色材質へ落ちる。
+置換表に無いスロットは、書き出し時に既定の灰色材質へ落ちる。
+
+置換表が1件も無く、ModelImporterの `materials` 欄が材質を取り込む設定
+（`importMaterials`・`materialImportMode` が0でない）で、FBX内蔵
+（`materialLocation: 1`）でもない場合は、Unityの旧方式
+（2017.2以前の既定）と同じく名前で `.mat` を探す。
+
+- 名前は `materialName` に従う。0は拡散テクスチャのファイル名（拡張子を除く。
+  無ければ材質名）、1は材質名、2は `モデル名-材質名`、3は拡散テクスチャ名
+  （無ければ `モデル名-材質名`）である。拡散テクスチャはFBXの `DiffuseColor`
+  への `OP` 接続から読む。
+- 探す場所は `materialSearch` に従う。0はモデルと同じフォルダの `Materials`、
+  1はモデルのフォルダから `Assets` まで各階層の `Materials`、2はそれに加えて
+  プロジェクト全体である。全体検索で同名が複数ある場合はパス順の先頭を使い、警告する。
+- 照合は完全一致を先に、無ければ大文字小文字を区別せずに行う。
+  WindowsとmacOSのUnityは大文字小文字を区別せずに見つけるためである。
+- 見つけたスロットは見つけた旨を、見つからないスロットは灰色材質にした旨を警告に残す。
+- Unityが材質名から除く記号の置き換えは再現しない。
+
+旧方式で選ばれる材質は、FBXだけを置いたときにUnityが割り当てる材質である。
+シーンやPrefabがレンダラの材質を上書きしている場合、その上書きは
+`--prefab` か `--renderers` で読む。
 
 購入アバターの割当はPrefabにあるため、置換表だけでは足りない。
 `--renderers` を指定した場合は、レンダラsidecar
@@ -49,8 +69,12 @@ FBXの材質スロット名は `.fbx.meta` の `externalObjects` が持つ
 詳しくは [`レンダラsidecarによる割当`](#レンダラsidecarによる割当--renderers) を参照。
 
 `.mat` はUnity YAMLとして読み、`Material` の代表型を使う。
+Unity 2018以前やAsset Serializationを `Force Binary` にした資産の `.mat` は
+型木付きバイナリであり、[`Unityデータモデル`](Unityデータモデル.md) のバイナリ読み取りで
+同じ `Material` の代表型へ写す。
 `m_Shader` のGUIDは、索引に `.shader` があればその先頭行のシェーダ名で、
 無ければ既知のlilToonのGUID表で系列と能力を判定する。
+Flat Lit Toon（[`Flat Lit Toonへの写像`](#flat-lit-toonへの写像)）は先に判定する。
 
 | 系列 | 透明度 | 例 |
 |---|---|---|
@@ -157,9 +181,14 @@ flowchart TB
   `m_Modifications` の `target` が全件一致し、シフォンの14件と
   `m_IsActive: 0` の対象（`Bra` のゲームオブジェクト）も一致する。
   ミルク・カリンはsidecarが無いため `.fbx.meta` 経路との整合確認に留める。
-- 2019.3より前の取り込み方式（`.meta` の `fileIDToRecycleName`）は未対応である。
-  新方式で解決できない対象は失敗させ、理由（旧方式は未対応）を文面に残す。
-  過去方式のフォールバックは作らない。
+- 2019.3より前の取り込み方式（`.meta` の `fileIDToRecycleName`）のPrefab・シーンは、
+  解析直後に `modernize_legacy_import_ids` で入力FBXへの参照を新方式のfileIDへ
+  書き換えてから、上の解決に渡す。旧方式は `classID × 100000 + 連番` を名前と
+  対応付けるため、名前からFBXのModelを一意に引き、ゲームオブジェクト（1）・
+  Transform（4）・メッシュ（43）・描画設定（137）を新方式の対象文字列で算出する。
+  `//RootNode` は取り込みルートである。名前が見つからない・複数のModelに当たる対象は
+  書き換えずに報告し、その対象を使う段は新方式で解決できないものとして失敗する。
+  Animatorなどそれ以外の種類は書き換えない。解決の各段に旧方式の分岐は持たせない。
 - 有効とは描画設定が有効かつ自階層がすべて有効な場合だけであり、
   祖先の `m_IsActive: 0` は子にも効く。取り込みルートの無効も子に効く。
   無効なメッシュは出力しない。既定は有効である。
@@ -531,6 +560,24 @@ MToonは材質ごとに1つのUV変換しか持てず、UVの反転と組み合�
 - Unity取込時の圧縮は再現しない。解像度は取り込み上限とNPOTで再現する。
   透明部のRGBなど、取込で変わる画素は参照実装と差が出る。
   差分の見方は検証報告に残す。
+
+## Flat Lit Toonへの写像
+
+CubedParadoxのFlat Lit Toon（シェーダ名に `Flat Lit Toon` を含む。`.shader` が
+無ければ配布物の `.shader.meta` で確かめたGUID1件）は、`FlatLitToonCore.cginc` の
+計算に合わせてMToonへ写す。
+
+| 出力 | 入力 | 備考 |
+|---|---|---|
+| 基準色 | `_MainTex × _Color` | `_ColorMask` の掛け分けは全体に色を掛ける近似（警告） |
+| `alphaMode` | `_Mode` | 0不透明・1カットアウト・2Fade・3Transparentは半透明 |
+| `doubleSided` | なし | シェーダはカリング指定を持たず、既定の背面カリング |
+| `shadeColorFactor` | `_Color × (1 - _Shadow)` | 影側は `lerp(間接光, 直接光, 1 - _Shadow)`。間接光はMToonの環境光に任せる |
+| `shadeMultiplyTexture` | `_MainTex` | |
+| `shadingToonyFactor` | 0.95 | `floor(saturate(光量) * 2)` の2値の硬い境界 |
+| 発光 | `_EmissionMap × _EmissionColor` | 色が0なら書かない。1超は丸めて警告 |
+| 法線 | `_BumpMap` | |
+| アウトライン | `_OutlineMode`・`_outline_width × 0.01`・`_outline_color` | 0なし・1Tinted（照明混合1）・2Colored（照明混合0で近似、警告）。物体座標の幅を世界座標として近似（警告） |
 
 ## 未対応（次の段）
 

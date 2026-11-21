@@ -535,7 +535,7 @@ fn export(
                 return 1;
             }
         };
-        let prefab_file = match SerializedFile::parse(&prefab_bytes, &ParseOptions::new()) {
+        let mut prefab_file = match SerializedFile::parse(&prefab_bytes, &ParseOptions::new()) {
             Ok(prefab_file) => prefab_file,
             Err(error) => {
                 diagnose_stage("Prefabの解析に失敗した", &error);
@@ -561,6 +561,15 @@ fn export(
                 escape_diag(&format!("{:?}", PathBuf::from(meta_os)))
             );
             return 1;
+        }
+        if let Err(code) = modernize_prefab_ids(
+            &mut prefab_file,
+            &fbx_meta.guid,
+            &fbx_meta.legacy_ids,
+            &file,
+            false,
+        ) {
+            return code;
         }
         let mappings = fbx_meta.mappings;
         let fbx_guid = fbx_meta.guid;
@@ -1038,6 +1047,49 @@ struct FbxMetaInfo {
     guid: String,
     /// humanoid対応表。メタが無い場合は空である。
     mappings: Vec<HumanBoneMapping>,
+    /// 旧方式の取り込みfileID表（`fileIDToRecycleName`）。無い場合は空である。
+    legacy_ids: Vec<(i64, String)>,
+}
+
+/// Prefabやシーンの旧方式の取り込みfileIDを新方式へ読み替える。
+///
+/// 同じPrefabを段階ごとに読み直すため、結果を標準エラーに残すのは
+/// `announce` が真の1か所（材質割当）だけにする。
+fn modernize_prefab_ids(
+    prefab: &mut vrctom::unity::SerializedFile,
+    fbx_guid: &str,
+    legacy_ids: &[(i64, String)],
+    file: &FbxFile<'_>,
+    announce: bool,
+) -> Result<(), i32> {
+    match vrctom::vrm::modernize_legacy_import_ids(prefab, fbx_guid, legacy_ids, file) {
+        Ok(_) if !announce => Ok(()),
+        Ok(report) => {
+            if report.rewritten > 0 {
+                eprintln!(
+                    "旧方式の取り込みfileID: 新方式へ{}件読み替えた",
+                    report.rewritten
+                );
+            }
+            if !report.unresolved.is_empty() {
+                eprintln!(
+                    "旧方式の取り込みfileID: 新方式へ写せない対象{}件: {}",
+                    report.unresolved.len(),
+                    report
+                        .unresolved
+                        .iter()
+                        .map(|name| escape_diag(name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            Ok(())
+        }
+        Err(error) => {
+            diagnose_stage("旧方式の取り込みfileIDを読み替えられない", &error);
+            Err(1)
+        }
+    }
 }
 
 /// 入力FBXの隣の `.fbx.meta` からGUIDとhumanoid対応表を読む。
@@ -1061,6 +1113,7 @@ fn load_fbx_meta(input: &Path) -> Result<FbxMetaInfo, i32> {
             return Ok(FbxMetaInfo {
                 guid: String::new(),
                 mappings: Vec::new(),
+                legacy_ids: Vec::new(),
             });
         }
         Err(error) => {
@@ -1088,8 +1141,13 @@ fn load_fbx_meta(input: &Path) -> Result<FbxMetaInfo, i32> {
         }
     };
     let guid = meta.guid().as_str().to_owned();
+    let legacy_ids = meta.legacy_recycle_names();
     match meta.human_bone_mappings() {
-        Ok(mappings) => Ok(FbxMetaInfo { guid, mappings }),
+        Ok(mappings) => Ok(FbxMetaInfo {
+            guid,
+            mappings,
+            legacy_ids,
+        }),
         Err(error) => {
             diagnose_stage(&format!("humanoidの対応表を読めない: {meta_label}"), &error);
             Err(1)
@@ -1153,13 +1211,21 @@ fn derive_physics_from_prefab(
             return Err(1);
         }
     };
-    let prefab = match SerializedFile::parse(&prefab_bytes, &ParseOptions::new()) {
+    let mut prefab = match SerializedFile::parse(&prefab_bytes, &ParseOptions::new()) {
         Ok(prefab) => prefab,
         Err(error) => {
             diagnose_stage("Prefabの解析に失敗した", &error);
             return Err(1);
         }
     };
+    let fbx_meta = load_fbx_meta(input)?;
+    modernize_prefab_ids(
+        &mut prefab,
+        &fbx_meta.guid,
+        &fbx_meta.legacy_ids,
+        file,
+        false,
+    )?;
     let Some(root) = assets_root else {
         eprintln!(
             "Prefabからの物理導出には材質配置が必要である: {}",
@@ -1450,7 +1516,7 @@ fn apply_prefab_assignment(
             return Err(1);
         }
     };
-    let prefab = match SerializedFile::parse(&prefab_bytes, &ParseOptions::new()) {
+    let mut prefab = match SerializedFile::parse(&prefab_bytes, &ParseOptions::new()) {
         Ok(prefab) => prefab,
         Err(error) => {
             diagnose_stage("Prefabの解析に失敗した", &error);
@@ -1528,6 +1594,13 @@ fn apply_prefab_assignment(
         return Err(1);
     };
     let fbx_guid = record.meta.guid().as_str().to_owned();
+    modernize_prefab_ids(
+        &mut prefab,
+        &fbx_guid,
+        &record.meta.legacy_recycle_names(),
+        file,
+        true,
+    )?;
     let remaps = match record.meta.external_object_remaps() {
         Ok(remaps) => remaps,
         Err(error) => {

@@ -8,7 +8,7 @@
 
 use yaml_serde::{Mapping, Value};
 
-use super::{Guid, ObjectRef, UnityError, UnityErrorKind, read_guid};
+use super::{FileId, Guid, ObjectRef, UnityError, UnityErrorKind, read_guid};
 
 /// `.meta` 1件の既定上限（バイト）。
 ///
@@ -115,6 +115,7 @@ impl AssetMeta {
             }
         };
         // importerは予約キー以外の唯一のブロックである。未知名も受け付ける。
+        // `timeCreated` と `licenseType` はUnity 2018以前のmetaが持つ予約キーである。
         let mut importer: Option<(&str, &Value)> = None;
         for (key, value) in mapping {
             let name = key.as_str().ok_or_else(|| {
@@ -123,7 +124,10 @@ impl AssetMeta {
                     "metaのトップレベルに文字列でないキーがある",
                 )
             })?;
-            if matches!(name, "fileFormatVersion" | "guid" | "folderAsset") {
+            if matches!(
+                name,
+                "fileFormatVersion" | "guid" | "folderAsset" | "timeCreated" | "licenseType"
+            ) {
                 continue;
             }
             if importer.is_some() {
@@ -160,6 +164,36 @@ impl AssetMeta {
     /// importerを返す。
     pub fn importer(&self) -> &Importer {
         &self.importer
+    }
+
+    /// ModelImporterの旧方式の取り込みfileID表（`fileIDToRecycleName`）を読む。
+    ///
+    /// Unity 2019.3より前のFBX取り込みは、サブアセットのfileIDを
+    /// `classID × 100000 + 連番` で振り、名前との対応をこの表に残す。
+    /// 表が無い・空の場合は空を返す。形状が合わない項目は読み飛ばす。
+    pub fn legacy_recycle_names(&self) -> Vec<(FileId, String)> {
+        let Some(table) = self
+            .importer
+            .settings
+            .get("fileIDToRecycleName")
+            .and_then(Value::as_mapping)
+        else {
+            return Vec::new();
+        };
+        table
+            .iter()
+            .filter_map(|(key, value)| {
+                let file_id = key
+                    .as_i64()
+                    .or_else(|| key.as_str().and_then(|text| text.parse().ok()))?;
+                let name = match value {
+                    Value::String(text) => text.clone(),
+                    Value::Number(number) => number.to_string(),
+                    _ => return None,
+                };
+                Some((file_id, name))
+            })
+            .collect()
     }
 
     /// importer設定の `externalObjects` にある置換表を読み取る。
@@ -455,6 +489,8 @@ pub enum AssetKind {
     Folder,
     /// `.prefab`。
     Prefab,
+    /// `.unity`（シーン）。Prefabインスタンスを含むため変換の入口にもなる。
+    Scene,
     /// `.mat`。
     Material,
     /// 画像（TextureImporter）。
@@ -491,6 +527,7 @@ pub(crate) fn classify(relative_path: &str, meta: &AssetMeta) -> AssetKind {
         .map(|(_, extension)| extension.to_ascii_lowercase());
     match extension.as_deref() {
         Some("prefab") => AssetKind::Prefab,
+        Some("unity") => AssetKind::Scene,
         Some("mat") => AssetKind::Material,
         Some("anim") => AssetKind::AnimationClip,
         Some("controller") => AssetKind::AnimatorController,

@@ -44,7 +44,8 @@ use super::bake::{
 use super::psd::{PsdError, decode_psd, is_psd, psd_dimensions};
 
 use crate::unity::{
-    AssetIndex, AssetKind, AssetSource, Guid, ParseOptions, SerializedFile, TypedObject,
+    AssetIndex, AssetKind, AssetRecord, AssetSource, BinaryFile, BinaryOptions, Guid, ParseOptions,
+    SerializedFile, TypedObject, is_binary_serialized,
 };
 // 索引化と正規化はnative限定の薄いラッパだけで使う。
 #[cfg(not(target_arch = "wasm32"))]
@@ -104,6 +105,12 @@ const BLEND_SHADER_GUIDS: [&str; 4] = [
     "0e3ece1bd59542743bccadb21f68318e",
     "1c12a37046f07ac4486881deaf0187ea",
 ];
+
+/// CubedParadoxのFlat Lit Toonの `.shader` のGUID。
+///
+/// `.shader` が索引に無い場合の判定に使う。配布物の `Flat Lit Toon.shader.meta` で
+/// 確かめた1件である。
+const FLAT_LIT_TOON_SHADER_GUIDS: [&str; 1] = ["4aee8da2849419148b1a8dab41bc3133"];
 
 /// アウトライン描画路を持つlilToonシェーダのGUID表（小文字）。
 ///
@@ -207,8 +214,16 @@ impl VrmMaterials {
             .filter(|entry| entry.original_type == "UnityEngine:Material")
             .collect();
         if remaps.is_empty() {
-            context.warn("FBXに材質の置換表がないため材質を読まない");
-            return Ok((None, context.report()));
+            // 置換表が無い場合はUnityの旧方式（名前で `Materials` フォルダを探す）を試す。
+            let Some(slots) = legacy_slots(&mut context, record, fbx_relative)? else {
+                return Ok((None, context.report()));
+            };
+            for (slot, guid) in slots {
+                context.load_legacy_slot(slot, guid)?;
+            }
+            context.assign_render_queue_offsets();
+            let (materials, report) = context.finish();
+            return Ok((Some(materials), report));
         }
         for entry in &remaps {
             context.load_slot(entry)?;
@@ -706,6 +721,233 @@ pub enum MaterialErrorKind {
     InvalidMaterial,
 }
 
+/// Unityの旧方式の材質名の決め方（`materialName`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyNaming {
+    /// 拡散テクスチャ名。無ければ材質名（0）。
+    Texture,
+    /// 材質名（1）。
+    Material,
+    /// `モデル名-材質名`（2）。
+    ModelAndMaterial,
+    /// 拡散テクスチャ名。無ければ `モデル名-材質名`（3）。
+    TextureOrModelAndMaterial,
+}
+
+/// 旧方式で探したスロット名と材質GUID（見つからなければ `None`）の列。
+type LegacySlots = Vec<(String, Option<Guid>)>;
+
+/// Unityの旧方式の材質の探し方（`materialSearch`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacySearch {
+    /// モデルと同じフォルダの `Materials` だけ（0）。
+    Local,
+    /// モデルのフォルダから `Assets` まで各階層の `Materials`（1）。
+    RecursiveUp,
+    /// 上に加えてプロジェクト全体（2）。
+    Everywhere,
+}
+
+/// 置換表の無いFBXについて、Unityの旧方式でスロットごとの材質を探す。
+///
+/// ModelImporterの `materials` 欄（`importMaterials`/`materialImportMode`・
+/// `materialName`・`materialSearch`・`materialLocation`）に従う。
+/// 材質を取り込まない設定・FBX内蔵（`materialLocation: 1`）・FBXの材質が
+/// 無い場合は警告して `None` を返す。名前の照合は完全一致を先に、
+/// 無ければ大文字小文字を区別せずに行う（WindowsとmacOSのUnityと同じ結果になる）。
+/// 見つからないスロットは `None` のGUIDで返し、灰色材質にする。
+fn legacy_slots(
+    context: &mut LoadContext<'_>,
+    record: &AssetRecord,
+    fbx_relative: &str,
+) -> Result<Option<LegacySlots>, MaterialError> {
+    let settings = record
+        .meta
+        .importer()
+        .settings
+        .get("materials")
+        .and_then(yaml_serde::Value::as_mapping);
+    let Some(settings) = settings else {
+        context.warn("FBXに材質の置換表がないため材質を読まない");
+        return Ok(None);
+    };
+    let import = number_of(settings, "materialImportMode")
+        .or_else(|| number_of(settings, "importMaterials"))
+        .unwrap_or(1);
+    if import == 0 {
+        context.warn("FBXは材質を取り込まない設定のため材質を読まない");
+        return Ok(None);
+    }
+    if number_of(settings, "materialLocation").is_some_and(|location| location != 0) {
+        context.warn("FBXに材質の置換表がないため材質を読まない");
+        return Ok(None);
+    }
+    let naming = match number_of(settings, "materialName").unwrap_or(0) {
+        0 => LegacyNaming::Texture,
+        1 => LegacyNaming::Material,
+        2 => LegacyNaming::ModelAndMaterial,
+        3 => LegacyNaming::TextureOrModelAndMaterial,
+        other => {
+            context.warn(format!("未知の材質名の決め方のため材質を読まない: {other}"));
+            return Ok(None);
+        }
+    };
+    let search = match number_of(settings, "materialSearch").unwrap_or(1) {
+        0 => LegacySearch::Local,
+        1 => LegacySearch::RecursiveUp,
+        2 => LegacySearch::Everywhere,
+        other => {
+            context.warn(format!("未知の材質の探し方のため材質を読まない: {other}"));
+            return Ok(None);
+        }
+    };
+    let fbx_options = crate::fbx::FbxOptions::new();
+    let bytes = match context
+        .source
+        .read_limited(fbx_relative, fbx_options.max_file_bytes() as u64)
+    {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            context.warn(format!(
+                "旧方式の材質検索のためのFBXを読めないため材質を読まない: {}",
+                escape_diag(&error.to_string())
+            ));
+            return Ok(None);
+        }
+    };
+    let fbx = match crate::fbx::FbxFile::parse(&bytes, &fbx_options) {
+        Ok(fbx) => fbx,
+        Err(error) => {
+            context.warn(format!(
+                "旧方式の材質検索のためのFBXを読めないため材質を読まない: {error}"
+            ));
+            return Ok(None);
+        }
+    };
+    if fbx.materials().is_empty() {
+        context.warn("FBXに材質が無いため材質を読まない");
+        return Ok(None);
+    }
+    let (folder, file) = match fbx_relative.rsplit_once('/') {
+        Some((folder, file)) => (folder, file),
+        None => ("", fbx_relative),
+    };
+    let model_name = file.rsplit_once('.').map_or(file, |(stem, _)| stem);
+    let mut slots = Vec::new();
+    for material in fbx.materials() {
+        let texture = material.diffuse_texture.as_deref().map(file_stem);
+        let model_and_material = format!("{model_name}-{}", material.name);
+        let name = match naming {
+            LegacyNaming::Texture => texture.unwrap_or(&material.name).to_owned(),
+            LegacyNaming::Material => material.name.clone(),
+            LegacyNaming::ModelAndMaterial => model_and_material,
+            LegacyNaming::TextureOrModelAndMaterial => {
+                texture.map(str::to_owned).unwrap_or(model_and_material)
+            }
+        };
+        let found = find_legacy_material(context, folder, &name, search);
+        match &found {
+            Some(path) => context.warn(format!(
+                "置換表が無いため旧方式で材質を探した: {}: {path}",
+                material.name
+            )),
+            None => context.warn(format!(
+                "旧方式で材質が見つからないため灰色材質にする: {}: {name}.mat",
+                material.name
+            )),
+        }
+        let guid = found.and_then(|path| {
+            context
+                .index
+                .get_by_path(&path)
+                .map(|record| record.meta.guid().clone())
+        });
+        slots.push((material.name.clone(), guid));
+    }
+    Ok(Some(slots))
+}
+
+/// パスの最後の要素から拡張子を除いた名前を返す。区切りは `/` と `\\` を認める。
+fn file_stem(path: &str) -> &str {
+    let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    file.rsplit_once('.').map_or(file, |(stem, _)| stem)
+}
+
+/// 旧方式の探し方で `名前.mat` の索引パスを探す。
+///
+/// 各階層では完全一致を先に、無ければ大文字小文字を区別しない一致を使う。
+/// プロジェクト全体の検索で複数見つかった場合はパス順の先頭を使い、警告する。
+fn find_legacy_material(
+    context: &mut LoadContext<'_>,
+    folder: &str,
+    name: &str,
+    search: LegacySearch,
+) -> Option<String> {
+    let file = format!("{name}.mat");
+    let mut current = Some(folder);
+    while let Some(dir) = current {
+        let candidate = if dir.is_empty() {
+            format!("Materials/{file}")
+        } else {
+            format!("{dir}/Materials/{file}")
+        };
+        if let Some(path) = find_material_path(context.index, &candidate) {
+            return Some(path);
+        }
+        if search == LegacySearch::Local {
+            return None;
+        }
+        current = match dir.rsplit_once('/') {
+            Some((parent, _)) => Some(parent),
+            None if dir.is_empty() => None,
+            None => Some(""),
+        };
+    }
+    if search != LegacySearch::Everywhere {
+        return None;
+    }
+    let lowered = file.to_lowercase();
+    let mut matches: Vec<&str> = context
+        .index
+        .entries()
+        .iter()
+        .filter(|record| record.kind == AssetKind::Material)
+        .map(|record| record.path.as_str())
+        .filter(|path| {
+            let base = path.rsplit('/').next().unwrap_or(path);
+            base == file || base.to_lowercase() == lowered
+        })
+        .collect();
+    matches.sort_unstable();
+    let first = matches.first().map(|path| (*path).to_owned());
+    if matches.len() > 1 {
+        context.warn(format!(
+            "旧方式の材質検索で同名の材質が複数あるため先頭を使う: {file}"
+        ));
+    }
+    first
+}
+
+/// 索引から材質のパスを探す。完全一致を先に、無ければ大文字小文字を区別せずに探す。
+fn find_material_path(index: &AssetIndex, candidate: &str) -> Option<String> {
+    if let Some(record) = index.get_by_path(candidate)
+        && record.kind == AssetKind::Material
+    {
+        return Some(record.path.clone());
+    }
+    let lowered = candidate.to_lowercase();
+    let mut matches: Vec<&str> = index
+        .entries()
+        .iter()
+        .filter(|record| {
+            record.kind == AssetKind::Material && record.path.to_lowercase() == lowered
+        })
+        .map(|record| record.path.as_str())
+        .collect();
+    matches.sort_unstable();
+    matches.first().map(|path| (*path).to_owned())
+}
+
 /// ローダーと書き出しの共通の灰色材質。
 ///
 /// 材質名はスロット名（空なら `Material`）、不透明、基準色は中間調の灰色、
@@ -882,6 +1124,29 @@ impl<'a> LoadContext<'a> {
             ));
         }
         let (material, queue) = self.resolve_material(entry, &slot)?;
+        self.entries.push(VrmMaterialEntry { slot, material });
+        self.queues.push(queue);
+        Ok(())
+    }
+
+    /// 旧方式の検索で見つけた材質1件を材質列に積む。
+    ///
+    /// 見つからなかったスロット（`guid` が `None`）は灰色材質にする。
+    /// 材質数の上限超過だけは失敗として返す。
+    fn load_legacy_slot(&mut self, slot: String, guid: Option<Guid>) -> Result<(), MaterialError> {
+        if !self.seen_slots.insert(slot.clone()) {
+            return Ok(());
+        }
+        if self.entries.len() >= self.options.max_materials {
+            return Err(MaterialError::new(
+                MaterialErrorKind::LimitExceeded,
+                format!("材質数が上限を超えた: {}", self.entries.len() + 1),
+            ));
+        }
+        let (material, queue) = match guid {
+            Some(guid) => self.load_material_by_guid(&guid, None, "旧方式で見つけた材質", &slot)?,
+            None => (placeholder(&slot), -1),
+        };
         self.entries.push(VrmMaterialEntry { slot, material });
         self.queues.push(queue);
         Ok(())
@@ -1066,27 +1331,37 @@ impl<'a> LoadContext<'a> {
                 .with_source(error));
             }
         };
-        let file = match SerializedFile::parse(&bytes, &ParseOptions::new()) {
-            Ok(file) => file,
-            Err(error) => {
-                self.warn(format!(
-                    "材質のYAMLが読めないため灰色材質にする: {slot}: {error}"
-                ));
-                return Ok((placeholder(slot), -1));
-            }
-        };
         let mut found = None;
         let mut decode_error = None;
-        for document in file.documents() {
-            match document.decode() {
-                Ok(TypedObject::Material(material)) => {
-                    found = Some(material);
-                    break;
-                }
-                // 材質以外の文書は読み飛ばす。材質の読み取り失敗は覚えて警告に載せる。
-                Ok(_) => {}
+        if is_binary_serialized(&bytes) {
+            // Unity 2018以前やForce Binaryの資産は型木付きバイナリで保存される。
+            match BinaryFile::parse(&bytes, &BinaryOptions::new())
+                .and_then(|file| file.first_material())
+            {
+                Ok(material) => found = material,
+                Err(error) => decode_error = Some(error),
+            }
+        } else {
+            let file = match SerializedFile::parse(&bytes, &ParseOptions::new()) {
+                Ok(file) => file,
                 Err(error) => {
-                    decode_error = Some(error);
+                    self.warn(format!(
+                        "材質のYAMLが読めないため灰色材質にする: {slot}: {error}"
+                    ));
+                    return Ok((placeholder(slot), -1));
+                }
+            };
+            for document in file.documents() {
+                match document.decode() {
+                    Ok(TypedObject::Material(material)) => {
+                        found = Some(material);
+                        break;
+                    }
+                    // 材質以外の文書は読み飛ばす。材質の読み取り失敗は覚えて警告に載せる。
+                    Ok(_) => {}
+                    Err(error) => {
+                        decode_error = Some(error);
+                    }
                 }
             }
         }
@@ -1106,6 +1381,16 @@ impl<'a> LoadContext<'a> {
             self.warn(format!("材質に非有限値があるため灰色材質にする: {slot}"));
             return Ok((placeholder(slot), -1));
         }
+        if self.is_flat_lit_toon(&material, slot) {
+            let series = flat_lit_toon_series(&material);
+            let queue = effective_queue(&material, Some(series));
+            let mapped = self.map_flat_lit_toon(&material, slot, series)?;
+            if let Err(field) = validate_material(&mapped) {
+                self.warn(format!("材質値が不正なため灰色材質にする: {slot}: {field}"));
+                return Ok((placeholder(slot), queue));
+            }
+            return Ok((mapped, queue));
+        }
         let Some(capability) = self.shader_capability(&material, slot) else {
             self.warn(format!(
                 "未対応シェーダのため灰色材質にする: {slot}: {}",
@@ -1120,6 +1405,163 @@ impl<'a> LoadContext<'a> {
             return Ok((placeholder(slot), queue));
         }
         Ok((mapped, queue))
+    }
+
+    /// シェーダ参照がCubedParadoxのFlat Lit Toonかどうかを返す。
+    ///
+    /// `.shader` が索引にあれば先頭のシェーダ名に `Flat Lit Toon` を含むかで判定し、
+    /// 無ければ既知のGUID表で判定する。
+    fn is_flat_lit_toon(&mut self, material: &crate::unity::Material, slot: &str) -> bool {
+        let Some(guid) = material.shader.guid.as_ref() else {
+            return false;
+        };
+        if material.shader.is_null() {
+            return false;
+        }
+        if FLAT_LIT_TOON_SHADER_GUIDS.contains(&guid.as_str()) {
+            return true;
+        }
+        let Some(record) = self.index.get(guid) else {
+            return false;
+        };
+        if record.kind != AssetKind::Shader {
+            return false;
+        }
+        match self.source.read_limited(&record.path, MAX_SHADER_BYTES) {
+            Ok(bytes) => std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(first_shader_name)
+                .is_some_and(|name| name.contains("Flat Lit Toon")),
+            Err(_) => {
+                self.warn(format!("シェーダ名を読めないためGUID表で判定する: {slot}"));
+                false
+            }
+        }
+    }
+
+    /// Flat Lit ToonのプロパティをVRM材質に写像する。
+    ///
+    /// 写像は `FlatLitToonCore.cginc` と `Flat Lit Toon.shader` の計算に合わせる。
+    /// 基準色は `_MainTex × _Color`、影側は `1 - _Shadow` を掛けた色を
+    /// 硬い境界（`floor` による2値）で切り替える。発光は `_EmissionMap × _EmissionColor`、
+    /// 法線は `_BumpMap`、アウトラインは `_OutlineMode`（0なし・1Tinted・2Colored）と
+    /// `_outline_width × 0.01`、`_outline_color` である。
+    /// `_ColorMask` による色の掛け分けと、物体座標のアウトライン幅は近似として警告する。
+    fn map_flat_lit_toon(
+        &mut self,
+        material: &crate::unity::Material,
+        slot: &str,
+        series: ShaderSeries,
+    ) -> Result<VrmMaterial, MaterialError> {
+        let base = color(material, "_Color").unwrap_or([1.0, 1.0, 1.0, 1.0]);
+        let base_rgb = [
+            srgb_to_linear(base[0]),
+            srgb_to_linear(base[1]),
+            srgb_to_linear(base[2]),
+        ];
+        if has_texture(material, "_ColorMask") && base != [1.0, 1.0, 1.0, 1.0] {
+            self.warn(format!(
+                "カラーマスクによる色の掛け分けは写像せず、全体に色を掛ける: {slot}"
+            ));
+        }
+        let alpha_mode = match series {
+            ShaderSeries::Opaque => VrmAlphaMode::Opaque,
+            ShaderSeries::Mask => VrmAlphaMode::Mask,
+            ShaderSeries::Blend => VrmAlphaMode::Blend,
+        };
+        let alpha_cutoff = clamp01(number(material, "_Cutoff").unwrap_or(0.5)) as f32;
+        let zwrite = number(material, "_ZWrite").unwrap_or(1.0) != 0.0;
+        let base_color_image = self.resolve_texture(material, slot, "_MainTex")?;
+        let normal_image = self.resolve_texture(material, slot, "_BumpMap")?;
+
+        // 影側は `lerp(間接光, 直接光, 1 - _Shadow)` で暗くなる。MToonでは影色を
+        // 基準色の `1 - _Shadow` 倍にし、間接光はMToonの環境光に任せる。
+        let shadow = clamp01(number(material, "_Shadow").unwrap_or(0.4)) as f32;
+        let kept = 1.0 - shadow;
+        let shade_color_factor = [base_rgb[0] * kept, base_rgb[1] * kept, base_rgb[2] * kept];
+
+        // 発光の既定テクスチャは白のため、未割り当てなら色だけで光る。
+        let (emissive_factor, clamped) = emission_linear_or(material, [0.0, 0.0, 0.0]);
+        if clamped {
+            self.warn(format!("1を超える発光色は1に丸める: {slot}"));
+        }
+        let emissive_image = if emissive_factor == [0.0, 0.0, 0.0] {
+            None
+        } else {
+            self.resolve_texture(material, slot, "_EmissionMap")?
+        };
+
+        let outline_mode = number(material, "_OutlineMode").unwrap_or(0.0) as i64;
+        let (outline_width_mode, outline_width_factor, outline_color_factor, outline_lighting_mix) =
+            match outline_mode {
+                1 | 2 => {
+                    let width = number(material, "_outline_width").unwrap_or(0.2).max(0.0);
+                    let outline = color(material, "_outline_color").unwrap_or([0.5, 0.5, 0.5, 1.0]);
+                    self.warn(format!(
+                        "アウトライン幅は物体座標の値を世界座標の幅として近似する: {slot}"
+                    ));
+                    // Tintedは基準色に線色を掛けて照らし、Coloredは線色だけを照らす。
+                    // MToonの照明混合はどちらも基準色を掛けるため、Coloredは混合0で近似する。
+                    let mix = if outline_mode == 1 {
+                        1.0
+                    } else {
+                        self.warn(format!(
+                            "Coloredアウトラインは照明を受けない線色で近似する: {slot}"
+                        ));
+                        0.0
+                    };
+                    (
+                        VrmOutlineWidthMode::WorldCoordinates,
+                        (width * 0.01) as f32,
+                        [
+                            srgb_to_linear(outline[0]),
+                            srgb_to_linear(outline[1]),
+                            srgb_to_linear(outline[2]),
+                        ],
+                        mix,
+                    )
+                }
+                _ => (VrmOutlineWidthMode::None, 0.0, [0.0, 0.0, 0.0], 1.0),
+            };
+
+        Ok(VrmMaterial {
+            name: material.name.clone(),
+            alpha_mode,
+            alpha_cutoff,
+            // Flat Lit Toonはカリング指定を持たず、Unityの既定の背面カリングで描く。
+            double_sided: false,
+            base_color_factor: [base_rgb[0], base_rgb[1], base_rgb[2], base[3] as f32],
+            base_color_image,
+            emissive_factor,
+            emissive_image,
+            normal_image,
+            normal_scale: 1.0,
+            mtoon: Some(VrmMtoonParameters {
+                transparent_with_z_write: series == ShaderSeries::Blend && zwrite,
+                render_queue_offset: 0,
+                shade_color_factor,
+                shade_multiply_image: base_color_image,
+                // `floor(saturate(光量) * 2)` の2値のため、境界は光量の中点で硬く切る。
+                shading_shift_factor: 0.0,
+                shading_toony_factor: 0.95,
+                gi_equalization_factor: 0.9,
+                matcap_factor: [0.0, 0.0, 0.0],
+                matcap_image: None,
+                rim_multiply_image: None,
+                outline_width_mode,
+                outline_width_factor,
+                outline_width_multiply_image: None,
+                outline_color_factor,
+                outline_lighting_mix_factor: outline_lighting_mix,
+                parametric_rim_color_factor: [0.0, 0.0, 0.0],
+                parametric_rim_fresnel_power_factor: 5.0,
+                parametric_rim_lift_factor: 0.0,
+                rim_lighting_mix_factor: 1.0,
+                uv_animation_scroll_x_speed_factor: 0.0,
+                uv_animation_scroll_y_speed_factor: 0.0,
+                uv_animation_rotation_speed_factor: 0.0,
+            }),
+        })
     }
 
     /// シェーダ参照から能力（系列・アウトライン・Multi/Lite）を求める。
@@ -3658,7 +4100,13 @@ fn shade_extra_layers(material: &crate::unity::Material) -> Vec<ShadeExtraLayer>
 
 /// 発光色を線形で読む。1超の有無も返す（`ReadEmission` の係数と対応）。
 fn emission_linear(material: &crate::unity::Material) -> ([f32; 3], bool) {
-    let emission = color(material, "_EmissionColor").unwrap_or([1.0, 1.0, 1.0, 1.0]);
+    emission_linear_or(material, [1.0, 1.0, 1.0])
+}
+
+/// 発光色を線形で読む。欄が無い場合は `fallback` を使う。1超の有無も返す。
+fn emission_linear_or(material: &crate::unity::Material, fallback: [f64; 3]) -> ([f32; 3], bool) {
+    let emission =
+        color(material, "_EmissionColor").unwrap_or([fallback[0], fallback[1], fallback[2], 1.0]);
     let raw = [
         srgb_to_linear_raw(emission[0]),
         srgb_to_linear_raw(emission[1]),
@@ -3966,6 +4414,15 @@ fn capability_of_name(name: &str, material: &crate::unity::Material) -> Option<S
         is_multi,
         is_lite,
     })
+}
+
+/// Flat Lit Toonの `_Mode`（0不透明・1カットアウト・2Fade・3Transparent）から系列を求める。
+fn flat_lit_toon_series(material: &crate::unity::Material) -> ShaderSeries {
+    match number(material, "_Mode").unwrap_or(0.0) as i64 {
+        1 => ShaderSeries::Mask,
+        2 | 3 => ShaderSeries::Blend,
+        _ => ShaderSeries::Opaque,
+    }
 }
 
 /// `.mat` から実効描画順を求める。

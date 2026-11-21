@@ -1,6 +1,7 @@
 //! Unityの保存データを参照関係を壊さず読み取る層。
 //!
 //! 担当するのは、展開済み配置の索引付けと、Unity YAML文書の汎用・型付き読み取り、
+//! 型木付きバイナリ保存形式（[`crate::unity::BinaryFile`]）の汎用読み取りと材質への写像、
 //! 単一ファイル内の階層の組み立てまでである。VRM生成・prefab合成・FBX解析・
 //! 画像デコード・スクリプト実行は行わない。
 //!
@@ -20,6 +21,7 @@
 //! 型・索引・YAML・階層はNative/Web共通で、同期の `&[u8]` 入力APIとする。
 //! ディレクトリ走査だけがNative限定である。
 
+mod binary;
 mod error;
 mod file_id;
 mod hierarchy;
@@ -33,8 +35,11 @@ mod yaml;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 
+pub use binary::{BinaryFile, BinaryObject, BinaryOptions, BinaryValue, is_binary_serialized};
 pub use error::{UnityError, UnityErrorKind};
-pub use file_id::{game_object_file_id, mesh_file_id, skinned_mesh_renderer_file_id};
+pub use file_id::{
+    game_object_file_id, mesh_file_id, skinned_mesh_renderer_file_id, transform_file_id,
+};
 pub use hierarchy::{HierarchyOptions, LocalHierarchy, LocalNode};
 pub use index::{AssetIndex, AssetRecord, IndexOptions, ReferenceLocation};
 pub use meta::{

@@ -167,6 +167,40 @@ fn 代表importerと未知importerとフォルダmetaを読める() {
 }
 
 #[test]
+fn 旧版metaのtimecreatedとlicensetypeはimporterとみなさない() {
+    // Unity 2018以前のmetaは `timeCreated` と `licenseType` をトップレベルに持つ。
+    let text = format!(
+        "fileFormatVersion: 2\nguid: {}\ntimeCreated: 1519744173\nlicenseType: Free\nModelImporter:\n  serializedVersion: 19\n",
+        guid(4)
+    );
+    let meta = AssetMeta::parse(text.as_bytes()).expect("旧版metaは読める");
+    assert_eq!(meta.importer().name, "ModelImporter");
+
+    let text = format!(
+        "fileFormatVersion: 2\nguid: {}\nfolderAsset: yes\ntimeCreated: 1519741135\nlicenseType: Free\nDefaultImporter:\n  userData: \n",
+        guid(5)
+    );
+    let meta = AssetMeta::parse(text.as_bytes()).expect("旧版フォルダmetaは読める");
+    assert!(meta.is_folder());
+    assert_eq!(meta.importer().name, "DefaultImporter");
+}
+
+#[test]
+fn シーンはシーン種別に分類する() {
+    let mut index = AssetIndex::new();
+    index
+        .insert(
+            "Avatar/Scene.unity",
+            AssetMeta::parse(&file_meta(6, "DefaultImporter", "  userData: \n")).expect("読める"),
+        )
+        .expect("登録できる");
+    assert_eq!(
+        index.get_by_path("Avatar/Scene.unity").expect("ある").kind,
+        AssetKind::Scene
+    );
+}
+
+#[test]
 fn modelimporterの置換表を元の型名付きで保持する() {
     let body = r#"  serializedVersion: 22200
   externalObjects:

@@ -1501,7 +1501,7 @@ fn build_direct_tree(
                 reversed.reverse();
                 let path = reversed;
                 // Transform fileIDは階層パスから求める。
-                let local_id = transform_file_id(&path.join("/"));
+                let local_id = crate::unity::transform_file_id(&path.join("/"));
                 node_fbx.insert(node_index, (view_index, model_index));
                 (
                     Some(TreeSource {
@@ -1696,7 +1696,7 @@ fn collect_main_instance_overlays(
     main_fbx_guid: &str,
     label: &str,
 ) -> Result<MainInstanceOverlays, VrmError> {
-    let import_tr = transform_file_id("");
+    let import_tr = crate::unity::transform_file_id("");
     let import_go = crate::unity::game_object_file_id("");
     // 取り込みfileIDからFBXモデル索引への逆引き表を作る。
     let mut tr_to_fbx: HashMap<FileId, usize> = HashMap::new();
@@ -2587,7 +2587,7 @@ fn build_fbx_hierarchy(file: &FbxFile<'_>, label: &str) -> Result<FbxHierarchy, 
     let mut path_at = HashMap::new();
     for p in &out_paths {
         let go = crate::unity::game_object_file_id(p);
-        let tr = transform_file_id(p);
+        let tr = crate::unity::transform_file_id(p);
         path_at.insert(go, p.clone());
         path_at.insert(tr, p.clone());
         go_fid_at.push(go);
@@ -2595,7 +2595,7 @@ fn build_fbx_hierarchy(file: &FbxFile<'_>, label: &str) -> Result<FbxHierarchy, 
     }
     // 取り込みルートも登録する。
     path_at.insert(crate::unity::game_object_file_id(""), String::new());
-    path_at.insert(transform_file_id(""), String::new());
+    path_at.insert(crate::unity::transform_file_id(""), String::new());
     Ok(FbxHierarchy {
         paths: out_paths,
         children_sorted,
@@ -2603,16 +2603,6 @@ fn build_fbx_hierarchy(file: &FbxFile<'_>, label: &str) -> Result<FbxHierarchy, 
         tr_fid_at,
         path_at,
     })
-}
-
-/// Transformの取り込みfileIDを作る。`Type:Transform->//RootNode/root/{path}/Transform0` である。
-fn transform_file_id(hierarchy_path: &str) -> FileId {
-    let text = if hierarchy_path.is_empty() {
-        "Type:Transform->//RootNode/root/Transform0".to_owned()
-    } else {
-        format!("Type:Transform->//RootNode/root/{hierarchy_path}/Transform0")
-    };
-    xxhash_rust::xxh64::xxh64(text.as_bytes(), 0) as FileId
 }
 
 // KumaPhone相当の副階層。Milfy.prefab内の2件目のインスタンス（副Prefab）と、
@@ -3058,7 +3048,7 @@ fn build_general_tree(
     label: &str,
 ) -> Result<Vec<TreeNode>, VrmError> {
     let models = fbx.models();
-    let import_tr = transform_file_id("");
+    let import_tr = crate::unity::transform_file_id("");
     let import_go = crate::unity::game_object_file_id("");
     // 取り込み根の有効状態。ツリーの頂点に畳み込む。
     let import_active = overlays.active.get(&import_go).copied().unwrap_or(true);
@@ -3486,7 +3476,7 @@ fn build_milfy_tree(
     });
     // 追加物（Milfyルート直下のローカル）。stripped等の非ローカルは副階層のはずであり、
     // graft 対象でなければ明示的に失敗する。
-    let root_tr = transform_file_id("");
+    let root_tr = crate::unity::transform_file_id("");
     let mut root_added: Vec<FileId> = Vec::new();
     if let Some(list) = added_by_parent.get(&root_tr) {
         for object in list {
@@ -3794,7 +3784,7 @@ struct PhoneAnchors {
 /// 副Prefab根の基準点を求める。取り込み根に対応するstrippedが1件ずつあるはずであり、
 /// それ以外（複数・欠落）は明示的に失敗する。
 fn phone_anchors(phone: &PhoneSubtree, label: &str) -> Result<PhoneAnchors, VrmError> {
-    let import_tr = transform_file_id("");
+    let import_tr = crate::unity::transform_file_id("");
     let import_go = crate::unity::game_object_file_id("");
     let mut root_tr: Vec<FileId> = Vec::new();
     let mut root_go: Vec<FileId> = Vec::new();
@@ -3943,7 +3933,7 @@ fn build_graft_subtree(
             model_id: model_id_phone.clone(),
             path: vec![root_name.clone()],
             asset_guid: phone.fbx_guid.clone(),
-            local_id: transform_file_id(""),
+            local_id: crate::unity::transform_file_id(""),
         }),
         added_trs: Some(root_trs),
         fbx_index: None,
@@ -3999,7 +3989,7 @@ fn build_graft_subtree(
     let mut stack: Vec<GraftFrame> = Vec::new();
     // graft根直下の追加物（取り込み根対象）を先に積み、FBXルートを後に積む。
     // 後に積んだFBXルートから先に訪ねるため、子順はFBX・追加物の順になる。
-    if let Some(added) = phone_added_by_target.get(&transform_file_id("")) {
+    if let Some(added) = phone_added_by_target.get(&crate::unity::transform_file_id("")) {
         for object in added.iter().rev() {
             stack.push(GraftFrame::Added {
                 parent: root_index,
@@ -4034,7 +4024,7 @@ fn build_graft_subtree(
                         model_id: model_id_phone.clone(),
                         path: full.clone(),
                         asset_guid: phone.fbx_guid.clone(),
-                        local_id: transform_file_id(&full.join("/")),
+                        local_id: crate::unity::transform_file_id(&full.join("/")),
                     }),
                     added_trs: None,
                     fbx_index: None,
@@ -4045,7 +4035,7 @@ fn build_graft_subtree(
                 });
                 nodes[tree_parent].children.push(node_index);
                 // 子の収集：FBX子（名前順）＋追加物（登録順）。
-                let tr_fid = transform_file_id(&full.join("/"));
+                let tr_fid = crate::unity::transform_file_id(&full.join("/"));
                 if let Some(added) = phone_added_by_target.get(&tr_fid) {
                     for object in added.iter().rev() {
                         stack.push(GraftFrame::Added {
@@ -4149,7 +4139,7 @@ fn graft_root_state(
     anchors: &PhoneAnchors,
     label: &str,
 ) -> Result<(String, TrsF64, bool), VrmError> {
-    let import_tr = transform_file_id("");
+    let import_tr = crate::unity::transform_file_id("");
     let import_go = crate::unity::game_object_file_id("");
     let base_name = phone
         .asset_path
@@ -5313,7 +5303,7 @@ fn collect_components(
     // strippedの対応付け。local fid → source fid → tree node である。
     // 取り込み根由来（import root）は graft 根と混同するため結ばない。
     // 該当はAvatarDescriptor等の所属だけであり、参照解決時に失敗させる。
-    let import_tr = transform_file_id("");
+    let import_tr = crate::unity::transform_file_id("");
     let import_go = crate::unity::game_object_file_id("");
     for (local, stripped) in parsed.stripped_tr.iter() {
         if stripped.source_fid == import_tr {
@@ -7206,7 +7196,7 @@ mod tests {
         // 取り込み根の初期化は想定内であり通す。
         // 骨Transformへの `m_LocalPosition` 上書きは集計し、対象不明は失敗させる。
         let main_guid = "9ef94258554e06b4ab03fbe9fc914c5c";
-        let bone_fid = transform_file_id("Armature/Hips");
+        let bone_fid = crate::unity::transform_file_id("Armature/Hips");
         let hier = FbxHierarchy {
             paths: vec!["Armature".to_owned(), "Armature/Hips".to_owned()],
             children_sorted: vec![vec![1], vec![]],
@@ -7214,7 +7204,7 @@ mod tests {
                 crate::unity::game_object_file_id("Armature"),
                 crate::unity::game_object_file_id("Armature/Hips"),
             ],
-            tr_fid_at: vec![transform_file_id("Armature"), bone_fid],
+            tr_fid_at: vec![crate::unity::transform_file_id("Armature"), bone_fid],
             path_at: HashMap::new(),
         };
         let bone_mod = PrefabMod {
@@ -7225,7 +7215,7 @@ mod tests {
             obj_ref: None,
         };
         let root_mod = PrefabMod {
-            target_fid: transform_file_id(""),
+            target_fid: crate::unity::transform_file_id(""),
             target_guid: Some(main_guid.to_owned()),
             path: "m_LocalPosition.x".to_owned(),
             value: Some(yaml_serde::Value::Number(0.into())),

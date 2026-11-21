@@ -105,6 +105,81 @@ impl SerializedFile {
                 format!("SerializedFileが上限を超えた: {}バイト", bytes.len()),
             ));
         }
+        if super::is_binary_serialized(bytes) {
+            return Self::parse_binary(bytes, options);
+        }
+        let mut file = Self::parse_text(bytes, options)?;
+        normalize_legacy_prefab(&mut file.documents);
+        Ok(file)
+    }
+
+    /// 型木付きバイナリを読み、Unity YAMLと同じ形の文書列にする。
+    ///
+    /// 各オブジェクトを [`BinaryFile::to_yaml`](super::BinaryFile::to_yaml) で
+    /// 汎用値に写し、型木の根の型名をクラス名にする。本文の原文は持たない。
+    fn parse_binary(bytes: &[u8], options: &ParseOptions) -> Result<Self, UnityError> {
+        let file = super::BinaryFile::parse(bytes, &super::BinaryOptions::new())?;
+        if file.objects().len() > options.max_documents {
+            return Err(UnityError::new(
+                UnityErrorKind::LimitExceeded,
+                format!("文書数が上限を超えた: {}", file.objects().len()),
+            ));
+        }
+        let mut documents = Vec::with_capacity(file.objects().len());
+        let mut seen: HashMap<FileId, ()> = HashMap::new();
+        for object in file.objects() {
+            if seen.insert(object.path_id, ()).is_some() {
+                return Err(UnityError::new(
+                    UnityErrorKind::Conflict,
+                    format!("fileIDが重複する: {}", object.path_id),
+                )
+                .with_file_id(object.path_id));
+            }
+            let value = file.read_value(object)?;
+            let raw = file.to_yaml(&value);
+            let Value::Mapping(mapping) = &raw else {
+                return Err(UnityError::new(
+                    UnityErrorKind::InvalidBinary,
+                    "オブジェクトの根が構造体でない",
+                )
+                .with_file_id(object.path_id)
+                .with_class_id(object.class_id));
+            };
+            // 旧版のstripped型は対応先だけを持つ。型の印が無い版でも同じ形なら扱う。
+            let stripped = object.stripped
+                || (!mapping.is_empty()
+                    && mapping.keys().all(|key| {
+                        matches!(
+                            key.as_str(),
+                            Some(
+                                "m_PrefabParentObject"
+                                    | "m_PrefabInternal"
+                                    | "m_CorrespondingSourceObject"
+                                    | "m_PrefabInstance"
+                                    | "m_PrefabAsset"
+                            )
+                        )
+                    }));
+            documents.push(Document {
+                file_id: object.path_id,
+                class_id: object.class_id,
+                class_name: match file.class_name(object) {
+                    "EditorExtension" | "" => super::objects::known_class_name(object.class_id)
+                        .unwrap_or("EditorExtension")
+                        .to_owned(),
+                    name => name.to_owned(),
+                },
+                stripped,
+                raw,
+                body: String::new(),
+            });
+        }
+        normalize_legacy_prefab(&mut documents);
+        Ok(Self { documents })
+    }
+
+    /// Unity YAMLのテキストを読む。
+    fn parse_text(bytes: &[u8], options: &ParseOptions) -> Result<Self, UnityError> {
         let text = std::str::from_utf8(bytes).map_err(|error| {
             UnityError::new(
                 UnityErrorKind::UnsupportedFormat,
@@ -237,10 +312,100 @@ impl SerializedFile {
         &self.documents
     }
 
+    /// 文書の一覧を書き換え可能で返す。旧方式の取り込みfileIDの読み替えに使う。
+    pub(crate) fn documents_mut(&mut self) -> &mut [Document] {
+        &mut self.documents
+    }
+
     /// fileIDで文書を探す。ない場合は `None` を返す。
     pub fn document(&self, file_id: FileId) -> Option<&Document> {
         self.documents.iter().find(|doc| doc.file_id() == file_id)
     }
+}
+
+/// Unity 2018.2以前のPrefab表現を2018.3以降の名前へ揃える。
+///
+/// - `Prefab`（classID 1001）のうち `m_IsPrefabParent` が真のものは
+///   Prefab資産自身の印であり、インスタンスではないため文書列から除く。
+/// - それ以外の `Prefab` は `PrefabInstance` とし、`m_ParentPrefab` を
+///   `m_SourcePrefab` と読む。
+/// - 各文書の `m_PrefabParentObject` は `m_CorrespondingSourceObject` と読む。
+/// - `m_PrefabInternal` は、資産自身の印を指す場合は `m_PrefabAsset`
+///   （`m_PrefabInstance` はnull）、それ以外は `m_PrefabInstance` と読む。
+///
+/// 新しい名前の欄が既にある場合は書き換えない。
+fn normalize_legacy_prefab(documents: &mut Vec<Document>) {
+    let mut asset_markers: Vec<FileId> = Vec::new();
+    for document in documents.iter() {
+        if document.class_id == 1001
+            && document.class_name == "Prefab"
+            && document
+                .raw
+                .get("m_IsPrefabParent")
+                .and_then(|value| value.as_i64().or(value.as_bool().map(i64::from)))
+                .is_some_and(|flag| flag != 0)
+        {
+            asset_markers.push(document.file_id);
+        }
+    }
+    documents.retain(|document| !asset_markers.contains(&document.file_id));
+    for document in documents.iter_mut() {
+        let Value::Mapping(mapping) = &document.raw else {
+            continue;
+        };
+        let is_legacy_instance = document.class_id == 1001 && document.class_name == "Prefab";
+        let legacy_keys = ["m_PrefabParentObject", "m_PrefabInternal", "m_ParentPrefab"];
+        if !is_legacy_instance && !legacy_keys.iter().any(|key| mapping.contains_key(*key)) {
+            continue;
+        }
+        let mut out = Mapping::new();
+        for (key, value) in mapping {
+            let name = key.as_str().unwrap_or_default();
+            let renamed = match name {
+                "m_PrefabParentObject" if !mapping.contains_key("m_CorrespondingSourceObject") => {
+                    Some("m_CorrespondingSourceObject")
+                }
+                "m_ParentPrefab"
+                    if is_legacy_instance && !mapping.contains_key("m_SourcePrefab") =>
+                {
+                    Some("m_SourcePrefab")
+                }
+                "m_PrefabInternal" if !mapping.contains_key("m_PrefabInstance") => {
+                    let local = value.get("guid").is_none();
+                    let target = value.get("fileID").and_then(Value::as_i64);
+                    if local && target.is_some_and(|target| asset_markers.contains(&target)) {
+                        out.insert(Value::String("m_PrefabInstance".to_owned()), null_ref());
+                        Some("m_PrefabAsset")
+                    } else {
+                        Some("m_PrefabInstance")
+                    }
+                }
+                _ => None,
+            };
+            match renamed {
+                Some(new_name) => {
+                    out.insert(Value::String(new_name.to_owned()), value.clone());
+                }
+                None => {
+                    out.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        document.raw = Value::Mapping(out);
+        if is_legacy_instance {
+            document.class_name = "PrefabInstance".to_owned();
+        }
+    }
+}
+
+/// null参照 `{fileID: 0}` を作る。
+fn null_ref() -> Value {
+    let mut mapping = Mapping::new();
+    mapping.insert(
+        Value::String("fileID".to_owned()),
+        Value::Number(yaml_serde::Number::from(0)),
+    );
+    Value::Mapping(mapping)
 }
 
 /// 列0の `---` から始まる行が文書ヘッダの完全形かどうかを返す。
@@ -414,6 +579,11 @@ impl Document {
     /// ない。利用者がタグ名や値の形に依存してはならない。
     pub fn raw(&self) -> &Value {
         &self.raw
+    }
+
+    /// クラス本体の汎用データを書き換え可能で返す。
+    pub(crate) fn raw_mut(&mut self) -> &mut Value {
+        &mut self.raw
     }
 
     /// 文書を代表型に読み替える。

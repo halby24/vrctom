@@ -250,6 +250,20 @@ const KNOWN_CLASSES: [(i32, &str); 6] = [
     (1001, "PrefabInstance"),
 ];
 
+/// 既知のclassIDのクラス名を返す。
+///
+/// バイナリ保存形式のstripped型は根の型名が基底の `EditorExtension` になるため、
+/// クラス名をこの表で補う。`PrefabInstance`（1001）は旧版の名前 `Prefab` を返す。
+pub(crate) fn known_class_name(class_id: i32) -> Option<&'static str> {
+    if class_id == 1001 {
+        return Some("Prefab");
+    }
+    KNOWN_CLASSES
+        .iter()
+        .find(|(id, _)| *id == class_id)
+        .map(|(_, name)| *name)
+}
+
 /// 文書を代表型に読み替える。
 ///
 /// classIDとクラス名の明白な不一致は、`stripped` より先に検出する。

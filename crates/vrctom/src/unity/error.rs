@@ -145,6 +145,8 @@ pub enum UnityErrorKind {
     InvalidMetadata,
     /// Unity YAMLの枠や構文が壊れている場合。
     InvalidYaml,
+    /// バイナリ保存形式の見出し・型木・本文が壊れている場合。
+    InvalidBinary,
     /// 参照の形状が壊れている場合。
     InvalidReference,
     /// GUID・パス・fileIDの重複など、後勝ちにしない衝突の場合。

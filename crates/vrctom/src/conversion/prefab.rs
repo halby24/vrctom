@@ -472,7 +472,7 @@ pub fn convert_prefab(
                 format!("Prefabを読めない: {prefab_path}: {error}"),
             ))
         })?;
-    let prefab_file = SerializedFile::parse(
+    let mut prefab_file = SerializedFile::parse(
         &prefab_bytes,
         &ParseOptions::new().with_max_file_bytes(limits.max_prefab_bytes),
     )
@@ -484,6 +484,28 @@ pub fn convert_prefab(
     })?;
     // 4. FBXを一度だけ解析する。表情・基準姿勢の解決に解析結果を使い回す。
     let file = FbxFile::parse(fbx_bytes, fbx_options).map_err(PrefabConversionError::Fbx)?;
+    // 2019.3より前の取り込みfileIDで書かれたPrefab・シーンは、以降の段が扱う
+    // 新方式のfileIDへ一度だけ読み替える。
+    let legacy = crate::vrm::modernize_legacy_import_ids(
+        &mut prefab_file,
+        &fbx_guid,
+        &record.meta.legacy_recycle_names(),
+        &file,
+    )
+    .map_err(PrefabConversionError::Prefab)?;
+    if legacy.rewritten > 0 {
+        warnings.push(format!(
+            "旧方式の取り込みfileIDを新方式へ{}件読み替えた",
+            legacy.rewritten
+        ));
+    }
+    if !legacy.unresolved.is_empty() {
+        warnings.push(format!(
+            "旧方式の取り込みfileIDを新方式へ写せない対象{}件: {}",
+            legacy.unresolved.len(),
+            legacy.unresolved.join(", ")
+        ));
+    }
     // 3. 表情・基準姿勢を中間モデル生成前に解決して `VrmOptions` へ反映する。
     // 空の解決結果は何も設定しない。
     let mut owned_vrm_options = vrm_options.clone();

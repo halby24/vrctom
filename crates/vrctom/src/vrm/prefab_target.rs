@@ -201,7 +201,7 @@ pub fn resolve_prefab_target(
 
 /// 全Prefabをパス昇順に走査し、変換対象のFBXを決める。
 ///
-/// 走査対象は種別がPrefabの記録だけであり、本文が読めない・解析できない
+/// 走査対象は種別がPrefabとシーン（`.unity`）の記録だけであり、本文が読めない・解析できない
 /// Prefabは `unreadable` に記録して全体は成功させる。ただし走査の合計
 /// 読み取り量が上限を超えた場合は全体を失敗させ、途中結果で成功扱いにしない。
 /// 個別Prefabの上限超過は `unreadable` に記録して次へ進み、合計予算は消費しない。
@@ -218,7 +218,7 @@ pub fn list_prefab_targets(
     let mut prefabs: Vec<&crate::unity::AssetRecord> = index
         .entries()
         .iter()
-        .filter(|entry| entry.kind == AssetKind::Prefab)
+        .filter(|entry| matches!(entry.kind, AssetKind::Prefab | AssetKind::Scene))
         .collect();
     prefabs.sort_by(|a, b| a.path.cmp(&b.path));
     let parse_options = ParseOptions::new().with_max_file_bytes(limits.max_prefab_bytes);

@@ -70,9 +70,9 @@ pub use physics_prefab::{
     PrefabScanIssue, derive_physics_sidecar, derive_physics_sidecar_with, find_prefab_candidates,
 };
 pub use prefab::{
-    PrefabBaseMaterial, PrefabHierarchyNode, PrefabMeshView, PrefabMode, PrefabPlan,
-    apply_prefab_plan, plan_prefab_assignment, prefab_base_materials, prefab_hierarchy_paths,
-    resolve_prefab_pool_paths,
+    LegacyImportIdReport, PrefabBaseMaterial, PrefabHierarchyNode, PrefabMeshView, PrefabMode,
+    PrefabPlan, apply_prefab_plan, modernize_legacy_import_ids, plan_prefab_assignment,
+    prefab_base_materials, prefab_hierarchy_paths, resolve_prefab_pool_paths,
 };
 pub use prefab_baseline::prefab_baseline_weights;
 pub use prefab_target::{

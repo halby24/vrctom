@@ -113,6 +113,11 @@ impl FbxOptions {
         }
     }
 
+    /// ファイルサイズの上限（バイト数）を返す。
+    pub fn max_file_bytes(&self) -> usize {
+        self.max_file_bytes
+    }
+
     /// ファイルサイズの上限（バイト数）を変更する。
     pub fn with_max_file_bytes(mut self, max_file_bytes: usize) -> Self {
         self.max_file_bytes = max_file_bytes;
@@ -477,14 +482,20 @@ pub struct Model {
 
 /// 材質1件の識別子。
 ///
-/// 色・テクスチャ・シェーダは読まず、IDと名前だけを保持する。
-/// 面の材質番号とスロット順の対応付けに使う。
+/// 色・シェーダは読まず、IDと名前と拡散テクスチャのファイル名だけを保持する。
+/// 面の材質番号とスロット順の対応付けと、Unityの旧方式の材質検索
+/// （拡散テクスチャ名で `.mat` を探す）に使う。
 #[derive(Debug, Clone)]
 pub struct Material {
     /// オブジェクトID。
     pub id: ObjectId,
     /// 材質名。`Name\x00Class` 形式の場合は最初の `\x00` で切る。
     pub name: String,
+    /// `DiffuseColor` に接続したテクスチャのファイル名（書かれたまま）。
+    ///
+    /// `FileName`・`RelativeFilename`・テクスチャ名の順に、空でない最初の値である。
+    /// 接続が無い場合は `None` である。複数ある場合は最初の接続を使う。
+    pub diffuse_texture: Option<String>,
 }
 
 /// メッシュ1件の要約。
@@ -833,7 +844,8 @@ impl<'a> FbxFile<'a> {
         let unit_scale_factor = read_unit_scale(&top)?;
         let mut models = read_models(&top)?;
         let mut meshes = read_meshes(bytes, &top)?;
-        let materials = read_material_objects(&top)?;
+        let mut materials = read_material_objects(&top)?;
+        wire_diffuse_textures(&top, &mut materials)?;
         let deformers = read_deformers(&top)?;
         let (pose_nodes, pose_ids) = read_pose_nodes(&top)?;
         // FBXのオブジェクトIDは全体で一意であり、衝突は
@@ -1882,9 +1894,76 @@ fn read_material_objects(top: &[RawNode]) -> Result<Vec<Material>, FbxError> {
         }
         let object = ObjectId(id);
         let name = split_class_name(node.props.get(1).and_then(RawProp::as_bytes), object)?;
-        materials.push(Material { id: object, name });
+        materials.push(Material {
+            id: object,
+            name,
+            diffuse_texture: None,
+        });
     }
     Ok(materials)
+}
+
+/// `Objects` 直下の `Texture` と `Connections` の `OP`（子→親・属性）から、
+/// 材質の `DiffuseColor` に繋がるテクスチャのファイル名を埋める。
+///
+/// 未知IDへの接続は無視する。テクスチャのファイル名は `FileName`・
+/// `RelativeFilename`・オブジェクト名の順に空でない最初の値を使う。
+fn wire_diffuse_textures(top: &[RawNode], materials: &mut [Material]) -> Result<(), FbxError> {
+    let Some(objects) = top.iter().find(|node| node.name.as_ref() == "Objects") else {
+        return Ok(());
+    };
+    let mut files: HashMap<i64, String> = HashMap::new();
+    for node in objects.children_by("Texture") {
+        let Some(id) = node.props.first().and_then(RawProp::as_int) else {
+            continue;
+        };
+        let string_of = |name: &str| {
+            node.child(name)
+                .and_then(|child| child.props.first())
+                .and_then(RawProp::as_bytes)
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .filter(|text| !text.is_empty())
+        };
+        let file = match string_of("FileName").or_else(|| string_of("RelativeFilename")) {
+            Some(file) => file,
+            None => split_class_name(node.props.get(1).and_then(RawProp::as_bytes), ObjectId(id))?,
+        };
+        if !file.is_empty() {
+            files.insert(id, file);
+        }
+    }
+    if files.is_empty() {
+        return Ok(());
+    }
+    let at_material: HashMap<i64, usize> = materials
+        .iter()
+        .enumerate()
+        .map(|(index, material)| (material.id.value(), index))
+        .collect();
+    let Some(connections) = top.iter().find(|node| node.name.as_ref() == "Connections") else {
+        return Ok(());
+    };
+    for node in &connections.children {
+        if node.props.first().and_then(RawProp::as_bytes) != Some(b"OP".as_slice()) {
+            continue;
+        }
+        let (Some(child), Some(parent), Some(property)) = (
+            node.props.get(1).and_then(RawProp::as_int),
+            node.props.get(2).and_then(RawProp::as_int),
+            node.props.get(3).and_then(RawProp::as_bytes),
+        ) else {
+            continue;
+        };
+        if property != b"DiffuseColor" {
+            continue;
+        }
+        if let (Some(file), Some(&at)) = (files.get(&child), at_material.get(&parent))
+            && materials[at].diffuse_texture.is_none()
+        {
+            materials[at].diffuse_texture = Some(file.clone());
+        }
+    }
+    Ok(())
 }
 
 /// `Objects` 直下の `Deformer`（`Skin`/`Cluster`/`BlendShape`/`BlendShapeChannel`）を読む。
