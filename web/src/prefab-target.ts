@@ -25,7 +25,7 @@ export function isSelectable(candidate: PrefabTargetCandidate): boolean {
 /**
  * 解決状態の日本語名を返す。
  *
- * 一覧の選択肢に添える短い説明であり、詳細は{@link targetSummary}に譲る。
+ * 一覧の各行に添える短い札であり、対象FBXなどの詳細は{@link targetDetails}に譲る。
  *
  * @param candidate - Prefab1件の解決結果。
  * @returns 状態の日本語名。
@@ -33,9 +33,7 @@ export function isSelectable(candidate: PrefabTargetCandidate): boolean {
 export function stateLabel(candidate: PrefabTargetCandidate): string {
   switch (candidate.state) {
     case "resolved":
-      return candidate.fbx === null
-        ? "変換可能（対象FBXが無いため選べない）"
-        : `変換可能（対象FBX: ${candidate.fbx.path}）`;
+      return candidate.fbx === null ? "対象FBXなし" : "変換可能";
     case "requiresPrefabResolution":
       return "ネストPrefabの解決が必要（未対応）";
     case "unsupportedMultipleFbx":
@@ -47,31 +45,100 @@ export function stateLabel(candidate: PrefabTargetCandidate): string {
   }
 }
 
+/** 資産パスをファイル名と親ディレクトリに分けた組。 */
+export interface SplitPath {
+  /** 末尾のファイル名。 */
+  readonly name: string;
+  /** 親ディレクトリ（末尾の`/`を含む）。直下の場合は空文字である。 */
+  readonly dir: string;
+}
+
 /**
- * 対象FBX・ネスト・未解決参照の要約を作る。
+ * 資産パスをファイル名と親ディレクトリに分ける。
  *
- * 一覧の補足行として使い、長い参照列は件数に畳む。
+ * @param path - 資産パス（`Assets/...`）。
+ * @returns ファイル名と親ディレクトリの組。
+ */
+export function splitAssetPath(path: string): SplitPath {
+  const slash = path.lastIndexOf("/");
+  if (slash < 0) {
+    return { name: path, dir: "" };
+  }
+  return { name: path.slice(slash + 1), dir: path.slice(0, slash + 1) };
+}
+
+/**
+ * パス列に共通する親ディレクトリを求める。一覧で同じ接頭辞を繰り返さないために使う。
+ *
+ * ディレクトリ単位で比べ、ファイル名の途中では切らない。
+ *
+ * @param paths - 資産パス列。
+ * @returns 共通の親ディレクトリ（末尾の`/`を含む）。無い場合は空文字である。
+ */
+export function commonDirectory(paths: readonly string[]): string {
+  let common: string[] | null = null;
+  for (const path of paths) {
+    const dirs = path.split("/").slice(0, -1);
+    if (common === null) {
+      common = dirs;
+      continue;
+    }
+    let length = 0;
+    while (length < common.length && length < dirs.length && common[length] === dirs[length]) {
+      length += 1;
+    }
+    common = common.slice(0, length);
+  }
+  return common === null || common.length === 0 ? "" : `${common.join("/")}/`;
+}
+
+/**
+ * 共通の親ディレクトリを取り除いた相対表示を作る。
+ *
+ * @param path - 資産パス。
+ * @param base - {@link commonDirectory}の結果。
+ * @returns `base`以下の相対パス。`base`で始まらない場合はそのまま返す。
+ */
+export function relativeTo(path: string, base: string): string {
+  return base !== "" && path.startsWith(base) ? path.slice(base.length) : path;
+}
+
+/** 一覧の1行に添える詳細の1項目。 */
+export interface TargetDetail {
+  /** 項目名。 */
+  readonly label: string;
+  /** 表示する値。共通ディレクトリを除いた相対パスや件数である。 */
+  readonly value: string;
+  /** 省略前の完全な値。ツールチップに使う。 */
+  readonly title: string;
+}
+
+/**
+ * 対象FBX・ネスト・未解決参照を項目列にまとめる。
+ *
+ * パスは共通ディレクトリを除いて短くし、完全なパスは`title`に残す。
+ * 長い参照列は件数に畳む。
  *
  * @param candidate - Prefab1件の解決結果。
- * @returns 要約文。情報が無い場合は空文字である。
+ * @param base - 一覧全体の共通ディレクトリ。
+ * @returns 表示する項目列。情報が無い場合は空である。
  */
-export function targetSummary(candidate: PrefabTargetCandidate): string {
-  const parts: string[] = [];
+export function targetDetails(candidate: PrefabTargetCandidate, base: string): TargetDetail[] {
+  const details: TargetDetail[] = [];
   if (candidate.fbx !== null) {
-    parts.push(`対象FBX: ${candidate.fbx.path}`);
+    details.push({ label: "FBX", value: relativeTo(candidate.fbx.path, base), title: candidate.fbx.path });
   }
-  if (candidate.nestedPrefabs.length > 0) {
-    parts.push(`ネストPrefab（ジオメトリは出力しない）: ${candidate.nestedPrefabs.join(", ")}`);
+  const nested = candidate.nestedPrefabs;
+  if (nested.length === 1 && nested[0] !== undefined) {
+    details.push({ label: "ネストPrefab", value: relativeTo(nested[0], base), title: nested[0] });
+  } else if (nested.length > 1) {
+    details.push({ label: "ネストPrefab", value: `${nested.length}件`, title: nested.join("\n") });
   }
-  if (candidate.unresolvedReferences.length > 0) {
-    const first = candidate.unresolvedReferences[0];
-    parts.push(
-      first === undefined
-        ? `未解決参照${candidate.unresolvedReferences.length}件`
-        : `未解決参照${candidate.unresolvedReferences.length}件（例: ${first}）`,
-    );
+  const unresolved = candidate.unresolvedReferences;
+  if (unresolved.length > 0) {
+    details.push({ label: "未解決参照", value: `${unresolved.length}件`, title: unresolved.join("\n") });
   }
-  return parts.join(" / ");
+  return details;
 }
 
 /**
@@ -119,7 +186,7 @@ export function targetsPrompt(candidates: readonly PrefabTargetCandidate[], unre
       ? "Prefabを選ぶと、そのPrefabが参照するFBXを変換します"
       : `変換可能なPrefabを1件検出しました: ${selected}。Prefabを選ぶと、そのPrefabが参照するFBXを変換します`;
   }
-  const base = `変換するPrefabを選んでください（変換可能${resolved}件）。Prefabを選ぶと、そのPrefabが参照するFBXを変換します`;
+  const base = `変換するPrefabを選んでください（変換可能${resolved}件）`;
   return unreadableCount > 0
     ? `${base}（読めなかったPrefabが${unreadableCount}件あります）`
     : base;

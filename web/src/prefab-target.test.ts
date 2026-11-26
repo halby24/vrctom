@@ -9,8 +9,11 @@ import {
   initialSelection,
   isSelectable,
   resolvedCount,
+  commonDirectory,
+  relativeTo,
+  splitAssetPath,
   stateLabel,
-  targetSummary,
+  targetDetails,
   targetsPrompt,
 } from "./prefab-target.js";
 
@@ -49,13 +52,13 @@ describe("isSelectable", () => {
 });
 
 describe("stateLabel", () => {
-  test("解決済みは対象FBXを添える", () => {
+  test("解決済みは変換可能とだけ示す", () => {
     const candidate = makeCandidate({
       prefab: "Assets/A.prefab",
       state: "resolved",
       fbx: { path: "Assets/A.fbx", guid: "guid-a" },
     });
-    expect(stateLabel(candidate)).toBe("変換可能（対象FBX: Assets/A.fbx）");
+    expect(stateLabel(candidate)).toBe("変換可能");
   });
 
   test("状態ごとに日本語文を返す", () => {
@@ -72,22 +75,56 @@ describe("stateLabel", () => {
   });
 });
 
-describe("targetSummary", () => {
-  test("対象FBXとネストと未解決を要約する", () => {
+describe("targetDetails", () => {
+  test("対象FBXとネストと未解決を共通ディレクトリからの相対で並べる", () => {
     const candidate = makeCandidate({
-      prefab: "Assets/A.prefab",
+      prefab: "Assets/X/A.prefab",
       state: "resolved",
-      fbx: { path: "Assets/A.fbx", guid: "guid-a" },
-      nestedPrefabs: ["Assets/Nested.prefab"],
+      fbx: { path: "Assets/X/Models/A.fbx", guid: "guid-a" },
+      nestedPrefabs: ["Assets/X/Nested.prefab"],
       unresolvedReferences: ["deadbeef"],
     });
-    expect(targetSummary(candidate)).toBe(
-      "対象FBX: Assets/A.fbx / ネストPrefab（ジオメトリは出力しない）: Assets/Nested.prefab / 未解決参照1件（例: deadbeef）",
-    );
+    expect(targetDetails(candidate, "Assets/X/")).toEqual([
+      { label: "FBX", value: "Models/A.fbx", title: "Assets/X/Models/A.fbx" },
+      { label: "ネストPrefab", value: "Nested.prefab", title: "Assets/X/Nested.prefab" },
+      { label: "未解決参照", value: "1件", title: "deadbeef" },
+    ]);
   });
 
-  test("情報が無い場合は空文字になる", () => {
-    expect(targetSummary(makeCandidate({ prefab: "Assets/N.prefab", state: "noModel" }))).toBe("");
+  test("複数のネストは件数に畳む", () => {
+    const candidate = makeCandidate({
+      prefab: "Assets/A.unity",
+      state: "requiresPrefabResolution",
+      nestedPrefabs: ["Assets/B.prefab", "Assets/C.prefab"],
+    });
+    expect(targetDetails(candidate, "")).toEqual([
+      { label: "ネストPrefab", value: "2件", title: "Assets/B.prefab\nAssets/C.prefab" },
+    ]);
+  });
+
+  test("情報が無い場合は空になる", () => {
+    expect(targetDetails(makeCandidate({ prefab: "Assets/N.prefab", state: "noModel" }), "")).toEqual([]);
+  });
+});
+
+describe("パスの分割と共通ディレクトリ", () => {
+  test("ファイル名と親ディレクトリに分ける", () => {
+    expect(splitAssetPath("Assets/X/A(PC).prefab")).toEqual({ name: "A(PC).prefab", dir: "Assets/X/" });
+    expect(splitAssetPath("A.prefab")).toEqual({ name: "A.prefab", dir: "" });
+  });
+
+  test("ディレクトリ単位で共通部分を求める", () => {
+    expect(
+      commonDirectory(["Assets/WWR/Medusa/Avatars/A.prefab", "Assets/WWR/Medusa/_Resources/Prefabs/B.prefab"]),
+    ).toBe("Assets/WWR/Medusa/");
+    expect(commonDirectory(["Assets/Ab/A.prefab", "Assets/Ac/B.prefab"])).toBe("Assets/");
+    expect(commonDirectory(["A.prefab"])).toBe("");
+    expect(commonDirectory([])).toBe("");
+  });
+
+  test("共通ディレクトリを除く", () => {
+    expect(relativeTo("Assets/X/A.fbx", "Assets/X/")).toBe("A.fbx");
+    expect(relativeTo("Other/A.fbx", "Assets/X/")).toBe("Other/A.fbx");
   });
 });
 

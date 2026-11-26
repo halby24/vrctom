@@ -129,19 +129,118 @@ body {
 }
 
 .candidates-field {
+  /* fieldsetは既定でmin-contentを下限に持ち、長いパスで列からはみ出す。 */
+  min-width: 0;
   border: 1px solid var(--line);
   border-radius: 6px;
   margin: 0.75rem 0;
+  padding: 0.5rem 0.75rem 0.75rem;
 }
 
-.candidates-field label {
-  display: block;
-  padding: 0.25rem 0;
+.controls {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
-.candidate-size {
+.candidate-base {
+  margin: 0 0 0.5rem;
   color: var(--muted);
-  font-size: 0.85rem;
+  font-size: 0.8rem;
+}
+
+.candidate-list {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.candidate {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 0.5rem;
+  align-items: start;
+  padding: 0.4rem 0.5rem;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  line-height: 1.4;
+}
+
+.candidate input[type="radio"] {
+  margin: 0.2rem 0 0;
+}
+
+.candidate:hover {
+  background: #f4f6fb;
+}
+
+.candidate:has(input:checked) {
+  border-color: var(--accent);
+  background: #eef3fe;
+}
+
+.candidate:has(input:disabled) {
+  cursor: default;
+}
+
+.candidate:has(input:disabled) .candidate-name {
+  color: var(--muted);
+}
+
+.candidate-body {
+  display: grid;
+  gap: 0.1rem;
+  min-width: 0;
+}
+
+.candidate-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.5rem;
+}
+
+.candidate-name {
+  font-weight: 600;
+}
+
+.candidate-badge {
+  padding: 0 0.4rem;
+  border-radius: 999px;
+  background: #eceef2;
+  color: var(--muted);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.candidate-dir {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.candidate-details {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.1rem 0.75rem;
+  font-size: 0.8rem;
+}
+
+.candidate-detail-label {
+  margin-right: 0.35rem;
+  color: var(--muted);
+}
+
+.candidate-others {
+  margin-top: 0.5rem;
+}
+
+.candidate-others summary {
+  color: var(--muted);
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.candidate-others .candidate-list {
+  margin-top: 0.25rem;
 }
 
 .prefab-warn {

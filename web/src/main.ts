@@ -22,8 +22,11 @@ import {
   initialSelection,
   isSelectable,
   resolvedCount,
+  commonDirectory,
+  relativeTo,
+  splitAssetPath,
   stateLabel,
-  targetSummary,
+  targetDetails,
   targetsPrompt,
 } from "./prefab-target.js";
 import { PreviewViewer } from "./viewer.js";
@@ -523,41 +526,114 @@ class App {
     return `変換可能なPrefabが見つかりませんでした（${parts.join("、")}）。ネストPrefabの解決や複数FBX参照は未対応です`;
   }
 
-  /** Prefab候補の一覧（ラジオ）を描く。選べない候補も理由を添えて示す。 */
+  /**
+   * Prefab候補の一覧（ラジオ）を描く。
+   *
+   * 長いパスで枠が崩れないよう、ファイル名を主に、共通ディレクトリを除いた
+   * 親ディレクトリと詳細を従に並べる。選べない候補は理由を添えて
+   * 折りたたみにまとめ、選べる候補を埋もれさせない。
+   */
   private renderTargets(): void {
     this.candidatesBox.replaceChildren();
-    for (const candidate of this.targets) {
-      const label = document.createElement("label");
-      const radio = document.createElement("input");
-      radio.type = "radio";
-      radio.name = "prefab-target";
-      radio.value = candidate.prefab;
-      radio.checked = candidate.prefab === this.selectedPrefab;
-      const selectable = isSelectable(candidate);
-      radio.disabled = !selectable;
-      // 処理中の無効化で選べる候補を見分けるための目印。`refreshButtons`で使う。
-      radio.dataset["selectable"] = selectable ? "true" : "false";
-      if (selectable) {
-        radio.addEventListener("change", () => {
-          this.selectPrefab(candidate.prefab);
-        });
+    if (this.targets.length === 0) {
+      return;
+    }
+    const base = commonDirectory(this.targets.map((candidate) => candidate.prefab));
+    if (base !== "") {
+      const baseLine = document.createElement("p");
+      baseLine.className = "candidate-base";
+      baseLine.textContent = `${base} 以下`;
+      this.candidatesBox.append(baseLine);
+    }
+    const selectable = this.targets.filter((candidate) => isSelectable(candidate));
+    const others = this.targets.filter((candidate) => !isSelectable(candidate));
+    const list = document.createElement("div");
+    list.className = "candidate-list";
+    for (const candidate of selectable) {
+      list.append(this.renderTarget(candidate, base));
+    }
+    if (selectable.length > 0) {
+      this.candidatesBox.append(list);
+    }
+    if (others.length > 0) {
+      const details = document.createElement("details");
+      details.className = "candidate-others";
+      // 選べる候補が無いときは理由を隠さず開いておく。
+      details.open = selectable.length === 0;
+      const summary = document.createElement("summary");
+      summary.textContent = `選べないPrefab・シーン（${others.length}件）`;
+      const otherList = document.createElement("div");
+      otherList.className = "candidate-list";
+      for (const candidate of others) {
+        otherList.append(this.renderTarget(candidate, base));
       }
-      const pathText = document.createElement("span");
-      pathText.textContent = candidate.prefab;
-      const stateText = document.createElement("span");
-      stateText.className = "candidate-size";
-      stateText.textContent = `（${stateLabel(candidate)}）`;
-      label.append(radio, pathText, stateText);
-      const summary = targetSummary(candidate);
-      if (summary !== "") {
-        const summaryLine = document.createElement("span");
-        summaryLine.className = "hint";
-        summaryLine.textContent = summary;
-        label.append(summaryLine);
-      }
-      this.candidatesBox.append(label);
+      details.append(summary, otherList);
+      this.candidatesBox.append(details);
     }
     this.appendPrefabUnreadable();
+  }
+
+  /** Prefab候補1件の行を作る。完全なパスはツールチップに残す。 */
+  private renderTarget(candidate: PrefabTargetCandidate, base: string): HTMLLabelElement {
+    const label = document.createElement("label");
+    label.className = "candidate";
+    label.title = candidate.prefab;
+    const radio = document.createElement("input");
+    radio.type = "radio";
+    radio.name = "prefab-target";
+    radio.value = candidate.prefab;
+    radio.checked = candidate.prefab === this.selectedPrefab;
+    const selectable = isSelectable(candidate);
+    radio.disabled = !selectable;
+    // 処理中の無効化で選べる候補を見分けるための目印。`refreshButtons`で使う。
+    radio.dataset["selectable"] = selectable ? "true" : "false";
+    if (selectable) {
+      radio.addEventListener("change", () => {
+        this.selectPrefab(candidate.prefab);
+      });
+    }
+    const body = document.createElement("span");
+    body.className = "candidate-body";
+    const { name, dir } = splitAssetPath(relativeTo(candidate.prefab, base));
+    const head = document.createElement("span");
+    head.className = "candidate-head";
+    const nameText = document.createElement("span");
+    nameText.className = "candidate-name";
+    nameText.textContent = name;
+    head.append(nameText);
+    if (!selectable) {
+      const badge = document.createElement("span");
+      badge.className = "candidate-badge";
+      badge.textContent = stateLabel(candidate);
+      head.append(badge);
+    }
+    body.append(head);
+    if (dir !== "") {
+      const dirText = document.createElement("span");
+      dirText.className = "candidate-dir";
+      dirText.textContent = dir;
+      body.append(dirText);
+    }
+    const details = targetDetails(candidate, base);
+    if (details.length > 0) {
+      const dl = document.createElement("span");
+      dl.className = "candidate-details";
+      for (const detail of details) {
+        const item = document.createElement("span");
+        item.className = "candidate-detail";
+        item.title = detail.title;
+        const key = document.createElement("span");
+        key.className = "candidate-detail-label";
+        key.textContent = detail.label;
+        const value = document.createElement("span");
+        value.textContent = detail.value;
+        item.append(key, value);
+        dl.append(item);
+      }
+      body.append(dl);
+    }
+    label.append(radio, body);
+    return label;
   }
 
   /** 読めなかったPrefabの記録を件数と代表で警告する。無い場合は何もしない。 */
