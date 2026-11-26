@@ -21,6 +21,8 @@ pub enum TypedObject {
     GameObject(GameObject),
     /// 位置・回転・拡大縮小と親子関係。
     Transform(Transform),
+    /// アニメータ。
+    Animator(Animator),
     /// スキンドメッシュ描画設定。
     SkinnedMeshRenderer(SkinnedMeshRenderer),
     /// マテリアル。
@@ -225,6 +227,22 @@ impl PrefabInstance {
     }
 }
 
+/// アニメータ。
+///
+/// Humanoid解決に使う参照（`m_GameObject`・`m_Enabled`・`m_Avatar`）を型付きで持ち、
+/// それ以外の欄は [`Animator::extra`] に残す。
+#[derive(Debug, Clone)]
+pub struct Animator {
+    /// 所属するゲームオブジェクトへの参照。
+    pub game_object: ObjectRef,
+    /// 有効かどうか。
+    pub enabled: bool,
+    /// 割り当てられたAvatarアセットへの参照。未割当はnull参照である。
+    pub avatar: ObjectRef,
+    /// 上記以外の欄。順序を保ったまま残す。
+    pub extra: Mapping,
+}
+
 /// `stripped` 文書の参照先。
 ///
 /// 対応元オブジェクトへの参照を型付きで持ち、残りは
@@ -241,10 +259,11 @@ pub struct PrefabLink {
 ///
 /// 型付き読み取りで明白な不一致を検出するための表である。
 /// 未知の組み合わせは [`TypedObject::Unknown`] として扱い、エラーにしない。
-const KNOWN_CLASSES: [(i32, &str); 6] = [
+const KNOWN_CLASSES: [(i32, &str); 7] = [
     (1, "GameObject"),
     (4, "Transform"),
     (21, "Material"),
+    (95, "Animator"),
     (114, "MonoBehaviour"),
     (137, "SkinnedMeshRenderer"),
     (1001, "PrefabInstance"),
@@ -304,6 +323,7 @@ pub(crate) fn decode_document(document: &Document) -> Result<TypedObject, UnityE
         1 => TypedObject::GameObject(decode_game_object(document, raw)?),
         4 => TypedObject::Transform(decode_transform(document, raw)?),
         21 => TypedObject::Material(decode_material(document, raw)?),
+        95 => TypedObject::Animator(decode_animator(document, raw)?),
         114 => TypedObject::MonoBehaviour(decode_mono_behaviour(document, raw)?),
         137 => TypedObject::SkinnedMeshRenderer(decode_skinned_mesh_renderer(document, raw)?),
         1001 => TypedObject::PrefabInstance(decode_prefab_instance(document, raw)?),
@@ -734,6 +754,38 @@ fn read_custom_render_queue(document: &Document, mapping: &Mapping) -> Result<i3
         Value::Null => Ok(-1),
         _ => Err(shape_error(document, "m_CustomRenderQueue", "整数でない")),
     }
+}
+
+/// Animatorの共通欄を読む。Avatar以外の欄は汎用データのまま残す。
+fn decode_animator(document: &Document, mapping: &Mapping) -> Result<Animator, UnityError> {
+    const CONSUMED: &[&str] = &[
+        "m_ObjectHideFlags",
+        "m_CorrespondingSourceObject",
+        "m_PrefabInstance",
+        "m_PrefabAsset",
+        "m_GameObject",
+        "m_Enabled",
+        "m_Avatar",
+    ];
+    let enabled = match mapping.get("m_Enabled") {
+        Some(value) => read_flag(document, value, "m_Enabled")?,
+        None => true,
+    };
+    let avatar = match mapping.get("m_Avatar") {
+        Some(value) => ObjectRef::decode_body(value)
+            .map_err(|error| attach_context(error, document, "m_Avatar"))?,
+        None => ObjectRef {
+            file_id: 0,
+            guid: None,
+            type_hint: None,
+        },
+    };
+    Ok(Animator {
+        game_object: read_ref(document, mapping, "m_GameObject")?,
+        enabled,
+        avatar,
+        extra: extra_of(mapping, CONSUMED),
+    })
 }
 
 /// MonoBehaviourの共通欄を読む。独自欄は汎用データのまま残す。

@@ -60,7 +60,7 @@ impl std::error::Error for VrmError {}
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VrmErrorKind {
-    /// 軸系がY-up・+Z正面・+X右手でない場合。
+    /// 軸系が互いに異なる3軸と `±1` の符号で直交基底を成さない場合。
     UnsupportedAxis,
     /// 単位換算係数が0以下または非有限の場合。
     UnsupportedUnitScale,

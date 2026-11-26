@@ -4,11 +4,11 @@
 //! 呼び出し側は [`HumanoidBones`] を明示指定して名前推測を使わないこともできる。
 //! 親子・拡大率の検証は書き出し時に行い、ここでは対応付けだけを担う。
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::VrmModel;
 use super::export::VrmExportError;
-use crate::unity::HumanBoneMapping;
+use crate::unity::{AssetIndex, AssetMeta, HumanBoneMapping, SerializedFile, TypedObject};
 
 /// VRM humanoidの骨。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1195,6 +1195,104 @@ pub fn is_known_humanoid_bone_name(name: &str) -> bool {
     HUMANOID_BONE_NAMES.contains(&name)
 }
 
+/// Prefabまたはシーンの `Animator`（classID 95）および `PrefabInstance` の
+/// `m_Avatar` 改変から、Humanoid解決の基準となるAvatarアセットのGUIDを返す。
+///
+/// 複数の有効な `Animator` がある場合は、`VRCAvatarDescriptor` と同じ
+/// `GameObject` に付いているもの、次に親のないルート `GameObject` に付いているもの、
+/// 最後に先頭に見つかったものの順で選ぶ。明示的な `m_Avatar` 参照が無い場合は
+/// `None` を返す（呼び出し側は対象FBX自身の `.fbx.meta` を基準とする）。
+pub fn resolve_animator_avatar_guid(prefab: &SerializedFile) -> Option<String> {
+    let mut animators: Vec<(i64, String)> = Vec::new();
+    let mut root_game_objects: HashSet<i64> = HashSet::new();
+    let mut descriptor_game_objects: HashSet<i64> = HashSet::new();
+    let mut mod_avatar_guids: Vec<String> = Vec::new();
+
+    for doc in prefab.documents() {
+        let Ok(typed) = doc.decode() else {
+            continue;
+        };
+        match typed {
+            TypedObject::Animator(anim) if anim.enabled => {
+                if let Some(guid) = non_zero_guid(&anim.avatar) {
+                    animators.push((anim.game_object.file_id, guid));
+                }
+            }
+            TypedObject::Transform(tr) if tr.father.is_null() => {
+                root_game_objects.insert(tr.game_object.file_id);
+            }
+            TypedObject::MonoBehaviour(mono)
+                if mono.extra.contains_key("ViewPosition")
+                    || mono.extra.contains_key("lipSync")
+                    || mono.extra.contains_key("baseAnimationLayers") =>
+            {
+                descriptor_game_objects.insert(mono.game_object.file_id);
+            }
+            TypedObject::PrefabInstance(instance) => {
+                if let Ok(mods) = instance.modifications() {
+                    for entry in mods {
+                        if entry.property_path == "m_Avatar"
+                            && let Some(obj_ref) = entry.object_reference
+                            && let Some(guid) = non_zero_guid(&obj_ref)
+                        {
+                            mod_avatar_guids.push(guid);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some((_, guid)) = animators
+        .iter()
+        .find(|(go, _)| descriptor_game_objects.contains(go))
+    {
+        return Some(guid.clone());
+    }
+    if let Some((_, guid)) = animators
+        .iter()
+        .find(|(go, _)| root_game_objects.contains(go))
+    {
+        return Some(guid.clone());
+    }
+    if let Some((_, guid)) = animators.into_iter().next() {
+        return Some(guid);
+    }
+    mod_avatar_guids.into_iter().next()
+}
+
+/// Prefabの `Animator` が参照するAvatarアセットの `.meta` を索引から解決して返す。
+///
+/// `Animator` に有効な外部 `m_Avatar` GUID があり索引に見つかる場合はその `.meta` を返す。
+/// 参照が無い場合や索引に無い外部アセットの場合は `fallback`（通常は対象FBX自身の `.fbx.meta`）を返す。
+pub fn resolve_animator_humanoid_meta<'a>(
+    prefab: &SerializedFile,
+    index: &'a AssetIndex,
+    fallback: &'a AssetMeta,
+) -> &'a AssetMeta {
+    let Some(guid_str) = resolve_animator_avatar_guid(prefab) else {
+        return fallback;
+    };
+    let Ok(guid) = crate::unity::Guid::parse(&guid_str) else {
+        return fallback;
+    };
+    index
+        .get(&guid)
+        .map(|record| &record.meta)
+        .unwrap_or(fallback)
+}
+
+/// 参照先GUIDが非空かつ全ゼロでない場合に文字列で返す。
+fn non_zero_guid(obj_ref: &crate::unity::ObjectRef) -> Option<String> {
+    let guid = obj_ref.guid.as_ref()?.as_str();
+    if guid.is_empty() || guid.chars().all(|c| c == '0') {
+        None
+    } else {
+        Some(guid.to_owned())
+    }
+}
+
 /// 親子検証のために、骨の許す親を同側で具体化する。
 pub(crate) fn allowed_parents_for(bone: HumanoidBone) -> Vec<HumanoidBone> {
     match bone.side() {
@@ -1441,5 +1539,84 @@ mod tests {
             match_bone("mixamorig:LeftUpperArm"),
             Some(HumanoidBone::LeftUpperArm)
         );
+    }
+
+    #[test]
+    fn animatorのm_avatar参照からhumanoidの基準guidを解決する() {
+        use crate::unity::ParseOptions;
+
+        // 複数AnimatorがあるときはVRCAvatarDescriptorと同じGameObjectのAnimatorを優先し、
+        // 無効なAnimator（m_Enabled: 0）は無視する。
+        let yaml = "\
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!95 &9501
+Animator:
+  m_GameObject: {fileID: 100}
+  m_Enabled: 0
+  m_Avatar: {fileID: 9000000, guid: 1111111111111111111111111111111a, type: 3}
+--- !u!95 &9502
+Animator:
+  m_GameObject: {fileID: 200}
+  m_Enabled: 1
+  m_Avatar: {fileID: 9000000, guid: 2222222222222222222222222222222b, type: 3}
+--- !u!95 &9503
+Animator:
+  m_GameObject: {fileID: 300}
+  m_Enabled: 1
+  m_Avatar: {fileID: 9000000, guid: 3333333333333333333333333333333c, type: 3}
+--- !u!114 &11401
+MonoBehaviour:
+  m_GameObject: {fileID: 300}
+  m_Enabled: 1
+  m_Script: {fileID: 11500000, guid: 4444444444444444444444444444444d, type: 3}
+  m_Name:
+  ViewPosition: {x: 0, y: 1.5, z: 0.1}
+";
+        let file = SerializedFile::parse(yaml.as_bytes(), &ParseOptions::new()).expect("読める");
+        assert_eq!(
+            resolve_animator_avatar_guid(&file).as_deref(),
+            Some("3333333333333333333333333333333c")
+        );
+
+        // AssetIndexにm_Avatar先があればそちらのmetaを返し、無ければフォールバックを返す。
+        let avatar_meta = AssetMeta::parse(
+            b"fileFormatVersion: 2\nguid: 3333333333333333333333333333333c\nModelImporter:\n  animationType: 3\n",
+        )
+        .expect("読める");
+        let fallback_meta = AssetMeta::parse(
+            b"fileFormatVersion: 2\nguid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nModelImporter:\n  animationType: 2\n",
+        )
+        .expect("読める");
+        let mut index = AssetIndex::new();
+        index
+            .insert("Assets/Dummy.fbx", avatar_meta)
+            .expect("登録できる");
+        let resolved = resolve_animator_humanoid_meta(&file, &index, &fallback_meta);
+        assert_eq!(resolved.guid().as_str(), "3333333333333333333333333333333c");
+
+        // PrefabInstanceのm_Avatar改変からも解決できる。
+        let mod_yaml = "\
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!1001 &1001
+PrefabInstance:
+  m_SourcePrefab: {fileID: 100100000, guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, type: 3}
+  m_Modification:
+    m_Modifications:
+    - target: {fileID: 9500000, guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, type: 3}
+      propertyPath: m_Avatar
+      value:
+      objectReference: {fileID: 9000000, guid: 5555555555555555555555555555555e, type: 3}
+";
+        let mod_file =
+            SerializedFile::parse(mod_yaml.as_bytes(), &ParseOptions::new()).expect("読める");
+        assert_eq!(
+            resolve_animator_avatar_guid(&mod_file).as_deref(),
+            Some("5555555555555555555555555555555e")
+        );
+        // 索引に無いGUIDの場合はフォールバックを返す。
+        let fallback = resolve_animator_humanoid_meta(&mod_file, &index, &fallback_meta);
+        assert_eq!(fallback.guid().as_str(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     }
 }

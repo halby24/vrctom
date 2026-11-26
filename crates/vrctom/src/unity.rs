@@ -48,7 +48,7 @@ pub use meta::{
 // 内部分割の詳細は公開しない。使う型だけをこの層で再公開する。
 pub(crate) use meta::classify;
 pub use objects::{
-    GameObject, Material, MonoBehaviour, NamedProperty, PrefabInstance, PrefabLink,
+    Animator, GameObject, Material, MonoBehaviour, NamedProperty, PrefabInstance, PrefabLink,
     PrefabModification, SkinnedMeshRenderer, TextureEnvironment, Transform, TypedObject,
 };
 pub(crate) use reference::read_guid;

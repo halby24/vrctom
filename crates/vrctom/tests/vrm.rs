@@ -1136,29 +1136,171 @@ fn 鏡像バインドでは巻き方向が反転する() {
 }
 
 #[test]
-fn 非標準軸では失敗する() {
-    // Z-upの軸系は受け付けない。
-    let globals = global_settings(2, 1, 0, 1, 1, 1, 1.0);
+fn 不正な軸系では失敗する() {
+    // 軸が重複している場合と符号が±1以外の場合は直交基底を成さず失敗する。
+    let invalid_cases = [
+        global_settings(1, 1, 1, 1, 0, 1, 1.0), // UpとFrontが重複
+        global_settings(1, 0, 2, 1, 0, 1, 1.0), // 符号が0
+        global_settings(1, 2, 2, 1, 0, 1, 1.0), // 符号が±1以外
+    ];
+    for globals in invalid_cases {
+        let bytes = assemble(
+            Some(globals),
+            vec![
+                model(1, b"Root\x00\x01Model", "Null"),
+                model(2, b"Owner\x00\x01Model", "Mesh"),
+                triangle_geometry(10, b"Tri\x00\x01Geometry", vec![]),
+                bind_pose(
+                    100,
+                    &[
+                        (1, bind_matrix(0.0, 0.0, 0.0)),
+                        (2, bind_matrix(0.0, 0.0, 0.0)),
+                    ],
+                ),
+            ],
+            vec![conn(2, 1), conn(10, 2), conn(1, 0)],
+        );
+        let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("不正軸も読める");
+        let error = VrmModel::from_fbx(&parsed, &VrmOptions::new()).expect_err("不正軸は失敗する");
+        assert_eq!(error.kind(), VrmErrorKind::UnsupportedAxis);
+        assert_eq!(error.object_id(), None);
+    }
+}
+
+#[test]
+fn z_up右手系の座標系を標準軸へ変換する() {
+    // Blender標準のZ-up右手系（+Z上・-Y正面・+X右）。
+    // 点 (x, y, z) は標準軸（+X右・+Y上・+Z正面）で (x, z, -y) に写る。
+    let globals = global_settings(2, 1, 1, -1, 0, 1, 100.0);
+    // 関節は Z-up で (1, -2, 3)（右1・前2・上3）に置く。
+    let joint_bind = bind_matrix(1.0, -2.0, 3.0);
     let bytes = assemble(
         Some(globals),
         vec![
-            model(1, b"Root\x00\x01Model", "Null"),
-            model(2, b"Owner\x00\x01Model", "Mesh"),
-            triangle_geometry(10, b"Tri\x00\x01Geometry", vec![]),
+            model(1, b"Armature\x00\x01Model", "Null"),
+            model(2, b"Joint\x00\x01Model", "LimbNode"),
+            model(3, b"Owner\x00\x01Model", "Mesh"),
+            geometry(
+                10,
+                b"Tri\x00\x01Geometry",
+                vec![
+                    // Z-up空間の三角形: (0,0,0), (1,0,0), (0,0,2)（+Z方向が上）
+                    vertices_node(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 2.0]),
+                    pvi_node(&[0, 1, -3]),
+                ],
+            ),
+            deformer(20, b"S\x00\x01Deformer", "Skin", vec![]),
+            deformer(
+                21,
+                b"C\x00\x01Deformer",
+                "Cluster",
+                vec![indexes_node(&[0, 1, 2]), weights_node(&[1.0, 1.0, 1.0])],
+            ),
             bind_pose(
                 100,
                 &[
                     (1, bind_matrix(0.0, 0.0, 0.0)),
-                    (2, bind_matrix(0.0, 0.0, 0.0)),
+                    (2, joint_bind),
+                    (3, bind_matrix(0.0, 0.0, 0.0)),
                 ],
             ),
         ],
-        vec![conn(2, 1), conn(10, 2), conn(1, 0)],
+        vec![
+            conn(1, 0),
+            conn(2, 1),
+            conn(3, 0),
+            conn(10, 3),
+            conn(20, 10),
+            conn(21, 20),
+            conn(2, 21),
+        ],
     );
-    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("非標準軸も読める");
-    let error = VrmModel::from_fbx(&parsed, &VrmOptions::new()).expect_err("非標準軸は失敗する");
-    assert_eq!(error.kind(), VrmErrorKind::UnsupportedAxis);
-    assert_eq!(error.object_id(), None);
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("Z-upは読める");
+    let (vrm, report) = VrmModel::from_fbx(&parsed, &VrmOptions::new()).expect("Z-upは変換できる");
+    // 頂点 (0,0,2)（Z-up上）が Y-up の (0,2,0) に写り、右手系のため巻き方向は反転しない。
+    assert_eq!(
+        vrm.meshes[0].vertices.positions,
+        vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 2.0, 0.0]]
+    );
+    assert_eq!(vrm.meshes[0].primitives[0].indices, vec![0, 1, 2]);
+    assert_eq!(report.mirrored_meshes, 0);
+    // 関節の平行移動も (1, 3, 2) に写り、逆バインド行列との積は単位行列になる。
+    let joint = &vrm.nodes[1];
+    assert_eq!(
+        [joint.local[12], joint.local[13], joint.local[14]],
+        [1.0, 3.0, 2.0]
+    );
+    let ibm = vrm.skins[0].inverse_bind_matrices[0];
+    // `joint.local * ibm == I` の平行移動成分が 0 であることを確かめる。
+    let tx = joint.local[0] * ibm[12]
+        + joint.local[4] * ibm[13]
+        + joint.local[8] * ibm[14]
+        + joint.local[12];
+    let ty = joint.local[1] * ibm[12]
+        + joint.local[5] * ibm[13]
+        + joint.local[9] * ibm[14]
+        + joint.local[13];
+    let tz = joint.local[2] * ibm[12]
+        + joint.local[6] * ibm[13]
+        + joint.local[10] * ibm[14]
+        + joint.local[14];
+    assert!(tx.abs() < 1e-12 && ty.abs() < 1e-12 && tz.abs() < 1e-12);
+}
+
+#[test]
+fn 左手系の座標系を右手系標準軸へ変換する() {
+    // 左手系（+Y上・+Z正面・-X右）。X座標が反転し、メッシュは巻き方向が反転する。
+    let globals = global_settings(1, 1, 2, 1, 0, -1, 100.0);
+    let joint_bind = bind_matrix(2.0, 3.0, 4.0);
+    let bytes = assemble(
+        Some(globals),
+        vec![
+            model(1, b"Armature\x00\x01Model", "Null"),
+            model(2, b"Joint\x00\x01Model", "LimbNode"),
+            model(3, b"Owner\x00\x01Model", "Mesh"),
+            triangle_geometry(10, b"Tri\x00\x01Geometry", vec![]),
+            deformer(20, b"S\x00\x01Deformer", "Skin", vec![]),
+            deformer(
+                21,
+                b"C\x00\x01Deformer",
+                "Cluster",
+                vec![indexes_node(&[0, 1, 2]), weights_node(&[1.0, 1.0, 1.0])],
+            ),
+            bind_pose(
+                100,
+                &[
+                    (1, bind_matrix(0.0, 0.0, 0.0)),
+                    (2, joint_bind),
+                    (3, bind_matrix(0.0, 0.0, 0.0)),
+                ],
+            ),
+        ],
+        vec![
+            conn(1, 0),
+            conn(2, 1),
+            conn(3, 0),
+            conn(10, 3),
+            conn(20, 10),
+            conn(21, 20),
+            conn(2, 21),
+        ],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("左手系は読める");
+    let (vrm, report) =
+        VrmModel::from_fbx(&parsed, &VrmOptions::new()).expect("左手系は変換できる");
+    // 頂点のXが反転し、三角形の巻き方向も反転して表裏を保つ。
+    assert_eq!(
+        vrm.meshes[0].vertices.positions,
+        vec![[0.0, 0.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+    );
+    assert_eq!(vrm.meshes[0].primitives[0].indices, vec![0, 2, 1]);
+    assert_eq!(report.mirrored_meshes, 1);
+    // 関節の位置は (-2, 3, 4) に写り、行列式は正（右手系）を保つ。
+    let j = &vrm.nodes[1].local;
+    assert_eq!([j[12], j[13], j[14]], [-2.0, 3.0, 4.0]);
+    let det = j[0] * (j[5] * j[10] - j[6] * j[9]) - j[4] * (j[1] * j[10] - j[2] * j[9])
+        + j[8] * (j[1] * j[6] - j[2] * j[5]);
+    assert!(det > 0.0, "ノードの行列式は正を保つ: det={det}");
 }
 
 #[test]

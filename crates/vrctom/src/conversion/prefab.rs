@@ -444,12 +444,6 @@ pub fn convert_prefab(
             format!("Prefab変換にはFBXのGUIDが必要である: {fbx_asset_path}（GUIDが全ゼロである）"),
         )));
     }
-    let mappings = record.meta.human_bone_mappings().map_err(|error| {
-        PrefabConversionError::Prefab(crate::vrm::VrmError::new(
-            VrmErrorKind::InvalidPrefab,
-            format!("humanoidの対応表を読めない: {error}"),
-        ))
-    })?;
     let remaps = record.meta.external_object_remaps().map_err(|error| {
         PrefabConversionError::Material(MaterialError::new(
             MaterialErrorKind::Unity,
@@ -480,6 +474,15 @@ pub fn convert_prefab(
         PrefabConversionError::Prefab(crate::vrm::VrmError::new(
             VrmErrorKind::InvalidPrefab,
             format!("PrefabのYAMLを読めない（{prefab_path}）: {error}"),
+        ))
+    })?;
+    // Humanoid対応表はPrefabのAnimator参照を優先し、無ければ対象FBX自身の.fbx.metaを使う。
+    let humanoid_meta =
+        crate::vrm::resolve_animator_humanoid_meta(&prefab_file, index, &record.meta);
+    let mappings = humanoid_meta.human_bone_mappings().map_err(|error| {
+        PrefabConversionError::Prefab(crate::vrm::VrmError::new(
+            VrmErrorKind::InvalidPrefab,
+            format!("humanoidの対応表を読めない: {error}"),
         ))
     })?;
     // 4. FBXを一度だけ解析する。表情・基準姿勢の解決に解析結果を使い回す。

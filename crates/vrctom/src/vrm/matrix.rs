@@ -203,6 +203,138 @@ pub(crate) fn scale_matrix(s: f64) -> [f64; 16] {
     ]
 }
 
+/// FBXの軸系からVRM 1.0標準軸（Y-up・+Z正面・+X右手）への座標変換。
+///
+/// 変換行列 `A` は列ベクトル規約でFBX空間の点・ベクトルを標準軸へ移す
+/// 4x4直交行列（各行が `coord`・`up`・`front` の単位ベクトル）である。
+///
+/// 右手系（`det(A) == +1`）ではメッシュ・ノードとも `A * W` を適用する。
+/// 左手系（`det(A) == -1`）では、メッシュ頂点・法線・差分には `A * W` を適用して
+/// 巻き方向反転を `det3 < 0` に任せ、ノードと逆バインド行列には右からX反転 `M_x` を
+/// 掛けて `A * W * M_x` とすることで、位置を `A` で移しつつ全ノードの行列式を
+/// 正（純粋右手系回転）に保つ。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct AxisTransform {
+    matrix: [f64; 16],
+    is_identity: bool,
+    handedness_flipped: bool,
+}
+
+impl AxisTransform {
+    /// FBXの [`crate::fbx::AxisSystem`] から座標変換を作る。
+    ///
+    /// 3軸が互いに異なり、各符号が `+1` または `-1` の場合に `Some` を返す。
+    /// 軸の重複や `±1` 以外の符号で直交基底を成さない場合は `None` を返す。
+    pub(crate) fn from_axis_system(axis: crate::fbx::AxisSystem) -> Option<Self> {
+        if ![axis.coord_sign, axis.up_sign, axis.front_sign]
+            .into_iter()
+            .all(|s| s == 1 || s == -1)
+        {
+            return None;
+        }
+        if axis.coord == axis.up || axis.coord == axis.front || axis.up == axis.front {
+            return None;
+        }
+        let axis_col = |a: crate::fbx::Axis| -> usize {
+            match a {
+                crate::fbx::Axis::X => 0,
+                crate::fbx::Axis::Y => 1,
+                crate::fbx::Axis::Z => 2,
+            }
+        };
+        let mut matrix = [0.0; 16];
+        // 行0（出力+X）= coord、行1（出力+Y）= up、行2（出力+Z）= front。
+        matrix[axis_col(axis.coord) * 4] = f64::from(axis.coord_sign);
+        matrix[axis_col(axis.up) * 4 + 1] = f64::from(axis.up_sign);
+        matrix[axis_col(axis.front) * 4 + 2] = f64::from(axis.front_sign);
+        matrix[15] = 1.0;
+        let is_identity = matrix == IDENTITY;
+        let handedness_flipped = det3(&matrix) < 0.0;
+        Some(Self {
+            matrix,
+            is_identity,
+            handedness_flipped,
+        })
+    }
+
+    /// 標準軸（変換不要）なら `true` を返す。
+    pub(crate) fn is_identity(&self) -> bool {
+        self.is_identity
+    }
+
+    /// 左手系から右手系への鏡像反転を伴うなら `true` を返す。
+    pub(crate) fn handedness_flipped(&self) -> bool {
+        self.handedness_flipped
+    }
+
+    /// メッシュ所有モデルの世界行列を標準軸空間へ移す（`A * world`）。
+    ///
+    /// 幾何変換 `G` はメッシュ側で右から掛かるため、結合則により
+    /// `(A * W) * G = A * (W * G)` として頂点・法線・差分に正しく作用する。
+    pub(crate) fn apply_mesh_world(&self, world: &[f64; 16]) -> [f64; 16] {
+        if self.is_identity {
+            return *world;
+        }
+        mul(&self.matrix, world)
+    }
+
+    /// ノード・関節の世界行列を標準軸空間へ移す。
+    ///
+    /// 右手系では `A * world`、左手系では `A * world * M_x` を返し、
+    /// 平行移動を `A` で移しながら行列式の符号を保つ。
+    pub(crate) fn apply_node_world(&self, world: &[f64; 16]) -> [f64; 16] {
+        if self.is_identity {
+            return *world;
+        }
+        let aligned = mul(&self.matrix, world);
+        if self.handedness_flipped {
+            mul_right_mirror_x(&aligned)
+        } else {
+            aligned
+        }
+    }
+
+    /// ノードのローカル行列を標準軸空間（VRM右手系）へ移す。
+    ///
+    /// ルートノードには [`Self::apply_node_world`] を適用する。
+    /// 子ノードは親の変換が打ち消し合うため、右手系では不変、
+    /// 左手系では相似変換 `M_x * local * M_x` を適用する。
+    pub(crate) fn apply_local_matrix(&self, local: &[f64; 16], is_root: bool) -> [f64; 16] {
+        if self.is_identity {
+            return *local;
+        }
+        if is_root {
+            self.apply_node_world(local)
+        } else if self.handedness_flipped {
+            mirror_x_similarity(local)
+        } else {
+            *local
+        }
+    }
+}
+
+/// 行列の右からX反転 `M_x = diag(-1, 1, 1, 1)` を掛ける（列0の符号反転）。
+fn mul_right_mirror_x(m: &[f64; 16]) -> [f64; 16] {
+    let mut out = *m;
+    out[0] = -out[0];
+    out[1] = -out[1];
+    out[2] = -out[2];
+    out[3] = -out[3];
+    out
+}
+
+/// X反転による相似変換 `M_x * m * M_x` を返す。
+fn mirror_x_similarity(m: &[f64; 16]) -> [f64; 16] {
+    let mut out = *m;
+    // 行0または列0の一方のみに属する成分の符号を反転する。
+    out[1] = -out[1];
+    out[2] = -out[2];
+    out[4] = -out[4];
+    out[8] = -out[8];
+    out[12] = -out[12];
+    out
+}
+
 /// 平行移動の行列を返す。FBXのオフセットとピボットに使う。
 pub(crate) fn translation_matrix(t: [f64; 3]) -> [f64; 16] {
     [
@@ -424,5 +556,111 @@ mod tests {
         let mut bad = IDENTITY;
         bad[0] = f64::INFINITY;
         assert!(transform_vector(&bad, [1.0, 0.0, 0.0]).is_none());
+    }
+
+    /// 標準軸・右手系Z-up・左手系それぞれの軸変換と不正軸の拒否を確かめる。
+    #[test]
+    fn 軸系変換が右手系と左手系を標準軸へ移し不正軸を拒否する() {
+        use crate::fbx::{Axis, AxisSystem};
+
+        // 標準軸（Y-up・+Z正面・+X右手）は単位変換である。
+        let standard = AxisTransform::from_axis_system(AxisSystem {
+            up: Axis::Y,
+            up_sign: 1,
+            front: Axis::Z,
+            front_sign: 1,
+            coord: Axis::X,
+            coord_sign: 1,
+        })
+        .expect("標準軸は有効");
+        assert!(standard.is_identity());
+        assert!(!standard.handedness_flipped());
+
+        // Blender標準のZ-up右手系（+Z上・-Y正面・+X右）。
+        let z_up = AxisTransform::from_axis_system(AxisSystem {
+            up: Axis::Z,
+            up_sign: 1,
+            front: Axis::Y,
+            front_sign: -1,
+            coord: Axis::X,
+            coord_sign: 1,
+        })
+        .expect("Z-up右手系は有効");
+        assert!(!z_up.is_identity());
+        assert!(!z_up.handedness_flipped());
+        // 点 (1, -2, 3)（右1・前2・上3）は標準軸で (1, 3, 2) になる。
+        let p = transform_point(&z_up.matrix, [1.0, -2.0, 3.0]).expect("点は変換できる");
+        assert_eq!(p, [1.0, 3.0, 2.0]);
+        // X軸+90度回転のルート行列を変換すると単位行列に戻る。
+        let rx_plus90 = fbx_euler_xyz_matrix([90.0, 0.0, 0.0]);
+        let aligned = z_up.apply_node_world(&rx_plus90);
+        for (a, b) in aligned.iter().zip(IDENTITY.iter()) {
+            assert!((a - b).abs() < 1e-12, "aligned={aligned:?}");
+        }
+
+        // 左手系（+Y上・+Z正面・-X右）は鏡像反転を伴うがノード行列式は正を保つ。
+        let left = AxisTransform::from_axis_system(AxisSystem {
+            up: Axis::Y,
+            up_sign: 1,
+            front: Axis::Z,
+            front_sign: 1,
+            coord: Axis::X,
+            coord_sign: -1,
+        })
+        .expect("左手系は有効");
+        assert!(!left.is_identity());
+        assert!(left.handedness_flipped());
+        let world = mul(
+            &translation_matrix([2.0, 3.0, 4.0]),
+            &fbx_euler_xyz_matrix([0.0, 30.0, 0.0]),
+        );
+        let node_w = left.apply_node_world(&world);
+        let mesh_w = left.apply_mesh_world(&world);
+        assert!(det3(&node_w) > 0.0, "ノード世界行列は右手系を保つ");
+        assert!(det3(&mesh_w) < 0.0, "メッシュ世界行列は鏡像反転を反映する");
+        assert_eq!([node_w[12], node_w[13], node_w[14]], [-2.0, 3.0, 4.0]);
+        // スキニング不変条件: `node_w * inv(node_w) * (mesh_w * v) == mesh_w * v`。
+        let ibm = inverse(&node_w).expect("逆バインド行列は存在する");
+        let skin = mul(&node_w, &ibm);
+        let v_baked = transform_point(&mesh_w, [1.0, 2.0, 3.0]).expect("頂点変換");
+        let v_skinned = transform_point(&skin, v_baked).expect("スキニング後");
+        for i in 0..3 {
+            assert!((v_skinned[i] - v_baked[i]).abs() < 1e-12);
+        }
+
+        // 軸の重複と ±1 以外の符号は拒否する。
+        assert!(
+            AxisTransform::from_axis_system(AxisSystem {
+                up: Axis::Y,
+                up_sign: 1,
+                front: Axis::Y,
+                front_sign: 1,
+                coord: Axis::X,
+                coord_sign: 1,
+            })
+            .is_none()
+        );
+        assert!(
+            AxisTransform::from_axis_system(AxisSystem {
+                up: Axis::Y,
+                up_sign: 0,
+                front: Axis::Z,
+                front_sign: 1,
+                coord: Axis::X,
+                coord_sign: 1,
+            })
+            .is_none()
+        );
+        assert!(
+            AxisTransform::from_axis_system(AxisSystem {
+                up: Axis::Y,
+                up_sign: 2,
+                front: Axis::Z,
+                front_sign: 1,
+                coord: Axis::X,
+                coord_sign: 1,
+            })
+            .is_none()
+        );
     }
 }

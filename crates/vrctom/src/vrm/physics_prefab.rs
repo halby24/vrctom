@@ -12,6 +12,8 @@ use std::collections::{HashMap, HashSet};
 use yaml_serde::Value;
 
 use super::error::{VrmError, VrmErrorKind};
+use super::humanoid::{HumanoidBone, HumanoidBones, resolve_animator_avatar_guid};
+use super::matrix::AxisTransform;
 use crate::fbx::FbxFile;
 use crate::fbx::{FbxOptions, LocalTransform};
 use crate::unity::SerializedFile;
@@ -804,6 +806,29 @@ fn fbx_meta_from_index(
     Ok(meta)
 }
 
+/// Humanoid解決の基準となる `.meta` を返す。
+///
+/// 主FBXの取り込み方式検証を行ったうえで、Prefabの `Animator`（または `m_Avatar` 改変）が
+/// 索引内のアセットを指している場合はそちらの `.meta` を優先し、無ければ主FBXの `.meta` を使う。
+fn resolve_humanoid_meta(
+    index: &AssetIndex,
+    fbx_asset_path: &str,
+    parsed: &ParsedPrefab,
+    label: &str,
+) -> Result<AssetMeta, VrmError> {
+    let fallback = fbx_meta_from_index(index, fbx_asset_path, label)?;
+    let Some(guid_str) = parsed.animator_avatar_guid.as_deref() else {
+        return Ok(fallback);
+    };
+    let Ok(guid) = crate::unity::Guid::parse(guid_str) else {
+        return Ok(fallback);
+    };
+    Ok(index
+        .get(&guid)
+        .map(|record| record.meta.clone())
+        .unwrap_or(fallback))
+}
+
 /// sidecarの参照元FBX1件。`sourceModels` の組み立てに使う。
 #[derive(Debug, Clone)]
 struct SourceModelEntry {
@@ -859,6 +884,8 @@ fn derive_instance_common(
     // 主インスタンスの改変内容のうち、姿勢の上書きは対象ノードの
     // ローカル変換へ適用し、構造変更は明示的に失敗させる。
     let overlays = collect_main_instance_overlays(parsed, milfy_hier, &phone, fbx_guid, label)?;
+    // humanoid・lookAtのための.metaはPrefabのAnimator参照を優先し、無ければ主FBXの.metaを使う。
+    let meta = resolve_humanoid_meta(input.index, input.fbx_asset_path, parsed, label)?;
     // ノード階層の組み立て。
     let model_id_main = model_id_from_asset_path(input.fbx_asset_path);
     let assembly = TreeAssembly {
@@ -869,6 +896,7 @@ fn derive_instance_common(
         main_fbx_guid: fbx_guid,
         model_id_main: &model_id_main,
         overlays: &overlays,
+        humanoid_meta: &meta,
         label,
     };
     let tree = assemble_tree(&assembly)?;
@@ -880,9 +908,6 @@ fn derive_instance_common(
     )?;
     // 成分の判別と収集。
     let collector = collect_components(parsed, &tree, &phone, fbx_guid, label)?;
-    // humanoid・lookAtのための.metaは索引の記録を正とする。
-    // 再読せず複製して使うため、nativeとメモリで同一結果になる。
-    let meta = fbx_meta_from_index(input.index, input.fbx_asset_path, label)?;
     // sourceModelsは主FBXと副FBX（ある場合）を資産パス順に並べる。
     // Unityの `SortedDictionary` と同じ決定性規則である。
     let mut sources = vec![SourceModelEntry::from_bytes(
@@ -986,8 +1011,8 @@ fn derive_direct_common(
     // 物理に参照される未対応ノードがあれば失敗させる。
     // 平面colliderだけの参照は平面経路が直接扱うため除く。
     check_direct_physics_refs(&build.tree, &collector, label)?;
-    // humanoid・lookAtのための.metaは索引の記録を正とする。
-    let meta = fbx_meta_from_index(input.index, input.fbx_asset_path, label)?;
+    // humanoid・lookAtのための.metaはPrefabのAnimator参照を優先し、無ければ主FBXの.metaを使う。
+    let meta = resolve_humanoid_meta(input.index, input.fbx_asset_path, parsed, label)?;
     // sourceModelsはメッシュのGUIDから埋める。入力FBXと参照FBXを資産パス順に並べる。
     let mut sources = vec![SourceModelEntry::from_bytes(
         input.fbx_bytes,
@@ -1967,6 +1992,8 @@ struct ParsedPrefab {
     local_go: HashMap<FileId, LocalGo>,
     local_tr: HashMap<FileId, LocalTr>,
     instances: Vec<ParsedInstance>,
+    /// Prefab内のAnimatorまたはm_Avatar改変が指すAvatarアセットのGUID。
+    animator_avatar_guid: Option<String>,
 }
 
 /// Unityネイティブの回転制約1件。VRC制約ではなく `RotationConstraint`
@@ -2343,6 +2370,7 @@ fn parse_prefab_docs_inner(prefab: &SerializedFile, label: &str) -> Result<Parse
             }
         }
     }
+    let animator_avatar_guid = resolve_animator_avatar_guid(prefab);
     Ok(ParsedPrefab {
         monos,
         smrs,
@@ -2352,6 +2380,7 @@ fn parse_prefab_docs_inner(prefab: &SerializedFile, label: &str) -> Result<Parse
         local_go,
         local_tr,
         instances,
+        animator_avatar_guid,
     })
 }
 
@@ -2624,6 +2653,8 @@ struct PhoneSubtree {
     fbx_sha256: String,
     /// SmartPhone.fbxのモデル列。階層の組み立てに使う。
     models: Vec<PhoneModel>,
+    /// SmartPhone.fbxの軸系からVRM標準軸への変換。
+    axis: AxisTransform,
     /// モデル索引ごとの子索引列。名前順（小文字優先・同点はバイト順）である。
     children_sorted: Vec<Vec<usize>>,
     /// ルート索引列。同じ規則で名前順である。
@@ -2786,7 +2817,7 @@ fn resolve_phone_subtree(
         sha
     };
     // 副FBXの階層を所有側へ写す。借用を残さない。
-    let models = read_phone_models(&fbx_bytes, label)?;
+    let (models, axis) = read_phone_models(&fbx_bytes, label)?;
     let (children_sorted, roots_sorted) = sort_phone_hierarchy(&models, label)?;
     Ok(Some(PhoneSubtree {
         guid,
@@ -2797,17 +2828,27 @@ fn resolve_phone_subtree(
         fbx_asset_path,
         fbx_sha256,
         models,
+        axis,
         children_sorted,
         roots_sorted,
     }))
 }
 
-/// 副FBXのモデル列を所有側へ写す。階層の組み立てだけに使う。
-fn read_phone_models(bytes: &[u8], label: &str) -> Result<Vec<PhoneModel>, VrmError> {
+/// 副FBXのモデル列と軸系変換を所有側へ写す。階層の組み立てだけに使う。
+fn read_phone_models(
+    bytes: &[u8],
+    label: &str,
+) -> Result<(Vec<PhoneModel>, AxisTransform), VrmError> {
     let file = FbxFile::parse(bytes, &FbxOptions::default()).map_err(|e| {
         VrmError::new(
             VrmErrorKind::InvalidPrefab,
             format!("副FBXを読めない（{}）: {e}", crate::escape_diag(label)),
+        )
+    })?;
+    let axis = AxisTransform::from_axis_system(file.axis_system()).ok_or_else(|| {
+        VrmError::new(
+            VrmErrorKind::UnsupportedAxis,
+            "副FBXの軸系が互いに異なる3軸と±1の符号で直交基底を成さない",
         )
     })?;
     let models = file.models();
@@ -2830,7 +2871,7 @@ fn read_phone_models(bytes: &[u8], label: &str) -> Result<Vec<PhoneModel>, VrmEr
             transform: model.transform,
         });
     }
-    Ok(out)
+    Ok((out, axis))
 }
 
 /// 副FBXの子列とルート列を名前順に並べる。主FBXの取り込み順と同じ規則
@@ -2999,6 +3040,7 @@ struct TreeAssembly<'a> {
     main_fbx_guid: &'a str,
     model_id_main: &'a str,
     overlays: &'a MainInstanceOverlays,
+    humanoid_meta: &'a AssetMeta,
     label: &'a str,
 }
 
@@ -3014,6 +3056,7 @@ fn assemble_tree(input: &TreeAssembly<'_>) -> Result<Vec<TreeNode>, VrmError> {
             input.phone,
             input.main_fbx_guid,
             input.model_id_main,
+            input.humanoid_meta,
             input.label,
         );
     }
@@ -3425,6 +3468,90 @@ fn build_general_tree(
     // ここでは配置の有無だけを確かめる。
     Ok(nodes)
 }
+/// Animator基準のHumanoid解決とFBX階層構造から骨格ルート（親なしノードの索引）を特定する。
+///
+/// `"Armature"` のような固定名には依存せず、次の優先順位で決定する。
+/// 1. `humanoid_meta` の対応表と [`HumanoidBones::detect_with_mapping_names`] で特定した
+///    `Hips`（または対応表内の骨）から親を遡って到達する親なしノード。
+/// 2. スキンの関節が属する親なしノードがちょうど1件であればそのノード。
+/// 3. 子を持つ非メッシュの親なしノードがちょうど1件であればそのノード。
+fn find_skeleton_root(
+    fbx: &FbxFile<'_>,
+    hier: &FbxHierarchy,
+    humanoid_meta: &AssetMeta,
+    label: &str,
+) -> Result<usize, VrmError> {
+    let models = fbx.models();
+    let at: HashMap<i64, usize> = models
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.id.value(), i))
+        .collect();
+    let ancestor_root = |start: usize| -> usize {
+        let mut current = start;
+        let mut seen = HashSet::new();
+        while seen.insert(current) {
+            let Some(parent_id) = models[current].parent else {
+                break;
+            };
+            let Some(&parent_idx) = at.get(&parent_id.value()) else {
+                break;
+            };
+            current = parent_idx;
+        }
+        current
+    };
+
+    // 1. Animator基準のHumanoid解決（`.meta` 対応表 + 骨名検出）で Hips の祖先ルートを引く。
+    let mappings = humanoid_meta.human_bone_mappings().unwrap_or_default();
+    let names: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
+    if let Ok((bones, _)) = HumanoidBones::detect_with_mapping_names(&names, &mappings)
+        && let Some(hips) = bones.get(HumanoidBone::Hips)
+    {
+        return Ok(ancestor_root(hips));
+    }
+    // 必須15骨が揃わない場合でも、対応表の Hips や登録済み骨から祖先ルートを引ける。
+    if let Some(hips_mapping) = mappings
+        .iter()
+        .find(|entry| entry.human_name.eq_ignore_ascii_case("Hips"))
+        .or_else(|| mappings.first())
+        && let Some(idx) = models.iter().position(|m| m.name == hips_mapping.bone_name)
+    {
+        return Ok(ancestor_root(idx));
+    }
+
+    // 2. スキン関節が属する親なしノードがちょうど1件ならそれを骨格ルートとする。
+    let mut skin_roots: HashSet<usize> = HashSet::new();
+    for skin in fbx.skins() {
+        for cluster in &skin.clusters {
+            if let Some(&joint_idx) = at.get(&cluster.joint.value()) {
+                skin_roots.insert(ancestor_root(joint_idx));
+            }
+        }
+    }
+    if skin_roots.len() == 1 {
+        return Ok(*skin_roots.iter().next().expect("1件ある"));
+    }
+
+    // 3. 子を持つ非メッシュの親なしノードがちょうど1件ならそれを骨格ルートとする。
+    let non_mesh_branch_roots: Vec<usize> = models
+        .iter()
+        .enumerate()
+        .filter(|(i, m)| {
+            m.parent.is_none() && m.mesh.is_none() && !hier.children_sorted[*i].is_empty()
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if non_mesh_branch_roots.len() == 1 {
+        return Ok(non_mesh_branch_roots[0]);
+    }
+
+    Err(VrmError::new(
+        VrmErrorKind::InvalidPrefab,
+        format!("骨格ルートが見つからない（{}）", crate::escape_diag(label)),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_milfy_tree(
     fbx: &FbxFile<'_>,
@@ -3433,6 +3560,7 @@ fn build_milfy_tree(
     phone: &Option<PhoneSubtree>,
     main_fbx_guid: &str,
     model_id_main: &str,
+    humanoid_meta: &AssetMeta,
     label: &str,
 ) -> Result<Vec<TreeNode>, VrmError> {
     let models = fbx.models();
@@ -3448,16 +3576,8 @@ fn build_milfy_tree(
     }
     let avatar_name = avatar_name_from_label(label);
     let mut nodes: Vec<TreeNode> = Vec::new();
-    // Armatureを探す。
-    let armature_idx = models
-        .iter()
-        .position(|m| m.name == "Armature" && m.parent.is_none())
-        .ok_or_else(|| {
-            VrmError::new(
-                VrmErrorKind::InvalidPrefab,
-                format!("Armatureが見つからない（{}）", crate::escape_diag(label)),
-            )
-        })?;
+    // Animator基準のHumanoid解決または骨格構造から骨格ルートを特定する。
+    let armature_idx = find_skeleton_root(fbx, hier, humanoid_meta, label)?;
     // メッシュルート（Armature以外）を名前順で集める。
     let mut mesh_roots: Vec<usize> = Vec::new();
     for (i, m) in models.iter().enumerate() {
@@ -4663,6 +4783,12 @@ fn compute_reference_locals(
     // bind対象は親のbind世界またはscene世界の逆行列とbind世界の積を分解する。
     // 非対象はsceneのローカルTRSをそのまま使う（float32に丸める）。
     let models = fbx.models();
+    let axis = AxisTransform::from_axis_system(fbx.axis_system()).ok_or_else(|| {
+        VrmError::new(
+            VrmErrorKind::UnsupportedAxis,
+            "軸系が互いに異なる3軸と±1の符号で直交基底を成さない",
+        )
+    })?;
     // FBXの単位をメートルに直す係数。cmのモデルでは0.01になる。
     // Prefab直置きの追加物はUnity空間（メートル）のため換算しない。
     let factor = fbx.unit_scale_factor();
@@ -4673,7 +4799,7 @@ fn compute_reference_locals(
         ));
     }
     let unit_to_meter = (factor / 100.0) as f32;
-    // bind世界行列（FBX BindPose）をUnity空間へ写してfloat32で持つ。
+    // bind世界行列（FBX BindPose）を標準軸へ揃えてからUnity空間へ写し、float32で持つ。
     // Unityは `meshWorld * bindpose.inverse` をbind世界にするため、
     // 実データ（Milfy）ではFBXのbind行列の鏡像と一致する。
     let bind_nodes = fbx.bind_pose_nodes().map_err(|e| {
@@ -4690,8 +4816,9 @@ fn compute_reference_locals(
         .collect();
     for node in bind_nodes {
         if let Some(&idx) = at.get(&node.model.value()) {
+            let aligned = axis.apply_node_world(&node.matrix);
             let mut m = [0f32; 16];
-            for (i, v) in node.matrix.iter().enumerate() {
+            for (i, v) in aligned.iter().enumerate() {
                 m[i] = *v as f32;
             }
             let mut world = mirror_matrix_f32(&m);
@@ -4702,14 +4829,20 @@ fn compute_reference_locals(
         }
     }
     // sceneローカルTRS（float32・Unity空間・メートル）。
-    // FBX由来はlocal_matrixを分解してから写し、副FBX由来も同じ手順でscene値を求める。
+    // FBX由来はlocal_matrixを標準軸へ揃えて分解してから写し、副FBX由来も同じ手順でscene値を求める。
     // FBXの単位（cm等）はここでメートルに直す。
     // prefab由来の追加物はUnity空間（メートル）のためそのまま使う。混合しない。
     let mut scene_trs: Vec<([f32; 3], [f32; 4], [f32; 3])> = Vec::with_capacity(tree.len());
     for node in tree {
         if let Some(fbx_index) = node.fbx_index {
             let model = &models[fbx_index];
-            let (p, r, s) = scene_trs_from_local_transform(&model.transform, &node.name, label)?;
+            let (p, r, s) = scene_trs_from_local_transform(
+                &model.transform,
+                &axis,
+                model.parent.is_none(),
+                &node.name,
+                label,
+            )?;
             let (mut pos, mut rot, mut scale) = fbx_trs_to_unity(p, r, s);
             // 主インスタンスの姿勢上書きを適用する。成分ごとに置き換える。
             // Prefabの値はUnity空間（メートル）であり、量子化済みの値をそのまま使う。
@@ -4760,7 +4893,13 @@ fn compute_reference_locals(
                     ),
                 )
             })?;
-            let (p, r, s) = scene_trs_from_local_transform(&model.transform, &node.name, label)?;
+            let (p, r, s) = scene_trs_from_local_transform(
+                &model.transform,
+                &phone.axis,
+                model.parent.is_none(),
+                &node.name,
+                label,
+            )?;
             let (pos, rot, scale) = fbx_trs_to_unity(p, r, s);
             scene_trs.push((
                 [pos[0] as f32, pos[1] as f32, pos[2] as f32],
@@ -4867,10 +5006,12 @@ fn compute_reference_locals(
     Ok(out)
 }
 
-/// FBXのローカル変換からsceneローカルTRS（float32）を求める。
-/// `local_matrix` の分解であり、Unityの取り込みTRSと同じ手順である。
+/// FBXのローカル変換から標準軸（右手系）のsceneローカルTRS（float32）を求める。
+/// `local_matrix` に軸系変換を適用して分解する。
 fn scene_trs_from_local_transform(
     transform: &LocalTransform,
+    axis: &AxisTransform,
+    is_root: bool,
     node_name: &str,
     label: &str,
 ) -> Result<TrsF32, VrmError> {
@@ -4880,8 +5021,9 @@ fn scene_trs_from_local_transform(
             format!("ローカル行列を作れない: {e}"),
         )
     })?;
+    let aligned = axis.apply_local_matrix(&local, is_root);
     let mut m32 = [0f32; 16];
-    for (i, v) in local.iter().enumerate() {
+    for (i, v) in aligned.iter().enumerate() {
         m32[i] = *v as f32;
     }
     decompose_bind_local_f32(&m32).map_err(|_| {
@@ -7237,6 +7379,7 @@ mod tests {
             local_go: HashMap::new(),
             local_tr: HashMap::new(),
             instances: vec![main],
+            animator_avatar_guid: None,
         };
         let overlays = collect_main_instance_overlays(&parsed, &hier, &None, main_guid, "test")
             .expect("取り込み根と既知の骨は通る");
@@ -7267,6 +7410,7 @@ mod tests {
             local_go: HashMap::new(),
             local_tr: HashMap::new(),
             instances: vec![bad],
+            animator_avatar_guid: None,
         };
         assert!(
             collect_main_instance_overlays(&parsed, &hier, &None, main_guid, "test").is_err(),
@@ -7553,5 +7697,90 @@ mod tests {
         let 失敗 = read_asset_limited(&読み手, "a.fbx", 1024, &mut 予算, "参照FBX", "test")
             .expect_err("合計上限の超過は失敗する");
         assert_eq!(失敗.kind(), VrmErrorKind::LimitExceeded);
+    }
+
+    #[test]
+    fn armature以外の骨格ルート名でもhumanoid解決から骨格ルートを特定できる() {
+        // Armatureという名前が存在しないFBX（Dummy_Armature -> CustomHips）でも、
+        // Animator基準の.meta対応表からHipsの祖先ルートを特定できることを確かめる。
+        fn prop_l(buf: &mut Vec<u8>, v: i64) {
+            buf.push(b'L');
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        fn prop_s(buf: &mut Vec<u8>, s: &[u8]) {
+            buf.push(b'S');
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s);
+        }
+        fn write_node<F: FnOnce(&mut Vec<u8>)>(
+            buf: &mut Vec<u8>,
+            name: &[u8],
+            props: &[u8],
+            prop_count: u32,
+            has_children: bool,
+            write_children: F,
+        ) {
+            let start = buf.len();
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            buf.extend_from_slice(&prop_count.to_le_bytes());
+            buf.extend_from_slice(&(props.len() as u32).to_le_bytes());
+            buf.push(name.len() as u8);
+            buf.extend_from_slice(name);
+            buf.extend_from_slice(props);
+            if has_children {
+                write_children(buf);
+                buf.extend_from_slice(&[0u8; 13]);
+            }
+            let end = buf.len() as u32;
+            buf[start..start + 4].copy_from_slice(&end.to_le_bytes());
+        }
+        fn model_node(out: &mut Vec<u8>, id: i64, name: &[u8], kind: &[u8]) {
+            let mut props = Vec::new();
+            prop_l(&mut props, id);
+            prop_s(&mut props, name);
+            prop_s(&mut props, kind);
+            write_node(out, b"Model", &props, 3, false, |_| {});
+        }
+        fn conn_node(out: &mut Vec<u8>, child: i64, parent: i64) {
+            let mut props = Vec::new();
+            prop_s(&mut props, b"OO");
+            prop_l(&mut props, child);
+            prop_l(&mut props, parent);
+            write_node(out, b"C", &props, 3, false, |_| {});
+        }
+
+        let mut fbx_bytes = Vec::new();
+        fbx_bytes.extend_from_slice(b"Kaydara FBX Binary  \x00\x1a\x00");
+        fbx_bytes.extend_from_slice(&7400u32.to_le_bytes());
+        write_node(&mut fbx_bytes, b"Objects", &[], 0, true, |out| {
+            model_node(out, 100, b"Body\x00\x01Model", b"Mesh");
+            model_node(out, 200, b"Dummy_Armature\x00\x01Model", b"Null");
+            model_node(out, 201, b"CustomHips\x00\x01Model", b"LimbNode");
+        });
+        write_node(&mut fbx_bytes, b"Connections", &[], 0, true, |out| {
+            conn_node(out, 100, 0);
+            conn_node(out, 200, 0);
+            conn_node(out, 201, 200);
+        });
+        fbx_bytes.extend_from_slice(&[0u8; 13]);
+
+        let fbx = FbxFile::parse(&fbx_bytes, &FbxOptions::default()).expect("最小FBXは読める");
+        let hier = build_fbx_hierarchy(&fbx, "test").expect("階層は作れる");
+        let meta = AssetMeta::parse(
+            b"\
+fileFormatVersion: 2
+guid: 1234567890abcdef1234567890abcdef
+ModelImporter:
+  animationType: 3
+  humanDescription:
+    human:
+    - boneName: CustomHips
+      humanName: Hips
+",
+        )
+        .expect("metaは読める");
+        let root_idx =
+            find_skeleton_root(&fbx, &hier, &meta, "test").expect("骨格ルートを特定できる");
+        assert_eq!(fbx.models()[root_idx].name, "Dummy_Armature");
     }
 }

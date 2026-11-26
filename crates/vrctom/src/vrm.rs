@@ -1,8 +1,8 @@
 //! FBX読み取り結果からVRM 1.0へ書き出す前の中間モデル。
 //!
-//! 入口は [`VrmModel::from_fbx`](crate::vrm::VrmModel::from_fbx) であり、ノード階層・スキン・メッシュ属性・
-//! 材質スロット・件数報告を持つ所有データを作る。座標変換や三角形化は行わず、
-//! 受け取ったバインド姿勢と幾何を決定的に組み立てるだけである。
+//! 入口は [`VrmModel::from_fbx`](crate::vrm::VrmModel::from_fbx) であり、FBXの軸系を
+//! VRM 1.0標準軸（Y-up・+Z正面・+X右手）へ揃えたうえで、ノード階層・スキン・
+//! メッシュ属性・材質スロット・件数報告を持つ所有データを作る。
 //!
 //! ```mermaid
 //! flowchart LR
@@ -40,7 +40,10 @@ pub use export::{
     VrmAvatarPermission, VrmCommercialUsage, VrmCreditNotation, VrmExportError, VrmExportErrorKind,
     VrmExportOptions, VrmMeta, VrmModification,
 };
-pub use humanoid::{HUMANOID_BONE_NAMES, HumanoidBone, HumanoidBones, is_known_humanoid_bone_name};
+pub use humanoid::{
+    HUMANOID_BONE_NAMES, HumanoidBone, HumanoidBones, is_known_humanoid_bone_name,
+    resolve_animator_avatar_guid, resolve_animator_humanoid_meta,
+};
 pub use look_at::{
     LookAtReport, SidecarEyePose, SidecarLookAt, VrmLookAt, VrmLookAtRange, resolve_look_at,
 };
@@ -49,7 +52,7 @@ pub use material::{
     VrmImage, VrmImageMime, VrmMaterial, VrmMaterialEntry, VrmMaterials, VrmMtoonParameters,
     VrmOutlineWidthMode, VrmSampler, VrmWrap,
 };
-use matrix::IDENTITY;
+use matrix::{AxisTransform, IDENTITY};
 pub use physics::{
     AppliedHumanoidBone, AuxiliaryNode, BranchSplit, CenterAssigned, CenterKind,
     ChangedHumanoidBone, CompiledSprings, HumanoidPoseReport, JointTrace, LostNode, NoCenter,
@@ -88,9 +91,10 @@ pub use renderers::{
     RendererMeshView, RendererPlan, RendererPoolEntry, RendererSidecar, apply_renderer_plan,
     load_renderer_materials_from, plan_renderer_assignment,
 };
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-use crate::fbx::{Axis, FbxErrorKind, FbxFile, ObjectId};
+use crate::fbx::{FbxErrorKind, FbxFile, ObjectId};
 
 /// メッシュ数の既定上限（10万）。
 ///
@@ -493,25 +497,48 @@ impl VrmModel {
     ///
     /// # Errors
     ///
-    /// 標準軸以外の軸系・0以下または非有限の単位換算・バインド行列が無いモデル・
+    /// 直交基底を成さない軸系・0以下または非有限の単位換算・バインド行列が無いモデル・
     /// 複数スキンの対応・子を持つメッシュモデル・破損した幾何や重み・
     /// 上限の超過などの場合に返す。
     pub fn from_fbx(
         file: &FbxFile<'_>,
         options: &VrmOptions,
     ) -> Result<(Self, VrmReport), VrmError> {
-        check_axis_system(file)?;
+        let axis = axis_transform(file)?;
         let root = check_unit_scale(file)?;
         let bind = bind_world_matrices(file)?;
+        let node_worlds: Cow<'_, [[f64; 16]]> = if axis.is_identity() {
+            Cow::Borrowed(&bind.worlds)
+        } else {
+            Cow::Owned(
+                bind.worlds
+                    .iter()
+                    .map(|world| axis.apply_node_world(world))
+                    .collect(),
+            )
+        };
+        let mesh_worlds: Cow<'_, [[f64; 16]]> = if axis.is_identity() {
+            Cow::Borrowed(&bind.worlds)
+        } else if !axis.handedness_flipped() {
+            // 右手系ではノード用とメッシュ用の世界行列が一致するため再計算を避ける。
+            Cow::Borrowed(&node_worlds)
+        } else {
+            Cow::Owned(
+                bind.worlds
+                    .iter()
+                    .map(|world| axis.apply_mesh_world(world))
+                    .collect(),
+            )
+        };
         // 関節の集合を先に求め、非関節ルートの正規化判定に使う。
         let joints = joint_model_ids(file);
-        let nodes = build_nodes(file, &bind.worlds, &joints)?;
-        let skins = build_skins(file, &bind.worlds)?;
+        let nodes = build_nodes(file, &node_worlds, &joints)?;
+        let skins = build_skins(file, &node_worlds)?;
         // 表情の選択はメッシュ変換の前に確定させ、対象メッシュの変換時に差分を配る。
         // 欠落は警告として返し、見つかる分だけを適用する。
         let (plan, expression_warnings) = resolve_expressions(file, options)?;
         let (meshes, mut report, expression_mesh) =
-            build_meshes(file, options, &bind.worlds, plan.as_ref())?;
+            build_meshes(file, options, &mesh_worlds, plan.as_ref())?;
         report.bind_pose_models = bind.pose_models;
         report.bind_cluster_models = bind.link_models;
         report.bind_rest_models = bind.rest_models;
@@ -531,25 +558,17 @@ impl VrmModel {
     }
 }
 
-/// 軸系がY-up・+Z正面・+X右手であることを確かめる。
+/// FBXの軸系からVRM 1.0標準軸（Y-up・+Z正面・+X右手）への変換を求める。
 ///
-/// それ以外の軸系は正面や上下の解釈を誤るため、非対応として失敗する。
-fn check_axis_system(file: &FbxFile<'_>) -> Result<(), VrmError> {
-    let axis = file.axis_system();
-    let standard = axis.up == Axis::Y
-        && axis.up_sign == 1
-        && axis.front == Axis::Z
-        && axis.front_sign == 1
-        && axis.coord == Axis::X
-        && axis.coord_sign == 1;
-    if standard {
-        Ok(())
-    } else {
-        Err(VrmError::new(
+/// 3軸が重複している場合や符号が `±1` でない場合は直交変換を構成できないため、
+/// `UnsupportedAxis` として失敗する。
+fn axis_transform(file: &FbxFile<'_>) -> Result<AxisTransform, VrmError> {
+    AxisTransform::from_axis_system(file.axis_system()).ok_or_else(|| {
+        VrmError::new(
             VrmErrorKind::UnsupportedAxis,
-            "軸系がY-up・+Z正面・+X右手でない",
-        ))
-    }
+            "軸系が互いに異なる3軸と±1の符号で直交基底を成さない",
+        )
+    })
 }
 
 /// 単位換算係数からシーンルートの拡大行列を作る。

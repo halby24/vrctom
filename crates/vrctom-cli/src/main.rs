@@ -571,8 +571,16 @@ fn export(
         ) {
             return code;
         }
-        let mappings = fbx_meta.mappings;
         let fbx_guid = fbx_meta.guid;
+        let mappings = match resolve_animator_mappings_override(
+            &prefab_file,
+            &fbx_guid,
+            assets_root.as_deref(),
+        ) {
+            Ok(Some(override_mappings)) => override_mappings,
+            Ok(None) => fbx_meta.mappings,
+            Err(code) => return code,
+        };
         if use_descriptor_expressions {
             // 目条件はdescriptorの左右Eyeではなく、humanoidとして左右Eyeが
             // 解決できることで判定する。モデル構築前に名前列で確かめる。
@@ -1161,6 +1169,43 @@ fn load_fbx_meta(input: &Path) -> Result<FbxMetaInfo, i32> {
 /// メタが無い場合だけ空の対応表として名前推測に任せる。
 fn load_humanoid_mappings(input: &Path) -> Result<Vec<HumanBoneMapping>, i32> {
     load_fbx_meta(input).map(|info| info.mappings)
+}
+
+/// Prefabの `Animator`（または `m_Avatar` 改変）が入力FBX以外のAvatarアセットを
+/// 指している場合、資産索引からその `.meta` のhumanoid対応表を読む。
+///
+/// 対象FBX自身を指している場合や参照が無い場合・索引に無い場合は `Ok(None)` を返す。
+fn resolve_animator_mappings_override(
+    prefab_file: &SerializedFile,
+    fbx_guid: &str,
+    assets_root: Option<&Path>,
+) -> Result<Option<Vec<HumanBoneMapping>>, i32> {
+    let Some(avatar_guid) = vrctom::vrm::resolve_animator_avatar_guid(prefab_file) else {
+        return Ok(None);
+    };
+    if avatar_guid.eq_ignore_ascii_case(fbx_guid) {
+        return Ok(None);
+    }
+    let Some(root) = assets_root else {
+        return Ok(None);
+    };
+    let Ok(guid) = vrctom::unity::Guid::parse(&avatar_guid) else {
+        return Ok(None);
+    };
+    let Ok(index) = vrctom::unity::scan_directory(root, &vrctom::unity::IndexOptions::default())
+    else {
+        return Ok(None);
+    };
+    let Some(record) = index.get(&guid) else {
+        return Ok(None);
+    };
+    match record.meta.human_bone_mappings() {
+        Ok(mappings) => Ok(Some(mappings)),
+        Err(error) => {
+            diagnose_stage("Animator参照先のhumanoid対応表を読めない", &error);
+            Err(1)
+        }
+    }
 }
 
 /// 共有変換入口の失敗を既存の段階文面で診断に出す。
