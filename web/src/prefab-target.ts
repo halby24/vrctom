@@ -7,7 +7,13 @@
  * @packageDocumentation
  */
 
-import type { PrefabTargetCandidate } from "./conversion-client.js";
+import type { PrefabTargetCandidate, PrefabTargetFbx } from "./conversion-client.js";
+
+/** 選択可能なPrefab候補。解決済みで対象FBXを持つ。 */
+export type SelectablePrefabTarget = PrefabTargetCandidate & {
+  readonly state: "resolved";
+  readonly fbx: PrefabTargetFbx;
+};
 
 /**
  * 変換対象として選べるかを確かめる。
@@ -18,7 +24,7 @@ import type { PrefabTargetCandidate } from "./conversion-client.js";
  * @param candidate - Prefab1件の解決結果。
  * @returns 選べる場合に真。
  */
-export function isSelectable(candidate: PrefabTargetCandidate): boolean {
+export function isSelectable(candidate: PrefabTargetCandidate): candidate is SelectablePrefabTarget {
   return candidate.state === "resolved" && candidate.fbx !== null;
 }
 

@@ -49,6 +49,18 @@ describe("isSelectable", () => {
       expect(isSelectable(makeCandidate({ prefab: `Assets/${state}.prefab`, state }))).toBe(false);
     }
   });
+
+  test("解決済みのシーン候補も選択可能としてFBXを参照できる", () => {
+    const candidate = makeCandidate({
+      prefab: "Assets/ペンギン/ペンギン.unity",
+      state: "resolved",
+      fbx: { path: "Assets/ペンギン/source/ペンギン_FBX.fbx", guid: "a4bd84bc66f71754582f32c727ccb528" },
+    });
+    expect(isSelectable(candidate)).toBe(true);
+    if (isSelectable(candidate)) {
+      expect(candidate.fbx.path).toBe("Assets/ペンギン/source/ペンギン_FBX.fbx");
+    }
+  });
 });
 
 describe("stateLabel", () => {

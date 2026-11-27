@@ -29,6 +29,7 @@ import {
   targetDetails,
   targetsPrompt,
 } from "./prefab-target.js";
+import type { SelectablePrefabTarget } from "./prefab-target.js";
 import { PreviewViewer } from "./viewer.js";
 
 /** 圧縮入力の上限（512MiB）。wasm側の上限と合わせる。 */
@@ -502,9 +503,11 @@ class App {
     }
     if (resolved === 1) {
       const selected = initialSelection(this.targets);
-      if (selected !== null) {
+      const target = selected === null ? null : (this.targets.find((candidate) => candidate.prefab === selected) ?? null);
+      if (target !== null && isSelectable(target)) {
         // 候補が一意なら選ぶ操作を挟まず自動で選ぶ。変換までは自動で進めない。
-        this.selectPrefab(selected);
+        // 読み込み直後は`opening`状態のため、利用者操作用の処理中ガードを通さず反映する。
+        this.applySelectedPrefab(target);
         return;
       }
     }
@@ -653,10 +656,7 @@ class App {
   }
 
   /**
-   * Prefabを選ぶ。対象FBXの表示と作品名の初期値をそろえる。
-   *
-   * 一覧を作り直すとクリックした要素がDOMから外れてフォーカスが途切れるため、
-   * 既存のラジオの印だけを合わせる。ネストPrefabがある場合は追加出力の対象として示す。
+   * 利用者の操作からPrefabを選ぶ。処理中と未解決候補を弾いて画面へ反映する。
    *
    * @param path - 選ぶPrefabの出力パス。
    */
@@ -669,11 +669,24 @@ class App {
       return;
     }
     const target = this.targets.find((candidate) => candidate.prefab === path) ?? null;
-    if (target === null || !isSelectable(target) || target.fbx === null) {
+    if (target === null || !isSelectable(target)) {
       this.setStatusText("変換するPrefabを選んでください");
       return;
     }
-    this.selectedPrefab = path;
+    this.applySelectedPrefab(target);
+  }
+
+  /**
+   * 検証済みのPrefab選択を画面へ反映し、選択完了状態へ移す。
+   *
+   * 一覧を作り直すとクリックした要素がDOMから外れてフォーカスが途切れるため、
+   * 既存のラジオの印だけを合わせる。読み込み完了時の自動選択と利用者選択の
+   * 双方から呼ぶため、処理中ガードは呼び出し側の{@link selectPrefab}に置く。
+   *
+   * @param target - 選択可能な解決済みPrefab候補。
+   */
+  private applySelectedPrefab(target: SelectablePrefabTarget): void {
+    this.selectedPrefab = target.prefab;
     // 選択のたびに一覧を作り直すと、クリックした要素がDOMから外れて
     // フォーカスと操作が途切れる。既存のラジオの印だけを合わせる。
     this.syncTargetRadios();
