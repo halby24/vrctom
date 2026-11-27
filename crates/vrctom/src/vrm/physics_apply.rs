@@ -329,6 +329,36 @@ pub fn apply_physics_sidecar(
     humanoid: &HumanoidBones,
     options: &SpringCompileOptions,
 ) -> Result<PhysicsApplyReport, PhysicsApplyError> {
+    apply_with_rollback(model, sidecar, fbx_bytes, Some(humanoid), options)
+}
+
+/// Humanoid 情報を使わずに物理sidecarを中間モデルへ適用し、構造化報告を返す。
+///
+/// 衣装やアクセサリなど全身の Humanoid 骨を持たないモデル向けの入口である。
+/// sidecar の解決とスプリング・コライダ・制約の生成だけを実行し、
+/// T-pose の適用（`tpose_applied = 0`）と視線解決（`look_at = None`）は行わない。
+///
+/// # Errors
+///
+/// 対応解決・スプリング生成のいずれかが失敗した場合に返す。
+/// この場合モデルのノード列と制約列は呼び出し前の状態に戻す。
+pub fn apply_physics_sidecar_without_humanoid(
+    model: &mut VrmModel,
+    sidecar: &PhysicsSidecar,
+    fbx_bytes: &[u8],
+    options: &SpringCompileOptions,
+) -> Result<PhysicsApplyReport, PhysicsApplyError> {
+    apply_with_rollback(model, sidecar, fbx_bytes, None, options)
+}
+
+/// 失敗時のノード・制約復元を共通化した物理適用の入口。
+fn apply_with_rollback(
+    model: &mut VrmModel,
+    sidecar: &PhysicsSidecar,
+    fbx_bytes: &[u8],
+    humanoid: Option<&HumanoidBones>,
+    options: &SpringCompileOptions,
+) -> Result<PhysicsApplyReport, PhysicsApplyError> {
     // 失敗時の部分更新を戻すため、変更し得る列だけを退避する。
     // メッシュ・スキン・表情は触らないため複製しない。
     let backup_nodes = model.nodes.clone();
@@ -346,7 +376,7 @@ fn apply_inner(
     model: &mut VrmModel,
     sidecar: &PhysicsSidecar,
     fbx_bytes: &[u8],
-    humanoid: &HumanoidBones,
+    humanoid: Option<&HumanoidBones>,
     options: &SpringCompileOptions,
 ) -> Result<PhysicsApplyReport, PhysicsApplyError> {
     let resolution = model
@@ -362,40 +392,47 @@ fn apply_inner(
         .iter()
         .map(|aux| aux.name.clone())
         .collect();
-    // humanoidのrest姿勢はsidecarのT-poseを優先する。無い骨は
-    // ノードの姿勢のまま残す。視線の測定とスプリングの生成より前に適用する。
-    // 書き出しに使う解決済み対応を渡し、不一致は適用前に失敗させる。
-    let pose = apply_humanoid_t_pose(sidecar, model, &resolution, humanoid).map_err(|error| {
-        PhysicsApplyError {
-            stage: TPOSE_STAGE,
-            error,
-            auxiliary_node_names: auxiliary_node_names.clone(),
-            tpose_skipped: Vec::new(),
-        }
-    })?;
-    let tpose_skipped: Vec<TposeSkippedEntry> = pose
-        .skipped
-        .iter()
-        .map(|skipped| TposeSkippedEntry {
-            bone: skipped.bone.clone(),
-            node_id: skipped.node_id.clone(),
-            reason: skipped.reason.to_string(),
-        })
-        .collect();
-    // 視線の解決。sidecarに視線記録が無い旧形式では何もしない。
-    // 測定も既定もここで確定する。モデルは変更しないため、
-    // 失敗時に部分更新は起きない。humanoidは解決より前に検出したものを
-    // 使い、補助ノードの影響を受けない。
-    let look_at = match sidecar.look_at.as_ref() {
-        Some(_) => resolve_look_at(sidecar, model, &resolution, humanoid).map_err(|error| {
-            PhysicsApplyError {
-                stage: LOOK_AT_STAGE,
-                error,
-                auxiliary_node_names: auxiliary_node_names.clone(),
-                tpose_skipped: tpose_skipped.clone(),
-            }
-        })?,
-        None => None,
+    // Humanoid がある経路では T-pose と視線を適用する。無い経路（衣装等）では飛ばす。
+    let (tpose_applied, tpose_skipped, look_at) = if let Some(humanoid) = humanoid {
+        // humanoidのrest姿勢はsidecarのT-poseを優先する。無い骨は
+        // ノードの姿勢のまま残す。視線の測定とスプリングの生成より前に適用する。
+        // 書き出しに使う解決済み対応を渡し、不一致は適用前に失敗させる。
+        let pose =
+            apply_humanoid_t_pose(sidecar, model, &resolution, humanoid).map_err(|error| {
+                PhysicsApplyError {
+                    stage: TPOSE_STAGE,
+                    error,
+                    auxiliary_node_names: auxiliary_node_names.clone(),
+                    tpose_skipped: Vec::new(),
+                }
+            })?;
+        let tpose_skipped: Vec<TposeSkippedEntry> = pose
+            .skipped
+            .iter()
+            .map(|skipped| TposeSkippedEntry {
+                bone: skipped.bone.clone(),
+                node_id: skipped.node_id.clone(),
+                reason: skipped.reason.to_string(),
+            })
+            .collect();
+        // 視線の解決。sidecarに視線記録が無い旧形式では何もしない。
+        // 測定も既定もここで確定する。モデルは変更しないため、
+        // 失敗時に部分更新は起きない。humanoidは解決より前に検出したものを
+        // 使い、補助ノードの影響を受けない。
+        let look_at = match sidecar.look_at.as_ref() {
+            Some(_) => resolve_look_at(sidecar, model, &resolution, humanoid).map_err(|error| {
+                PhysicsApplyError {
+                    stage: LOOK_AT_STAGE,
+                    error,
+                    auxiliary_node_names: auxiliary_node_names.clone(),
+                    tpose_skipped: tpose_skipped.clone(),
+                }
+            })?,
+            None => None,
+        };
+        (pose.applied.len(), tpose_skipped, look_at)
+    } else {
+        (0, Vec::new(), None)
     };
     let compiled = compile_springs(sidecar, model, &resolution, options).map_err(|error| {
         PhysicsApplyError {
@@ -437,7 +474,7 @@ fn apply_inner(
     };
     let report = PhysicsApplyReport {
         auxiliary_node_names,
-        tpose_applied: pose.applied.len(),
+        tpose_applied,
         tpose_skipped,
         look_at: look_at.as_ref().map(|(_, report)| to_look_summary(report)),
         spring_count: compiled.report.spring_count,

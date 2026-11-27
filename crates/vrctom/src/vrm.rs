@@ -38,8 +38,8 @@ pub mod renderers;
 pub use descriptor::{DescriptorExpressionPlan, expressions_from_avatar_descriptor};
 pub use error::{VrmError, VrmErrorKind};
 pub use export::{
-    VrmAvatarPermission, VrmCommercialUsage, VrmCreditNotation, VrmExportError, VrmExportErrorKind,
-    VrmExportOptions, VrmMeta, VrmModification,
+    GlbExportOptions, VrmAvatarPermission, VrmCommercialUsage, VrmCreditNotation, VrmExportError,
+    VrmExportErrorKind, VrmExportOptions, VrmMeta, VrmModification,
 };
 pub use humanoid::{
     HUMANOID_BONE_NAMES, HumanoidBone, HumanoidBones, is_known_humanoid_bone_name,
@@ -72,6 +72,7 @@ pub use physics::{
 pub use physics_apply::{
     LookAtAppliedSummary, LookAtRangeSummary, LostNodeSummary, PhysicsApplyError,
     PhysicsApplyReport, SkippedBoneSummary, TposeSkippedEntry, apply_physics_sidecar,
+    apply_physics_sidecar_without_humanoid,
 };
 pub use physics_prefab::{
     DerivedSidecar, PhysicsDeriveLimits, PrefabCandidates, PrefabDeriveInput, PrefabDeriveSource,
@@ -347,6 +348,22 @@ pub struct VrmReport {
     pub warnings: Vec<String>,
 }
 
+/// モーフターゲット（BlendShape）の保持方針。
+///
+/// 既定は [`ExpressionsOnly`](Self::ExpressionsOnly) であり、VRM 1.0 出力向けの
+/// 既存挙動を保つ。Three.js 等で体形調整用や衣装貫通防止用の BlendShape も
+/// 操作したい場合は [`All`](Self::All) を指定する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VrmMorphMode {
+    /// 表情プロファイルで参照されるメッシュの互換形状（束ね参照・`vrc.`・MMD名）のみを残す。
+    /// `expressions` が未指定の場合はモーフターゲットを作らない。
+    #[default]
+    ExpressionsOnly,
+    /// 所有モデルを持つ全メッシュの有効な単一フレーム BlendShape チャンネルをすべて残す。
+    /// `expressions` が同時指定されている場合は、表情の束ねも維持する。
+    All,
+}
+
 /// 中間モデル生成の資源上限。
 ///
 /// フィールドは非公開で、既定値は [`Default`] が設定する。
@@ -358,6 +375,8 @@ pub struct VrmOptions {
     max_triangles: usize,
     max_morph_targets: usize,
     max_morph_bytes: usize,
+    morph_mode: VrmMorphMode,
+    allow_rest_without_bind_pose: bool,
     expressions: Option<VrmExpressionProfile>,
     expression_mesh: Option<ObjectId>,
     baseline_weights: Option<BaselineWeights>,
@@ -424,10 +443,31 @@ impl VrmOptions {
             max_triangles: DEFAULT_MAX_TRIANGLES,
             max_morph_targets: DEFAULT_MAX_MORPH_TARGETS,
             max_morph_bytes: DEFAULT_MAX_MORPH_BYTES,
+            morph_mode: VrmMorphMode::ExpressionsOnly,
+            allow_rest_without_bind_pose: false,
             expressions: None,
             expression_mesh: None,
             baseline_weights: None,
         }
+    }
+
+    /// モーフターゲット（BlendShape）の保持方針を変更する。
+    ///
+    /// 既定は [`VrmMorphMode::ExpressionsOnly`] である。
+    pub fn with_morph_mode(mut self, mode: VrmMorphMode) -> Self {
+        self.morph_mode = mode;
+        self
+    }
+
+    /// `BindPose` が無い非スキン FBX に対して rest 姿勢の使用を許可するかどうかを変更する。
+    ///
+    /// 既定は `false` であり、`BindPose` が無い FBX は [`VrmErrorKind::MissingBindPose`] で失敗する。
+    /// スキンを持たない小物や衣装 FBX で `true` を指定すると、ローカル変換から計算した
+    /// rest 世界行列を用いて変換できる。スキンを持つ FBX で `BindPose` が無い場合は
+    /// `true` を指定しても引き続き失敗する。
+    pub fn with_allow_rest_without_bind_pose(mut self, allow: bool) -> Self {
+        self.allow_rest_without_bind_pose = allow;
+        self
     }
 
     /// メッシュ数の上限を変更する。
@@ -511,7 +551,7 @@ impl VrmModel {
     ) -> Result<(Self, VrmReport), VrmError> {
         let axis = axis_transform(file)?;
         let root = check_unit_scale(file)?;
-        let bind = bind_world_matrices(file)?;
+        let bind = bind_world_matrices_inner(file, options.allow_rest_without_bind_pose)?;
         let node_worlds: Cow<'_, [[f64; 16]]> = if axis.is_identity() {
             Cow::Borrowed(&bind.worlds)
         } else {
@@ -539,16 +579,16 @@ impl VrmModel {
         let joints = joint_model_ids(file);
         let nodes = build_nodes(file, &node_worlds, &joints)?;
         let skins = build_skins(file, &node_worlds)?;
-        // 表情の選択はメッシュ変換の前に確定させ、対象メッシュの変換時に差分を配る。
-        // 欠落は警告として返し、見つかる分だけを適用する。
-        let (plan, expression_warnings) = resolve_expressions(file, options)?;
+        // モーフターゲットと表情の解決はメッシュ変換の前に確定させ、変換時に差分を配る。
+        // 欠落や未対応チャンネルのスキップは警告として返す。
+        let (morphs, morph_warnings) = resolve_morphs(file, options)?;
         let (meshes, mut report, expression_mesh) =
-            build_meshes(file, options, &mesh_worlds, plan.as_ref())?;
+            build_meshes(file, options, &mesh_worlds, &morphs)?;
         report.bind_pose_models = bind.pose_models;
         report.bind_cluster_models = bind.link_models;
         report.bind_rest_models = bind.rest_models;
-        report.warnings = expression_warnings;
-        let expressions = build_expressions(&meshes, plan.as_ref(), expression_mesh)?;
+        report.warnings = morph_warnings;
+        let expressions = build_expressions(&meshes, morphs.expressions.as_ref(), expression_mesh)?;
         let model = Self {
             root,
             nodes,
@@ -680,13 +720,19 @@ fn is_mmd_shape_name(name: &str) -> bool {
     keys.contains(&name.nfkc().collect::<String>())
 }
 
-/// 解決済みの表情選択。対象メッシュとFBX順に絞ったチャンネルデルタを持つ。
-struct ResolvedPlan {
+/// 解決済みの全モーフターゲットと表情選択。
+struct ResolvedMorphs {
+    /// ジオメトリごとの保持チャンネル列（FBXの出現順）。
+    by_mesh: HashMap<ObjectId, Vec<ResolvedChannel>>,
+    /// 表情の束ね情報。表情を作らない場合は `None` である。
+    expressions: Option<ExpressionSelection>,
+}
+
+/// 採用メッシュと確定済みの表情束ね。
+struct ExpressionSelection {
     /// 表情対象のメッシュGeometry。
     geometry: ObjectId,
-    /// 残す条件（束ね参照・`vrc.`・MMD名）に当てはまるチャンネル。FBXの出現順を保つ。
-    channels: Vec<ResolvedChannel>,
-    /// プロファイル順の式束ね。重複ターゲットは1つにまとめた索引を指す。
+    /// プロファイル順の式束ね。
     bindings: Vec<VrmExpressionBinding>,
 }
 
@@ -698,6 +744,348 @@ struct ResolvedChannel {
     id: ObjectId,
     /// 形状デルタ。
     data: crate::fbx::ShapeData,
+}
+
+/// モーフターゲットと表情を保持方針に従って解決する。
+fn resolve_morphs(
+    file: &FbxFile<'_>,
+    options: &VrmOptions,
+) -> Result<(ResolvedMorphs, Vec<String>), VrmError> {
+    match options.morph_mode {
+        VrmMorphMode::ExpressionsOnly => {
+            let (plan, warnings) = resolve_expressions(file, options)?;
+            let mut by_mesh = HashMap::new();
+            let expressions = plan.map(|plan| {
+                let geometry = plan.geometry;
+                by_mesh.insert(geometry, plan.channels);
+                ExpressionSelection {
+                    geometry,
+                    bindings: plan.bindings,
+                }
+            });
+            Ok((
+                ResolvedMorphs {
+                    by_mesh,
+                    expressions,
+                },
+                warnings,
+            ))
+        }
+        VrmMorphMode::All => resolve_all_morphs(file, options),
+    }
+}
+
+/// `VrmMorphMode::All` 向けに、所有モデルを持つ全メッシュの BlendShape を解決する。
+fn resolve_all_morphs(
+    file: &FbxFile<'_>,
+    options: &VrmOptions,
+) -> Result<(ResolvedMorphs, Vec<String>), VrmError> {
+    let mesh_channels: Vec<(ObjectId, Vec<crate::fbx::BlendShapeChannel>)> = file
+        .meshes()
+        .iter()
+        .map(|mesh| (mesh.id, file.blend_shape_channels(mesh.id)))
+        .collect();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut expr_target: Option<(ObjectId, Vec<VrmExpressionBinding>)> = None;
+
+    if let Some(profile) = options.expressions.as_ref() {
+        let wanted = collect_wanted_targets(profile);
+        if !wanted.is_empty() {
+            let (selected_geom, sel_warnings) =
+                resolve_expression_geometry(file, options, &mesh_channels, &wanted)?;
+            warnings.extend(sel_warnings);
+            if let Some(geometry) = selected_geom {
+                let (bindings, bind_warnings) =
+                    resolve_geometry_bindings(file, profile, &wanted, &mesh_channels, geometry)?;
+                warnings.extend(bind_warnings);
+                if !bindings.is_empty() {
+                    expr_target = Some((geometry, bindings));
+                }
+            }
+        }
+    }
+
+    // 所有モデルが無いメッシュは後段 `build_meshes` で出力対象外になるため、モーフも展開しない。
+    let owned_meshes: HashSet<i64> = file
+        .models()
+        .iter()
+        .filter_map(|model| model.mesh.map(|id| id.value()))
+        .collect();
+
+    let mut per_mesh_kept: Vec<(ObjectId, Vec<&crate::fbx::BlendShapeChannel>)> = Vec::new();
+    let mut total_upper_bytes = 0usize;
+
+    for mesh in file.meshes() {
+        if !owned_meshes.contains(&mesh.id.value()) {
+            continue;
+        }
+        let channels = mesh_channels
+            .iter()
+            .find(|(id, _)| *id == mesh.id)
+            .map(|(_, channels)| channels.as_slice())
+            .unwrap_or(&[]);
+        if channels.is_empty() {
+            continue;
+        }
+        let bound: HashSet<&str> = match expr_target.as_ref() {
+            Some((geom, bindings)) if *geom == mesh.id => bindings
+                .iter()
+                .map(|binding| binding.target.as_str())
+                .collect(),
+            _ => HashSet::new(),
+        };
+        let mut kept: Vec<&crate::fbx::BlendShapeChannel> = Vec::new();
+        for channel in channels {
+            let name = channel.name.as_str();
+            if bound.contains(name) {
+                if kept.iter().any(|existing| existing.name == name) {
+                    return Err(VrmError::new(
+                        VrmErrorKind::AmbiguousExpressionTarget,
+                        format!("同じ表情ターゲット名が重複する: {name}"),
+                    )
+                    .with_object(mesh.id));
+                }
+                validate_expression_channel_meta(file, channel)?;
+                kept.push(channel);
+            } else if try_validate_optional_channel_meta(file, channel, &mut warnings)? {
+                kept.push(channel);
+            }
+        }
+        if kept.len() > options.max_morph_targets {
+            return Err(VrmError::new(
+                VrmErrorKind::LimitExceeded,
+                "モーフターゲット数が上限を超えた",
+            )
+            .with_object(mesh.id));
+        }
+        let mesh_upper = kept
+            .len()
+            .checked_mul(mesh.corner_count)
+            .and_then(|count| count.checked_mul(12))
+            .unwrap_or(usize::MAX);
+        total_upper_bytes = total_upper_bytes.saturating_add(mesh_upper);
+        if total_upper_bytes > options.max_morph_bytes {
+            return Err(VrmError::new(
+                VrmErrorKind::LimitExceeded,
+                "モーフターゲットの量が上限を超えた",
+            )
+            .with_object(mesh.id));
+        }
+        if !kept.is_empty() {
+            per_mesh_kept.push((mesh.id, kept));
+        }
+    }
+
+    let mut by_mesh: HashMap<ObjectId, Vec<ResolvedChannel>> =
+        HashMap::with_capacity(per_mesh_kept.len());
+    for (geometry, kept) in &per_mesh_kept {
+        let mut resolved = Vec::with_capacity(kept.len());
+        for channel in kept {
+            let data = file
+                .shape_data(channel.shapes[0].shape)
+                .map_err(wrap_fbx_error)?;
+            resolved.push(ResolvedChannel {
+                name: channel.name.clone(),
+                id: channel.id,
+                data,
+            });
+        }
+        by_mesh.insert(*geometry, resolved);
+    }
+
+    let expressions = match expr_target {
+        Some((geometry, bindings)) => {
+            let kept = per_mesh_kept
+                .iter()
+                .find(|(id, _)| *id == geometry)
+                .map(|(_, kept)| kept.as_slice())
+                .unwrap_or(&[]);
+            let filtered =
+                filter_baseline_bindings(options, geometry, bindings, kept, &mut warnings);
+            if filtered.is_empty() {
+                None
+            } else {
+                Some(ExpressionSelection {
+                    geometry,
+                    bindings: filtered,
+                })
+            }
+        }
+        None => None,
+    };
+
+    Ok((
+        ResolvedMorphs {
+            by_mesh,
+            expressions,
+        },
+        warnings,
+    ))
+}
+
+/// 要求ターゲット名を重複排除・要求順で集める。
+fn collect_wanted_targets(profile: &VrmExpressionProfile) -> Vec<&str> {
+    let mut wanted: Vec<&str> = Vec::with_capacity(profile.bindings.len());
+    for binding in &profile.bindings {
+        if !wanted.contains(&binding.target.as_str()) {
+            wanted.push(binding.target.as_str());
+        }
+    }
+    wanted
+}
+
+/// 単一フレーム・初期値ゼロ・全100重み率の条件を表情束ね向けに厳格検証する。
+fn validate_expression_channel_meta(
+    file: &FbxFile<'_>,
+    channel: &crate::fbx::BlendShapeChannel,
+) -> Result<(), VrmError> {
+    let name = channel.name.as_str();
+    if channel.shapes.len() != 1 {
+        return Err(VrmError::new(
+            VrmErrorKind::UnsupportedBlendShape,
+            format!(
+                "単一フレームでないチャンネルがある: {name}（形状数{}）",
+                channel.shapes.len()
+            ),
+        )
+        .with_object(channel.id));
+    }
+    match channel.deform_percent {
+        Some(value) if value.is_finite() && value.abs() <= FULL_WEIGHT_TOLERANCE => {}
+        _ => {
+            return Err(VrmError::new(
+                VrmErrorKind::UnsupportedBlendShape,
+                format!("初期値がゼロでないチャンネルがある: {name}"),
+            )
+            .with_object(channel.id));
+        }
+    }
+    if channel.has_full_weights {
+        let weights = file
+            .blend_channel_weights(channel.id)
+            .map_err(wrap_fbx_error)?;
+        let all_full = weights
+            .iter()
+            .all(|v| v.is_finite() && (*v - 100.0).abs() <= FULL_WEIGHT_TOLERANCE);
+        if !all_full {
+            return Err(VrmError::new(
+                VrmErrorKind::UnsupportedBlendShape,
+                format!("重み率が全100でないチャンネルがある: {name}"),
+            )
+            .with_object(channel.id));
+        }
+    }
+    Ok(())
+}
+
+/// 束ね対象外の任意チャンネルについて単一フレーム等の条件を確かめ、非対応は警告して飛ばす。
+///
+/// 非有限値や FBX デコードの失敗は構造破損としてエラーを返す。
+fn try_validate_optional_channel_meta(
+    file: &FbxFile<'_>,
+    channel: &crate::fbx::BlendShapeChannel,
+    warnings: &mut Vec<String>,
+) -> Result<bool, VrmError> {
+    let name = channel.name.as_str();
+    if channel.shapes.len() != 1 {
+        warnings.push(format!(
+            "モーフターゲットを飛ばした: {name}（単一フレームでないため: 形状数{}）",
+            channel.shapes.len()
+        ));
+        return Ok(false);
+    }
+    match channel.deform_percent {
+        Some(value) if !value.is_finite() => {
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidStructure,
+                format!("初期値が有限でないチャンネルがある: {name}"),
+            )
+            .with_object(channel.id));
+        }
+        Some(value) if value.abs() <= FULL_WEIGHT_TOLERANCE => {}
+        _ => {
+            warnings.push(format!(
+                "モーフターゲットを飛ばした: {name}（初期値がゼロでないため）"
+            ));
+            return Ok(false);
+        }
+    }
+    if channel.has_full_weights {
+        let weights = file
+            .blend_channel_weights(channel.id)
+            .map_err(wrap_fbx_error)?;
+        if weights.iter().any(|v| !v.is_finite()) {
+            return Err(VrmError::new(
+                VrmErrorKind::InvalidStructure,
+                format!("重み率が有限でないチャンネルがある: {name}"),
+            )
+            .with_object(channel.id));
+        }
+        if !weights
+            .iter()
+            .all(|v| (*v - 100.0).abs() <= FULL_WEIGHT_TOLERANCE)
+        {
+            warnings.push(format!(
+                "モーフターゲットを飛ばした: {name}（重み率が全100でないため）"
+            ));
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// 基準姿勢で既に最大のチャンネルを参照する束ねを落とし、警告を追加する。
+fn filter_baseline_bindings(
+    options: &VrmOptions,
+    geometry: ObjectId,
+    bindings: Vec<VrmExpressionBinding>,
+    kept: &[&crate::fbx::BlendShapeChannel],
+    warnings: &mut Vec<String>,
+) -> Vec<VrmExpressionBinding> {
+    let baseline_map: HashMap<ObjectId, f64> = options
+        .baseline_weights
+        .as_ref()
+        .and_then(|weights| weights.meshes.get(&geometry))
+        .map(|channels| {
+            channels
+                .iter()
+                .map(|entry| (entry.channel, entry.weight))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut filtered: Vec<VrmExpressionBinding> = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        // 束ねの解決先はkept列の最初の同名チャンネルであり、
+        // `build_expressions` の名前解決と同じ向きである。
+        let target_id = kept
+            .iter()
+            .find(|channel| channel.name == binding.target)
+            .map(|channel| channel.id);
+        let is_full = target_id.is_some_and(|id| {
+            baseline_map
+                .get(&id)
+                .is_some_and(|weight| (*weight - 100.0).abs() <= FULL_WEIGHT_TOLERANCE)
+        });
+        if is_full {
+            warnings.push(format!(
+                "表情ターゲットを適用しない: {}（基準姿勢で既に最大のため）",
+                binding.target
+            ));
+            continue;
+        }
+        filtered.push(binding);
+    }
+    filtered
+}
+
+/// 解決済みの表情選択。対象メッシュとFBX順に絞ったチャンネルデルタを持つ。
+struct ResolvedPlan {
+    /// 表情対象のメッシュGeometry。
+    geometry: ObjectId,
+    /// 残す条件（束ね参照・`vrc.`・MMD名）に当てはまるチャンネル。FBXの出現順を保つ。
+    channels: Vec<ResolvedChannel>,
+    /// プロファイル順の式束ね。重複ターゲットは1つにまとめた索引を指す。
+    bindings: Vec<VrmExpressionBinding>,
 }
 
 /// 表情の選択指定を解決する。指定が無い場合と束ねが空の場合は警告無しで `None` を返す。
@@ -927,41 +1315,7 @@ fn candidate_has_nonzero_matched_target(
             )
             .with_object(geometry));
         };
-        if channel.shapes.len() != 1 {
-            return Err(VrmError::new(
-                VrmErrorKind::UnsupportedBlendShape,
-                format!(
-                    "単一フレームでないチャンネルがある: {want}（形状数{}）",
-                    channel.shapes.len()
-                ),
-            )
-            .with_object(channel.id));
-        }
-        match channel.deform_percent {
-            Some(value) if value.is_finite() && value.abs() <= FULL_WEIGHT_TOLERANCE => {}
-            _ => {
-                return Err(VrmError::new(
-                    VrmErrorKind::UnsupportedBlendShape,
-                    format!("初期値がゼロでないチャンネルがある: {want}"),
-                )
-                .with_object(channel.id));
-            }
-        }
-        if channel.has_full_weights {
-            let weights = file
-                .blend_channel_weights(channel.id)
-                .map_err(wrap_fbx_error)?;
-            let all_full = weights
-                .iter()
-                .all(|v| v.is_finite() && (*v - 100.0).abs() <= FULL_WEIGHT_TOLERANCE);
-            if !all_full {
-                return Err(VrmError::new(
-                    VrmErrorKind::UnsupportedBlendShape,
-                    format!("重み率が全100でないチャンネルがある: {want}"),
-                )
-                .with_object(channel.id));
-            }
-        }
+        validate_expression_channel_meta(file, channel)?;
         let data = file
             .shape_data(channel.shapes[0].shape)
             .map_err(wrap_fbx_error)?;
@@ -982,34 +1336,13 @@ fn candidate_has_nonzero_matched_target(
     Ok(found_nonzero)
 }
 
-fn resolve_expressions(
+/// 表情対象のメッシュGeometryをヒントまたは最大一致＋同率解消で選ぶ。
+fn resolve_expression_geometry(
     file: &FbxFile<'_>,
     options: &VrmOptions,
-) -> Result<(Option<ResolvedPlan>, Vec<String>), VrmError> {
-    let Some(profile) = options.expressions.as_ref() else {
-        return Ok((None, Vec::new()));
-    };
-    // 要求順を保ちつつ重複ターゲットは1つにまとめる。欠落警告はこの順序で1件ずつ出す。
-    let mut wanted: Vec<&str> = Vec::with_capacity(profile.bindings.len());
-    for binding in &profile.bindings {
-        if !wanted.contains(&binding.target.as_str()) {
-            wanted.push(binding.target.as_str());
-        }
-    }
-    if wanted.is_empty() {
-        return Ok((None, Vec::new()));
-    }
-    // 全メッシュのチャンネル名を調べ、異なる名前の一致数を数える。
-    // メッシュ名はジオメトリ名であり、モデル名（`Body` など）とは限らない。
-    // チャンネル列は所有データを保ち、名前集合だけを借用する。
-    // 同名チャンネルが複数あっても加点しない（集合で数える）。
-    let mesh_channels: Vec<(ObjectId, Vec<crate::fbx::BlendShapeChannel>)> = file
-        .meshes()
-        .iter()
-        .map(|mesh| (mesh.id, file.blend_shape_channels(mesh.id)))
-        .collect();
-    // ヒント指定時は最大一致による選択をせず、そのメッシュを採用する。
-    // FBXのメッシュ一覧に無い場合は構造破損として失敗する。
+    mesh_channels: &[(ObjectId, Vec<crate::fbx::BlendShapeChannel>)],
+    wanted: &[&str],
+) -> Result<(Option<ObjectId>, Vec<String>), VrmError> {
     if let Some(hint) = options.expression_mesh {
         if file.mesh(hint).is_none() {
             return Err(VrmError::new(
@@ -1018,26 +1351,16 @@ fn resolve_expressions(
             )
             .with_object(hint));
         }
-        return resolve_with_geometry(
-            file,
-            options,
-            profile,
-            &wanted,
-            &mesh_channels,
-            hint,
-            Vec::new(),
-        );
+        return Ok((Some(hint), Vec::new()));
     }
     let mut counts: Vec<(ObjectId, usize)> = Vec::with_capacity(mesh_channels.len());
-    for (id, channels) in &mesh_channels {
+    for (id, channels) in mesh_channels {
         let names: HashSet<&str> = channels.iter().map(|c| c.name.as_str()).collect();
         let count = wanted.iter().filter(|want| names.contains(**want)).count();
         counts.push((*id, count));
     }
     let max_count = counts.iter().map(|(_, count)| *count).max().unwrap_or(0);
     if max_count == 0 {
-        // 一致が無い場合は表情を作らず、全要求を要求順に警告する。
-        // 追加の集約警告は重ねない。
         let warnings = wanted
             .iter()
             .map(|want| format!("表情ターゲットを適用しない: {want}（一致するメッシュが無いため）"))
@@ -1049,40 +1372,21 @@ fn resolve_expressions(
         .filter(|(_, count)| *count == max_count)
         .map(|(id, _)| *id)
         .collect();
-    // 決定的な診断のため、FBXのメッシュ順（`mesh_channels` の順序）を保つ。
-    // `counts` 自体がその順序のため、ここで並べ替えない。
-    // 正の最大一致数で同率の場合は限定解消を試み、解消できなければ失敗する。
     let (geometry, selection_warnings) = match best.as_slice() {
         [single] => (*single, Vec::new()),
-        _ => resolve_expression_tie(file, options, &mesh_channels, &wanted, &best)?,
+        _ => resolve_expression_tie(file, options, mesh_channels, wanted, &best)?,
     };
-    resolve_with_geometry(
-        file,
-        options,
-        profile,
-        &wanted,
-        &mesh_channels,
-        geometry,
-        selection_warnings,
-    )
+    Ok((Some(geometry), selection_warnings))
 }
 
-/// 採用メッシュを確定済みとして束ねとチャンネルを解決する共通処理。
-///
-/// 所有モデルの有無・束ねの絞り・欠落警告・重複検査・上限検査・
-/// 単一フレーム条件の検査は既存の選択なし経路と同じである。
-/// ヒント使用時も要求ターゲットが採用メッシュに無い場合は同じ警告を出し、
-/// 束ねを落とす。最終的に束ねが0件なら `(None, warnings)` を返す。
-#[allow(clippy::too_many_arguments)]
-fn resolve_with_geometry(
+/// 採用メッシュの所有確認と存在するターゲットへの束ね絞り・欠落警告生成を行う。
+fn resolve_geometry_bindings(
     file: &FbxFile<'_>,
-    options: &VrmOptions,
     profile: &VrmExpressionProfile,
     wanted: &[&str],
     mesh_channels: &[(ObjectId, Vec<crate::fbx::BlendShapeChannel>)],
     geometry: ObjectId,
-    selection_warnings: Vec<String>,
-) -> Result<(Option<ResolvedPlan>, Vec<String>), VrmError> {
+) -> Result<(Vec<VrmExpressionBinding>, Vec<String>), VrmError> {
     // 対象メッシュに所有モデルが無い場合は後段で飛ばされ、束ねが宙に浮くため失敗する。
     let owned = file
         .models()
@@ -1100,7 +1404,6 @@ fn resolve_with_geometry(
         .find(|(id, _)| *id == geometry)
         .map(|(_, channels)| channels.iter().map(|c| c.name.as_str()).collect())
         .unwrap_or_default();
-    // 採用メッシュの識別情報は欠落警告に含める。
     let adopted_label = {
         let name = file
             .mesh(geometry)
@@ -1108,26 +1411,72 @@ fn resolve_with_geometry(
             .unwrap_or("(不明)");
         format!("{name} [object: {}]", geometry.value())
     };
-    // 採用メッシュに存在するターゲットの束ねだけを元の順序で残す。
-    // 欠落判定は採用メッシュ内であり、他メッシュにあるだけなら未適用として警告する。
     let bindings: Vec<VrmExpressionBinding> = profile
         .bindings
         .iter()
         .filter(|binding| adopted_names.contains(binding.target.as_str()))
         .cloned()
         .collect();
+    let warnings = wanted
+        .iter()
+        .filter(|want| !adopted_names.contains(**want))
+        .map(|want| {
+            format!("表情ターゲットを適用しない: {want}（採用メッシュ {adopted_label} に無いため）")
+        })
+        .collect();
+    Ok((bindings, warnings))
+}
+
+fn resolve_expressions(
+    file: &FbxFile<'_>,
+    options: &VrmOptions,
+) -> Result<(Option<ResolvedPlan>, Vec<String>), VrmError> {
+    let Some(profile) = options.expressions.as_ref() else {
+        return Ok((None, Vec::new()));
+    };
+    // 要求順を保ちつつ重複ターゲットは1つにまとめる。欠落警告はこの順序で1件ずつ出す。
+    let wanted = collect_wanted_targets(profile);
+    if wanted.is_empty() {
+        return Ok((None, Vec::new()));
+    }
+    // 全メッシュのチャンネル名を調べ、異なる名前の一致数を数える。
+    let mesh_channels: Vec<(ObjectId, Vec<crate::fbx::BlendShapeChannel>)> = file
+        .meshes()
+        .iter()
+        .map(|mesh| (mesh.id, file.blend_shape_channels(mesh.id)))
+        .collect();
+    let (selected_geom, selection_warnings) =
+        resolve_expression_geometry(file, options, &mesh_channels, &wanted)?;
+    let Some(geometry) = selected_geom else {
+        return Ok((None, selection_warnings));
+    };
+    resolve_with_geometry(
+        file,
+        options,
+        profile,
+        &wanted,
+        &mesh_channels,
+        geometry,
+        selection_warnings,
+    )
+}
+
+/// 採用メッシュを確定済みとして束ねとチャンネルを解決する共通処理。
+#[allow(clippy::too_many_arguments)]
+fn resolve_with_geometry(
+    file: &FbxFile<'_>,
+    options: &VrmOptions,
+    profile: &VrmExpressionProfile,
+    wanted: &[&str],
+    mesh_channels: &[(ObjectId, Vec<crate::fbx::BlendShapeChannel>)],
+    geometry: ObjectId,
+    selection_warnings: Vec<String>,
+) -> Result<(Option<ResolvedPlan>, Vec<String>), VrmError> {
+    let (bindings, missing_warnings) =
+        resolve_geometry_bindings(file, profile, wanted, mesh_channels, geometry)?;
     // 警告順は選択警告の後に欠落警告（要求順）を置く。
     let mut warnings: Vec<String> = selection_warnings;
-    warnings.extend(
-        wanted
-            .iter()
-            .filter(|want| !adopted_names.contains(**want))
-            .map(|want| {
-                format!(
-                    "表情ターゲットを適用しない: {want}（採用メッシュ {adopted_label} に無いため）"
-                )
-            }),
-    );
+    warnings.extend(missing_warnings);
     if bindings.is_empty() {
         return Ok((None, warnings));
     }
@@ -1192,88 +1541,17 @@ fn resolve_with_geometry(
     }
     let mut resolved = Vec::with_capacity(kept.len());
     for channel in &kept {
-        let name = channel.name.as_str();
-        if channel.shapes.len() != 1 {
-            return Err(VrmError::new(
-                VrmErrorKind::UnsupportedBlendShape,
-                format!(
-                    "単一フレームでないチャンネルがある: {name}（形状数{}）",
-                    channel.shapes.len()
-                ),
-            )
-            .with_object(channel.id));
-        }
-        match channel.deform_percent {
-            Some(value) if value.is_finite() && value.abs() <= FULL_WEIGHT_TOLERANCE => {}
-            _ => {
-                return Err(VrmError::new(
-                    VrmErrorKind::UnsupportedBlendShape,
-                    format!("初期値がゼロでないチャンネルがある: {name}"),
-                )
-                .with_object(channel.id));
-            }
-        }
-        if channel.has_full_weights {
-            let weights = file
-                .blend_channel_weights(channel.id)
-                .map_err(wrap_fbx_error)?;
-            let all_full = weights
-                .iter()
-                .all(|v| v.is_finite() && (*v - 100.0).abs() <= FULL_WEIGHT_TOLERANCE);
-            if !all_full {
-                return Err(VrmError::new(
-                    VrmErrorKind::UnsupportedBlendShape,
-                    format!("重み率が全100でないチャンネルがある: {name}"),
-                )
-                .with_object(channel.id));
-            }
-        }
+        validate_expression_channel_meta(file, channel)?;
         let data = file
             .shape_data(channel.shapes[0].shape)
             .map_err(wrap_fbx_error)?;
         resolved.push(ResolvedChannel {
-            name: name.to_owned(),
+            name: channel.name.clone(),
             id: channel.id,
             data,
         });
     }
-    // 基準姿勢で既に最大のチャンネルを参照する束ねは、その式だけ落として警告する。
-    // ベースへ焼き込んだ分はVRMランタイムが戻せないため、束ねを残すと二重に掛かる。
-    // チャンネル列の索引は従来どおり維持し、落とした束ねのチャンネルが残ってもよい。
-    let baseline_map: HashMap<ObjectId, f64> = options
-        .baseline_weights
-        .as_ref()
-        .and_then(|weights| weights.meshes.get(&geometry))
-        .map(|channels| {
-            channels
-                .iter()
-                .map(|entry| (entry.channel, entry.weight))
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut filtered: Vec<VrmExpressionBinding> = Vec::with_capacity(bindings.len());
-    for binding in bindings {
-        // 束ねの解決先はkept列の最初の同名チャンネルであり、
-        // `build_expressions` の名前解決と同じ向きである。
-        // 束ね名の重複は上で失敗済みのため、ここでは最初の一致を見る。
-        let target_id = kept
-            .iter()
-            .find(|channel| channel.name == binding.target)
-            .map(|channel| channel.id);
-        let is_full = target_id.is_some_and(|id| {
-            baseline_map
-                .get(&id)
-                .is_some_and(|weight| (*weight - 100.0).abs() <= FULL_WEIGHT_TOLERANCE)
-        });
-        if is_full {
-            warnings.push(format!(
-                "表情ターゲットを適用しない: {}（基準姿勢で既に最大のため）",
-                binding.target
-            ));
-            continue;
-        }
-        filtered.push(binding);
-    }
+    let filtered = filter_baseline_bindings(options, geometry, bindings, &kept, &mut warnings);
     if filtered.is_empty() {
         return Ok((None, warnings));
     }
@@ -1306,16 +1584,16 @@ pub(crate) fn wrap_fbx_error(error: crate::fbx::FbxError) -> VrmError {
     out
 }
 
-/// 解決済み選択から表情を作る。束ねは中間メッシュ索引と選択順のターゲット索引を指す。
+/// 解決済み選択から表情を作る。束ねは中間メッシュ索引とターゲット索引を指す。
 ///
 /// 対象メッシュが変換結果に無い場合は構造破損として失敗する。
 /// 所有の確認は解決時に済ませているため、通常は到達しない。
 fn build_expressions(
     meshes: &[VrmMesh],
-    plan: Option<&ResolvedPlan>,
+    selection: Option<&ExpressionSelection>,
     expression_mesh: Option<usize>,
 ) -> Result<VrmExpressions, VrmError> {
-    let Some(plan) = plan else {
+    let Some(selection) = selection else {
         return Ok(VrmExpressions::default());
     };
     let Some(mesh_index) = expression_mesh else {
@@ -1323,27 +1601,27 @@ fn build_expressions(
             VrmErrorKind::InvalidStructure,
             "表情対象のメッシュが出力に無い",
         )
-        .with_object(plan.geometry));
+        .with_object(selection.geometry));
     };
-    if mesh_index >= meshes.len() {
+    let Some(mesh) = meshes.get(mesh_index) else {
         return Err(VrmError::new(
             VrmErrorKind::InvalidStructure,
             "表情束ねのメッシュ索引が範囲外である",
         )
-        .with_object(plan.geometry));
-    }
-    let mut preset = Vec::with_capacity(plan.bindings.len());
-    for binding in &plan.bindings {
-        let Some(target) = plan
-            .channels
+        .with_object(selection.geometry));
+    };
+    let mut preset = Vec::with_capacity(selection.bindings.len());
+    for binding in &selection.bindings {
+        let Some(target) = mesh
+            .targets
             .iter()
-            .position(|channel| channel.name == binding.target)
+            .position(|target| target.name == binding.target)
         else {
             return Err(VrmError::new(
                 VrmErrorKind::InvalidStructure,
                 format!("表情束ねのターゲットが解決結果に無い: {}", binding.target),
             )
-            .with_object(plan.geometry));
+            .with_object(selection.geometry));
         };
         preset.push(VrmExpression {
             name: binding.expression.clone(),
@@ -1457,10 +1735,6 @@ struct BindWorlds {
 /// 候補を同一とみなし、スキンID昇順・クラスタ出現順の最初の候補を代表値に
 /// 使う。許容を超える差・非有限の候補は失敗のままにする。
 /// 退化（行列が特異・成分が有限でない・参照が循環）は失敗のままにする。
-fn bind_world_matrices(file: &FbxFile<'_>) -> Result<BindWorlds, VrmError> {
-    bind_world_matrices_inner(file, false)
-}
-
 /// ネストPrefabの副FBX向けに全モデルのバインド世界行列を `models()` 順に返す。
 ///
 /// スキンが無く `BindPose` も無い非スキン小物FBXでは `rest_world_matrices` を返す。
@@ -1968,13 +2242,13 @@ fn build_skins(file: &FbxFile<'_>, bind: &[[f64; 16]]) -> Result<Vec<VrmSkin>, V
 
 /// メッシュ列と件数報告を作る。
 ///
-/// 表情の選択がある場合は対象メッシュの変換時に差分を配り、
-/// 出力側のメッシュ索引を返す。対象外のメッシュには何も載せない。
+/// 解決済みモーフがある場合はメッシュ単位で差分を配り、
+/// 表情対象メッシュの変換結果索引を返す。
 fn build_meshes(
     file: &FbxFile<'_>,
     options: &VrmOptions,
     bind: &[[f64; 16]],
-    plan: Option<&ResolvedPlan>,
+    morphs: &ResolvedMorphs,
 ) -> Result<(Vec<VrmMesh>, VrmReport, Option<usize>), VrmError> {
     let geometry_skin: HashMap<i64, usize> = file
         .skins()
@@ -1993,22 +2267,9 @@ fn build_meshes(
     let mut degenerate_normals = 0usize;
     let mut mirrored_meshes = 0usize;
     let mut morph_target_count = 0usize;
+    let mut total_morph_bytes = 0usize;
     let mut baseline_meshes = 0usize;
     let mut baseline_shapes = 0usize;
-    // 選択順のチャンネル借用は対象メッシュの変換時だけ使う。
-    // 所有権は解決結果が持ち、ここでは参照だけを束ねる。
-    let plan_channels: Vec<mesh::SelectedMorphChannel> = plan
-        .map(|plan| {
-            plan.channels
-                .iter()
-                .map(|channel| mesh::SelectedMorphChannel {
-                    name: &channel.name,
-                    id: channel.id,
-                    data: &channel.data,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
     // 所有モデル探索をメッシュごとの全走査にしないため、モデル列を一度だけ走査する。
     // 1メッシュに複数モデルが対応する破損はここで残し、後段で同じ挙動で失敗する。
     let mut owners_by_mesh: HashMap<i64, Vec<usize>> = HashMap::new();
@@ -2091,13 +2352,28 @@ fn build_meshes(
             out
         })?;
         let combined = matrix::mul(&bind[owner_index], &geometric);
-        let selected = match plan {
-            Some(plan) if mesh.id == plan.geometry => Some(mesh::SelectedMorph {
-                channels: &plan_channels,
+        let mesh_channels: Vec<mesh::SelectedMorphChannel> = morphs
+            .by_mesh
+            .get(&mesh.id)
+            .map(|channels| {
+                channels
+                    .iter()
+                    .map(|channel| mesh::SelectedMorphChannel {
+                        name: &channel.name,
+                        id: channel.id,
+                        data: &channel.data,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let selected = if mesh_channels.is_empty() {
+            None
+        } else {
+            Some(mesh::SelectedMorph {
+                channels: &mesh_channels,
                 max_morph_bytes: options.max_morph_bytes,
                 max_morph_targets: options.max_morph_targets,
-            }),
-            _ => None,
+            })
         };
         // 基準姿勢は出力対象のうちPrefabが参照する全メッシュへ適用する。
         // 表情の採用メッシュだけではなく、`--no-expressions` でも焼く。
@@ -2119,6 +2395,21 @@ fn build_meshes(
             selected,
             baseline,
         )?;
+        let mesh_morph_bytes = outcome
+            .mesh
+            .targets
+            .len()
+            .checked_mul(outcome.mesh.vertices.positions.len())
+            .and_then(|count| count.checked_mul(12))
+            .unwrap_or(usize::MAX);
+        total_morph_bytes = total_morph_bytes.saturating_add(mesh_morph_bytes);
+        if total_morph_bytes > options.max_morph_bytes {
+            return Err(VrmError::new(
+                VrmErrorKind::LimitExceeded,
+                "モーフターゲットの量が上限を超えた",
+            )
+            .with_object(mesh.id));
+        }
         vertex_count += outcome.mesh.vertices.positions.len();
         if vertex_count > options.max_vertices {
             return Err(VrmError::new(
@@ -2148,10 +2439,10 @@ fn build_meshes(
         }
         meshes.push(outcome.mesh);
     }
-    let expression_mesh = match plan {
-        Some(plan) => meshes
+    let expression_mesh = match morphs.expressions.as_ref() {
+        Some(selection) => meshes
             .iter()
-            .position(|mesh| mesh.geometry == plan.geometry),
+            .position(|mesh| mesh.geometry == selection.geometry),
         None => None,
     };
     let report = VrmReport {
@@ -2168,7 +2459,11 @@ fn build_meshes(
         mirrored_meshes,
         morph_target_count,
         degenerate_normals,
-        expression_count: plan.map(|plan| plan.bindings.len()).unwrap_or(0),
+        expression_count: morphs
+            .expressions
+            .as_ref()
+            .map(|selection| selection.bindings.len())
+            .unwrap_or(0),
         baseline_meshes,
         baseline_shapes,
         bind_pose_models: 0,

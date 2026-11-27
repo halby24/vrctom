@@ -56,7 +56,19 @@ impl WebPackage {
         self.package
             .convert(fbx_path, options_json)
             .map(|converted| Converted {
-                vrm: converted.vrm,
+                glb: converted.vrm,
+                report: converted.report_json,
+            })
+            .map_err(to_js_error)
+    }
+
+    /// 選んだFBXを `VRMC_vrm` なしの汎用 GLB へ変換し、バイト列とレポートJSONを持つ [`Converted`] を返す。
+    #[wasm_bindgen(js_name = convertGlb)]
+    pub fn convert_glb(&self, fbx_path: &str, options_json: &str) -> Result<Converted, JsValue> {
+        self.package
+            .convert_glb(fbx_path, options_json)
+            .map(|converted| Converted {
+                glb: converted.glb,
                 report: converted.report_json,
             })
             .map_err(to_js_error)
@@ -64,7 +76,7 @@ impl WebPackage {
 
     /// 選んだPrefabを変換し、VRMバイト列とレポートJSONを持つ [`Converted`] を返す。
     ///
-    /// `options_json` は `{"name","authors","expressions","baseline","physics"}` のJSONである。
+    /// `options_json` は `{"name","authors","expressions","baseline","physics","morphTargets"}` のJSONである。
     /// 失敗は既存の `to_js_error` でJSの `Error` へ写す。
     #[wasm_bindgen(js_name = convertPrefab)]
     pub fn convert_prefab(
@@ -75,36 +87,69 @@ impl WebPackage {
         self.package
             .convert_prefab(prefab_path, options_json)
             .map(|converted| Converted {
-                vrm: converted.vrm,
+                glb: converted.vrm,
+                report: converted.report_json,
+            })
+            .map_err(to_js_error)
+    }
+
+    /// 選んだPrefabを `VRMC_vrm` なしの汎用 GLB へ変換し、バイト列とレポートJSONを持つ [`Converted`] を返す。
+    ///
+    /// `options_json` は `{"baseline","physics","morphTargets"}` のJSONである。
+    #[wasm_bindgen(js_name = convertPrefabGlb)]
+    pub fn convert_prefab_glb(
+        &self,
+        prefab_path: &str,
+        options_json: &str,
+    ) -> Result<Converted, JsValue> {
+        self.package
+            .convert_prefab_glb(prefab_path, options_json)
+            .map(|converted| Converted {
+                glb: converted.glb,
                 report: converted.report_json,
             })
             .map_err(to_js_error)
     }
 }
 
-/// 変換結果。VRMバイト列とレポートJSONを持つ。
+/// 変換結果。GLB（VRM 1.0 または汎用 GLB）バイト列とレポートJSONを持つ。
 #[wasm_bindgen]
 pub struct Converted {
-    vrm: Vec<u8>,
+    glb: Vec<u8>,
     report: String,
 }
 
 #[wasm_bindgen]
 impl Converted {
-    /// VRM 1.0のGLBバイト列を返す。
+    /// GLBバイト列を複製して返す。
     #[wasm_bindgen(getter)]
-    pub fn vrm(&self) -> Vec<u8> {
-        self.vrm.clone()
+    pub fn glb(&self) -> Vec<u8> {
+        self.glb.clone()
     }
 
-    /// VRM 1.0のGLBバイト列を取り出す。
+    /// GLBバイト列を取り出す。
+    ///
+    /// 複製せず所有権ごと渡すため、大きなモデルではこちらを使う。
+    /// 呼び出し後は空になる。
+    #[wasm_bindgen(js_name = takeGlb)]
+    pub fn take_glb(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.glb)
+    }
+
+    /// VRM 1.0のGLBバイト列を返す（[`glb`](Self::glb) の互換別名）。
+    #[wasm_bindgen(getter)]
+    pub fn vrm(&self) -> Vec<u8> {
+        self.glb.clone()
+    }
+
+    /// VRM 1.0のGLBバイト列を取り出す（[`takeGlb`](Self::take_glb) の互換別名）。
     ///
     /// 複製せず所有権ごと渡すため、大きなVRMではこちらを使う。
     /// 呼び出し後は空になる。Worker側の移行先であり、
     /// 従来の `vrm` 取得子は互換のため残す。
     #[wasm_bindgen(js_name = takeVrm)]
     pub fn take_vrm(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.vrm)
+        std::mem::take(&mut self.glb)
     }
 
     /// レポートのJSON文字列を返す。

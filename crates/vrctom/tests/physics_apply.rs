@@ -432,3 +432,48 @@ fn 対応不一致は補助まで出して段階を返す() {
     assert_eq!(モデル.nodes.len(), もとノード数);
     assert!(モデル.spring_bones.springs.is_empty());
 }
+
+#[test]
+fn humanoid無しの物理適用はt_poseと視線を飛ばしてスプリングを適用する() {
+    let fbxバイト列 = b"fake-fbx";
+    let mut モデル = 書き出し可能モデルを作る();
+    let 文 = 髪sidecarを作る(fbxバイト列, &モデル);
+    let sidecar =
+        PhysicsSidecar::from_json(&文, &PhysicsLimits::new()).expect("合成sidecarは検証を通る");
+    let 報告 = vrctom::vrm::apply_physics_sidecar_without_humanoid(
+        &mut モデル,
+        &sidecar,
+        fbxバイト列,
+        &SpringCompileOptions::new(),
+    )
+    .expect("Humanoid無しでも適用できる");
+    assert_eq!(報告.tpose_applied, 0);
+    assert!(報告.tpose_skipped.is_empty());
+    assert!(報告.look_at.is_none());
+    assert_eq!(報告.spring_count, 1);
+    assert_eq!(報告.joint_count, 2);
+    assert_eq!(モデル.spring_bones.springs.len(), 1);
+    assert!(モデル.look_at.is_none());
+}
+
+#[test]
+fn humanoid無しの物理適用でも解決失敗時はモデルを変更しない() {
+    let fbxバイト列 = b"fake-fbx";
+    let mut モデル = 書き出し可能モデルを作る();
+    let もとノード数 = モデル.nodes.len();
+    let mut 文: serde_json::Value =
+        serde_json::from_str(&髪sidecarを作る(fbxバイト列, &モデル)).expect("合成sidecarは読める");
+    文["sourceModels"][0]["sha256"] = serde_json::json!("0".repeat(64));
+    let sidecar =
+        PhysicsSidecar::from_json(&文.to_string(), &PhysicsLimits::new()).expect("書式は通る");
+    let 失敗 = vrctom::vrm::apply_physics_sidecar_without_humanoid(
+        &mut モデル,
+        &sidecar,
+        fbxバイト列,
+        &SpringCompileOptions::new(),
+    )
+    .expect_err("SHA不一致は失敗する");
+    assert_eq!(失敗.error().kind(), VrmErrorKind::InvalidPhysicsSidecar);
+    assert_eq!(モデル.nodes.len(), もとノード数);
+    assert!(モデル.spring_bones.springs.is_empty());
+}

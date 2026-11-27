@@ -1958,3 +1958,231 @@ fn mtoon材質はunlitと法線と既定値を書き出す() {
         "UV回転の既定値がある"
     );
 }
+
+/// Humanoid 骨を持たない衣装向けモデルを作成し、汎用 GLB 書き出しを検証する。
+fn 非humanoid衣装モデルを作る() -> VrmModel {
+    let ノード = vec![
+        VrmNode {
+            name: "Armature".to_string(),
+            parent: None,
+            children: vec![1],
+            local: 単位行列(),
+        },
+        VrmNode {
+            name: "RibbonRoot".to_string(),
+            parent: Some(0),
+            children: vec![2],
+            local: 単位行列(),
+        },
+        VrmNode {
+            name: "RibbonTip".to_string(),
+            parent: Some(1),
+            children: Vec::new(),
+            local: [
+                1.0, 0.0, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0, //
+                0.0, 0.2, 0.0, 1.0, //
+            ],
+        },
+        VrmNode {
+            name: "RibbonMesh".to_string(),
+            parent: None,
+            children: Vec::new(),
+            local: 単位行列(),
+        },
+    ];
+    let スキン = VrmSkin {
+        joints: vec![1, 2],
+        inverse_bind_matrices: vec![単位行列(), 単位行列()],
+        joint_models: vec![ObjectId::new(1), ObjectId::new(2)],
+    };
+    let メッシュ = VrmMesh {
+        node: 3,
+        geometry: ObjectId::new(100),
+        model: ObjectId::new(200),
+        name: "RibbonMesh".to_string(),
+        skin: Some(0),
+        material_slots: vec!["RibbonMat".to_string()],
+        vertices: VrmVertices {
+            positions: vec![[0.0, 0.0, 0.0], [0.2, 0.0, 0.0], [0.0, 0.2, 0.0]],
+            normals: Some(vec![[0.0, 0.0, 1.0]; 3]),
+            uv_sets: vec![vec![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]],
+            joints: Some(vec![[0, 0, 0, 0], [1, 0, 0, 0], [1, 0, 0, 0]]),
+            weights: Some(vec![
+                [1.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+            ]),
+        },
+        primitives: vec![VrmPrimitive {
+            material: 0,
+            indices: vec![0, 1, 2],
+        }],
+        targets: Vec::new(),
+    };
+    VrmModel {
+        root: 単位行列(),
+        nodes: ノード,
+        skins: vec![スキン],
+        meshes: vec![メッシュ],
+        expressions: VrmExpressions::default(),
+        spring_bones: vrctom::vrm::VrmSpringBones::default(),
+        node_constraints: Vec::new(),
+        look_at: None,
+    }
+}
+
+#[test]
+fn to_glbはhumanoid無しモデルからvrmc_vrm無しのglbを書き出す() {
+    let モデル = 非humanoid衣装モデルを作る();
+    let バイト列 = モデル
+        .to_glb(&vrctom::vrm::GlbExportOptions::new())
+        .expect("Humanoid無しモデルでもGLBを書き出せる");
+    let (json, _bin) = glbを分解する(&バイト列);
+    assert!(
+        json.get("extensions")
+            .and_then(|v| v.get("VRMC_vrm"))
+            .is_none(),
+        "汎用GLBにはVRMC_vrmを含めない"
+    );
+    assert!(
+        json["skins"][0].get("skeleton").is_none(),
+        "Humanoid無しのためskin.skeletonは付かない"
+    );
+    assert_eq!(json["meshes"].as_array().map(Vec::len), Some(1));
+}
+
+#[test]
+fn to_glbはmtoonとスプリングとノード制約を書き出しextensions_usedに載せる() {
+    let mut モデル = 非humanoid衣装モデルを作る();
+    モデル.spring_bones = vrctom::vrm::VrmSpringBones {
+        colliders: vec![vrctom::vrm::VrmSpringCollider {
+            node: 1,
+            shape: vrctom::vrm::VrmSpringColliderShape::Sphere {
+                offset: [0.0, 0.0, 0.0],
+                radius: 0.05,
+            },
+            extended: Some(vrctom::vrm::VrmSpringColliderExtension::Plane {
+                normal: [0.0, 1.0, 0.0],
+                offset: [0.0, 0.0, 0.0],
+            }),
+        }],
+        collider_groups: vec![vrctom::vrm::VrmSpringColliderGroup {
+            name: "RibbonGroup".to_string(),
+            colliders: vec![0],
+        }],
+        springs: vec![vrctom::vrm::VrmSpring {
+            name: "Ribbon".to_string(),
+            center: None,
+            collider_groups: vec![0],
+            joints: vec![
+                vrctom::vrm::VrmSpringJoint {
+                    node: 1,
+                    hit_radius: 0.02,
+                    stiffness: 1.0,
+                    gravity_power: 0.0,
+                    gravity_dir: [0.0, -1.0, 0.0],
+                    drag_force: 0.5,
+                    limit: Some(vrctom::vrm::VrmSpringJointLimit::Cone {
+                        angle: 0.5,
+                        rotation: [0.0, 0.0, 0.0, 1.0],
+                    }),
+                },
+                vrctom::vrm::VrmSpringJoint {
+                    node: 2,
+                    hit_radius: 0.02,
+                    stiffness: 1.0,
+                    gravity_power: 0.0,
+                    gravity_dir: [0.0, -1.0, 0.0],
+                    drag_force: 0.5,
+                    limit: None,
+                },
+            ],
+        }],
+    };
+    モデル.node_constraints = vec![vrctom::vrm::VrmNodeConstraint {
+        node: 2,
+        source: 1,
+        weight: 1.0,
+        kind: vrctom::vrm::VrmNodeConstraintKind::Rotation,
+    }];
+    let 材質 = VrmMaterials::new(
+        vec![VrmMaterialEntry {
+            slot: "RibbonMat".to_string(),
+            material: VrmMaterial {
+                name: "RibbonMat".to_string(),
+                base_color_factor: [1.0, 1.0, 1.0, 1.0],
+                base_color_image: None,
+                emissive_factor: [0.0, 0.0, 0.0],
+                emissive_image: None,
+                normal_image: None,
+                normal_scale: 1.0,
+                alpha_mode: VrmAlphaMode::Opaque,
+                alpha_cutoff: 0.5,
+                double_sided: false,
+                mtoon: Some(VrmMtoonParameters::default()),
+            },
+        }],
+        Vec::new(),
+    );
+    let バイト列 = モデル
+        .to_glb(&vrctom::vrm::GlbExportOptions::new().with_materials(材質))
+        .expect("MToon・物理・制約付きでGLBを書き出せる");
+    let (json, _bin) = glbを分解する(&バイト列);
+    assert!(json["extensions"].get("VRMC_vrm").is_none());
+    assert!(json["extensions"].get("VRMC_springBone").is_some());
+    assert!(
+        json["materials"][0]["extensions"]
+            .get("VRMC_materials_mtoon")
+            .is_some()
+    );
+    assert!(
+        json["nodes"][2]["extensions"]
+            .get("VRMC_node_constraint")
+            .is_some()
+    );
+    let used: Vec<&str> = json["extensionsUsed"]
+        .as_array()
+        .expect("extensionsUsedがある")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(!used.contains(&"VRMC_vrm"));
+    for 期待 in [
+        "VRMC_materials_mtoon",
+        "KHR_materials_unlit",
+        "VRMC_springBone",
+        "VRMC_springBone_limit",
+        "VRMC_springBone_extended_collider",
+        "VRMC_node_constraint",
+    ] {
+        assert!(used.contains(&期待), "{期待} が extensionsUsed に含まれる");
+    }
+}
+
+#[test]
+fn to_glbは拡張が無いとき不要なextensions項目を書かない() {
+    let モデル = 非humanoid衣装モデルを作る();
+    let バイト列 = モデル
+        .to_glb(&vrctom::vrm::GlbExportOptions::new())
+        .expect("拡張無しGLBを書き出せる");
+    let (json, _bin) = glbを分解する(&バイト列);
+    assert!(
+        json.get("extensions").is_none(),
+        "ルート拡張が空ならextensions自体を省略する"
+    );
+    assert!(
+        json.get("extensionsUsed").is_none(),
+        "拡張不使用時はextensionsUsedを省略する"
+    );
+}
+
+#[test]
+fn to_glbは出力上限を超えるとlimit_exceededで失敗する() {
+    let モデル = 非humanoid衣装モデルを作る();
+    let 失敗 = モデル
+        .to_glb(&vrctom::vrm::GlbExportOptions::new().with_max_output_bytes(16))
+        .expect_err("上限超過は失敗する");
+    assert_eq!(失敗.kind(), VrmExportErrorKind::LimitExceeded);
+}

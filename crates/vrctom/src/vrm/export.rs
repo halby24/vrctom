@@ -285,6 +285,46 @@ impl VrmExportOptions {
     }
 }
 
+/// 汎用 GLB 書き出しの設定。
+///
+/// `VRMC_vrm` 拡張（meta・humanoid・expressions・lookAt）を含めず、
+/// 材質（`VRMC_materials_mtoon` 等）・スプリング（`VRMC_springBone`）・
+/// ノード制約（`VRMC_node_constraint`）だけを載せて GLB バイト列を組み立てる。
+#[derive(Debug, Clone)]
+pub struct GlbExportOptions {
+    /// Unityの `.mat` から作った材質。`None` の場合は灰色PBR材質を書く。
+    pub materials: Option<VrmMaterials>,
+    max_output_bytes: usize,
+}
+
+impl GlbExportOptions {
+    /// 設定を作る。材質は灰色PBR、出力上限は既定値になる。
+    pub fn new() -> Self {
+        Self {
+            materials: None,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+        }
+    }
+
+    /// Unityから読み取った材質を使う。
+    pub fn with_materials(mut self, materials: VrmMaterials) -> Self {
+        self.materials = Some(materials);
+        self
+    }
+
+    /// 出力バイト数の上限を変更する。
+    pub fn with_max_output_bytes(mut self, bytes: usize) -> Self {
+        self.max_output_bytes = bytes;
+        self
+    }
+}
+
+impl Default for GlbExportOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// VRM書き出しの失敗エラー。
 ///
 /// 対象ノード・骨が判明している範囲で索引を保持し、表示だけが逃がす。
@@ -402,7 +442,35 @@ impl VrmModel {
             None => HumanoidBones::detect(self)?,
         };
         let bones = validate_humanoid(self, &humanoid)?;
-        let mut writer = GlbWriter::new(self, options, &bones);
+        let mut writer = GlbWriter::new(
+            self,
+            options.materials.as_ref(),
+            options.max_output_bytes,
+            ExportProfile::Vrm {
+                meta: &options.meta,
+                bones: &bones,
+            },
+        );
+        writer.build()
+    }
+
+    /// `VRMC_vrm` 拡張を持たない汎用 GLB バイト列を作る。
+    ///
+    /// meta と humanoid の検証は行わず、全身ボーンを持たない衣装・アクセサリでも書き出せる。
+    /// 材質（`VRMC_materials_mtoon`）・スプリング（`VRMC_springBone`）・
+    /// ノード制約（`VRMC_node_constraint`）はモデルと設定に応じて書き出す。
+    ///
+    /// # Errors
+    ///
+    /// 構造の不整合・材質値の不正・スプリングや制約の検証失敗・
+    /// 出力上限の超過の場合に返す。
+    pub fn to_glb(&self, options: &GlbExportOptions) -> Result<Vec<u8>, VrmExportError> {
+        let mut writer = GlbWriter::new(
+            self,
+            options.materials.as_ref(),
+            options.max_output_bytes,
+            ExportProfile::Glb,
+        );
         writer.build()
     }
 }
@@ -546,11 +614,23 @@ fn check_positive_scale(
     Ok(())
 }
 
+/// GLB 書き出し時の形式区分。
+enum ExportProfile<'a> {
+    /// VRM 1.0（`VRMC_vrm` と `skin.skeleton` を書く）。
+    Vrm {
+        meta: &'a VrmMeta,
+        bones: &'a ResolvedBones,
+    },
+    /// 汎用 GLB（`VRMC_vrm` と `skin.skeleton` を書かず、材質・物理拡張のみ書く）。
+    Glb,
+}
+
 /// GLB組み立ての作業領域。バッファ・JSON・対応表を持つ。
 struct GlbWriter<'a> {
     model: &'a VrmModel,
-    options: &'a VrmExportOptions,
-    bones: &'a ResolvedBones,
+    materials: Option<&'a VrmMaterials>,
+    max_output_bytes: usize,
+    profile: ExportProfile<'a>,
     root: gltf::json::Root,
     bin: Vec<u8>,
     mesh_indices: Vec<usize>,
@@ -563,11 +643,17 @@ struct GlbWriter<'a> {
 }
 
 impl<'a> GlbWriter<'a> {
-    fn new(model: &'a VrmModel, options: &'a VrmExportOptions, bones: &'a ResolvedBones) -> Self {
+    fn new(
+        model: &'a VrmModel,
+        materials: Option<&'a VrmMaterials>,
+        max_output_bytes: usize,
+        profile: ExportProfile<'a>,
+    ) -> Self {
         Self {
             model,
-            options,
-            bones,
+            materials,
+            max_output_bytes,
+            profile,
             root: gltf::json::Root::default(),
             bin: Vec::new(),
             mesh_indices: Vec::new(),
@@ -586,7 +672,7 @@ impl<'a> GlbWriter<'a> {
         self.build_skins()?;
         self.build_nodes()?;
         self.build_scene()?;
-        self.build_vrm_extension()?;
+        self.build_extensions()?;
         self.build_buffer();
         let json = gltf::json::serialize::to_string(&self.root).map_err(|error| {
             VrmExportError::new(
@@ -602,14 +688,11 @@ impl<'a> GlbWriter<'a> {
     /// 画像は単一バッファへ4バイト境界で詰め、サンプラは値の組で重複排除し、
     /// テクスチャは画像ごとに1件作る。材質が無い場合は何もしない。
     fn build_images(&mut self) -> Result<(), VrmExportError> {
-        // `options` は `&'a` の共有参照のため、参照だけを複写して借用を切り離し、
-        // 後続の `bin`・`root` への可変借用と競合させない。
-        let options: &'a VrmExportOptions = self.options;
-        let Some(materials) = options.materials.as_ref() else {
+        let Some(materials) = self.materials else {
             return Ok(());
         };
         let images = materials.images();
-        let max_output_bytes = options.max_output_bytes;
+        let max_output_bytes = self.max_output_bytes;
         // フィールド単位で借用し、`self` 全体の可変借用を作らない。
         let bin = &mut self.bin;
         let root = &mut self.root;
@@ -693,9 +776,7 @@ impl<'a> GlbWriter<'a> {
         }
         for slot in slots {
             let resolved = self
-                .options
                 .materials
-                .as_ref()
                 .and_then(|materials| materials.get(&slot))
                 .cloned();
             let material = match resolved {
@@ -984,11 +1065,13 @@ impl<'a> GlbWriter<'a> {
 
     /// スキンと逆バインド行列アクセサを作る。
     fn build_skins(&mut self) -> Result<(), VrmExportError> {
-        let hips = self
-            .bones
-            .iter()
-            .find(|(bone, _)| *bone == HumanoidBone::Hips)
-            .map(|(_, node)| *node);
+        let hips = match self.profile {
+            ExportProfile::Vrm { bones, .. } => bones
+                .iter()
+                .find(|(bone, _)| *bone == HumanoidBone::Hips)
+                .map(|(_, node)| *node),
+            ExportProfile::Glb => None,
+        };
         for skin in &self.model.skins {
             if skin.joints.len() != skin.inverse_bind_matrices.len() {
                 return Err(VrmExportError::new(
@@ -1190,9 +1273,70 @@ impl<'a> GlbWriter<'a> {
         Ok(())
     }
 
-    /// `VRMC_vrm` 拡張（meta・humanoid・expressions）を書く。
-    fn build_vrm_extension(&mut self) -> Result<(), VrmExportError> {
-        let meta = &self.options.meta;
+    /// ルートの拡張と `extensionsUsed` を形式に応じて組み立てる。
+    fn build_extensions(&mut self) -> Result<(), VrmExportError> {
+        let mut others = serde_json::Map::new();
+        let mut used = Vec::new();
+        if let ExportProfile::Vrm { meta, bones } = self.profile {
+            let vrmc = self.build_vrmc_vrm_json(meta, bones)?;
+            others.insert("VRMC_vrm".to_string(), serde_json::Value::Object(vrmc));
+            used.push("VRMC_vrm".to_string());
+        }
+        if self.wrote_mtoon {
+            used.push("VRMC_materials_mtoon".to_string());
+            used.push("KHR_materials_unlit".to_string());
+        }
+        let mut wrote_spring_bone = false;
+        let mut wrote_spring_bone_limit = false;
+        let mut wrote_spring_bone_extended_collider = false;
+        if !self.model.spring_bones.springs.is_empty()
+            || !self.model.spring_bones.colliders.is_empty()
+            || !self.model.spring_bones.collider_groups.is_empty()
+        {
+            let spring_bone = self.build_spring_bone_json()?;
+            // 1件でも角度制限があれば、読み手向けに拡張使用を宣言する。
+            wrote_spring_bone_limit = self
+                .model
+                .spring_bones
+                .springs
+                .iter()
+                .flat_map(|spring| spring.joints.iter())
+                .any(|joint| joint.limit.is_some());
+            // 1件でも拡張colliderがあれば、読み手向けに拡張使用を宣言する。
+            wrote_spring_bone_extended_collider = self
+                .model
+                .spring_bones
+                .colliders
+                .iter()
+                .any(|collider| collider.extended.is_some());
+            others.insert("VRMC_springBone".to_string(), spring_bone);
+            wrote_spring_bone = true;
+        }
+        if !others.is_empty() {
+            self.root.extensions = Some(gltf::json::extensions::root::Root { others });
+        }
+        if wrote_spring_bone {
+            used.push("VRMC_springBone".to_string());
+        }
+        if wrote_spring_bone_limit {
+            used.push("VRMC_springBone_limit".to_string());
+        }
+        if wrote_spring_bone_extended_collider {
+            used.push("VRMC_springBone_extended_collider".to_string());
+        }
+        if !self.model.node_constraints.is_empty() {
+            used.push("VRMC_node_constraint".to_string());
+        }
+        self.root.extensions_used = used;
+        Ok(())
+    }
+
+    /// `VRMC_vrm` 拡張（meta・humanoid・expressions・lookAt）のJSONを作る。
+    fn build_vrmc_vrm_json(
+        &self,
+        meta: &VrmMeta,
+        bones: &ResolvedBones,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, VrmExportError> {
         let mut meta_value = serde_json::Map::new();
         meta_value.insert(
             "name".to_string(),
@@ -1284,7 +1428,7 @@ impl<'a> GlbWriter<'a> {
             serde_json::Value::String(meta.modification.as_str().to_string()),
         );
         let mut human_bones = serde_json::Map::new();
-        for (bone, node) in self.bones {
+        for (bone, node) in bones {
             human_bones.insert(bone.name().to_string(), serde_json::json!({ "node": node }));
         }
         let mut vrmc = serde_json::Map::new();
@@ -1306,54 +1450,7 @@ impl<'a> GlbWriter<'a> {
             let look_value = super::look_at::look_at_json(look, self.model.nodes.len())?;
             vrmc.insert("lookAt".to_string(), look_value);
         }
-        let mut others = serde_json::Map::new();
-        others.insert("VRMC_vrm".to_string(), serde_json::Value::Object(vrmc));
-        let mut wrote_spring_bone = false;
-        let mut wrote_spring_bone_limit = false;
-        let mut wrote_spring_bone_extended_collider = false;
-        if !self.model.spring_bones.springs.is_empty()
-            || !self.model.spring_bones.colliders.is_empty()
-            || !self.model.spring_bones.collider_groups.is_empty()
-        {
-            let spring_bone = self.build_spring_bone_json()?;
-            // 1件でも角度制限があれば、読み手向けに拡張使用を宣言する。
-            wrote_spring_bone_limit = self
-                .model
-                .spring_bones
-                .springs
-                .iter()
-                .flat_map(|spring| spring.joints.iter())
-                .any(|joint| joint.limit.is_some());
-            // 1件でも拡張colliderがあれば、読み手向けに拡張使用を宣言する。
-            wrote_spring_bone_extended_collider = self
-                .model
-                .spring_bones
-                .colliders
-                .iter()
-                .any(|collider| collider.extended.is_some());
-            others.insert("VRMC_springBone".to_string(), spring_bone);
-            wrote_spring_bone = true;
-        }
-        self.root.extensions = Some(gltf::json::extensions::root::Root { others });
-        let mut used = vec!["VRMC_vrm".to_string()];
-        if self.wrote_mtoon {
-            used.push("VRMC_materials_mtoon".to_string());
-            used.push("KHR_materials_unlit".to_string());
-        }
-        if wrote_spring_bone {
-            used.push("VRMC_springBone".to_string());
-        }
-        if wrote_spring_bone_limit {
-            used.push("VRMC_springBone_limit".to_string());
-        }
-        if wrote_spring_bone_extended_collider {
-            used.push("VRMC_springBone_extended_collider".to_string());
-        }
-        if !self.model.node_constraints.is_empty() {
-            used.push("VRMC_node_constraint".to_string());
-        }
-        self.root.extensions_used = used;
-        Ok(())
+        Ok(vrmc)
     }
 
     /// VRM 1.0 のプリセット表情名かどうか。
@@ -1659,7 +1756,7 @@ impl<'a> GlbWriter<'a> {
         if !self.bin.is_empty() {
             total += 8 + bin_padded as u64;
         }
-        if total > u32::MAX as u64 || total > self.options.max_output_bytes as u64 {
+        if total > u32::MAX as u64 || total > self.max_output_bytes as u64 {
             return Err(VrmExportError::new(
                 VrmExportErrorKind::LimitExceeded,
                 "出力バイト数が上限を超えた",
@@ -1722,7 +1819,7 @@ impl<'a> GlbWriter<'a> {
         data: &[u8],
         target: Option<gltf::json::buffer::Target>,
     ) -> Result<gltf::json::Index<gltf::json::buffer::View>, VrmExportError> {
-        let max_output_bytes = self.options.max_output_bytes;
+        let max_output_bytes = self.max_output_bytes;
         push_view_into(
             &mut self.bin,
             &mut self.root,

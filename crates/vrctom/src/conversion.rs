@@ -8,7 +8,9 @@
 pub mod prefab;
 
 use crate::fbx::{FbxError, FbxFile, FbxOptions};
-use crate::vrm::{VrmError, VrmExportError, VrmExportOptions, VrmModel, VrmOptions, VrmReport};
+use crate::vrm::{
+    GlbExportOptions, VrmError, VrmExportError, VrmExportOptions, VrmModel, VrmOptions, VrmReport,
+};
 
 /// 中間モデルとその件数・警告の報告の束ね。
 ///
@@ -137,6 +139,21 @@ pub fn export_model(
     model.to_vrm(options).map_err(ConversionError::Export)
 }
 
+/// 中間モデルから汎用 GLB バイト列を作る。
+///
+/// [`VrmModel::to_glb`] と同じバイト列を返す。`VRMC_vrm` 拡張は含めず、
+/// 材質・スプリング・ノード制約だけを書き出す。
+///
+/// # Errors
+///
+/// 書き出しに失敗した場合は [`ConversionError::Export`] を返す。
+pub fn export_model_glb(
+    model: &VrmModel,
+    options: &GlbExportOptions,
+) -> Result<Vec<u8>, ConversionError> {
+    model.to_glb(options).map_err(ConversionError::Export)
+}
+
 /// FBXバイト列からVRMバイト列と件数・警告の報告を作る。
 ///
 /// [`build_model`] と [`export_model`] の合成であり、読み取りは一度だけ行う。
@@ -153,5 +170,23 @@ pub fn convert_fbx(
 ) -> Result<(Vec<u8>, VrmReport), ConversionError> {
     let built = build_model(fbx_bytes, fbx_options, vrm_options)?;
     let bytes = export_model(&built.model, export_options)?;
+    Ok((bytes, built.report))
+}
+
+/// FBXバイト列から汎用 GLB バイト列と件数・警告の報告を作る。
+///
+/// [`build_model`] と [`export_model_glb`] の合成であり、`VRMC_vrm` 拡張を含めない。
+///
+/// # Errors
+///
+/// FBX解析・中間モデル・書き出しの失敗を段階ごとのバリアントで返す。
+pub fn convert_fbx_glb(
+    fbx_bytes: &[u8],
+    fbx_options: &FbxOptions,
+    vrm_options: &VrmOptions,
+    export_options: &GlbExportOptions,
+) -> Result<(Vec<u8>, VrmReport), ConversionError> {
+    let built = build_model(fbx_bytes, fbx_options, vrm_options)?;
+    let bytes = export_model_glb(&built.model, export_options)?;
     Ok((bytes, built.report))
 }

@@ -629,3 +629,57 @@ fn convert_fbxでglbの実際の式とレポート件数が一致する() {
     assert_eq!(report.warnings.len(), 1);
     assert!(report.warnings[0].contains("無い名前"));
 }
+
+#[test]
+fn export_model_glbとconvert_fbx_glbでhumanoid無しモデルをglb変換できる() {
+    use vrctom::conversion::{convert_fbx_glb, export_model_glb};
+    use vrctom::vrm::{GlbExportOptions, VrmMorphMode};
+
+    // Humanoid 骨を持たず BindPose も持たないシンプルなモデル。
+    let objs = vec![
+        model(1, "SkirtRoot", "Null"),
+        model(2, "SkirtOwner", "Mesh"),
+        geometry(
+            10,
+            "SkirtGeo",
+            vec![
+                vertices_node(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+                pvi_node(&[0, 1, -3]),
+            ],
+        ),
+        変形子(40, b"Blend\x00\x01Deformer", "BlendShape", vec![]),
+        伝達子(30, b"Shrink\x00\x01SubDeformer"),
+        形状(20, b"ShrinkShape\x00\x01Shape", &[0], &[0.1, 0.0, 0.0]),
+    ];
+    let conns = vec![
+        conn(1, 0),
+        conn(2, 1),
+        conn(10, 2),
+        conn(20, 30),
+        conn(30, 40),
+        conn(40, 10),
+    ];
+    let bytes = file(vec![objects(objs), connections(conns)]);
+    let vrm_options = VrmOptions::new()
+        .with_allow_rest_without_bind_pose(true)
+        .with_morph_mode(VrmMorphMode::All);
+
+    let built = build_model(&bytes, &FbxOptions::new(), &vrm_options).expect("中間モデルを作れる");
+    let glb_from_model =
+        export_model_glb(&built.model, &GlbExportOptions::new()).expect("GLBを書き出せる");
+    let (glb_direct, report) = convert_fbx_glb(
+        &bytes,
+        &FbxOptions::new(),
+        &vrm_options,
+        &GlbExportOptions::new(),
+    )
+    .expect("convert_fbx_glbで変換できる");
+    assert_eq!(glb_from_model, glb_direct);
+    assert_eq!(report.morph_target_count, 1);
+    let json = glbのjsonを取り出す(&glb_direct);
+    assert!(json["extensions"].get("VRMC_vrm").is_none());
+    assert_eq!(
+        json["meshes"][0]["extras"]["targetNames"],
+        serde_json::json!(["Shrink"])
+    );
+}

@@ -4196,3 +4196,162 @@ fn 別資産のstripped文書は対応元を汚染しない() {
         prefab_baseline_weights(&prefab, "試験", &fbx, guid).expect("別資産の文書は汚染しない");
     assert_eq!(weights.meshes[&ObjectId::new(10)].len(), 1);
 }
+
+#[test]
+fn morph_mode_allは複数メッシュのブレンドシェイプをすべて残す() {
+    let extra_mesh = triangle_geometry(11, b"Cloth\x00\x01Geometry", vec![]);
+    let extra_model = model(3, b"ClothOwner\x00\x01Model", "Mesh");
+    let bytes = 表情最小ファイル(
+        &[(
+            "Shrink_Chest",
+            "s1",
+            &[0],
+            &[0.1, 0.0, 0.0],
+            Some(0.0),
+            None,
+        )],
+        vec![
+            extra_model,
+            extra_mesh,
+            束ねノード(3001, b"ClothBlend\x00\x01Deformer"),
+            形状(1010, b"s2\x00\x01Shape", &[1], &[0.0, 0.2, 0.0]),
+            伝達子(2010, b"Shrink_Waist\x00\x01SubDeformer", Some(0.0), None),
+        ],
+        vec![
+            conn(3, 1),
+            conn(11, 3),
+            conn(1010, 2010),
+            conn(2010, 3001),
+            conn(3001, 11),
+        ],
+        &[(3, bind_matrix(0.0, 0.0, 0.0))],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("解析できる");
+    let options = VrmOptions::new().with_morph_mode(vrctom::vrm::VrmMorphMode::All);
+    let (model, report) = VrmModel::from_fbx(&parsed, &options).expect("全モーフを保持できる");
+    assert_eq!(model.meshes.len(), 2);
+    assert_eq!(model.meshes[0].targets.len(), 1);
+    assert_eq!(model.meshes[0].targets[0].name, "Shrink_Chest");
+    assert_eq!(model.meshes[1].targets.len(), 1);
+    assert_eq!(model.meshes[1].targets[0].name, "Shrink_Waist");
+    assert_eq!(report.morph_target_count, 2);
+    assert!(model.expressions.preset.is_empty());
+}
+
+#[test]
+fn morph_mode_allは表情プロファイルと併用しても正しいターゲット索引へ束ねる() {
+    let bytes = 表情最小ファイル(
+        &[
+            ("Shrink_Body", "s0", &[0], &[0.1, 0.0, 0.0], Some(0.0), None),
+            ("vrc.v_aa", "s1", &[1], &[0.0, 0.2, 0.0], Some(0.0), None),
+        ],
+        vec![],
+        vec![],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("解析できる");
+    let profile = VrmExpressionProfile {
+        bindings: vec![束ね("aa", "vrc.v_aa")],
+    };
+    let options = VrmOptions::new()
+        .with_morph_mode(vrctom::vrm::VrmMorphMode::All)
+        .with_expressions(profile);
+    let (model, report) = VrmModel::from_fbx(&parsed, &options).expect("併用して変換できる");
+    assert_eq!(model.meshes[0].targets.len(), 2);
+    assert_eq!(model.meshes[0].targets[0].name, "Shrink_Body");
+    assert_eq!(model.meshes[0].targets[1].name, "vrc.v_aa");
+    assert_eq!(report.expression_count, 1);
+    assert_eq!(model.expressions.preset[0].morph_target_binds[0].target, 1);
+}
+
+#[test]
+fn morph_mode_allは束ね対象外の非単一フレームや非ゼロ初期値を警告で飛ばす() {
+    // 2形状（非単一フレーム）と非ゼロ初期値（50.0）を束ね対象外に混ぜる。
+    let bytes = 表情最小ファイル(
+        &[
+            ("KeepMe", "s0", &[0], &[0.1, 0.0, 0.0], Some(0.0), None),
+            (
+                "NonZeroInit",
+                "s1",
+                &[1],
+                &[0.0, 0.2, 0.0],
+                Some(50.0),
+                None,
+            ),
+        ],
+        vec![
+            形状(1020, b"f1\x00\x01Shape", &[0], &[0.1, 0.0, 0.0]),
+            形状(1021, b"f2\x00\x01Shape", &[1], &[0.0, 0.1, 0.0]),
+            伝達子(2020, b"MultiFrame\x00\x01SubDeformer", Some(0.0), None),
+        ],
+        vec![conn(1020, 2020), conn(1021, 2020), conn(2020, 3000)],
+        &[],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("解析できる");
+    let options = VrmOptions::new().with_morph_mode(vrctom::vrm::VrmMorphMode::All);
+    let (model, report) =
+        VrmModel::from_fbx(&parsed, &options).expect("非対応チャンネルは飛ばして成功する");
+    assert_eq!(model.meshes[0].targets.len(), 1);
+    assert_eq!(model.meshes[0].targets[0].name, "KeepMe");
+    assert_eq!(report.warnings.len(), 2);
+    assert!(report.warnings.iter().any(|w| w.contains("NonZeroInit")));
+    assert!(report.warnings.iter().any(|w| w.contains("MultiFrame")));
+}
+
+#[test]
+fn morph_mode_allは全メッシュ合算のモーフバイト上限超過で失敗する() {
+    // 3頂点×12バイト=36バイト/メッシュ。2メッシュ合計72バイトに対して上限71バイトで失敗する。
+    let extra_mesh = triangle_geometry(11, b"Cloth\x00\x01Geometry", vec![]);
+    let extra_model = model(3, b"ClothOwner\x00\x01Model", "Mesh");
+    let bytes = 表情最小ファイル(
+        &[("m1", "s1", &[0], &[0.1, 0.0, 0.0], Some(0.0), None)],
+        vec![
+            extra_model,
+            extra_mesh,
+            束ねノード(3001, b"ClothBlend\x00\x01Deformer"),
+            形状(1010, b"s2\x00\x01Shape", &[1], &[0.0, 0.2, 0.0]),
+            伝達子(2010, b"m2\x00\x01SubDeformer", Some(0.0), None),
+        ],
+        vec![
+            conn(3, 1),
+            conn(11, 3),
+            conn(1010, 2010),
+            conn(2010, 3001),
+            conn(3001, 11),
+        ],
+        &[(3, bind_matrix(0.0, 0.0, 0.0))],
+    );
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("解析できる");
+    let fail = VrmModel::from_fbx(
+        &parsed,
+        &VrmOptions::new()
+            .with_morph_mode(vrctom::vrm::VrmMorphMode::All)
+            .with_max_morph_bytes(71),
+    )
+    .expect_err("合算上限超過は失敗する");
+    assert_eq!(fail.kind(), VrmErrorKind::LimitExceeded);
+}
+
+#[test]
+fn allow_rest_without_bind_poseは非スキンfbxの変換を許可し既定では失敗する() {
+    // BindPoseを持たない非スキン小物FBX。
+    let objs = vec![
+        model(1, b"Prop\x00\x01Model", "Mesh"),
+        triangle_geometry(10, b"PropGeo\x00\x01Geometry", vec![]),
+    ];
+    let conns = vec![conn(1, 0), conn(10, 1)];
+    let bytes = assemble(None, objs, conns);
+    let parsed = FbxFile::parse(&bytes, &FbxOptions::new()).expect("解析できる");
+
+    let default_err =
+        VrmModel::from_fbx(&parsed, &VrmOptions::new()).expect_err("既定ではMissingBindPoseになる");
+    assert_eq!(default_err.kind(), VrmErrorKind::MissingBindPose);
+
+    let (model, report) = VrmModel::from_fbx(
+        &parsed,
+        &VrmOptions::new().with_allow_rest_without_bind_pose(true),
+    )
+    .expect("許可時はrest姿勢で変換できる");
+    assert_eq!(model.meshes.len(), 1);
+    assert_eq!(report.bind_rest_models, 1);
+}

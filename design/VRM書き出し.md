@@ -346,6 +346,21 @@ UVはFBXとUnityの左下原点からglTFの左上原点へ合わせるため、
 - 対象と参照先のノード索引は範囲内であり、互いに異なる。
 - 重みは0〜1の有限値である。
 
+## 汎用 GLB 書き出しと部分適用
+
+Three.js（`@pixiv/three-vrm`）等で元アバターとは別に衣装やアクセサリを個別読み込みする用途に向けて、
+`VRMC_vrm` 拡張を含めない汎用 GLB 書き出し（`VrmModel::to_glb` / `GlbExportOptions`）を提供する。
+
+- `VrmMeta` と `HumanoidBones` の必須検証を行わず、`VRMC_vrm` と `skin.skeleton` を出力しない。
+- MToon 材質（`VRMC_materials_mtoon`・`KHR_materials_unlit`）・スプリング（`VRMC_springBone` 系）・
+  ノード制約（`VRMC_node_constraint`）はモデルと設定に応じて VRM 書き出しと同じ規則で出力する。
+- ルート拡張が 1 件も無い場合は空の `extensions` オブジェクトを書かない。
+- 物理適用は Humanoid を前提にしない入口（`apply_physics_sidecar_without_humanoid`）を用意し、
+  T-pose 適用と視線解決を省いてスプリングとノード制約だけを適用する。
+- モーフターゲットの保持方針（`VrmMorphMode`）として、既存の `ExpressionsOnly` に加え、
+  所有モデルを持つ全メッシュの単一フレーム BlendShape を残す `All` を選べるようにする。
+  束ね対象外の非単一フレームや非ゼロ初期値のチャンネルは変換を止めず警告を残して飛ばす。
+
 ## アクセサ
 
 - 位置はVEC3/F32で、min/maxを付ける。

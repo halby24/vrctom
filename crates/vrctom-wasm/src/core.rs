@@ -7,16 +7,17 @@
 use serde::{Deserialize, Serialize};
 use vrctom::conversion::prefab::{
     PrefabConversionError, PrefabConversionLimits, PrefabConversionOptions, PrefabExpressions,
-    PrefabPhysics,
+    PrefabGlbConversionOptions, PrefabPhysics,
 };
-use vrctom::conversion::{ConversionError, build_model_from_fbx, export_model};
+use vrctom::conversion::{ConversionError, build_model_from_fbx, export_model, export_model_glb};
 use vrctom::fbx::{FbxFile, FbxOptions};
 use vrctom::unity::{AssetIndex, HumanBoneMapping, IndexOptions, ParseOptions};
 use vrctom::unitypackage::{EntryKind, MemoryPackage, UnpackOptions, unpack_in_memory};
 use vrctom::vrm::{
-    HumanoidBones, MaterialOptions, PhysicsDeriveLimits, PhysicsLimits, PhysicsSidecar,
-    PrefabDeriveSource, PrefabMode, PrefabTargetLimits, PrefabTargetState, SpringCompileOptions,
-    VrmExportOptions, VrmExpressionProfile, VrmMeta, VrmOptions, apply_physics_sidecar,
+    GlbExportOptions, HumanoidBones, MaterialOptions, PhysicsDeriveLimits, PhysicsLimits,
+    PhysicsSidecar, PrefabDeriveSource, PrefabMode, PrefabTargetLimits, PrefabTargetState,
+    SpringCompileOptions, VrmExportOptions, VrmExpressionProfile, VrmMeta, VrmMorphMode,
+    VrmOptions, apply_physics_sidecar, apply_physics_sidecar_without_humanoid,
     derive_physics_sidecar_with, find_prefab_candidates, list_prefab_targets,
     resolve_prefab_target,
 };
@@ -40,6 +41,7 @@ pub struct Limits {
     max_output_bytes: usize,
     max_prefab_bytes: u64,
     max_physics_total_bytes: u64,
+    max_morph_targets_all: usize,
 }
 
 impl Limits {
@@ -48,7 +50,8 @@ impl Limits {
     /// 圧縮入力512MiB・展開後2GiB・tar10万件・FBX1件128MiB・
     /// 画像1枚32MiB・合計256MiB・画素1枚16777216（4096²）・
     /// 復号結果の保持量の予算67108864（4096²x4、RGBAで256MiB）・
-    /// VRM出力512MiB・Prefab本文64MiB・物理の依存合計512MiBである。
+    /// VRM出力512MiB・Prefab本文64MiB・物理の依存合計512MiB・
+    /// 全モーフ保持時の1メッシュ上限1024件である。
     ///
     /// 保持量の予算は復号結果の共有表が持つ画素数の目安であり、
     /// 超えたら保持を捨てて再復号する。上限は安全のための
@@ -68,6 +71,7 @@ impl Limits {
             max_output_bytes: 512 * 1024 * 1024,
             max_prefab_bytes: 64 * 1024 * 1024,
             max_physics_total_bytes: 512 * 1024 * 1024,
+            max_morph_targets_all: 1024,
         }
     }
 
@@ -141,6 +145,12 @@ impl Limits {
     /// 候補走査と導出の両方に使い、物理導出の上限へ渡す。
     pub fn with_max_physics_total_bytes(mut self, bytes: u64) -> Self {
         self.max_physics_total_bytes = bytes;
+        self
+    }
+
+    /// 全モーフ保持時の1メッシュあたりのモーフターゲット数上限を変更する。
+    pub fn with_max_morph_targets_all(mut self, count: usize) -> Self {
+        self.max_morph_targets_all = count;
         self
     }
 
@@ -448,6 +458,8 @@ struct PrefabReport {
     images: usize,
     /// 表情数。
     expressions: usize,
+    /// 全メッシュ合計のモーフターゲット数。
+    morph_targets: usize,
     /// 診断の警告文。失敗とは区別する。
     warnings: Vec<String>,
     /// 材質割当の報告。
@@ -463,6 +475,15 @@ struct PrefabReport {
 pub struct ConvertedPackage {
     /// VRM 1.0のGLBバイト列。
     pub vrm: Vec<u8>,
+    /// レポートのJSON文字列。
+    pub report_json: String,
+}
+
+/// 汎用 GLB 変換結果。GLBバイト列とレポートJSONを持つ。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvertedGlb {
+    /// `VRMC_vrm` を含まない GLB バイト列。
+    pub glb: Vec<u8>,
     /// レポートのJSON文字列。
     pub report_json: String,
 }
@@ -706,69 +727,17 @@ impl Package {
         limits: &Limits,
     ) -> Result<ConvertedPackage, CoreError> {
         let options = parse_prefab_options(options_json)?;
-        // 1. Prefabから直接FBXを解決する。`Resolved` 以外は失敗にする。
-        let resolution = resolve_prefab_target(
-            &self.package,
-            &self.index,
-            prefab_path,
-            &prefab_target_limits(limits),
-        )
-        .map_err(|error| {
-            CoreError::new(
-                Stage::Prefab,
-                format!("Prefab対象の解決に失敗した: {error}"),
-            )
-            .with_path(prefab_path.to_owned())
-        })?;
-        let fbx_path = match resolution.state {
-            PrefabTargetState::Resolved => {
-                let fbx = resolution.fbx.clone().ok_or_else(|| {
-                    CoreError::new(
-                        Stage::Prefab,
-                        format!("Prefabから直接FBXを解決できない: {prefab_path}"),
-                    )
-                    .with_path(prefab_path.to_owned())
-                })?;
-                fbx.path
-            }
-            PrefabTargetState::NoModel => {
-                return Err(prefab_unresolved_error(
-                    prefab_path,
-                    "モデル参照が無い",
-                    &resolution,
-                ));
-            }
-            PrefabTargetState::UnsupportedMultipleFbx => {
-                return Err(prefab_unresolved_error(
-                    prefab_path,
-                    "直接FBXが複数ある",
-                    &resolution,
-                ));
-            }
-            PrefabTargetState::RequiresPrefabResolution => {
-                return Err(prefab_unresolved_error(
-                    prefab_path,
-                    "ネストPrefabの解決が必要である",
-                    &resolution,
-                ));
-            }
-            PrefabTargetState::Unresolved => {
-                return Err(prefab_unresolved_error(
-                    prefab_path,
-                    "未解決の参照がある",
-                    &resolution,
-                ));
-            }
-        };
-        // 2. 解決したFBXのバイト列を読む。
+        let fbx_path = self.resolve_prefab_fbx_path(prefab_path, limits)?;
         let fbx_bytes = self.fbx_bytes(&fbx_path, limits.max_fbx_bytes)?;
-        // 3. 作品情報と出力上限を作る。
         let meta = VrmMeta::new(options.name(&fbx_path), options.authors());
         let export_options =
             VrmExportOptions::new(meta).with_max_output_bytes(limits.max_output_bytes);
-        // 4. 中間モデルの選択は既定であり、上限は既定値でよい。
-        let vrm_options = VrmOptions::new();
-        // 5. Prefab変換の選択と資源上限を作る。
+        let mut vrm_options = VrmOptions::new();
+        if options.morph_mode == VrmMorphMode::All {
+            vrm_options = vrm_options
+                .with_morph_mode(VrmMorphMode::All)
+                .with_max_morph_targets(limits.max_morph_targets_all);
+        }
         let prefab_options = PrefabConversionOptions {
             expressions: if options.expressions_descriptor {
                 PrefabExpressions::Descriptor
@@ -782,14 +751,8 @@ impl Package {
                 PrefabPhysics::None
             },
             material_options: limits.material_options(),
-            limits: PrefabConversionLimits::new()
-                .with_max_prefab_bytes(limits.max_prefab_bytes)
-                .with_max_fbx_bytes(limits.max_fbx_bytes)
-                .with_max_extra_fbx_bytes(limits.max_fbx_bytes)
-                .with_max_total_bytes(limits.max_physics_total_bytes)
-                .with_max_output_bytes(limits.max_output_bytes),
+            limits: prefab_conversion_limits(limits),
         };
-        // 6. 共有のPrefab変換本体を呼ぶ。
         let (vrm, report) = vrctom::conversion::prefab::convert_prefab(
             &self.package,
             &self.index,
@@ -801,58 +764,120 @@ impl Package {
             &prefab_options,
         )
         .map_err(|error| prefab_conversion_error(&error, prefab_path))?;
-        // 7. 報告をJSON用へ写す。件数は変換報告の値を使い、生成直後の報告は流用しない。
-        let rendered = PrefabReport {
-            prefab: report.prefab,
-            fbx: report.fbx,
-            fbx_guid: report.fbx_guid,
-            nested_prefabs: report.nested_prefabs,
-            bytes: report.bytes as u64,
-            nodes: report.nodes,
-            meshes: report.meshes,
-            skins: report.skins,
-            materials: report.materials,
-            images: report.images,
-            expressions: report.expressions,
-            warnings: report.warnings,
-            assignment: PrefabAssignmentReport {
-                mode: report.assignment_mode.map(|mode| match mode {
-                    PrefabMode::Instance => "instance".to_owned(),
-                    PrefabMode::Direct => "direct".to_owned(),
-                }),
-                active_meshes: report.active_meshes,
-                excluded_meshes: report.excluded_meshes,
-                excluded_names: report.excluded_names,
-                material_pool: report.material_pool,
+        let report_json = render_prefab_report(prefab_path, report)?;
+        Ok(ConvertedPackage { vrm, report_json })
+    }
+
+    /// 選んだPrefabを `VRMC_vrm` なしの汎用 GLB へ変換する。
+    ///
+    /// `prefab_path` は `Assets/...` の出力パス、`options_json` は
+    /// `{"baseline","physics","morphTargets"}` のJSONである。
+    ///
+    /// # Errors
+    ///
+    /// オプション不正・対象解決の失敗・FBX不在・材質読み取り・変換の失敗の場合に段階付きで返す。
+    pub fn convert_prefab_glb(
+        &self,
+        prefab_path: &str,
+        options_json: &str,
+    ) -> Result<ConvertedGlb, CoreError> {
+        self.convert_prefab_glb_with_limits(prefab_path, options_json, &Limits::new())
+    }
+
+    /// 上限を指定して選んだPrefabを汎用 GLB へ変換する。
+    fn convert_prefab_glb_with_limits(
+        &self,
+        prefab_path: &str,
+        options_json: &str,
+        limits: &Limits,
+    ) -> Result<ConvertedGlb, CoreError> {
+        let options = parse_prefab_glb_options(options_json)?;
+        let fbx_path = self.resolve_prefab_fbx_path(prefab_path, limits)?;
+        let fbx_bytes = self.fbx_bytes(&fbx_path, limits.max_fbx_bytes)?;
+        let export_options = GlbExportOptions::new().with_max_output_bytes(limits.max_output_bytes);
+        let mut vrm_options = VrmOptions::new();
+        if options.keep_all_morphs {
+            vrm_options = vrm_options
+                .with_morph_mode(VrmMorphMode::All)
+                .with_max_morph_targets(limits.max_morph_targets_all);
+        }
+        let prefab_options = PrefabGlbConversionOptions {
+            baseline: options.baseline,
+            physics: if options.physics_derive {
+                PrefabPhysics::Derive
+            } else {
+                PrefabPhysics::None
             },
-            baseline: PrefabBaselineReport {
-                meshes: report.baseline_meshes,
-                shapes: report.baseline_shapes,
-            },
-            physics: PrefabPhysicsReport {
-                prefab: if report.physics.used {
-                    Some(prefab_path.to_owned())
-                } else {
-                    None
-                },
-                selection: "target".to_owned(),
-                springs: report.physics.springs,
-                joints: report.physics.joints,
-                colliders: report.physics.colliders,
-                groups: report.physics.groups,
-                tpose_applied: report.physics.tpose_applied,
-                tpose_skipped: report.physics.tpose_skipped,
-                look_at: report.physics.look_at,
-            },
+            material_options: limits.material_options(),
+            limits: prefab_conversion_limits(limits),
         };
-        let report_json = serde_json::to_string(&rendered).map_err(|error| {
+        let (glb, report) = vrctom::conversion::prefab::convert_prefab_glb(
+            &self.package,
+            &self.index,
+            prefab_path,
+            &fbx_bytes,
+            &FbxOptions::default(),
+            &vrm_options,
+            export_options,
+            &prefab_options,
+        )
+        .map_err(|error| prefab_conversion_error(&error, prefab_path))?;
+        let report_json = render_prefab_report(prefab_path, report)?;
+        Ok(ConvertedGlb { glb, report_json })
+    }
+
+    /// Prefabから直接参照されるFBXパスを解決する。`Resolved` 以外は失敗にする。
+    fn resolve_prefab_fbx_path(
+        &self,
+        prefab_path: &str,
+        limits: &Limits,
+    ) -> Result<String, CoreError> {
+        let resolution = resolve_prefab_target(
+            &self.package,
+            &self.index,
+            prefab_path,
+            &prefab_target_limits(limits),
+        )
+        .map_err(|error| {
             CoreError::new(
-                Stage::Export,
-                format!("レポートのJSON化に失敗した: {error}"),
+                Stage::Prefab,
+                format!("Prefab対象の解決に失敗した: {error}"),
             )
             .with_path(prefab_path.to_owned())
         })?;
-        Ok(ConvertedPackage { vrm, report_json })
+        match resolution.state {
+            PrefabTargetState::Resolved => resolution
+                .fbx
+                .as_ref()
+                .map(|fbx| fbx.path.clone())
+                .ok_or_else(|| {
+                    CoreError::new(
+                        Stage::Prefab,
+                        format!("Prefabから直接FBXを解決できない: {prefab_path}"),
+                    )
+                    .with_path(prefab_path.to_owned())
+                }),
+            PrefabTargetState::NoModel => Err(prefab_unresolved_error(
+                prefab_path,
+                "モデル参照が無い",
+                &resolution,
+            )),
+            PrefabTargetState::UnsupportedMultipleFbx => Err(prefab_unresolved_error(
+                prefab_path,
+                "直接FBXが複数ある",
+                &resolution,
+            )),
+            PrefabTargetState::RequiresPrefabResolution => Err(prefab_unresolved_error(
+                prefab_path,
+                "ネストPrefabの解決が必要である",
+                &resolution,
+            )),
+            PrefabTargetState::Unresolved => Err(prefab_unresolved_error(
+                prefab_path,
+                "未解決の参照がある",
+                &resolution,
+            )),
+        }
     }
 
     /// 選んだFBXを変換する。
@@ -939,10 +964,16 @@ impl Package {
         // 物理指定の解決。`"none"` と候補0件の `"auto"` は物理なしであり、
         // それ以外はPrefabを1件に定めて導出・適用する。
         let physics =
-            match self.resolve_physics_prefab(fbx_path, &options, limits, &mut warnings)? {
+            match self.resolve_physics_prefab(fbx_path, &options.physics, limits, &mut warnings)? {
                 PhysicsPlan::Skip { selection } => PhysicsReport::skipped(selection),
-                PhysicsPlan::Apply { prefab, selection } => self.apply_prefab_physics(
-                    fbx_path, &prefab, selection, &fbx_file, &fbx_bytes, &humanoid, limits,
+                PhysicsPlan::Apply { prefab, selection } => self.apply_prefab_physics_with(
+                    fbx_path,
+                    &prefab,
+                    selection,
+                    &fbx_file,
+                    &fbx_bytes,
+                    Some(&humanoid),
+                    limits,
                     &mut built,
                 )?,
             };
@@ -978,6 +1009,108 @@ impl Package {
         Ok(ConvertedPackage { vrm, report_json })
     }
 
+    /// 選んだFBXを `VRMC_vrm` なしの汎用 GLB へ変換する。
+    ///
+    /// `fbx_path` は `Assets/...` の出力パス、`options_json` は
+    /// `{"physics","morphTargets"}` のJSONである。
+    ///
+    /// # Errors
+    ///
+    /// オプション不正・FBX不在・材質読み取り・変換の失敗の場合に段階付きで返す。
+    pub fn convert_glb(
+        &self,
+        fbx_path: &str,
+        options_json: &str,
+    ) -> Result<ConvertedGlb, CoreError> {
+        self.convert_glb_with_limits(fbx_path, options_json, &Limits::new())
+    }
+
+    /// 上限を指定して選んだFBXを汎用 GLB へ変換する。
+    fn convert_glb_with_limits(
+        &self,
+        fbx_path: &str,
+        options_json: &str,
+        limits: &Limits,
+    ) -> Result<ConvertedGlb, CoreError> {
+        let options = parse_glb_options(options_json)?;
+        let fbx_bytes = self.fbx_bytes(fbx_path, limits.max_fbx_bytes)?;
+        let relative = fbx_relative(fbx_path)?;
+        let (materials, material_report) = vrctom::vrm::VrmMaterials::load_with(
+            &self.package,
+            &self.index,
+            &relative,
+            &limits.material_options(),
+        )
+        .map_err(|error| {
+            let path = error.path().map(str::to_owned);
+            let mut failure = CoreError::new(
+                Stage::Material,
+                format!("材質の読み取りに失敗した: {error}"),
+            );
+            if let Some(path) = path {
+                failure = failure.with_path(path);
+            }
+            failure
+        })?;
+        let mut warnings: Vec<String> = material_report.warnings().to_vec();
+        if materials.is_none() {
+            warnings.push("材質を読めなかったため灰色で出力する".to_owned());
+        }
+        let material_count = materials.as_ref().map_or(0, |found| found.entries().len());
+        let image_count = materials.as_ref().map_or(0, |found| found.images().len());
+        let mut vrm_options = VrmOptions::new().with_allow_rest_without_bind_pose(true);
+        if options.keep_all_morphs {
+            vrm_options = vrm_options
+                .with_morph_mode(VrmMorphMode::All)
+                .with_max_morph_targets(limits.max_morph_targets_all);
+        }
+        let fbx_file = FbxFile::parse(&fbx_bytes, &FbxOptions::default()).map_err(|error| {
+            CoreError::new(Stage::Fbx, format!("FBXの解析に失敗した: {error}"))
+                .with_path(fbx_path.to_owned())
+        })?;
+        let mut built = build_model_from_fbx(&fbx_file, &vrm_options)
+            .map_err(|error| conversion_error(&error, fbx_path))?;
+        warnings.extend(built.report.warnings.iter().cloned());
+        let physics = if options.physics == PhysicsSelection::Auto && fbx_file.skins().is_empty() {
+            warnings.push("スキンが無いためPrefab由来の物理を適用しない".to_owned());
+            PhysicsReport::skipped("undetected")
+        } else {
+            match self.resolve_physics_prefab(fbx_path, &options.physics, limits, &mut warnings)? {
+                PhysicsPlan::Skip { selection } => PhysicsReport::skipped(selection),
+                PhysicsPlan::Apply { prefab, selection } => self.apply_prefab_physics_with(
+                    fbx_path, &prefab, selection, &fbx_file, &fbx_bytes, None, limits, &mut built,
+                )?,
+            }
+        };
+        let mut export_options =
+            GlbExportOptions::new().with_max_output_bytes(limits.max_output_bytes);
+        if let Some(materials) = materials {
+            export_options = export_options.with_materials(materials);
+        }
+        let glb = export_model_glb(&built.model, &export_options)
+            .map_err(|error| conversion_error(&error, fbx_path))?;
+        let report = GlbReport {
+            fbx: fbx_path.to_owned(),
+            bytes: glb.len() as u64,
+            nodes: built.model.nodes.len(),
+            meshes: built.report.mesh_count,
+            skins: built.report.skin_count,
+            materials: material_count,
+            images: image_count,
+            morph_targets: built.report.morph_target_count,
+            warnings,
+            physics: GlbPhysicsReport::from(physics),
+        };
+        let report_json = serde_json::to_string(&report).map_err(|error| {
+            CoreError::new(
+                Stage::Export,
+                format!("レポートのJSON化に失敗した: {error}"),
+            )
+            .with_path(fbx_path.to_owned())
+        })?;
+        Ok(ConvertedGlb { glb, report_json })
+    }
+
     /// 物理指定を解決し、使うPrefabパスを返す。
     ///
     /// `"auto"` は候補1件なら自動選択するが、解析不能Prefab（`unreadable`）が
@@ -991,11 +1124,11 @@ impl Package {
     fn resolve_physics_prefab(
         &self,
         fbx_path: &str,
-        options: &ResolvedOptions,
+        physics: &PhysicsSelection,
         limits: &Limits,
         warnings: &mut Vec<String>,
     ) -> Result<PhysicsPlan, CoreError> {
-        match &options.physics {
+        match physics {
             PhysicsSelection::None => Ok(PhysicsPlan::Skip { selection: "none" }),
             PhysicsSelection::Explicit(path) => {
                 let found = self.scan_prefabs(fbx_path, limits)?;
@@ -1089,18 +1222,17 @@ impl Package {
 
     /// 指定Prefabから物理sidecarを導出して中間モデルへ適用し、報告を返す。
     ///
-    /// Prefab本文と `.meta` はパッケージと索引から読み、ファイルシステムに触れない。
-    /// 導出・sidecar読み取り・適用のいずれかが失敗したら物理なしにせず失敗する。
-    /// 成功時は `built` のノード列と制約列を更新する。
+    /// `humanoid` が `Some` の場合は T-pose と視線も適用し、`None` の場合はスプリングと
+    /// 制約だけを適用する。
     #[allow(clippy::too_many_arguments)]
-    fn apply_prefab_physics(
+    fn apply_prefab_physics_with(
         &self,
         fbx_path: &str,
         prefab_path: &str,
         selection: &'static str,
         fbx_file: &FbxFile<'_>,
         fbx_bytes: &[u8],
-        humanoid: &HumanoidBones,
+        humanoid: Option<&HumanoidBones>,
         limits: &Limits,
         built: &mut vrctom::conversion::BuiltModel,
     ) -> Result<PhysicsReport, CoreError> {
@@ -1141,13 +1273,21 @@ impl Package {
                 )
                 .with_path(fbx_path.to_owned())
             })?;
-        let applied = apply_physics_sidecar(
-            &mut built.model,
-            &sidecar,
-            fbx_bytes,
-            humanoid,
-            &SpringCompileOptions::new(),
-        )
+        let applied = match humanoid {
+            Some(humanoid) => apply_physics_sidecar(
+                &mut built.model,
+                &sidecar,
+                fbx_bytes,
+                humanoid,
+                &SpringCompileOptions::new(),
+            ),
+            None => apply_physics_sidecar_without_humanoid(
+                &mut built.model,
+                &sidecar,
+                fbx_bytes,
+                &SpringCompileOptions::new(),
+            ),
+        }
         .map_err(|error| {
             CoreError::new(Stage::Physics, format!("物理の適用に失敗した: {error}"))
                 .with_path(fbx_path.to_owned())
@@ -1228,6 +1368,74 @@ impl Package {
             .with_path(fbx_path.to_owned())
         })
     }
+}
+
+/// `Limits` からPrefab変換の上限を作る。
+fn prefab_conversion_limits(limits: &Limits) -> PrefabConversionLimits {
+    PrefabConversionLimits::new()
+        .with_max_prefab_bytes(limits.max_prefab_bytes)
+        .with_max_fbx_bytes(limits.max_fbx_bytes)
+        .with_max_extra_fbx_bytes(limits.max_fbx_bytes)
+        .with_max_total_bytes(limits.max_physics_total_bytes)
+        .with_max_output_bytes(limits.max_output_bytes)
+}
+
+/// Prefab変換報告をJSON文字列へ整える。
+fn render_prefab_report(
+    prefab_path: &str,
+    report: vrctom::conversion::prefab::PrefabConversionReport,
+) -> Result<String, CoreError> {
+    let rendered = PrefabReport {
+        prefab: report.prefab,
+        fbx: report.fbx,
+        fbx_guid: report.fbx_guid,
+        nested_prefabs: report.nested_prefabs,
+        bytes: report.bytes as u64,
+        nodes: report.nodes,
+        meshes: report.meshes,
+        skins: report.skins,
+        materials: report.materials,
+        images: report.images,
+        expressions: report.expressions,
+        morph_targets: report.morph_targets,
+        warnings: report.warnings,
+        assignment: PrefabAssignmentReport {
+            mode: report.assignment_mode.map(|mode| match mode {
+                PrefabMode::Instance => "instance".to_owned(),
+                PrefabMode::Direct => "direct".to_owned(),
+            }),
+            active_meshes: report.active_meshes,
+            excluded_meshes: report.excluded_meshes,
+            excluded_names: report.excluded_names,
+            material_pool: report.material_pool,
+        },
+        baseline: PrefabBaselineReport {
+            meshes: report.baseline_meshes,
+            shapes: report.baseline_shapes,
+        },
+        physics: PrefabPhysicsReport {
+            prefab: if report.physics.used {
+                Some(prefab_path.to_owned())
+            } else {
+                None
+            },
+            selection: "target".to_owned(),
+            springs: report.physics.springs,
+            joints: report.physics.joints,
+            colliders: report.physics.colliders,
+            groups: report.physics.groups,
+            tpose_applied: report.physics.tpose_applied,
+            tpose_skipped: report.physics.tpose_skipped,
+            look_at: report.physics.look_at,
+        },
+    };
+    serde_json::to_string(&rendered).map_err(|error| {
+        CoreError::new(
+            Stage::Export,
+            format!("レポートのJSON化に失敗した: {error}"),
+        )
+        .with_path(prefab_path.to_owned())
+    })
 }
 
 /// Web向けの展開上限。
@@ -1531,6 +1739,9 @@ struct RawPrefabOptions {
     baseline: Option<bool>,
     /// 物理を導出して適用するかどうか。省略時は真である。
     physics: Option<bool>,
+    /// モーフターゲット保持方針。`expressions`（既定）か `all` である。
+    #[serde(rename = "morphTargets")]
+    morph_targets: Option<String>,
 }
 
 /// 解釈済みのPrefab変換オプション。
@@ -1541,6 +1752,7 @@ struct ResolvedPrefabOptions {
     expressions_descriptor: bool,
     baseline: bool,
     physics_derive: bool,
+    morph_mode: VrmMorphMode,
 }
 
 impl ResolvedPrefabOptions {
@@ -1580,7 +1792,8 @@ impl ResolvedPrefabOptions {
 /// Prefab変換オプションJSONを解釈する.
 ///
 /// `expressions` の省略時は `descriptor` と同じであり、`baseline`・`physics` の
-/// 省略時は真である。不正値は段階付きで失敗させる。
+/// 省略時は真である。`morphTargets` の省略時は `expressions` である。
+/// 不正値は段階付きで失敗させる。
 fn parse_prefab_options(options_json: &str) -> Result<ResolvedPrefabOptions, CoreError> {
     let raw: RawPrefabOptions = serde_json::from_str(options_json).map_err(|error| {
         CoreError::new(
@@ -1599,13 +1812,109 @@ fn parse_prefab_options(options_json: &str) -> Result<ResolvedPrefabOptions, Cor
             ));
         }
     };
+    let morph_mode = match raw.morph_targets.as_deref() {
+        None | Some("expressions") => VrmMorphMode::ExpressionsOnly,
+        Some("all") => VrmMorphMode::All,
+        Some(other) => {
+            return Err(CoreError::new(
+                Stage::Options,
+                format!(
+                    "モーフターゲット指定を読めない: {other:?}（\"expressions\"・\"all\"のいずれか）"
+                ),
+            ));
+        }
+    };
     Ok(ResolvedPrefabOptions {
         name: raw.name,
         authors: raw.authors.unwrap_or_default(),
         expressions_descriptor,
         baseline: raw.baseline.unwrap_or(true),
         physics_derive: raw.physics.unwrap_or(true),
+        morph_mode,
     })
+}
+
+/// Prefab汎用 GLB 変換オプションのJSONの読み取り結果。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawPrefabGlbOptions {
+    /// 基準姿勢の焼き込みを行うかどうか。省略時は真である。
+    baseline: Option<bool>,
+    /// 物理を導出して適用するかどうか。省略時は真である。
+    physics: Option<bool>,
+    /// モーフターゲット保持方針。`all`（既定）か `none` である。
+    #[serde(rename = "morphTargets")]
+    morph_targets: Option<String>,
+}
+
+/// 解釈済みのPrefab汎用 GLB 変換オプション。
+#[derive(Debug, Clone)]
+struct ResolvedPrefabGlbOptions {
+    baseline: bool,
+    physics_derive: bool,
+    keep_all_morphs: bool,
+}
+
+/// Prefab汎用 GLB 変換オプションJSONを解釈する。
+fn parse_prefab_glb_options(options_json: &str) -> Result<ResolvedPrefabGlbOptions, CoreError> {
+    let raw: RawPrefabGlbOptions = serde_json::from_str(options_json).map_err(|error| {
+        CoreError::new(
+            Stage::Options,
+            format!("Prefab汎用GLB変換オプションのJSONを読めない: {error}"),
+        )
+    })?;
+    let keep_all_morphs = parse_glb_morph_targets(raw.morph_targets.as_deref())?;
+    Ok(ResolvedPrefabGlbOptions {
+        baseline: raw.baseline.unwrap_or(true),
+        physics_derive: raw.physics.unwrap_or(true),
+        keep_all_morphs,
+    })
+}
+
+/// FBX汎用 GLB 変換オプションのJSONの読み取り結果。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+struct RawGlbOptions {
+    /// 物理指定。省略時は `"auto"` である。
+    #[serde(deserialize_with = "de_physics_selection")]
+    physics: PhysicsSelection,
+    /// モーフターゲット保持方針。`all`（既定）か `none` である。
+    #[serde(rename = "morphTargets")]
+    morph_targets: Option<String>,
+}
+
+/// 解釈済みのFBX汎用 GLB 変換オプション。
+#[derive(Debug, Clone)]
+struct ResolvedGlbOptions {
+    physics: PhysicsSelection,
+    keep_all_morphs: bool,
+}
+
+/// FBX汎用 GLB 変換オプションJSONを解釈する。
+fn parse_glb_options(options_json: &str) -> Result<ResolvedGlbOptions, CoreError> {
+    let raw: RawGlbOptions = serde_json::from_str(options_json).map_err(|error| {
+        CoreError::new(
+            Stage::Options,
+            format!("汎用GLB変換オプションのJSONを読めない: {error}"),
+        )
+    })?;
+    let keep_all_morphs = parse_glb_morph_targets(raw.morph_targets.as_deref())?;
+    Ok(ResolvedGlbOptions {
+        physics: raw.physics,
+        keep_all_morphs,
+    })
+}
+
+/// 汎用 GLB の `morphTargets` 指定（`"all"` 既定 / `"none"`）を解釈する。
+fn parse_glb_morph_targets(value: Option<&str>) -> Result<bool, CoreError> {
+    match value {
+        None | Some("all") => Ok(true),
+        Some("none") => Ok(false),
+        Some(other) => Err(CoreError::new(
+            Stage::Options,
+            format!("モーフターゲット指定を読めない: {other:?}（\"all\"・\"none\"のいずれか）"),
+        )),
+    }
 }
 
 /// UIへ返す物理の構造化情報。
@@ -1665,6 +1974,53 @@ struct Report {
     expressions: usize,
     warnings: Vec<String>,
     physics: PhysicsReport,
+}
+
+/// 汎用 GLB 変換の物理の構造化報告。JS向けに `camelCase` で送る。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GlbPhysicsReport {
+    prefab: Option<String>,
+    selection: String,
+    springs: usize,
+    joints: usize,
+    colliders: usize,
+    groups: usize,
+    tpose_applied: usize,
+    tpose_skipped: usize,
+    look_at: Option<String>,
+}
+
+impl From<PhysicsReport> for GlbPhysicsReport {
+    fn from(report: PhysicsReport) -> Self {
+        Self {
+            prefab: report.prefab,
+            selection: report.selection,
+            springs: report.springs,
+            joints: report.joints,
+            colliders: report.colliders,
+            groups: report.groups,
+            tpose_applied: report.tpose_applied,
+            tpose_skipped: report.tpose_skipped,
+            look_at: report.look_at,
+        }
+    }
+}
+
+/// 汎用 GLB 変換のレポート。JS向けに `camelCase` で送る。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GlbReport {
+    fbx: String,
+    bytes: u64,
+    nodes: usize,
+    meshes: usize,
+    skins: usize,
+    materials: usize,
+    images: usize,
+    morph_targets: usize,
+    warnings: Vec<String>,
+    physics: GlbPhysicsReport,
 }
 
 #[cfg(test)]
@@ -3287,7 +3643,12 @@ mod tests {
         let options = 解決確認用オプション(PhysicsSelection::Auto);
         let mut warnings = Vec::new();
         let error = package
-            .resolve_physics_prefab("Assets/Model.fbx", &options, &Limits::new(), &mut warnings)
+            .resolve_physics_prefab(
+                "Assets/Model.fbx",
+                &options.physics,
+                &Limits::new(),
+                &mut warnings,
+            )
             .expect_err("解析不能があれば自動確定は失敗する");
         assert_eq!(error.stage(), Stage::Physics);
         assert_eq!(error.stage().as_str(), "physics");
@@ -3312,7 +3673,12 @@ mod tests {
         let options = 解決確認用オプション(PhysicsSelection::Auto);
         let mut warnings = Vec::new();
         let plan = package
-            .resolve_physics_prefab("Assets/Model.fbx", &options, &Limits::new(), &mut warnings)
+            .resolve_physics_prefab(
+                "Assets/Model.fbx",
+                &options.physics,
+                &Limits::new(),
+                &mut warnings,
+            )
             .expect("0件かつ解析不能0件は物理なしで続ける");
         match plan {
             PhysicsPlan::Skip { selection } => assert_eq!(selection, "undetected"),
@@ -3334,7 +3700,12 @@ mod tests {
         ));
         let mut warnings = Vec::new();
         let plan = package
-            .resolve_physics_prefab("Assets/Model.fbx", &options, &Limits::new(), &mut warnings)
+            .resolve_physics_prefab(
+                "Assets/Model.fbx",
+                &options.physics,
+                &Limits::new(),
+                &mut warnings,
+            )
             .expect("候補にある明示は通す");
         match plan {
             PhysicsPlan::Apply { prefab, selection } => {
@@ -3939,6 +4310,197 @@ mod tests {
                 .convert_prefab("Assets/Avatar.prefab", json)
                 .expect_err(&format!("不正は失敗する: {json}"));
             assert_eq!(error.stage(), Stage::Options, "入力: {json}");
+        }
+    }
+
+    #[test]
+    fn convert_prefabでmorph_targets_allを指定でき不正値はoptions段階で失敗する() {
+        let fbx = 手別名fbxを組み立てる("LeftHand", "RightHand");
+        let prefab = format!(
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1001 &100\nPrefabInstance:\n  m_Modification:\n    m_TransformParent: {{fileID: 0}}\n    m_Modifications: []\n  m_SourcePrefab: {{fileID: 100100000, guid: {}, type: 3}}\n",
+            guid(1)
+        );
+        let bytes = package_bytes(&[
+            Member::Pathname {
+                guid: guid(1),
+                content: b"Assets/Model.fbx".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(1),
+                content: fbx,
+            },
+            Member::Meta {
+                guid: guid(1),
+                content: file_meta(1, "ModelImporter", "  externalObjects: {}\n"),
+            },
+            Member::Pathname {
+                guid: guid(2),
+                content: b"Assets/Avatar.prefab".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(2),
+                content: prefab.into_bytes(),
+            },
+            Member::Meta {
+                guid: guid(2),
+                content: prefab_メタ(2),
+            },
+        ]);
+        let package = Package::open(&bytes).expect("開ける");
+        let converted = package
+            .convert_prefab(
+                "Assets/Avatar.prefab",
+                r#"{"physics":false,"morphTargets":"all"}"#,
+            )
+            .expect("morphTargets:allは変換できる");
+        let report: serde_json::Value =
+            serde_json::from_str(&converted.report_json).expect("レポートはJSON");
+        assert_eq!(report["morphTargets"], serde_json::json!(0));
+
+        let err = package
+            .convert_prefab(
+                "Assets/Avatar.prefab",
+                r#"{"physics":false,"morphTargets":"invalid"}"#,
+            )
+            .expect_err("不正なmorphTargetsは失敗する");
+        assert_eq!(err.stage(), Stage::Options);
+    }
+
+    #[test]
+    fn convert_prefab_glbでhumanoid無し衣装と非スキン小物をglb変換でき不正オプションはoptionsで失敗する()
+     {
+        // BindPose無し・Humanoid無しの小物FBX（Hat）。
+        let hat_fbx = {
+            let objs = vec![
+                合成model(10, "Hat", "Mesh"),
+                合成geometry(
+                    30,
+                    "HatGeo",
+                    vec![
+                        合成vertices(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+                        合成pvi(&[0, 1, -3]),
+                    ],
+                ),
+            ];
+            let conns = vec![合成conn(10, 0), 合成conn(30, 10)];
+            合成file(vec![
+                TNode::branch(b"Objects", Props::default(), objs),
+                TNode::branch(b"Connections", Props::default(), conns),
+            ])
+        };
+        let hat_prefab = format!(
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1001 &100\nPrefabInstance:\n  m_Modification:\n    m_TransformParent: {{fileID: 0}}\n    m_Modifications: []\n  m_SourcePrefab: {{fileID: 100100000, guid: {}, type: 3}}\n",
+            guid(1)
+        );
+        let bytes = package_bytes(&[
+            Member::Pathname {
+                guid: guid(1),
+                content: b"Assets/Hat.fbx".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(1),
+                content: hat_fbx,
+            },
+            Member::Meta {
+                guid: guid(1),
+                content: file_meta(1, "ModelImporter", "  externalObjects: {}\n"),
+            },
+            Member::Pathname {
+                guid: guid(2),
+                content: b"Assets/Hat.prefab".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(2),
+                content: hat_prefab.into_bytes(),
+            },
+            Member::Meta {
+                guid: guid(2),
+                content: prefab_メタ(2),
+            },
+        ]);
+        let package = Package::open(&bytes).expect("開ける");
+        let converted = package
+            .convert_prefab_glb("Assets/Hat.prefab", "{}")
+            .expect("非スキン小物PrefabもGLB変換できる");
+        assert_eq!(&converted.glb[0..4], b"glTF");
+        let report: serde_json::Value =
+            serde_json::from_str(&converted.report_json).expect("レポートはJSON");
+        assert_eq!(report["expressions"], serde_json::json!(0));
+        assert_eq!(report["morphTargets"], serde_json::json!(0));
+        assert!(report["physics"]["prefab"].is_null());
+
+        let none_morph = package
+            .convert_prefab_glb(
+                "Assets/Hat.prefab",
+                r#"{"physics":false,"morphTargets":"none"}"#,
+            )
+            .expect("morphTargets:noneも受け付ける");
+        assert_eq!(&none_morph.glb[0..4], b"glTF");
+
+        for bad in [
+            "{壊れた",
+            r#"{"unknown":1}"#,
+            r#"{"morphTargets":"expressions"}"#,
+        ] {
+            let err = package
+                .convert_prefab_glb("Assets/Hat.prefab", bad)
+                .expect_err("不正オプションは失敗する");
+            assert_eq!(err.stage(), Stage::Options, "入力: {bad}");
+        }
+    }
+
+    #[test]
+    fn convert_glbでhumanoid無しfbxをglb変換でき不正オプションはoptionsで失敗する() {
+        let hat_fbx = {
+            let objs = vec![
+                合成model(10, "Hat", "Mesh"),
+                合成geometry(
+                    30,
+                    "HatGeo",
+                    vec![
+                        合成vertices(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+                        合成pvi(&[0, 1, -3]),
+                    ],
+                ),
+            ];
+            let conns = vec![合成conn(10, 0), 合成conn(30, 10)];
+            合成file(vec![
+                TNode::branch(b"Objects", Props::default(), objs),
+                TNode::branch(b"Connections", Props::default(), conns),
+            ])
+        };
+        let bytes = 合成fbxパッケージ(
+            hat_fbx,
+            file_meta(1, "ModelImporter", "  externalObjects: {}\n"),
+        );
+        let package = Package::open(&bytes).expect("開ける");
+        let converted = package
+            .convert_glb("Assets/Model.fbx", "{}")
+            .expect("Humanoid無しFBXをGLB変換できる");
+        assert_eq!(&converted.glb[0..4], b"glTF");
+        let json_len = u32::from_le_bytes(converted.glb[12..16].try_into().expect("長さ")) as usize;
+        let json: serde_json::Value =
+            serde_json::from_slice(&converted.glb[20..20 + json_len]).expect("JSONは読める");
+        assert!(json["extensions"].get("VRMC_vrm").is_none());
+        let report: serde_json::Value =
+            serde_json::from_str(&converted.report_json).expect("レポートはJSON");
+        assert_eq!(report["fbx"], serde_json::json!("Assets/Model.fbx"));
+        assert_eq!(report["morphTargets"], serde_json::json!(0));
+        assert_eq!(
+            report["physics"]["selection"],
+            serde_json::json!("undetected")
+        );
+
+        for bad in [
+            "{壊れた",
+            r#"{"unknown":1}"#,
+            r#"{"morphTargets":"invalid"}"#,
+            r#"{"physics":"bad"}"#,
+        ] {
+            let err = package
+                .convert_glb("Assets/Model.fbx", bad)
+                .expect_err("不正オプションは失敗する");
+            assert_eq!(err.stage(), Stage::Options, "入力: {bad}");
         }
     }
 }

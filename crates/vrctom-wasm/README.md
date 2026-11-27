@@ -66,17 +66,43 @@ UI を止めないため、Web Worker 内で呼び出してください。
 |---|---|
 | `new WebPackage(bytes)` | パッケージを検証・展開・索引化する。失敗したら例外 |
 | `pkg.prefabTargets()` | 全 Prefab の解決状態を JSON 文字列で返す（パス昇順） |
-| `pkg.convertPrefab(prefabPath, optionsJson)` | 選んだ Prefab を VRM に変換する |
+| `pkg.convertPrefab(prefabPath, optionsJson)` | 選んだ Prefab を VRM 1.0 に変換する |
+| `pkg.convertPrefabGlb(prefabPath, optionsJson)` | 選んだ Prefab を `VRMC_vrm` なしの汎用 GLB に変換する（衣装・アクセサリ向け） |
 | `pkg.fbxCandidates()` | FBX 候補を JSON 文字列で返す（パス昇順。互換用） |
 | `pkg.prefabCandidates(fbxPath)` | 対象 FBX を参照する Prefab 候補を JSON 文字列で返す（互換用） |
-| `pkg.convert(fbxPath, optionsJson)` | 選んだ FBX を VRM に変換する（互換用） |
-| `converted.takeVrm()` | GLB バイト列を複製せず取り出す。呼び出し後は空になる |
-| `converted.vrm` | GLB バイト列を複製して返す（互換用） |
+| `pkg.convert(fbxPath, optionsJson)` | 選んだ FBX を VRM 1.0 に変換する（互換用） |
+| `pkg.convertGlb(fbxPath, optionsJson)` | 選んだ FBX を `VRMC_vrm` なしの汎用 GLB に変換する |
+| `converted.takeGlb()` | GLB バイト列を複製せず取り出す。呼び出し後は空になる |
+| `converted.glb` | GLB バイト列を複製して返す |
+| `converted.takeVrm()` | `takeGlb()` の互換別名 |
+| `converted.vrm` | `glb` の互換別名 |
 | `converted.report` | レポートを JSON 文字列で返す |
 | `.free()` | wasm 側のメモリを解放する |
 
 `WebPackage` は展開済みの内容を保持します。開き直す前に古い `WebPackage` を
-`free()` してください。同じ `WebPackage` からは何度でも `convertPrefab`・`convert` できます。
+`free()` してください。同じ `WebPackage` からは何度でも変換メソッドを呼べます。
+
+### 元アバターと衣装を個別に読み込む（Three.js + `@pixiv/three-vrm`）
+
+元アバターの `.unitypackage` は `convertPrefab` で VRM 1.0 へ、衣装やアクセサリの `.unitypackage` は
+`convertPrefabGlb`（または `convertGlb`）で `VRMC_vrm` なしの汎用 GLB へ変換します。
+汎用 GLB にも MToon 材質（`VRMC_materials_mtoon`）・揺れもの（`VRMC_springBone`）・
+制約（`VRMC_node_constraint`）が含まれるため、Three.js 側でどちらも `GLTFLoader` +
+`VRMLoaderPlugin` を通して読み込めます。
+
+```ts
+// 衣装・アクセサリの変換例（元アバターと同じく Worker 内での呼び出しを推奨します）
+const outfitPkg = new WebPackage(new Uint8Array(outfitPackageBytes));
+const outfitTargets = JSON.parse(outfitPkg.prefabTargets());
+const outfitTarget = outfitTargets.candidates.find((c) => c.state === "resolved");
+const convertedOutfit = outfitPkg.convertPrefabGlb(
+  outfitTarget.prefab,
+  JSON.stringify({ morphTargets: "all" }),
+);
+const outfitGlb: Uint8Array = convertedOutfit.takeGlb();
+convertedOutfit.free();
+outfitPkg.free();
+```
 
 ## 変換オプション
 
@@ -88,7 +114,8 @@ Prefab 入口（`convertPrefab`）のオプションは次のとおりです。
   "authors": ["作者A", "作者B"],
   "expressions": "descriptor",
   "baseline": true,
-  "physics": true
+  "physics": true,
+  "morphTargets": "expressions"
 }
 ```
 
@@ -97,6 +124,33 @@ Prefab 入口（`convertPrefab`）のオプションは次のとおりです。
 - `expressions` … 省略時は `"descriptor"` と同じで、descriptor 由来の表情を作る。`"none"` で作らない
 - `baseline` … 省略時は真。偽で基準姿勢の焼き込みを止める
 - `physics` … 省略時は真で、選んだ Prefab から物理を導出して適用する。偽で物理なしにする
+- `morphTargets` … 省略時は `"expressions"` で表情関連の互換形状だけを残す。`"all"` にすると全メッシュの単一フレーム BlendShape（貫通防止用シェイプキーなど）を残す
+
+Prefab 汎用 GLB 入口（`convertPrefabGlb`）のオプションは次のとおりです。
+
+```json
+{
+  "baseline": true,
+  "physics": true,
+  "morphTargets": "all"
+}
+```
+
+- `baseline` … 省略時は真。偽で基準姿勢の焼き込みを止める
+- `physics` … 省略時は真で、選んだ Prefab から物理を導出して適用する（非スキン FBX の場合は警告を残して物理なしになる）。偽で物理なしにする
+- `morphTargets` … 省略時は `"all"` で全メッシュの単一フレーム BlendShape を残す。`"none"` でモーフターゲットを作らない
+
+FBX 汎用 GLB 入口（`convertGlb`）のオプションは次のとおりです。
+
+```json
+{
+  "physics": "auto",
+  "morphTargets": "all"
+}
+```
+
+- `physics` … 省略時は `"auto"`。指定規則は旧 FBX 入口（`convert`）と同じだが、`"auto"` かつ非スキン FBX の場合は警告を残して物理なしになる
+- `morphTargets` … 省略時は `"all"`。`"none"` でモーフターゲットを作らない
 
 旧 FBX 入口（`convert`）のオプションは次のとおりです。互換のため残ります。
 
@@ -136,6 +190,7 @@ Prefab 入口（`convertPrefab`）のレポートは次のとおりです。
   "materials": 3,
   "images": 4,
   "expressions": 8,
+  "morphTargets": 57,
   "warnings": [],
   "assignment": {
     "mode": "instance",
@@ -164,9 +219,38 @@ Prefab 入口（`convertPrefab`）のレポートは次のとおりです。
 
 `assignment.mode` は割当の出所（`instance`=改変内容、`direct`=直接記述）であり、
 無い場合は `null` です。`nestedPrefabs` は空でも必ず出ます。
+`morphTargets` は全メッシュ合計の出力モーフターゲット数です。
+`convertPrefabGlb` でも同じ形式のレポートを返します（`expressions` は `0` です）。
 `physics.selection` は Prefab 入口では `"target"` であり、
 物理なしの場合は `prefab` と `lookAt` が `null` になります。
 `baseline` は焼き込んだメッシュ数と非ゼロチャンネル数です。
+
+FBX 汎用 GLB 入口（`convertGlb`）のレポートは `camelCase` で返ります。
+
+```json
+{
+  "fbx": "Assets/Outfit.fbx",
+  "bytes": 123456,
+  "nodes": 10,
+  "meshes": 2,
+  "skins": 1,
+  "materials": 3,
+  "images": 4,
+  "morphTargets": 12,
+  "warnings": [],
+  "physics": {
+    "prefab": null,
+    "selection": "undetected",
+    "springs": 0,
+    "joints": 0,
+    "colliders": 0,
+    "groups": 0,
+    "tposeApplied": 0,
+    "tposeSkipped": 0,
+    "lookAt": null
+  }
+}
+```
 
 旧 FBX 入口（`convert`）のレポートは次のとおりです。互換のため残ります。
 
@@ -238,6 +322,7 @@ try {
 | 画像 1 枚 | 32 MiB |
 | 画像合計 | 256 MiB |
 | 画像 1 枚の画素数 | 4096² |
+| 全モーフ保持時のモーフ数（1 メッシュあたり） | 1,024 |
 | Prefab本文 1 件 | 64 MiB |
 | 物理の依存資産合計 | 512 MiB |
 | VRM 出力 | 512 MiB |
