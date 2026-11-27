@@ -1888,52 +1888,7 @@ fn hex_nibble(value: u8) -> char {
 
 /// TRSから列優先の4x4行列を作る。`T * R * S` の順である。
 fn trs_to_matrix(trs: &SidecarTrs) -> [f64; 16] {
-    compose_trs(trs.position, trs.rotation, trs.scale)
-}
-
-/// 位置・回転（四元数 `[x, y, z, w]`）・拡大率から列優先の4x4行列を作る。
-/// `T * R * S` の順であり、回転は正規化済みを想定する（正規化は行わない）。
-/// sidecarのTRSとVRMローカルの再合成で共有する。
-fn compose_trs(position: [f64; 3], rotation: [f64; 4], scale: [f64; 3]) -> [f64; 16] {
-    let (x, y, z, w) = (rotation[0], rotation[1], rotation[2], rotation[3]);
-    let (sx, sy, sz) = (scale[0], scale[1], scale[2]);
-    // 正規化済みの四元数から回転行列を作り、列ごとに拡大率を掛ける。
-    let xx = x * x;
-    let yy = y * y;
-    let zz = z * z;
-    let xy = x * y;
-    let xz = x * z;
-    let yz = y * z;
-    let wx = w * x;
-    let wy = w * y;
-    let wz = w * z;
-    let r00 = 1.0 - 2.0 * (yy + zz);
-    let r10 = 2.0 * (xy + wz);
-    let r20 = 2.0 * (xz - wy);
-    let r01 = 2.0 * (xy - wz);
-    let r11 = 1.0 - 2.0 * (xx + zz);
-    let r21 = 2.0 * (yz + wx);
-    let r02 = 2.0 * (xz + wy);
-    let r12 = 2.0 * (yz - wx);
-    let r22 = 1.0 - 2.0 * (xx + yy);
-    [
-        r00 * sx,
-        r10 * sx,
-        r20 * sx,
-        0.0, //
-        r01 * sy,
-        r11 * sy,
-        r21 * sy,
-        0.0, //
-        r02 * sz,
-        r12 * sz,
-        r22 * sz,
-        0.0, //
-        position[0],
-        position[1],
-        position[2],
-        1.0, //
-    ]
+    matrix::compose_trs(trs.position, trs.rotation, trs.scale)
 }
 
 /// sidecarの参照世界行列を求める。

@@ -656,8 +656,7 @@ class App {
    * Prefabを選ぶ。対象FBXの表示と作品名の初期値をそろえる。
    *
    * 一覧を作り直すとクリックした要素がDOMから外れてフォーカスが途切れるため、
-   * 既存のラジオの印だけを合わせる。ネストPrefabの注意は変換に含まれない
-   * 範囲として示す。
+   * 既存のラジオの印だけを合わせる。ネストPrefabがある場合は追加出力の対象として示す。
    *
    * @param path - 選ぶPrefabの出力パス。
    */
@@ -680,7 +679,7 @@ class App {
     this.syncTargetRadios();
     this.resolvedFbx.textContent = `対象FBX: ${target.fbx.path}`;
     if (target.nestedPrefabs.length > 0) {
-      this.prefabNote.textContent = `ネストPrefabのジオメトリは出力しません: ${target.nestedPrefabs.join(", ")}`;
+      this.prefabNote.textContent = `ネストPrefabのメッシュも出力します: ${target.nestedPrefabs.join(", ")}`;
       this.prefabNote.hidden = false;
     } else {
       this.prefabNote.replaceChildren();

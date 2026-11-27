@@ -36,12 +36,13 @@ pub fn scan_directory(root: &Path, options: &IndexOptions) -> Result<AssetIndex,
 /// `root` は [`scan_directory`] に渡す `Assets` そのものを指す。
 /// 上限付き読み取りの意味は材質層の旧 `read_limited` と同じであり、
 /// `limit` を超える内容は切り詰めず `InvalidData` で失敗する。
-pub(crate) struct FsAssetSource<'a> {
+pub struct FsAssetSource<'a> {
     root: &'a Path,
 }
 
 impl<'a> FsAssetSource<'a> {
-    pub(crate) fn new(root: &'a Path) -> Self {
+    /// `Assets` ディレクトリを基準とする読み手を作る。
+    pub fn new(root: &'a Path) -> Self {
         Self { root }
     }
 }

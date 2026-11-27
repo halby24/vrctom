@@ -2475,3 +2475,96 @@ fn 骨名の型違いは文字列でないと診断する() {
     assert!(文面.contains("文字列でない"), "型違いの診断になる: {文面}");
     assert!(!文面.contains("がない"), "欠落の診断と区別する: {文面}");
 }
+
+#[test]
+fn mesh_rendererとmesh_filterとprefab配置情報を型付きで読める() {
+    let yaml = format!(
+        "{}{}{}{}{}{}",
+        YAML_DIRECTIVES,
+        document(
+            23,
+            230,
+            false,
+            "MeshRenderer",
+            "  m_GameObject: {fileID: 100}\n  m_Enabled: 1\n  m_Materials:\n  - {fileID: 2100000, guid: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, type: 2}\n"
+        ),
+        document(
+            33,
+            330,
+            false,
+            "MeshFilter",
+            "  m_GameObject: {fileID: 100}\n  m_Mesh: {fileID: 4300000, guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb, type: 3}\n"
+        ),
+        document(
+            1001,
+            1001,
+            false,
+            "PrefabInstance",
+            "  m_Modification:\n    m_TransformParent: {fileID: 400}\n    m_Modifications: []\n    m_AddedGameObjects:\n    - targetCorrespondingSourceObject: {fileID: 400000, guid: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb, type: 3}\n      addedObject: {fileID: 500}\n  m_SourcePrefab: {fileID: 100100000, guid: cccccccccccccccccccccccccccccccc, type: 3}\n"
+        ),
+        document(
+            4,
+            401,
+            true,
+            "Transform",
+            "  m_CorrespondingSourceObject: {fileID: 400002, guid: cccccccccccccccccccccccccccccccc, type: 3}\n  m_PrefabInstance: {fileID: 1001}\n"
+        ),
+        document(
+            1001,
+            1002,
+            false,
+            "PrefabInstance",
+            "  m_SourcePrefab: {fileID: 100100000, guid: dddddddddddddddddddddddddddddddd, type: 3}\n"
+        ),
+    );
+    let file = SerializedFile::parse(yaml.as_bytes(), &ParseOptions::new()).expect("読める");
+
+    let TypedObject::MeshRenderer(mr) = file.document(230).expect("ある").decode().expect("読める")
+    else {
+        panic!("MeshRendererになる");
+    };
+    assert_eq!(mr.game_object.file_id, 100);
+    assert!(mr.enabled);
+    assert_eq!(mr.materials.len(), 1);
+    assert_eq!(
+        mr.materials[0].guid.as_ref().expect("GUID").as_str(),
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+
+    let TypedObject::MeshFilter(mf) = file.document(330).expect("ある").decode().expect("読める")
+    else {
+        panic!("MeshFilterになる");
+    };
+    assert_eq!(mf.game_object.file_id, 100);
+    assert_eq!(mf.mesh.file_id, 4300000);
+    assert_eq!(
+        mf.mesh.guid.as_ref().expect("GUID").as_str(),
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    );
+
+    let TypedObject::PrefabInstance(inst1) =
+        file.document(1001).expect("ある").decode().expect("読める")
+    else {
+        panic!("PrefabInstanceになる");
+    };
+    assert_eq!(inst1.transform_parent().expect("読める").file_id, 400);
+    let added = inst1.added_game_objects().expect("読める");
+    assert_eq!(added.len(), 1);
+    assert_eq!(added[0].target_corresponding_source.file_id, 400000);
+    assert_eq!(added[0].added_object.file_id, 500);
+
+    let TypedObject::Stripped(link) = file.document(401).expect("ある").decode().expect("読める")
+    else {
+        panic!("Strippedになる");
+    };
+    assert_eq!(link.prefab_instance().expect("読める").file_id, 1001);
+
+    // m_Modification自体が無い場合はnull参照と空列を返す。
+    let TypedObject::PrefabInstance(inst2) =
+        file.document(1002).expect("ある").decode().expect("読める")
+    else {
+        panic!("PrefabInstanceになる");
+    };
+    assert!(inst2.transform_parent().expect("読める").is_null());
+    assert!(inst2.added_game_objects().expect("読める").is_empty());
+}

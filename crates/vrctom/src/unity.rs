@@ -38,7 +38,8 @@ mod native;
 pub use binary::{BinaryFile, BinaryObject, BinaryOptions, BinaryValue, is_binary_serialized};
 pub use error::{UnityError, UnityErrorKind};
 pub use file_id::{
-    game_object_file_id, mesh_file_id, skinned_mesh_renderer_file_id, transform_file_id,
+    game_object_file_id, mesh_file_id, mesh_filter_file_id, mesh_renderer_file_id,
+    skinned_mesh_renderer_file_id, transform_file_id,
 };
 pub use hierarchy::{HierarchyOptions, LocalHierarchy, LocalNode};
 pub use index::{AssetIndex, AssetRecord, IndexOptions, ReferenceLocation};
@@ -48,8 +49,9 @@ pub use meta::{
 // 内部分割の詳細は公開しない。使う型だけをこの層で再公開する。
 pub(crate) use meta::classify;
 pub use objects::{
-    Animator, GameObject, Material, MonoBehaviour, NamedProperty, PrefabInstance, PrefabLink,
-    PrefabModification, SkinnedMeshRenderer, TextureEnvironment, Transform, TypedObject,
+    AddedGameObject, Animator, GameObject, Material, MeshFilter, MeshRenderer, MonoBehaviour,
+    NamedProperty, PrefabInstance, PrefabLink, PrefabModification, SkinnedMeshRenderer,
+    TextureEnvironment, Transform, TypedObject,
 };
 pub(crate) use reference::read_guid;
 pub use reference::{FileId, Guid, ObjectRef};
@@ -58,7 +60,7 @@ pub(crate) use yaml::bignum_digits;
 pub use yaml::{Document, ParseOptions, SerializedFile};
 
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) use native::FsAssetSource;
+pub use native::FsAssetSource;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::scan_directory;
 

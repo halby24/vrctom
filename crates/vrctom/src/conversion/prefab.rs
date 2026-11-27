@@ -20,13 +20,13 @@
 use crate::fbx::{FbxError, FbxFile, FbxOptions};
 use crate::unity::{AssetIndex, AssetSource, ParseOptions, SerializedFile};
 use crate::vrm::{
-    HumanoidBones, MaterialError, MaterialErrorKind, MaterialOptions, PhysicsLimits,
-    PhysicsSidecar, PrefabMeshView, PrefabMode, PrefabTargetState, SpringCompileOptions,
-    VrmExportError, VrmExportOptions, VrmModel, VrmOptions, apply_physics_sidecar,
-    apply_prefab_plan, derive_physics_sidecar_with, expressions_from_avatar_descriptor,
-    load_renderer_materials_from, plan_prefab_assignment, prefab_base_materials,
-    prefab_baseline_weights, prefab_hierarchy_paths, resolve_prefab_pool_paths,
-    resolve_prefab_target,
+    HumanoidBones, MaterialError, MaterialErrorKind, MaterialOptions, NestedPrefabInput,
+    NestedPrefabLimits, PhysicsLimits, PhysicsSidecar, PrefabMeshView, PrefabMode,
+    PrefabTargetState, SpringCompileOptions, VrmExportError, VrmExportOptions, VrmModel,
+    VrmOptions, apply_nested_prefab_meshes, apply_physics_sidecar, apply_prefab_plan,
+    derive_physics_sidecar_with, expressions_from_avatar_descriptor, load_renderer_materials_from,
+    plan_prefab_assignment, prefab_base_materials, prefab_baseline_weights, prefab_hierarchy_paths,
+    prepare_nested_prefab_meshes, resolve_prefab_pool_paths, resolve_prefab_target,
 };
 
 /// 1件のPrefab本文の既定上限（64MiB）。
@@ -419,10 +419,6 @@ pub fn convert_prefab(
         }
     };
     let mut warnings: Vec<String> = Vec::new();
-    // ネストPrefabのジオメトリは対象外であり、捨てずに報告と警告に残す。
-    for nested in &nested_prefabs {
-        warnings.push(format!("ネストPrefabのジオメトリは出力しない: {nested}"));
-    }
     // 2. `.fbx.meta` からGUID・humanoid対応表・置換表を索引経由で読む。
     let Some(indexed_fbx) = strip_assets_prefix(&fbx_asset_path) else {
         return Err(PrefabConversionError::Prefab(crate::vrm::VrmError::new(
@@ -664,6 +660,23 @@ pub fn convert_prefab(
     let mut plan = plan_prefab_assignment(&prefab_file, prefab_path, &fbx_guid, &base, &views)
         .map_err(PrefabConversionError::Assignment)?;
     let assignment_mode = Some(plan.mode);
+    let nested_limits = NestedPrefabLimits::new()
+        .with_max_prefab_bytes(limits.max_prefab_bytes)
+        .with_max_fbx_bytes(limits.max_extra_fbx_bytes)
+        .with_max_total_bytes(limits.max_total_bytes);
+    let nested_input = NestedPrefabInput {
+        source,
+        index,
+        root_prefab: &prefab_file,
+        root_prefab_path: prefab_path,
+        main_fbx: &file,
+        main_fbx_guid: &fbx_guid,
+        fbx_options,
+        vrm_options: &owned_vrm_options,
+        limits: &nested_limits,
+    };
+    let nested_prepared = prepare_nested_prefab_meshes(&model, &mut plan.pool, &nested_input)
+        .map_err(PrefabConversionError::Assignment)?;
     resolve_prefab_pool_paths(&mut plan.pool, index);
     let (materials, material_report) =
         load_renderer_materials_from(source, index, &plan.pool, &options.material_options)
@@ -674,6 +687,13 @@ pub fn convert_prefab(
     let image_count = materials.images().len();
     let assignment_report = apply_prefab_plan(&mut model, &plan, &materials)
         .map_err(PrefabConversionError::Assignment)?;
+    let nested_report = apply_nested_prefab_meshes(&mut model, nested_prepared)
+        .map_err(PrefabConversionError::Assignment)?;
+    warnings.extend(nested_report.warnings);
+    let mut excluded_names = assignment_report.excluded_names.clone();
+    excluded_names.extend(nested_report.excluded_names);
+    let active_meshes = plan.active_count() + nested_report.active_meshes;
+    let excluded_meshes = assignment_report.excluded_count + nested_report.excluded_meshes;
     // 8. VRMバイト列を作る。呼び出し側のmeta・権限は保つ。
     let export_options = export_options
         .with_humanoid(humanoid)
@@ -692,9 +712,9 @@ pub fn convert_prefab(
             fbx_guid,
             nested_prefabs,
             assignment_mode,
-            active_meshes: plan.active_count(),
-            excluded_meshes: assignment_report.excluded_count,
-            excluded_names: assignment_report.excluded_names.clone(),
+            active_meshes,
+            excluded_meshes,
+            excluded_names,
             material_pool: assignment_report.pool_count,
             baseline_meshes: report.baseline_meshes,
             baseline_shapes: report.baseline_shapes,
@@ -1123,8 +1143,8 @@ mod tests {
 
     #[test]
     fn 直接fbx1件とネストprefabで変換に成功する() {
-        // 直接FBX1件にネストPrefabが付いても `Resolved` として変換でき、
-        // ネストは報告と警告に残る。物理は導出しても空のまま通る。
+        // 直接FBX1件に空のネストPrefabが付いても `Resolved` として変換でき、
+        // ネストは報告に残る。「出力しない」警告は出さない。
         use crate::unity::skinned_mesh_renderer_file_id;
         let fbx_bytes = 書き出し可能なfbxを組み立てる();
         let renderer = skinned_mesh_renderer_file_id("Hips/Owner");
@@ -1168,12 +1188,11 @@ mod tests {
         assert_eq!(報告.fbx_guid, FBX_GUID);
         assert_eq!(報告.nested_prefabs, vec!["Assets/Nest.prefab".to_owned()]);
         assert!(
-            報告
+            !報告
                 .warnings
                 .iter()
-                .any(|警告| 警告.contains("ネストPrefabのジオメトリは出力しない")
-                    && 警告.contains("Assets/Nest.prefab")),
-            "ネストの警告が残る: {:?}",
+                .any(|警告| 警告.contains("ネストPrefabのジオメトリは出力しない")),
+            "旧仕様の警告は出さない: {:?}",
             報告.warnings
         );
         assert!(!報告.physics.used, "物理なしを指定したため使わない");

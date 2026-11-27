@@ -47,6 +47,36 @@ pub fn skinned_mesh_renderer_file_id(hierarchy_path: &str) -> FileId {
     ))
 }
 
+/// メッシュ描画設定（`MeshRenderer`）のサブアセット fileID を作る。
+///
+/// 対象文字列は `Type:MeshRenderer->//RootNode/root/{階層パス}/MeshRenderer0` であり、
+/// 階層パスが空の場合は取り込みルート自身の
+/// `Type:MeshRenderer->//RootNode/root/MeshRenderer0` になる。
+pub fn mesh_renderer_file_id(hierarchy_path: &str) -> FileId {
+    if hierarchy_path.is_empty() {
+        import_file_id("Type:MeshRenderer->//RootNode/root/MeshRenderer0")
+    } else {
+        import_file_id(&format!(
+            "Type:MeshRenderer->//RootNode/root/{hierarchy_path}/MeshRenderer0"
+        ))
+    }
+}
+
+/// メッシュフィルタ（`MeshFilter`）のサブアセット fileID を作る。
+///
+/// 対象文字列は `Type:MeshFilter->//RootNode/root/{階層パス}/MeshFilter0` であり、
+/// 階層パスが空の場合は取り込みルート自身の
+/// `Type:MeshFilter->//RootNode/root/MeshFilter0` になる。
+pub fn mesh_filter_file_id(hierarchy_path: &str) -> FileId {
+    if hierarchy_path.is_empty() {
+        import_file_id("Type:MeshFilter->//RootNode/root/MeshFilter0")
+    } else {
+        import_file_id(&format!(
+            "Type:MeshFilter->//RootNode/root/{hierarchy_path}/MeshFilter0"
+        ))
+    }
+}
+
 /// Transformのサブアセット fileID を作る。
 ///
 /// 対象文字列は `Type:Transform->//RootNode/root/{階層パス}/Transform0` であり、
@@ -114,5 +144,28 @@ mod tests {
         // `Type:GameObject->//RootNode/root0` の値であり、マヌカ・シフォンの
         // 両Prefabで `m_IsActive`・`m_Name` の対象として現れる固定値である。
         assert_eq!(game_object_file_id(""), 919132149155446097);
+    }
+
+    #[test]
+    fn mesh_rendererとmesh_filterのfile_idが既知のxxh64ハッシュと一致する() {
+        assert_eq!(
+            mesh_renderer_file_id(""),
+            xxhash_rust::xxh64::xxh64(b"Type:MeshRenderer->//RootNode/root/MeshRenderer0", 0)
+                as FileId
+        );
+        assert_eq!(
+            mesh_renderer_file_id("Body"),
+            xxhash_rust::xxh64::xxh64(b"Type:MeshRenderer->//RootNode/root/Body/MeshRenderer0", 0)
+                as FileId
+        );
+        assert_eq!(
+            mesh_filter_file_id(""),
+            xxhash_rust::xxh64::xxh64(b"Type:MeshFilter->//RootNode/root/MeshFilter0", 0) as FileId
+        );
+        assert_eq!(
+            mesh_filter_file_id("Prop/Cap"),
+            xxhash_rust::xxh64::xxh64(b"Type:MeshFilter->//RootNode/root/Prop/Cap/MeshFilter0", 0)
+                as FileId
+        );
     }
 }

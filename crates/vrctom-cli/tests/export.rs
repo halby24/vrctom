@@ -1729,3 +1729,105 @@ fn no_baselineはprefabなしで終了コード2になる() {
     assert!(output.stdout.is_empty());
     assert!(!output.stderr.is_empty());
 }
+
+#[test]
+fn cliのprefab変換でもネストprefabのメッシュが出力vrmに含まれる() {
+    let work = tempfile::TempDir::new().expect("作業場所は作れる");
+    let assets = work.path().join("Assets");
+    fs::create_dir_all(&assets).expect("Assets作成");
+
+    let main_fbx = exact名fbxバイト列();
+    let prop_fbx = {
+        let mut vertices = Props::default();
+        vertices.d_raw(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        let mut pvi = Props::default();
+        pvi.i_raw(&[0, 1, -3]);
+        let objs = vec![
+            model_node(10, "Wand", "Mesh"),
+            geometry_node(
+                30,
+                "WandGeo",
+                vec![
+                    TNode::leaf(b"Vertices", vertices),
+                    TNode::leaf(b"PolygonVertexIndex", pvi),
+                ],
+            ),
+        ];
+        let conns = vec![conn(10, 0), conn(30, 10)];
+        binary_fbx(vec![
+            TNode::branch(b"Objects", Props::default(), objs),
+            TNode::branch(b"Connections", Props::default(), conns),
+        ])
+    };
+    let main_guid = "fb00000000000000000000000000000b";
+    let prop_guid = "fb00000000000000000000000000000c";
+    let nest_guid = "0e00000000000000000000000000000d";
+    let avatar_guid = "a0000000000000000000000000000007";
+
+    fs::write(assets.join("Main.fbx"), &main_fbx).unwrap();
+    fs::write(
+        assets.join("Main.fbx.meta"),
+        format!("fileFormatVersion: 2\nguid: {main_guid}\nModelImporter:\n  externalObjects: []\n"),
+    )
+    .unwrap();
+    fs::write(assets.join("Prop.fbx"), &prop_fbx).unwrap();
+    fs::write(
+        assets.join("Prop.fbx.meta"),
+        format!("fileFormatVersion: 2\nguid: {prop_guid}\nModelImporter:\n  externalObjects: []\n"),
+    )
+    .unwrap();
+    fs::write(
+        assets.join("Nest.prefab"),
+        format!(
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1001 &200\nPrefabInstance:\n  m_Modification:\n    m_TransformParent: {{fileID: 0}}\n    m_Modifications: []\n  m_SourcePrefab: {{fileID: 100100000, guid: {prop_guid}, type: 3}}\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        assets.join("Nest.prefab.meta"),
+        format!(
+            "fileFormatVersion: 2\nguid: {nest_guid}\nPrefabImporter:\n  externalObjects: []\n"
+        ),
+    )
+    .unwrap();
+    let avatar_path = assets.join("Avatar.prefab");
+    fs::write(
+        &avatar_path,
+        format!(
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1001 &100\nPrefabInstance:\n  m_Modification:\n    m_TransformParent: {{fileID: 0}}\n    m_Modifications: []\n  m_SourcePrefab: {{fileID: 100100000, guid: {main_guid}, type: 3}}\n--- !u!1001 &300\nPrefabInstance:\n  m_Modification:\n    m_TransformParent: {{fileID: 0}}\n    m_Modifications: []\n  m_SourcePrefab: {{fileID: 100100000, guid: {nest_guid}, type: 3}}\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        assets.join("Avatar.prefab.meta"),
+        format!(
+            "fileFormatVersion: 2\nguid: {avatar_guid}\nPrefabImporter:\n  externalObjects: []\n"
+        ),
+    )
+    .unwrap();
+
+    let out_vrm = work.path().join("out.vrm");
+    let main_arg = assets.join("Main.fbx").to_string_lossy().into_owned();
+    let prefab_arg = avatar_path.to_string_lossy().into_owned();
+    let out_arg = out_vrm.to_string_lossy().into_owned();
+    let output = run(
+        &[
+            "export",
+            &main_arg,
+            "--prefab",
+            &prefab_arg,
+            "--no-physics",
+            "-o",
+            &out_arg,
+        ],
+        work.path(),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(stderr.contains("有効2件"), "有効2件が出る: {stderr}");
+    let vrm_bytes = fs::read(&out_vrm).expect("出力VRMが読める");
+    assert!(
+        json塊に含まれるか(&vrm_bytes, "\"Wand\""),
+        "ネストPrefabのWandノード/メッシュがGLBに含まれる"
+    );
+}

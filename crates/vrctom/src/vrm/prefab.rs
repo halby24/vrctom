@@ -31,8 +31,9 @@ use super::renderers::{
 };
 use crate::fbx::FbxFile;
 use crate::unity::{
-    AssetIndex, FileId, GameObject, SerializedFile, SkinnedMeshRenderer, Transform, TypedObject,
-    game_object_file_id, mesh_file_id, skinned_mesh_renderer_file_id, transform_file_id,
+    AssetIndex, FileId, GameObject, MeshFilter, SerializedFile, Transform, TypedObject,
+    game_object_file_id, mesh_file_id, mesh_filter_file_id, mesh_renderer_file_id,
+    skinned_mesh_renderer_file_id, transform_file_id,
 };
 
 /// 対応付け用の中間メッシュ1件の要約。
@@ -247,6 +248,12 @@ pub fn modernize_legacy_import_ids(
             1 => unique(name).map(|node| game_object_file_id(&node.path)),
             4 if name == "//RootNode" => Some(transform_file_id("")),
             4 => unique(name).map(|node| transform_file_id(&node.path)),
+            23 => unique(name)
+                .filter(|node| node.has_mesh)
+                .map(|node| mesh_renderer_file_id(&node.path)),
+            33 => unique(name)
+                .filter(|node| node.has_mesh)
+                .map(|node| mesh_filter_file_id(&node.path)),
             43 => unique(name)
                 .filter(|node| node.has_mesh)
                 .map(|node| mesh_file_id(&node.name)),
@@ -523,21 +530,25 @@ fn build_id_tables(
             ));
         }
         mesh_at.insert(mesh_id, index);
-        let renderer_id = skinned_mesh_renderer_file_id(view.hierarchy_path);
-        match renderer_at.get(&renderer_id) {
-            Some(&first) if meshes[first].hierarchy_path != view.hierarchy_path => {
-                return Err(VrmError::new(
-                    VrmErrorKind::InvalidPrefab,
-                    format!(
-                        "描画設定IDが重複するため先勝ちにしない: {}（{}）",
-                        crate::escape_diag(view.hierarchy_path),
-                        crate::escape_diag(prefab_label),
-                    ),
-                ));
-            }
-            Some(_) => {}
-            None => {
-                renderer_at.insert(renderer_id, index);
+        for renderer_id in [
+            skinned_mesh_renderer_file_id(view.hierarchy_path),
+            mesh_renderer_file_id(view.hierarchy_path),
+        ] {
+            match renderer_at.get(&renderer_id) {
+                Some(&first) if meshes[first].hierarchy_path != view.hierarchy_path => {
+                    return Err(VrmError::new(
+                        VrmErrorKind::InvalidPrefab,
+                        format!(
+                            "描画設定IDが重複するため先勝ちにしない: {}（{}）",
+                            crate::escape_diag(view.hierarchy_path),
+                            crate::escape_diag(prefab_label),
+                        ),
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    renderer_at.insert(renderer_id, index);
+                }
             }
         }
         // 自分を含む祖先のゲームオブジェクトIDを登録する。階層パスは
@@ -594,14 +605,26 @@ fn plan_instance_mode(
     // 直接記述との混在は真の割当が定まらないため失敗する。
     // `stripped` 文書は型付き読み取りで区別済みであり、ここには来ない。
     for (file_id, typed) in decoded {
-        if let TypedObject::SkinnedMeshRenderer(renderer) = typed
-            && !renderer.mesh.is_null()
-            && renderer
-                .mesh
-                .guid
-                .as_ref()
-                .is_some_and(|guid| guid.as_str() == fbx_guid)
-        {
+        let points_fbx = match typed {
+            TypedObject::SkinnedMeshRenderer(renderer) => {
+                !renderer.mesh.is_null()
+                    && renderer
+                        .mesh
+                        .guid
+                        .as_ref()
+                        .is_some_and(|guid| guid.as_str() == fbx_guid)
+            }
+            TypedObject::MeshFilter(filter) => {
+                !filter.mesh.is_null()
+                    && filter
+                        .mesh
+                        .guid
+                        .as_ref()
+                        .is_some_and(|guid| guid.as_str() == fbx_guid)
+            }
+            _ => false,
+        };
+        if points_fbx {
             return Err(VrmError::new(
                 VrmErrorKind::InvalidPrefab,
                 format!(
@@ -839,6 +862,7 @@ fn plan_direct_mode(
     let mut game_objects: HashMap<FileId, &GameObject> = HashMap::new();
     let mut transforms: HashMap<FileId, &Transform> = HashMap::new();
     let mut transform_of_go: HashMap<FileId, FileId> = HashMap::new();
+    let mut mesh_filters_by_go: HashMap<FileId, Vec<(FileId, &MeshFilter)>> = HashMap::new();
     for (file_id, typed) in decoded {
         match typed {
             TypedObject::GameObject(game_object) => {
@@ -864,56 +888,63 @@ fn plan_direct_mode(
                     ));
                 }
             }
+            TypedObject::MeshFilter(filter) => {
+                mesh_filters_by_go
+                    .entry(filter.game_object.file_id)
+                    .or_default()
+                    .push((*file_id, filter));
+            }
             _ => {}
         }
     }
     // 入力FBXを指す描画設定だけを集める。別FBXのものは扱わない。
-    struct Candidate<'a> {
-        renderer: &'a SkinnedMeshRenderer,
+    struct Candidate {
+        game_object: FileId,
+        enabled: bool,
         mesh_index: usize,
         materials: Vec<(String, FileId)>,
         renderer_path: String,
     }
-    let mut candidates: Vec<Candidate<'_>> = Vec::new();
-    for (file_id, typed) in decoded {
-        let TypedObject::SkinnedMeshRenderer(renderer) = typed else {
-            continue;
-        };
-        if renderer.mesh.is_null()
-            || renderer
-                .mesh
+    let build_candidate = |renderer_fid: FileId,
+                           game_object: FileId,
+                           enabled: bool,
+                           mesh_ref: &crate::unity::ObjectRef,
+                           renderer_materials: &[crate::unity::ObjectRef]|
+     -> Result<Option<Candidate>, VrmError> {
+        if mesh_ref.is_null()
+            || mesh_ref
                 .guid
                 .as_ref()
                 .is_none_or(|guid| guid.as_str() != fbx_guid)
         {
-            continue;
-        };
-        let Some(&mesh_index) = id_tables.mesh_at.get(&renderer.mesh.file_id) else {
+            return Ok(None);
+        }
+        let Some(&mesh_index) = id_tables.mesh_at.get(&mesh_ref.file_id) else {
             return Err(VrmError::new(
                 VrmErrorKind::InvalidPrefab,
                 format!(
                     "メッシュIDを解決できない: 描画設定{}のfileID {}（{}。旧方式のPrefabは新方式のXXH64と一致しない）",
-                    file_id,
-                    renderer.mesh.file_id,
+                    renderer_fid,
+                    mesh_ref.file_id,
                     crate::escape_diag(prefab_label),
                 ),
             ));
         };
         let view = &meshes[mesh_index];
-        if renderer.materials.len() != view.slot_names.len() {
+        if renderer_materials.len() != view.slot_names.len() {
             return Err(VrmError::new(
                 VrmErrorKind::InvalidPrefab,
                 format!(
                     "レンダラの材質数とメッシュの材質スロット数が一致しない: {}（{}件に対してスロット{}件）（{}）",
                     crate::escape_diag(view.hierarchy_path),
-                    renderer.materials.len(),
+                    renderer_materials.len(),
                     view.slot_names.len(),
                     crate::escape_diag(prefab_label),
                 ),
             ));
         }
-        let mut materials = Vec::with_capacity(renderer.materials.len());
-        for (slot, reference) in renderer.materials.iter().enumerate() {
+        let mut materials = Vec::with_capacity(renderer_materials.len());
+        for (slot, reference) in renderer_materials.iter().enumerate() {
             if reference.is_null() || reference.guid.is_none() {
                 return Err(VrmError::new(
                     VrmErrorKind::InvalidPrefab,
@@ -928,18 +959,73 @@ fn plan_direct_mode(
             materials.push((guid.as_str().to_owned(), reference.file_id));
         }
         let renderer_path = hierarchy_names(
-            renderer.game_object.file_id,
+            game_object,
             &game_objects,
             &transforms,
             &transform_of_go,
             prefab_label,
         )?;
-        candidates.push(Candidate {
-            renderer,
+        Ok(Some(Candidate {
+            game_object,
+            enabled,
             mesh_index,
             materials,
             renderer_path,
-        });
+        }))
+    };
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for (file_id, typed) in decoded {
+        match typed {
+            TypedObject::SkinnedMeshRenderer(renderer) => {
+                if let Some(candidate) = build_candidate(
+                    *file_id,
+                    renderer.game_object.file_id,
+                    renderer.enabled,
+                    &renderer.mesh,
+                    &renderer.materials,
+                )? {
+                    candidates.push(candidate);
+                }
+            }
+            TypedObject::MeshRenderer(renderer) => {
+                let filters: Vec<(FileId, &MeshFilter)> = mesh_filters_by_go
+                    .get(&renderer.game_object.file_id)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .filter(|(_, filter)| {
+                        !filter.mesh.is_null()
+                            && filter
+                                .mesh
+                                .guid
+                                .as_ref()
+                                .is_some_and(|guid| guid.as_str() == fbx_guid)
+                    })
+                    .collect();
+                if filters.len() > 1 {
+                    return Err(VrmError::new(
+                        VrmErrorKind::InvalidPrefab,
+                        format!(
+                            "1つのゲームオブジェクトに複数のMeshFilterがあるため先勝ちにしない: {}（{}）",
+                            renderer.game_object.file_id,
+                            crate::escape_diag(prefab_label),
+                        ),
+                    ));
+                }
+                if let Some((_, filter)) = filters.first()
+                    && let Some(candidate) = build_candidate(
+                        *file_id,
+                        renderer.game_object.file_id,
+                        renderer.enabled,
+                        &filter.mesh,
+                        &renderer.materials,
+                    )?
+                {
+                    candidates.push(candidate);
+                }
+            }
+            _ => {}
+        }
     }
     if candidates.is_empty() {
         return Err(VrmError::new(
@@ -950,11 +1036,11 @@ fn plan_direct_mode(
             ),
         ));
     }
-    let mut active_of: HashMap<usize, &Candidate<'_>> = HashMap::new();
+    let mut active_of: HashMap<usize, &Candidate> = HashMap::new();
     for candidate in &candidates {
-        let active = candidate.renderer.enabled
+        let active = candidate.enabled
             && hierarchy_active(
-                candidate.renderer.game_object.file_id,
+                candidate.game_object,
                 &game_objects,
                 &transforms,
                 &transform_of_go,
@@ -1176,7 +1262,7 @@ fn hierarchy_active(
 /// 描画設定自体の有効と、自階層のゲームオブジェクト・祖先の有効を合わせる。
 /// 祖先の無効は子にも効く。取り込みルート（階層パスが空）の無効も子に効く。
 /// 登録の無い階層は既定で有効である。祖先パスは階層パスの末尾からの分割で求める。
-fn renderer_active(
+pub(crate) fn renderer_active(
     mesh_index: usize,
     hierarchy_path: &str,
     renderer_enabled: &HashMap<usize, bool>,
@@ -1206,7 +1292,7 @@ fn renderer_active(
 /// `m_Materials` で始まる他の形（大きさなど）は材質割当と有効状態に
 /// 関わらないため無視する。`data[` で始まるのに添字が読めない場合は
 /// 呼び出し側で失敗させる。
-fn material_slot_index(property_path: &str) -> Option<usize> {
+pub(crate) fn material_slot_index(property_path: &str) -> Option<usize> {
     const PREFIX: &str = "m_Materials.Array.data[";
     let rest = property_path.strip_prefix(PREFIX)?;
     let digits = rest.strip_suffix(']')?;
@@ -1214,7 +1300,7 @@ fn material_slot_index(property_path: &str) -> Option<usize> {
 }
 
 /// 0/1または真偽値の改変値を真偽値として読む。
-fn read_flag_value(
+pub(crate) fn read_flag_value(
     value: &Option<Value>,
     prefab_label: &str,
     path: &str,

@@ -3777,6 +3777,138 @@ mod tests {
     }
 
     #[test]
+    fn wasm境界のconvert_prefabでネストprefabのメッシュと材質が書き出される() {
+        use vrctom::unity::mesh_renderer_file_id;
+
+        let main_fbx = 手別名fbxを組み立てる("LeftHand", "RightHand");
+        // BindPoseを持たないシンプルな非スキン小物FBX。
+        let prop_fbx = {
+            let mut objs = vec![
+                合成model(10, "Wand", "Mesh"),
+                {
+                    let mut mp = Props::default();
+                    mp.l(20);
+                    mp.s(b"PropMat\x00\x01Material");
+                    TNode::leaf(b"Material", mp)
+                },
+                合成geometry(
+                    30,
+                    "WandGeo",
+                    vec![
+                        合成vertices(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]),
+                        合成pvi(&[0, 1, -3]),
+                    ],
+                ),
+            ];
+            let conns = vec![合成conn(10, 0), 合成conn(20, 10), 合成conn(30, 10)];
+            let _ = &mut objs;
+            合成file(vec![
+                TNode::branch(b"Objects", Props::default(), objs),
+                TNode::branch(b"Connections", Props::default(), conns),
+            ])
+        };
+
+        let prop_mr = mesh_renderer_file_id("Wand");
+        let mat_body = "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!21 &2100000\nMaterial:\n  m_Name: PropMat\n  m_Shader: {fileID: 4800000, guid: df12117ecd77c31469c224178886498e, type: 3}\n  m_SavedProperties:\n    m_TexEnvs: []\n    m_Floats:\n    - _Cutoff: 0.5\n    - _Cull: 2.0\n    - _ZWrite: 1.0\n    - _UseShadow: 1.0\n    - _ShadowBorder: 0.5\n    - _ShadowBlur: 0.1\n    - _lilToonVersion: 45.0\n    m_Ints: []\n    m_Colors:\n    - _Color: {r: 1, g: 1, b: 1, a: 1}\n    - _ShadowColor: {r: 0.82, g: 0.76, b: 0.85, a: 1}\n"
+            .as_bytes()
+            .to_vec();
+
+        let nest_prefab = format!(
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1001 &200\nPrefabInstance:\n  m_Modification:\n    m_TransformParent: {{fileID: 0}}\n    m_Modifications:\n    - target: {{fileID: {prop_mr}, guid: {}, type: 3}}\n      propertyPath: m_Materials.Array.data[0]\n      value: \n      objectReference: {{fileID: 2100000, guid: {}, type: 2}}\n  m_SourcePrefab: {{fileID: 100100000, guid: {}, type: 3}}\n",
+            guid(2),
+            guid(3),
+            guid(2)
+        );
+        let avatar_prefab = format!(
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1001 &100\nPrefabInstance:\n  m_Modification:\n    m_TransformParent: {{fileID: 0}}\n    m_Modifications: []\n  m_SourcePrefab: {{fileID: 100100000, guid: {}, type: 3}}\n--- !u!1001 &300\nPrefabInstance:\n  m_Modification:\n    m_TransformParent: {{fileID: 0}}\n    m_Modifications: []\n  m_SourcePrefab: {{fileID: 100100000, guid: {}, type: 3}}\n",
+            guid(1),
+            guid(4)
+        );
+
+        let bytes = package_bytes(&[
+            Member::Pathname {
+                guid: guid(1),
+                content: b"Assets/Main.fbx".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(1),
+                content: main_fbx,
+            },
+            Member::Meta {
+                guid: guid(1),
+                content: file_meta(1, "ModelImporter", "  externalObjects: {}\n"),
+            },
+            Member::Pathname {
+                guid: guid(2),
+                content: b"Assets/Prop.fbx".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(2),
+                content: prop_fbx,
+            },
+            Member::Meta {
+                guid: guid(2),
+                content: file_meta(2, "ModelImporter", "  externalObjects: {}\n"),
+            },
+            Member::Pathname {
+                guid: guid(3),
+                content: b"Assets/Prop.mat".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(3),
+                content: mat_body,
+            },
+            Member::Meta {
+                guid: guid(3),
+                content: file_meta(3, "NativeFormatImporter", "  externalObjects: {}\n"),
+            },
+            Member::Pathname {
+                guid: guid(4),
+                content: b"Assets/Nest.prefab".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(4),
+                content: nest_prefab.into_bytes(),
+            },
+            Member::Meta {
+                guid: guid(4),
+                content: prefab_メタ(4),
+            },
+            Member::Pathname {
+                guid: guid(5),
+                content: b"Assets/Avatar.prefab".to_vec(),
+            },
+            Member::Asset {
+                guid: guid(5),
+                content: avatar_prefab.into_bytes(),
+            },
+            Member::Meta {
+                guid: guid(5),
+                content: prefab_メタ(5),
+            },
+        ]);
+
+        let package = Package::open(&bytes).expect("開ける");
+        let converted = package
+            .convert_prefab("Assets/Avatar.prefab", r#"{"physics":false}"#)
+            .expect("ネストPrefab込みで変換できる");
+        assert_eq!(&converted.vrm[0..4], b"glTF");
+        let report: serde_json::Value =
+            serde_json::from_str(&converted.report_json).expect("レポートはJSON");
+        assert_eq!(report["meshes"], serde_json::json!(2));
+        assert_eq!(report["assignment"]["activeMeshes"], serde_json::json!(2));
+        assert_eq!(report["materials"], serde_json::json!(1));
+        assert_eq!(
+            report["nestedPrefabs"],
+            serde_json::json!(["Assets/Nest.prefab"])
+        );
+        assert_eq!(
+            report["warnings"],
+            serde_json::json!(["VRCAvatarDescriptorが無いため表情を作らない"])
+        );
+    }
+
+    #[test]
     fn guid全ゼロではprefab変換がprefab段階で失敗する() {
         // FBXのGUIDが全ゼロの場合は未設定として失敗する。
         let prefab_body = prefab_実体文書("100100000", &guid(0)).into_bytes();

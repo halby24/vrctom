@@ -24,7 +24,8 @@ mod humanoid;
 mod look_at;
 mod material;
 pub(crate) mod matrix;
-mod mesh;
+pub(crate) mod mesh;
+mod nested_prefab;
 pub mod physics;
 mod physics_apply;
 pub mod physics_prefab;
@@ -53,6 +54,10 @@ pub use material::{
     VrmOutlineWidthMode, VrmSampler, VrmWrap,
 };
 use matrix::{AxisTransform, IDENTITY};
+pub use nested_prefab::{
+    NestedPrefabInput, NestedPrefabLimits, NestedPrefabReport, PreparedNestedPrefabs,
+    apply_nested_prefab_meshes, prepare_nested_prefab_meshes,
+};
 pub use physics::{
     AppliedHumanoidBone, AuxiliaryNode, BranchSplit, CenterAssigned, CenterKind,
     ChangedHumanoidBone, CompiledSprings, HumanoidPoseReport, JointTrace, LostNode, NoCenter,
@@ -562,7 +567,7 @@ impl VrmModel {
 ///
 /// 3軸が重複している場合や符号が `±1` でない場合は直交変換を構成できないため、
 /// `UnsupportedAxis` として失敗する。
-fn axis_transform(file: &FbxFile<'_>) -> Result<AxisTransform, VrmError> {
+pub(crate) fn axis_transform(file: &FbxFile<'_>) -> Result<AxisTransform, VrmError> {
     AxisTransform::from_axis_system(file.axis_system()).ok_or_else(|| {
         VrmError::new(
             VrmErrorKind::UnsupportedAxis,
@@ -575,7 +580,7 @@ fn axis_transform(file: &FbxFile<'_>) -> Result<AxisTransform, VrmError> {
 ///
 /// 係数は `UnitScaleFactor / 100` を拡大率にする。0以下または非有限の
 /// 場合は大きさを決められないため、非対応として失敗する。
-fn check_unit_scale(file: &FbxFile<'_>) -> Result<[f64; 16], VrmError> {
+pub(crate) fn check_unit_scale(file: &FbxFile<'_>) -> Result<[f64; 16], VrmError> {
     let factor = file.unit_scale_factor();
     if factor.is_finite() && factor > 0.0 {
         Ok(matrix::scale_matrix(factor / 100.0))
@@ -1285,7 +1290,7 @@ fn resolve_with_geometry(
 /// 読み取り層の失敗を中間モデル層の失敗へ写す。
 ///
 /// 資源上限の超過だけは種別を保ち、それ以外は構造破損として扱う。
-fn wrap_fbx_error(error: crate::fbx::FbxError) -> VrmError {
+pub(crate) fn wrap_fbx_error(error: crate::fbx::FbxError) -> VrmError {
     let message = error.to_string();
     let object = error.object_id();
     let mut out = VrmError::new(
@@ -1453,6 +1458,22 @@ struct BindWorlds {
 /// 使う。許容を超える差・非有限の候補は失敗のままにする。
 /// 退化（行列が特異・成分が有限でない・参照が循環）は失敗のままにする。
 fn bind_world_matrices(file: &FbxFile<'_>) -> Result<BindWorlds, VrmError> {
+    bind_world_matrices_inner(file, false)
+}
+
+/// ネストPrefabの副FBX向けに全モデルのバインド世界行列を `models()` 順に返す。
+///
+/// スキンが無く `BindPose` も無い非スキン小物FBXでは `rest_world_matrices` を返す。
+pub(crate) fn bind_world_matrices_for_nested(
+    file: &FbxFile<'_>,
+) -> Result<Vec<[f64; 16]>, VrmError> {
+    bind_world_matrices_inner(file, true).map(|bind| bind.worlds)
+}
+
+fn bind_world_matrices_inner(
+    file: &FbxFile<'_>,
+    allow_rest_without_bind_pose: bool,
+) -> Result<BindWorlds, VrmError> {
     let nodes = file.bind_pose_nodes().map_err(|error| {
         // 読み取り層の検査結果を引き継ぎ、構造破損として扱う。
         // 資源上限の超過だけは種別を保つ。
@@ -1484,6 +1505,16 @@ fn bind_world_matrices(file: &FbxFile<'_>) -> Result<BindWorlds, VrmError> {
         });
     }
     if by_model.is_empty() {
+        if allow_rest_without_bind_pose && file.skins().is_empty() {
+            let worlds = rest_world_matrices(file)?;
+            let rest_models = worlds.len();
+            return Ok(BindWorlds {
+                worlds,
+                pose_models: 0,
+                link_models: 0,
+                rest_models,
+            });
+        }
         return Err(VrmError::new(
             VrmErrorKind::MissingBindPose,
             "バインド行列が無いモデルがある",
@@ -1595,7 +1626,7 @@ fn bind_world_matrices(file: &FbxFile<'_>) -> Result<BindWorlds, VrmError> {
 /// `InheritType` に従って親から積む（[`crate::fbx::inherit_world_matrix`]）。
 /// `BindPose` に無いモデル（Blenderが出力しない末端ボーンなど）の代替に使う。
 /// 循環・非有限・分解失敗は構造破損として失敗する。
-fn rest_world_matrices(file: &FbxFile<'_>) -> Result<Vec<[f64; 16]>, VrmError> {
+pub(crate) fn rest_world_matrices(file: &FbxFile<'_>) -> Result<Vec<[f64; 16]>, VrmError> {
     let models = file.models();
     let at: HashMap<i64, usize> = models
         .iter()
@@ -1668,11 +1699,56 @@ fn rest_world_matrices(file: &FbxFile<'_>) -> Result<Vec<[f64; 16]>, VrmError> {
 }
 
 /// 全スキンのクラスタが指す関節モデルのID集合を返す。
-fn joint_model_ids(file: &FbxFile<'_>) -> HashSet<i64> {
+pub(crate) fn joint_model_ids(file: &FbxFile<'_>) -> HashSet<i64> {
     file.skins()
         .iter()
         .flat_map(|skin| skin.clusters.iter().map(|cluster| cluster.joint.value()))
         .collect()
+}
+
+/// `VrmModel` 内部ノード空間（`model.root` を掛けない座標系）での各ノードの世界行列を返す。
+///
+/// 親子に循環がある場合や親索引が範囲外の場合は `InvalidStructure` を返す。
+pub(crate) fn model_vrm_worlds(model: &VrmModel) -> Result<Vec<[f64; 16]>, VrmError> {
+    let count = model.nodes.len();
+    let mut worlds = vec![IDENTITY; count];
+    let mut done = vec![false; count];
+    for start in 0..count {
+        let mut chain = Vec::new();
+        let mut seen = HashSet::new();
+        let mut current = start;
+        loop {
+            if done[current] {
+                break;
+            }
+            if !seen.insert(current) {
+                return Err(VrmError::new(
+                    VrmErrorKind::InvalidStructure,
+                    "Vrmノードの親子に循環がある",
+                ));
+            }
+            chain.push(current);
+            match model.nodes[current].parent {
+                Some(parent) if parent < count => current = parent,
+                Some(_) => {
+                    return Err(VrmError::new(
+                        VrmErrorKind::InvalidStructure,
+                        "Vrmノードの親索引が範囲外である",
+                    ));
+                }
+                None => break,
+            }
+        }
+        for &node in chain.iter().rev() {
+            let local = &model.nodes[node].local;
+            worlds[node] = match model.nodes[node].parent {
+                Some(parent) => matrix::mul(&worlds[parent], local),
+                None => *local,
+            };
+            done[node] = true;
+        }
+    }
+    Ok(worlds)
 }
 
 /// ノード列を作る。`bind` は `models()` 順のバインド世界行列、

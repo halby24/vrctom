@@ -136,7 +136,7 @@ Prefab 入口（`convertPrefab`）のレポートは次のとおりです。
   "materials": 3,
   "images": 4,
   "expressions": 8,
-  "warnings": ["ネストPrefabのジオメトリは出力しない: Assets/Phone.prefab"],
+  "warnings": [],
   "assignment": {
     "mode": "instance",
     "activeMeshes": 2,

@@ -23,6 +23,10 @@ pub enum TypedObject {
     Transform(Transform),
     /// アニメータ。
     Animator(Animator),
+    /// 非スキンメッシュ描画設定。
+    MeshRenderer(MeshRenderer),
+    /// メッシュフィルタ。
+    MeshFilter(MeshFilter),
     /// スキンドメッシュ描画設定。
     SkinnedMeshRenderer(SkinnedMeshRenderer),
     /// マテリアル。
@@ -84,6 +88,26 @@ pub struct SkinnedMeshRenderer {
     pub blend_shape_weights: Option<Vec<f64>>,
     /// 有効かどうか。
     pub enabled: bool,
+}
+
+/// 非スキンメッシュ描画設定。
+#[derive(Debug, Clone)]
+pub struct MeshRenderer {
+    /// 所属するゲームオブジェクトへの参照。
+    pub game_object: ObjectRef,
+    /// マテリアルへの参照列。
+    pub materials: Vec<ObjectRef>,
+    /// 有効かどうか。
+    pub enabled: bool,
+}
+
+/// メッシュフィルタ。
+#[derive(Debug, Clone)]
+pub struct MeshFilter {
+    /// 所属するゲームオブジェクトへの参照。
+    pub game_object: ObjectRef,
+    /// メッシュへの参照。nullの場合もある。
+    pub mesh: ObjectRef,
 }
 
 /// テクスチャ環境（`m_TexEnvs` の1項目の値部）。
@@ -180,6 +204,15 @@ pub struct PrefabModification {
     pub object_reference: Option<ObjectRef>,
 }
 
+/// `m_Modification.m_AddedGameObjects` の1件。
+#[derive(Debug, Clone)]
+pub struct AddedGameObject {
+    /// 追加先の親Transform（対応元オブジェクト）への参照。
+    pub target_corresponding_source: ObjectRef,
+    /// 追加されたオブジェクト（Transform）への参照。
+    pub added_object: ObjectRef,
+}
+
 impl PrefabInstance {
     /// 改変内容の一覧を型付きで読む。
     ///
@@ -225,6 +258,86 @@ impl PrefabInstance {
             .map(|(index, item)| decode_modification(item, index))
             .collect()
     }
+
+    /// 配置先の親Transform（`m_Modification.m_TransformParent`）を型付きで読む。
+    ///
+    /// `m_Modification` や `m_TransformParent` が無い場合とnullの場合は
+    /// `file_id: 0` のnull参照を返す。
+    ///
+    /// # Errors
+    ///
+    /// `m_Modification` や `m_TransformParent` の形状が壊れている場合に返す。
+    pub fn transform_parent(&self) -> Result<ObjectRef, UnityError> {
+        const FIELD: &str = "m_Modification.m_TransformParent";
+        let Some(modification) = self.extra.get("m_Modification") else {
+            return Ok(null_object_ref());
+        };
+        if matches!(modification, Value::Null) {
+            return Ok(null_object_ref());
+        }
+        let modification = modification.as_mapping().ok_or_else(|| {
+            UnityError::new(
+                UnityErrorKind::TypeMismatch,
+                "改変内容がマッピングでない: m_Modification",
+            )
+            .with_field("m_Modification".to_owned())
+        })?;
+        let Some(parent) = modification.get("m_TransformParent") else {
+            return Ok(null_object_ref());
+        };
+        if matches!(parent, Value::Null) {
+            return Ok(null_object_ref());
+        }
+        ObjectRef::decode_body(parent).map_err(|error| {
+            if error.field().is_none() {
+                error.with_field(FIELD.to_owned())
+            } else {
+                error
+            }
+        })
+    }
+
+    /// 追加されたゲームオブジェクト一覧（`m_Modification.m_AddedGameObjects`）を型付きで読む。
+    ///
+    /// 欄が無い場合とnullの場合は空を返す。
+    ///
+    /// # Errors
+    ///
+    /// 改変内容や要素の形状が壊れている場合に返す。
+    pub fn added_game_objects(&self) -> Result<Vec<AddedGameObject>, UnityError> {
+        const FIELD: &str = "m_Modification.m_AddedGameObjects";
+        let Some(modification) = self.extra.get("m_Modification") else {
+            return Ok(Vec::new());
+        };
+        if matches!(modification, Value::Null) {
+            return Ok(Vec::new());
+        }
+        let modification = modification.as_mapping().ok_or_else(|| {
+            UnityError::new(
+                UnityErrorKind::TypeMismatch,
+                "改変内容がマッピングでない: m_Modification",
+            )
+            .with_field("m_Modification".to_owned())
+        })?;
+        let Some(list) = modification.get("m_AddedGameObjects") else {
+            return Ok(Vec::new());
+        };
+        if matches!(list, Value::Null) {
+            return Ok(Vec::new());
+        }
+        let items = list.as_sequence().ok_or_else(|| {
+            UnityError::new(
+                UnityErrorKind::TypeMismatch,
+                "追加オブジェクト一覧がシーケンスでない: m_AddedGameObjects",
+            )
+            .with_field(FIELD.to_owned())
+        })?;
+        items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| decode_added_game_object(item, index))
+            .collect()
+    }
 }
 
 /// アニメータ。
@@ -255,14 +368,41 @@ pub struct PrefabLink {
     pub extra: Mapping,
 }
 
+impl PrefabLink {
+    /// 所属する `PrefabInstance`（`m_PrefabInstance`）への参照を型付きで読む。
+    ///
+    /// 欄が無い場合とnullの場合は `file_id: 0` のnull参照を返す。
+    ///
+    /// # Errors
+    ///
+    /// `m_PrefabInstance` の形状が壊れている場合に返す。
+    pub fn prefab_instance(&self) -> Result<ObjectRef, UnityError> {
+        let Some(value) = self.extra.get("m_PrefabInstance") else {
+            return Ok(null_object_ref());
+        };
+        if matches!(value, Value::Null) {
+            return Ok(null_object_ref());
+        }
+        ObjectRef::decode_body(value).map_err(|error| {
+            if error.field().is_none() {
+                error.with_field("m_PrefabInstance".to_owned())
+            } else {
+                error
+            }
+        })
+    }
+}
+
 /// 既知クラス名とclassIDの対応。
 ///
 /// 型付き読み取りで明白な不一致を検出するための表である。
 /// 未知の組み合わせは [`TypedObject::Unknown`] として扱い、エラーにしない。
-const KNOWN_CLASSES: [(i32, &str); 7] = [
+const KNOWN_CLASSES: [(i32, &str); 9] = [
     (1, "GameObject"),
     (4, "Transform"),
     (21, "Material"),
+    (23, "MeshRenderer"),
+    (33, "MeshFilter"),
     (95, "Animator"),
     (114, "MonoBehaviour"),
     (137, "SkinnedMeshRenderer"),
@@ -323,6 +463,8 @@ pub(crate) fn decode_document(document: &Document) -> Result<TypedObject, UnityE
         1 => TypedObject::GameObject(decode_game_object(document, raw)?),
         4 => TypedObject::Transform(decode_transform(document, raw)?),
         21 => TypedObject::Material(decode_material(document, raw)?),
+        23 => TypedObject::MeshRenderer(decode_mesh_renderer(document, raw)?),
+        33 => TypedObject::MeshFilter(decode_mesh_filter(document, raw)?),
         95 => TypedObject::Animator(decode_animator(document, raw)?),
         114 => TypedObject::MonoBehaviour(decode_mono_behaviour(document, raw)?),
         137 => TypedObject::SkinnedMeshRenderer(decode_skinned_mesh_renderer(document, raw)?),
@@ -682,6 +824,30 @@ fn decode_skinned_mesh_renderer(
     })
 }
 
+/// MeshRendererの共通欄を読む。
+fn decode_mesh_renderer(
+    document: &Document,
+    mapping: &Mapping,
+) -> Result<MeshRenderer, UnityError> {
+    Ok(MeshRenderer {
+        game_object: read_ref(document, mapping, "m_GameObject")?,
+        materials: read_ref_list(document, mapping, "m_Materials")?,
+        enabled: read_flag(
+            document,
+            required(document, mapping, "m_Enabled")?,
+            "m_Enabled",
+        )?,
+    })
+}
+
+/// MeshFilterの共通欄を読む。
+fn decode_mesh_filter(document: &Document, mapping: &Mapping) -> Result<MeshFilter, UnityError> {
+    Ok(MeshFilter {
+        game_object: read_ref(document, mapping, "m_GameObject")?,
+        mesh: read_ref(document, mapping, "m_Mesh")?,
+    })
+}
+
 /// テクスチャ環境を読む。
 fn read_texture_environment(
     document: &Document,
@@ -898,5 +1064,63 @@ fn decode_modification(item: &Value, index: usize) -> Result<PrefabModification,
         property_path: property_path.to_owned(),
         value,
         object_reference,
+    })
+}
+
+/// `file_id: 0` のnull参照を返す。
+fn null_object_ref() -> ObjectRef {
+    ObjectRef {
+        file_id: 0,
+        guid: None,
+        type_hint: None,
+    }
+}
+
+/// `m_AddedGameObjects` の1件を読む。
+fn decode_added_game_object(item: &Value, index: usize) -> Result<AddedGameObject, UnityError> {
+    let field = format!("m_AddedGameObjects[{index}]");
+    let mapping = item.as_mapping().ok_or_else(|| {
+        UnityError::new(UnityErrorKind::TypeMismatch, "追加項目がマッピングでない")
+            .with_field(field.clone())
+    })?;
+    let target = mapping
+        .get("targetCorrespondingSourceObject")
+        .ok_or_else(|| {
+            UnityError::new(
+                UnityErrorKind::TypeMismatch,
+                "追加項目に対象オブジェクトがない",
+            )
+            .with_field(field.clone())
+        })
+        .and_then(|value| {
+            ObjectRef::decode_body(value).map_err(|error| {
+                if error.field().is_none() {
+                    error.with_field(format!("{field}.targetCorrespondingSourceObject"))
+                } else {
+                    error
+                }
+            })
+        })?;
+    let added = mapping
+        .get("addedObject")
+        .ok_or_else(|| {
+            UnityError::new(
+                UnityErrorKind::TypeMismatch,
+                "追加項目に追加オブジェクトがない",
+            )
+            .with_field(field.clone())
+        })
+        .and_then(|value| {
+            ObjectRef::decode_body(value).map_err(|error| {
+                if error.field().is_none() {
+                    error.with_field(format!("{field}.addedObject"))
+                } else {
+                    error
+                }
+            })
+        })?;
+    Ok(AddedGameObject {
+        target_corresponding_source: target,
+        added_object: added,
     })
 }

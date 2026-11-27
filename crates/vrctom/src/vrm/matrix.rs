@@ -424,6 +424,166 @@ pub(crate) fn decompose_trs(m: &[f64; 16]) -> Option<([f64; 3], [f64; 16], [f64;
     Some((translation, rotation, scales))
 }
 
+/// 位置・回転（四元数 `[x, y, z, w]`）・拡大率から列優先の4x4行列を作る。
+/// `T * R * S` の順であり、回転は正規化済みを想定する（正規化は行わない）。
+pub(crate) fn compose_trs(position: [f64; 3], rotation: [f64; 4], scale: [f64; 3]) -> [f64; 16] {
+    let (x, y, z, w) = (rotation[0], rotation[1], rotation[2], rotation[3]);
+    let (sx, sy, sz) = (scale[0], scale[1], scale[2]);
+    // 正規化済みの四元数から回転行列を作り、列ごとに拡大率を掛ける。
+    let xx = x * x;
+    let yy = y * y;
+    let zz = z * z;
+    let xy = x * y;
+    let xz = x * z;
+    let yz = y * z;
+    let wx = w * x;
+    let wy = w * y;
+    let wz = w * z;
+    let r00 = 1.0 - 2.0 * (yy + zz);
+    let r10 = 2.0 * (xy + wz);
+    let r20 = 2.0 * (xz - wy);
+    let r01 = 2.0 * (xy - wz);
+    let r11 = 1.0 - 2.0 * (xx + zz);
+    let r21 = 2.0 * (yz + wx);
+    let r02 = 2.0 * (xz + wy);
+    let r12 = 2.0 * (yz - wx);
+    let r22 = 1.0 - 2.0 * (xx + yy);
+    [
+        r00 * sx,
+        r10 * sx,
+        r20 * sx,
+        0.0, //
+        r01 * sy,
+        r11 * sy,
+        r21 * sy,
+        0.0, //
+        r02 * sz,
+        r12 * sz,
+        r22 * sz,
+        0.0, //
+        position[0],
+        position[1],
+        position[2],
+        1.0, //
+    ]
+}
+
+/// 平行移動成分（12〜14番）だけに `factor` を掛けた行列を返す。
+pub(crate) fn scale_translation(m: &[f64; 16], factor: f64) -> [f64; 16] {
+    let mut out = *m;
+    out[12] *= factor;
+    out[13] *= factor;
+    out[14] *= factor;
+    out
+}
+
+/// 行列の左からX反転 `M_x = diag(-1, 1, 1, 1)` を掛ける（行0の符号反転）。
+pub(crate) fn mul_left_mirror_x(m: &[f64; 16]) -> [f64; 16] {
+    let mut out = *m;
+    out[0] = -out[0];
+    out[4] = -out[4];
+    out[8] = -out[8];
+    out[12] = -out[12];
+    out
+}
+
+/// Unity左手系・メートル単位のローカルTRSを、VRM右手系・主モデルノード空間のローカル行列へ写す。
+///
+/// 位置はX反転のうえ `main_root_scale` で割り、回転はY・Z反転後に正規化する。
+/// 非有限値・非正の `main_root_scale`・ゼロ長の四元数は `None` を返す。
+pub(crate) fn unity_local_to_vrm_matrix(
+    position: [f64; 3],
+    rotation: [f64; 4],
+    scale: [f64; 3],
+    main_root_scale: f64,
+) -> Option<[f64; 16]> {
+    if !main_root_scale.is_finite()
+        || main_root_scale <= 0.0
+        || !position.iter().all(|v| v.is_finite())
+        || !rotation.iter().all(|v| v.is_finite())
+        || !scale.iter().all(|v| v.is_finite())
+    {
+        return None;
+    }
+    let mirrored_rot = [rotation[0], -rotation[1], -rotation[2], rotation[3]];
+    let len2 = mirrored_rot[0] * mirrored_rot[0]
+        + mirrored_rot[1] * mirrored_rot[1]
+        + mirrored_rot[2] * mirrored_rot[2]
+        + mirrored_rot[3] * mirrored_rot[3];
+    if !len2.is_finite() || len2 < 1e-12 {
+        return None;
+    }
+    let len = len2.sqrt();
+    let rot_vrm = [
+        mirrored_rot[0] / len,
+        mirrored_rot[1] / len,
+        mirrored_rot[2] / len,
+        mirrored_rot[3] / len,
+    ];
+    let pos_vrm = [
+        -position[0] / main_root_scale,
+        position[1] / main_root_scale,
+        position[2] / main_root_scale,
+    ];
+    let out = compose_trs(pos_vrm, rot_vrm, scale);
+    is_finite_matrix(&out).then_some(out)
+}
+
+/// VRM右手系・主モデルノード空間のローカル行列を、Unity左手系・メートル単位のTRSへ戻す。
+///
+/// 鏡像（`det3 < 0`）を含む場合はX軸の拡大率を負にして回転行列を純粋回転に保つ。
+/// 分解できない場合は `None` を返す。
+pub(crate) fn decompose_vrm_matrix_to_unity_trs(
+    m: &[f64; 16],
+    main_root_scale: f64,
+) -> Option<([f64; 3], [f64; 4], [f64; 3])> {
+    if !main_root_scale.is_finite() || main_root_scale <= 0.0 || !is_finite_matrix(m) {
+        return None;
+    }
+    let (t_vrm, mut r_mat, mut s) = decompose_trs(m)?;
+    if det3(&r_mat) < 0.0 {
+        r_mat[0] = -r_mat[0];
+        r_mat[1] = -r_mat[1];
+        r_mat[2] = -r_mat[2];
+        s[0] = -s[0];
+    }
+    let q_vrm = rotation_matrix_to_quat(&r_mat)?;
+    let p_u = [
+        -t_vrm[0] * main_root_scale,
+        t_vrm[1] * main_root_scale,
+        t_vrm[2] * main_root_scale,
+    ];
+    let q_u = [q_vrm[0], -q_vrm[1], -q_vrm[2], q_vrm[3]];
+    Some((p_u, q_u, s))
+}
+
+/// 3x3純粋回転行列から単位四元数 `[x, y, z, w]` を抽出する（Shepperd法）。
+fn rotation_matrix_to_quat(r: &[f64; 16]) -> Option<[f64; 4]> {
+    let (m00, m10, m20) = (r[0], r[1], r[2]);
+    let (m01, m11, m21) = (r[4], r[5], r[6]);
+    let (m02, m12, m22) = (r[8], r[9], r[10]);
+    let trace = m00 + m11 + m22;
+    let q = if trace > 0.0 {
+        let s = (trace + 1.0).sqrt() * 2.0;
+        [(m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, 0.25 * s]
+    } else if m00 > m11 && m00 > m22 {
+        let s = (1.0 + m00 - m11 - m22).sqrt() * 2.0;
+        [0.25 * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s]
+    } else if m11 > m22 {
+        let s = (1.0 + m11 - m00 - m22).sqrt() * 2.0;
+        [(m01 + m10) / s, 0.25 * s, (m12 + m21) / s, (m02 - m20) / s]
+    } else {
+        let s = (1.0 + m22 - m00 - m11).sqrt() * 2.0;
+        [(m02 + m20) / s, (m12 + m21) / s, 0.25 * s, (m10 - m01) / s]
+    };
+    let len2 = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+    if !len2.is_finite() || len2 < 1e-12 {
+        return None;
+    }
+    let len = len2.sqrt();
+    Some([q[0] / len, q[1] / len, q[2] / len, q[3] / len])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,5 +822,30 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn unityとvrm間のローカルtrs変換と分解が往復一致する() {
+        let pos = [0.25, -1.5, 0.75];
+        // 正規化前の回転でも正規化されて往復一致する。
+        let rot = [0.2, -0.4, 0.1, 0.8888194417315589];
+        let scale = [1.2, 0.8, 1.5];
+        let main_root_scale = 0.01;
+        let vrm = unity_local_to_vrm_matrix(pos, rot, scale, main_root_scale)
+            .expect("有効なTRSは変換できる");
+        let (p_back, q_back, s_back) =
+            decompose_vrm_matrix_to_unity_trs(&vrm, main_root_scale).expect("分解できる");
+        for i in 0..3 {
+            assert!((p_back[i] - pos[i]).abs() < 1e-12, "p[{i}]");
+            assert!((s_back[i] - scale[i]).abs() < 1e-12, "s[{i}]");
+        }
+        // 四元数は q と -q が同じ回転を表すため、内積の絶対値で比較する。
+        let dot = rot[0] * q_back[0] + rot[1] * q_back[1] + rot[2] * q_back[2] + rot[3] * q_back[3];
+        assert!((dot.abs() - 1.0).abs() < 1e-12, "dot={dot}");
+        let vrm_again = unity_local_to_vrm_matrix(p_back, q_back, s_back, main_root_scale)
+            .expect("再変換できる");
+        for i in 0..16 {
+            assert!((vrm_again[i] - vrm[i]).abs() < 1e-12, "m[{i}]");
+        }
     }
 }

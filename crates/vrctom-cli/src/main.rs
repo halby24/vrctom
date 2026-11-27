@@ -775,6 +775,7 @@ fn export(
                 &prefab_path,
                 &input,
                 assets_root.as_deref(),
+                &vrm_options,
             ) {
                 Ok(out) => Some(out),
                 Err(code) => return code,
@@ -1541,11 +1542,15 @@ fn apply_prefab_assignment(
     prefab_path: &std::path::Path,
     input: &std::path::Path,
     assets_root: Option<&std::path::Path>,
+    vrm_options: &VrmOptions,
 ) -> Result<(VrmMaterials, RendererApplyReport), i32> {
-    use vrctom::unity::{IndexOptions, ParseOptions, SerializedFile, scan_directory};
+    use vrctom::unity::{
+        FsAssetSource, IndexOptions, ParseOptions, SerializedFile, scan_directory,
+    };
     use vrctom::vrm::{
-        PrefabMeshView, apply_prefab_plan, load_renderer_materials_with_index,
-        plan_prefab_assignment, prefab_base_materials, prefab_hierarchy_paths,
+        NestedPrefabInput, NestedPrefabLimits, PrefabMeshView, apply_nested_prefab_meshes,
+        apply_prefab_plan, load_renderer_materials_with_index, plan_prefab_assignment,
+        prefab_base_materials, prefab_hierarchy_paths, prepare_nested_prefab_meshes,
         resolve_prefab_pool_paths,
     };
 
@@ -1705,6 +1710,30 @@ fn apply_prefab_assignment(
         escape_diag(&relative),
         plan.fbx_guid
     );
+    let fs_source = FsAssetSource::new(&canonical_assets);
+    let fbx_options = FbxOptions::default();
+    let nested_limits = NestedPrefabLimits::new()
+        .with_max_fbx_bytes(1 << 30)
+        .with_max_prefab_bytes(u64::MAX)
+        .with_max_total_bytes(u64::MAX);
+    let nested_input = NestedPrefabInput {
+        source: &fs_source,
+        index: &index,
+        root_prefab: &prefab,
+        root_prefab_path: &prefab_label,
+        main_fbx: file,
+        main_fbx_guid: &fbx_guid,
+        fbx_options: &fbx_options,
+        vrm_options,
+        limits: &nested_limits,
+    };
+    let nested_prepared = match prepare_nested_prefab_meshes(model, &mut plan.pool, &nested_input) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            diagnose_stage("ネストPrefabの解決に失敗した", &error);
+            return Err(1);
+        }
+    };
     resolve_prefab_pool_paths(&mut plan.pool, &index);
     let (materials, material_report) = match load_renderer_materials_with_index(
         &canonical_assets,
@@ -1721,17 +1750,30 @@ fn apply_prefab_assignment(
     for warning in material_report.warnings() {
         eprintln!("材質の警告: {}", escape_diag(warning));
     }
-    let report = match apply_prefab_plan(model, &plan, &materials) {
+    let mut report = match apply_prefab_plan(model, &plan, &materials) {
         Ok(report) => report,
         Err(error) => {
             diagnose_stage("Prefab割当の適用に失敗した", &error);
             return Err(1);
         }
     };
+    let nested_report = match apply_nested_prefab_meshes(model, nested_prepared) {
+        Ok(nested_report) => nested_report,
+        Err(error) => {
+            diagnose_stage("ネストPrefabの適用に失敗した", &error);
+            return Err(1);
+        }
+    };
+    for warning in &nested_report.warnings {
+        eprintln!("ネストPrefabの警告: {}", escape_diag(warning));
+    }
+    report.included_count += nested_report.active_meshes;
+    report.excluded_count += nested_report.excluded_meshes;
+    report.excluded_names.extend(nested_report.excluded_names);
     eprintln!(
         "Prefab割当: {}方式 有効{}件 除外{}件（{}） 材質プール{}件",
         mode,
-        plan.active_count(),
+        report.included_count,
         report.excluded_count,
         escape_diag(&report.excluded_names.join(", ")),
         report.pool_count
