@@ -122,7 +122,8 @@ npm pack ./crates/vrctom-wasm/pkg --dry-run
 ## 制限
 
 - 出力はVRM 1.0のみである（VRM 0.xは書かない）。
-- 材質はlilToonとFlat Lit Toonを写像する。それ以外のシェーダは灰色材質になる。
+- 材質はlilToon・Flat Lit Toon・VRChat SDKのMobile系（Toon Standard・Toon Lit・
+  MatCap Lit・Standard Liteなど）を写像する。それ以外のシェーダは灰色材質になる。
 - Matcap合成・デカール・lilToon材質拡張は未対応である。
 - Unity 2018以前の資産（バイナリ保存の `.mat`・`.prefab`・`.unity`、旧版のPrefab表現、
   `.meta` の `fileIDToRecycleName`、置換表の無いFBXの旧方式の材質検索）に対応する。

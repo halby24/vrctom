@@ -151,6 +151,13 @@ pub struct Material {
     pub ints: Vec<NamedProperty<i64>>,
     /// 色プロパティの一覧。順序と重複を保つ。色は `r, g, b, a` 順の `f64` である。
     pub colors: Vec<NamedProperty<[f64; 4]>>,
+    /// 有効なシェーダキーワード。出現順で重複は除く。
+    ///
+    /// `m_ShaderKeywords`（空白区切りの文字列。Unity 2021.1以前）と
+    /// `m_ValidKeywords`・`m_InvalidKeywords`（文字列の列。Unity 2021.2以降）の和である。
+    /// `m_InvalidKeywords` はシェーダが無い環境で保存された有効キーワードを含むため加える。
+    /// 欄の欠落や形状違いは空として読む（キーワードは補助情報のため失敗にしない）。
+    pub shader_keywords: Vec<String>,
 }
 
 /// スクリプト参照と独自欄を持つ振る舞い。
@@ -902,7 +909,31 @@ fn decode_material(document: &Document, mapping: &Mapping) -> Result<Material, U
         floats,
         ints,
         colors,
+        shader_keywords: read_shader_keywords(mapping),
     })
+}
+
+/// シェーダキーワードを読む。[`Material::shader_keywords`] の規則に従う。
+fn read_shader_keywords(mapping: &Mapping) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |keyword: &str| {
+        if !keyword.is_empty() && !out.iter().any(|known| known == keyword) {
+            out.push(keyword.to_owned());
+        }
+    };
+    if let Some(Value::String(text)) = mapping.get("m_ShaderKeywords") {
+        text.split_whitespace().for_each(&mut push);
+    }
+    for key in ["m_ValidKeywords", "m_InvalidKeywords"] {
+        if let Some(Value::Sequence(list)) = mapping.get(key) {
+            for item in list {
+                if let Value::String(keyword) = item {
+                    push(keyword.trim());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// `m_CustomRenderQueue` を読む。欠落時は-1（シェーダ既定）にする。

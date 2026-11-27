@@ -20,8 +20,8 @@
 //!     images --> materials
 //! ```
 //!
-//! 画像のデコード・再エンコードは取り込み上限の縮小の範囲で行い、
-//! テクスチャのベイク、lilToon以外のシェーダの解釈は行わない。
+//! 解釈するシェーダはlilToon・Flat Lit Toonと、VRChat SDKのMobile系
+//! （[`mobile`] モジュール）である。それ以外は灰色材質へ落とす。
 //! 形式は先頭バイトで判定し、PNG・JPEGとPSDの保存済み合成画像を受け付ける。
 //! PSDはRaw・RLEの8bit RGB・Grayscaleだけを復号し、復号後にPNGへ符号化する。
 
@@ -42,6 +42,8 @@ use super::bake::{
     import_fitted_size, load_bake_image, matcap_disc_average, shade_layer_weights,
 };
 use super::psd::{PsdError, decode_psd, is_psd, psd_dimensions};
+
+mod mobile;
 
 use crate::unity::{
     AssetIndex, AssetKind, AssetRecord, AssetSource, BinaryFile, BinaryOptions, Guid, ParseOptions,
@@ -1390,6 +1392,9 @@ impl<'a> LoadContext<'a> {
                 return Ok((placeholder(slot), queue));
             }
             return Ok((mapped, queue));
+        }
+        if let Some(kind) = self.mobile_shader(&material, slot) {
+            return self.resolve_mobile(&material, slot, kind);
         }
         let Some(capability) = self.shader_capability(&material, slot) else {
             self.warn(format!(

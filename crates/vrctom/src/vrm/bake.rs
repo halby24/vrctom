@@ -84,6 +84,11 @@ impl BakeImage {
         &self.rgba
     }
 
+    /// 標本化時にsRGB復号するかどうかを返す。`.meta` の `sRGBTexture` である。
+    pub fn srgb(&self) -> bool {
+        self.srgb
+    }
+
     /// 行優先のRGBA8から焼き入力画像を作る。
     ///
     /// PSDの保存済みcompositeなど、既に復号済みの画素を焼きや縮小の

@@ -821,8 +821,35 @@ impl<'a> BinaryFile<'a> {
             floats,
             ints,
             colors,
+            shader_keywords: shader_keywords(value),
         })
     }
+}
+
+/// シェーダキーワードを読む。規則はYAML側の [`Material::shader_keywords`] と同じである。
+fn shader_keywords(value: &BinaryValue) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |keyword: &str| {
+        if !keyword.is_empty() && !out.iter().any(|known| known == keyword) {
+            out.push(keyword.to_owned());
+        }
+    };
+    if let Some(text) = value
+        .field("m_ShaderKeywords")
+        .and_then(BinaryValue::as_str)
+    {
+        text.split_whitespace().for_each(&mut push);
+    }
+    for key in ["m_ValidKeywords", "m_InvalidKeywords"] {
+        if let Some(list) = value.field(key).and_then(BinaryValue::as_array) {
+            for item in list {
+                if let Some(keyword) = item.as_str() {
+                    push(keyword.trim());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// `f32` をYAMLの最短表記と同じ `f64` へ広げる。

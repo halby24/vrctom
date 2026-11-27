@@ -74,7 +74,8 @@ Unity 2018以前やAsset Serializationを `Force Binary` にした資産の `.ma
 同じ `Material` の代表型へ写す。
 `m_Shader` のGUIDは、索引に `.shader` があればその先頭行のシェーダ名で、
 無ければ既知のlilToonのGUID表で系列と能力を判定する。
-Flat Lit Toon（[`Flat Lit Toonへの写像`](#flat-lit-toonへの写像)）は先に判定する。
+Flat Lit Toon（[`Flat Lit Toonへの写像`](#flat-lit-toonへの写像)）と
+VRChat SDKのMobile系（[`VRChat Mobileシェーダへの写像`](#vrchat-mobileシェーダへの写像)）は先に判定する。
 
 | 系列 | 透明度 | 例 |
 |---|---|---|
@@ -557,6 +558,7 @@ MToonは材質ごとに1つのUV変換しか持てず、UVの反転と組み合�
   上限内の元の解像度と形式のまま埋め込む。
   縮小が必要な場合・焼き出力・PSD由来だけPNGへ符号化する。
 - 異なるシェーダ（Poiyomi・URP・Standardなど）の見た目は再現しない。
+- Mobile系シェーダの頂点色の乗算・鏡面反射・金属度・遮蔽は再現しない。
 - Unity取込時の圧縮は再現しない。解像度は取り込み上限とNPOTで再現する。
   透明部のRGBなど、取込で変わる画素は参照実装と差が出る。
   差分の見方は検証報告に残す。
@@ -578,6 +580,55 @@ CubedParadoxのFlat Lit Toon（シェーダ名に `Flat Lit Toon` を含む。`.
 | 発光 | `_EmissionMap × _EmissionColor` | 色が0なら書かない。1超は丸めて警告 |
 | 法線 | `_BumpMap` | |
 | アウトライン | `_OutlineMode`・`_outline_width × 0.01`・`_outline_color` | 0なし・1Tinted（照明混合1）・2Colored（照明混合0で近似、警告）。物体座標の幅を世界座標として近似（警告） |
+
+## VRChat Mobileシェーダへの写像
+
+VRChat SDK（`com.vrchat.base` の `Sample Assets/Shaders/Mobile`）のシェーダは
+アバターのパッケージに含まれないため、`.shader.meta` のGUID表（SDK 3.0.9〜3.11.0で不変を確認した15件）で
+先に判定し、索引に `.shader` がある場合だけシェーダ名（`VRChat/Mobile/` で始まる）でも判定する。
+写像は各シェーダの計算に合わせ、`material/mobile.rs` に置く。
+
+| シェーダ | 陰影 | 写すもの | 備考 |
+|---|---|---|---|
+| Toon Lit | なし（影色＝基準色） | `_MainTex` | `albedo × (直接光 + 間接光)` で光の向きを使わない |
+| MatCap Lit | なし | `_MainTex`、`_MatCap` の内接円平均を基準色に乗算 | 乗算MatCapは平均色の近似（警告） |
+| Diffuse・Bumped Diffuse | Lambert | `_MainTex`、Bumpedは `_BumpMap` | |
+| Bumped Mapped Specular（2件） | Lambert | `_MainTex`・`_BumpMap` | 鏡面反射は写さない（警告） |
+| Standard Lite | Lambert | `_MainTex × _Color`・`_BumpMap × _BumpScale`、`_EMISSION` 時の `_EmissionMap × _EmissionColor` | 金属度・遮蔽テクスチャ・`_DETAIL` は警告 |
+| Particles/Alpha Blended・Additive | なし | `_MainTex`。半透明・両面・Z書き込みなし | Additiveは半透明の近似（警告） |
+| Particles/Multiply・Skybox・Lightmapped・Supersampled UI | — | 灰色材質（警告） | 乗算合成とワールド用は扱わない |
+
+Lambertは影色を黒とし、`shadingShift = -0.5`・`shadingToony = 0.5` とする。
+MToonの `linearstep(-1 + toony, 1 - toony, N·L + shift)` が `saturate(N·L)` に一致する。
+暗部は間接光だけになり、MToonの環境光が受け持つ。
+
+### Toon Standard
+
+Toon Standard・Toon Standard (Outline) は `ToonStandard/CG/Helpers.cginc` の
+`GetDiffuseBRDFBase` に合わせる。機能の多くはシェーダキーワードで切り替わるため、
+材質のキーワード（[`Unityデータモデル`](Unityデータモデル.md#型付き読み取り)）で有効かどうかを判定する。
+
+| 出力 | 入力 | 備考 |
+|---|---|---|
+| 基準色 | `_MainTex × _Color × lerp(_Color × _ShadowAlbedo, 1, min(1, Ramp最大 + _ShadowBoost))` | Ramp最大は通常1で、係数は1になる |
+| `shadeColorFactor` | `_Color × lerp(_Color × _ShadowAlbedo, 1, min(1, Ramp最小 + _ShadowBoost))` | 実際は影色に `_MainTex` も掛かる。テクスチャを除いた近似（警告） |
+| `shadingShift`・`shadingToony` | `_Ramp` | 下記の当てはめ |
+| `doubleSided` | `_Culling` | 0は両面、1（前面カリング）は両面で近似（警告）、2は片面 |
+| 法線 | `USE_NORMAL_MAPS` 時の `_BumpMap × _BumpScale` | |
+| 発光 | `_EmissionMap × _EmissionColor × _EmissionStrength` | 常に有効。1超は丸めて警告、UV1指定は警告 |
+| MatCap | `USE_MATCAP` 時。`_MatcapType` 0は `_Matcap × _MatcapStrength` を載せ、1は内接円平均を基準色・影色に乗算 | 加算は照明前に足す計算の近似。マスクは警告 |
+| リム | `USE_RIMLIGHT` 時。色 `_RimColor × _RimIntensity`、指数 `ln 0.5 / ln(1 - _RimRange)`、照明混合は `_RimEnvironmental` | `smoothstep` の中点を合わせる近似（警告）。アルベド色付けは警告 |
+| アウトライン | (Outline) 変種で `_OutlineThickness > 0` の時。幅 `× 0.01` の世界座標、色 `lerp(_OutlineColor, 白, _OutlineFromAlbedo)`、照明混合 `_OutlineFromAlbedo` | 画面上の太さの上限は再現しない。マスクは緑チャンネル指定の時だけ幅乗算に載せる |
+
+`USE_SPECULAR`・`USE_OCCLUSION_MAP`・`USE_DETAIL_MAPS`・`USE_HUE_SHIFT`・
+`USE_COLOR_MASK`・`USE_AUDIOLINK`、`_VertexColor`・`_MinBrightness` は使用時に警告して写さない。
+
+Rampの横軸は `N·L × 0.5 + 0.5` である。最小値から最大値への遷移の10%・90%の位置から
+区間 `[u0, u1]` を求め（双線形のRampは線形区間へ伸ばし、点標本化のRampは段の境界をそのまま使う）、
+`shift = 1 - (u0 + u1)`・`toony = 1 - (u1 - u0)`（上限0.95）とする。
+SDK付属の7種（Flat・Realistic系3種・Toon 2/3/4 Band）はGUIDごとの標本を持ち、
+画像が無くても当てはめる。それ以外は索引の画像の中央の行から当てはめて警告する。
+未割り当てはシェーダ既定の白であり、陰影を付けない。
 
 ## 未対応（次の段）
 
