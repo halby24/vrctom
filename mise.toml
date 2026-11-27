@@ -20,6 +20,10 @@ run = "cargo nextest run --workspace"
 description = "vrctom-wasmをwasm32向けに構築しweb向けglueを出す"
 run = "sh web/scripts/build-wasm.sh"
 
+[tasks.release]
+description = "版を上げてタグをpushし、npm公開を起動する（patch|minor|major|X.Y.Z [--dry-run]）"
+run = "sh scripts/release.sh"
+
 [tasks.web-dev]
 description = "webの開発サーバを起動する"
 run = "pnpm --dir web dev"

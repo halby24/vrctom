@@ -20,7 +20,8 @@ on:
         default: true
 
 permissions:
-  contents: read
+  # contents: write はタグ push 時の GitHub Release 作成に使う。
+  contents: write
   id-token: write
 
 jobs:
@@ -29,6 +30,9 @@ jobs:
     steps:
       - name: リポジトリを取得する
         uses: actions/checkout@v4
+        with:
+          # リリースノートを前回のタグからのコミットで作るため履歴を全部取る。
+          fetch-depth: 0
       - name: Rustツールチェーンを入れる
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
@@ -66,3 +70,22 @@ jobs:
             args="$args --dry-run"
           fi
           npm publish ./crates/vrctom-wasm/pkg $args
+      - name: GitHub Releaseを作る
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prev=$(git describe --tags --abbrev=0 --match 'v*' "${GITHUB_REF_NAME}^" 2>/dev/null || true)
+          if [ -n "$prev" ]; then
+            range="$prev..$GITHUB_REF_NAME"
+          else
+            range="$GITHUB_REF_NAME"
+          fi
+          {
+            echo "npm: [@halby/vrctom-wasm@${GITHUB_REF_NAME#v}](https://www.npmjs.com/package/@halby/vrctom-wasm/v/${GITHUB_REF_NAME#v})"
+            echo
+            echo "## 変更"
+            echo
+            git log --no-merges --format='- %s' "$range" | grep -v 'へ版を上げる$' || true
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md

@@ -29,17 +29,40 @@ wasm-pack が作る `package.json` は `scripts/finalize-package.mjs` が
 npm pack ./crates/vrctom-wasm/pkg --dry-run
 ```
 
-## 版を上げる
+## 版を上げて公開する（通常の手順）
 
-`Cargo.toml` の workspace 版を上げます。
+`main` で次を実行します。
 
-```toml
-[workspace.package]
-version = "0.1.1"
+```sh
+mise run release patch   # 不具合修正だけ
+mise run release minor   # 機能追加・挙動の変更
 ```
 
-`crates/vrctom-wasm/Cargo.toml` は `version.workspace = true` のため、
-個別の版は編集しません。`package.json` の版は wasm-pack が Cargo から作ります。
+`scripts/release.sh` が次を順に行います。
+
+1. `main` であること、作業ツリーがきれいなこと、`origin/main` と一致することを確かめる
+2. 前回のタグからコミットがあることを確かめ、含まれる変更を表示する
+3. `mise run check` と `mise run test` を通す
+4. `Cargo.toml` の `[workspace.package] version` を上げ、`Cargo.lock` を更新する
+5. 「x.y.zへ版を上げる」でコミットし、`vx.y.z` タグを付けて main と一緒に push する
+
+push されたタグを受けて `.github/workflows/npm.yml` が npm へ公開し、
+前回のタグからのコミット一覧で GitHub Release を作ります。
+
+`mise run release minor --dry-run` で、何も変えずに次の版と含まれる変更を確認できます。
+版を直接指定する場合は `mise run release 1.0.0` とします。
+
+`crates/*/Cargo.toml` は `version.workspace = true` のため、個別の版は編集しません。
+`package.json` の版は wasm-pack が Cargo から作ります。
+
+### 版の上げ方（0.x の間）
+
+| 変更 | 上げる位置 |
+|---|---|
+| 不具合修正、内部の整理 | patch |
+| 機能追加、出力や API の挙動が変わる変更 | minor |
+
+1.0.0 以降は semver に従い、互換性を壊す変更で major を上げます。
 
 ## 初回公開（0.1.0、完了済み）
 
@@ -92,19 +115,15 @@ Trusted Publisher に GitHub Actions を登録します。
 2. npm の Settings → Publishing access を
    「Require 2FA and disallow tokens」に変更する
 
-## 通常の公開（Trusted Publishing 移行後）
+## 公開ワークフローの中身
 
-```sh
-git tag v0.1.1
-git push origin v0.1.1
-```
-
-`.github/workflows/npm.yml` が次を行います。
+`.github/workflows/npm.yml` は `v*` タグの push で次を行います。
 
 1. Rust のテスト
 2. `web/scripts/build-wasm.sh` による wasm のビルド
 3. タグと `pkg/package.json` の版の一致確認
 4. `npm publish --access public`
+5. GitHub Release の作成
 
 公開直後はレジストリの複製が追いつかず、`npm view` や `npm install` が
 数分間 404 を返すことがあります。パッケージページ、
