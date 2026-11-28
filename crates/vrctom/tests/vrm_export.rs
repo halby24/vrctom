@@ -2186,3 +2186,43 @@ fn to_glbは出力上限を超えるとlimit_exceededで失敗する() {
         .expect_err("上限超過は失敗する");
     assert_eq!(失敗.kind(), VrmExportErrorKind::LimitExceeded);
 }
+
+#[test]
+fn to_glbはhumanoid指定時にvrmc_vrmを出さずextrasへ対応表を書く() {
+    let モデル = 非humanoid衣装モデルを作る();
+    let 未指定バイト列 = モデル
+        .to_glb(&vrctom::vrm::GlbExportOptions::new())
+        .expect("未指定でも書き出せる");
+    let (未指定json, _) = glbを分解する(&未指定バイト列);
+    assert!(
+        未指定json.get("extras").is_none(),
+        "humanoid未指定ならルートextrasは省略する"
+    );
+    assert!(
+        未指定json["nodes"][1].get("extras").is_none(),
+        "humanoid未指定ならノードextrasは省略する"
+    );
+
+    let mut 部分対応 = HumanoidBones::new();
+    部分対応.set(HumanoidBone::Hips, 1);
+    let バイト列 = モデル
+        .to_glb(&vrctom::vrm::GlbExportOptions::new().with_humanoid(部分対応))
+        .expect("部分humanoid付きでGLBを書き出せる");
+    let (json, _bin) = glbを分解する(&バイト列);
+    検証報告が空であることを確かめる(&json塊を取り出す(&バイト列));
+    assert!(json.get("extensions").is_none(), "VRMC_vrmは出さない");
+    assert_eq!(
+        json["extras"]["vrctom"]["humanoid"]["humanBones"]["hips"],
+        serde_json::json!({ "node": 1, "name": "RibbonRoot" }),
+        "ルートextrasにvrctom.humanoid.humanBonesが入る"
+    );
+    assert_eq!(
+        json["nodes"][1]["extras"]["vrctomHumanoidBone"],
+        serde_json::json!("hips"),
+        "対応ノードのextrasにvrctomHumanoidBoneが入る"
+    );
+    assert!(
+        json["nodes"][0].get("extras").is_none(),
+        "非humanoidノードにはextrasを付けない"
+    );
+}

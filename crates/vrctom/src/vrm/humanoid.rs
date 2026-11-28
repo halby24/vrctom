@@ -618,6 +618,113 @@ pub(crate) fn unity_bone_to_vrm(normalized: &str) -> Option<Option<HumanoidBone>
         .map(|(_, bone)| *bone)
 }
 
+/// Modular Avatar 等のコンポーネントが骨名へ付ける接頭辞・接尾辞。
+///
+/// [`HumanoidBones::detect_with_mapping_and_affixes`] 等で名前検出を行う際、
+/// 先頭・末尾からこの文字列を取り除いた結果でも骨名を照合する。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Hash)]
+pub struct BoneNameAffix {
+    /// ボーン名の先頭から取り除く接頭辞。
+    pub prefix: String,
+    /// ボーン名の末尾から取り除く接尾辞。
+    pub suffix: String,
+}
+
+impl BoneNameAffix {
+    /// 接頭辞・接尾辞の組を作る。
+    pub fn new(prefix: impl Into<String>, suffix: impl Into<String>) -> Self {
+        Self {
+            prefix: prefix.into(),
+            suffix: suffix.into(),
+        }
+    }
+
+    /// 接頭辞・接尾辞の双方が空かどうかを返す。
+    pub fn is_empty(&self) -> bool {
+        self.prefix.is_empty() && self.suffix.is_empty()
+    }
+
+    /// 骨名から接頭辞と接尾辞を取り除いた本体名を返す。
+    ///
+    /// 両方空の場合、接頭辞・接尾辞が一致しない場合、または除去後に空文字列になる場合は
+    /// `None` を返す。
+    pub fn strip<'a>(&self, name: &'a str) -> Option<&'a str> {
+        if self.is_empty() {
+            return None;
+        }
+        let body = name
+            .strip_prefix(&self.prefix)?
+            .strip_suffix(&self.suffix)?;
+        if body.is_empty() {
+            return None;
+        }
+        Some(body)
+    }
+}
+
+/// Prefab 内の有効な `ModularAvatarMergeArmature` コンポーネントから接頭辞・接尾辞を抽出する。
+///
+/// `MonoBehaviour` のうち有効（`m_Enabled != 0`）で、`mergeTarget`・`prefix`・`suffix` の
+/// 3 欄をすべて持つ文書を対象とする。双方空の組は除外し、出現順を保ったまま重複を除く。
+pub fn extract_merge_armature_affixes(prefab: &SerializedFile) -> Vec<BoneNameAffix> {
+    let mut affixes = Vec::new();
+    let mut seen: HashSet<BoneNameAffix> = HashSet::new();
+    for doc in prefab.documents() {
+        let Ok(TypedObject::MonoBehaviour(mono)) = doc.decode() else {
+            continue;
+        };
+        if !mono.enabled {
+            continue;
+        }
+        let extra = &mono.extra;
+        if !(extra.contains_key("mergeTarget")
+            && extra.contains_key("prefix")
+            && extra.contains_key("suffix"))
+        {
+            continue;
+        }
+        let prefix = extra
+            .get("prefix")
+            .map(read_affix_string)
+            .unwrap_or_default();
+        let suffix = extra
+            .get("suffix")
+            .map(read_affix_string)
+            .unwrap_or_default();
+        let affix = BoneNameAffix::new(prefix, suffix);
+        if affix.is_empty() {
+            continue;
+        }
+        if seen.insert(affix.clone()) {
+            affixes.push(affix);
+        }
+    }
+    affixes
+}
+
+/// `Value` から接頭辞・接尾辞の文字列を取り出す。
+fn read_affix_string(value: &yaml_serde::Value) -> String {
+    if let Some(digits) = crate::unity::bignum_digits(value) {
+        return digits.to_owned();
+    }
+    match value {
+        yaml_serde::Value::String(text) => text.clone(),
+        yaml_serde::Value::Number(number) => {
+            if let Some(int) = number.as_i64() {
+                int.to_string()
+            } else if let Some(int) = number.as_u64() {
+                int.to_string()
+            } else {
+                number
+                    .as_f64()
+                    .map(|float| format!("{float}"))
+                    .unwrap_or_default()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
 /// 骨とノード索引の対応付け。
 ///
 /// フィールドは非公開で、`set` で上書きできる。`detect` は名前から作る。
@@ -640,6 +747,23 @@ impl HumanoidBones {
     /// 骨のノード索引を返す。未対応は `None` である。
     pub fn get(&self, bone: HumanoidBone) -> Option<usize> {
         self.bones.get(&bone).copied()
+    }
+
+    /// 対応付けが空かどうかを返す。
+    pub fn is_empty(&self) -> bool {
+        self.bones.is_empty()
+    }
+
+    /// 対応付けられた骨の件数を返す。
+    pub fn len(&self) -> usize {
+        self.bones.len()
+    }
+
+    /// VRM 1.0 の必須 15 骨がすべて対応付けられているかどうかを返す。
+    pub fn has_required_bones(&self) -> bool {
+        HumanoidBone::all()
+            .filter(|bone| bone.is_required())
+            .all(|bone| self.bones.contains_key(&bone))
     }
 
     /// 対応付けを骨の列挙順で返す。
@@ -669,7 +793,7 @@ impl HumanoidBones {
     ///
     /// 同じ骨に複数ノードが一致した場合・必須骨が無い場合に返す。
     pub fn detect(model: &VrmModel) -> Result<Self, VrmExportError> {
-        Ok(Self::resolve(model, &[])?.0)
+        Ok(Self::resolve(model, &[], &[])?.0)
     }
 
     /// Unityの対応表とノード名から対応付ける。
@@ -700,7 +824,24 @@ impl HumanoidBones {
         model: &VrmModel,
         mappings: &[HumanBoneMapping],
     ) -> Result<(Self, Vec<String>), VrmExportError> {
-        Self::resolve(model, mappings)
+        Self::resolve(model, mappings, &[])
+    }
+
+    /// Unityの対応表・接頭辞/接尾辞・ノード名から対応付ける。
+    ///
+    /// [`detect_with_mapping`](Self::detect_with_mapping) に加え、
+    /// 名前推測で一致しないボーン名から `affixes` を順に取り除いた本体名でも照合する。
+    ///
+    /// # Errors
+    ///
+    /// 対応先ノードの欠落や重複・同じ骨や同じノードへの複数対応付け・
+    /// 名前推測の重複・必須骨の欠落の場合に返す。
+    pub fn detect_with_mapping_and_affixes(
+        model: &VrmModel,
+        mappings: &[HumanBoneMapping],
+        affixes: &[BoneNameAffix],
+    ) -> Result<(Self, Vec<String>), VrmExportError> {
+        Self::resolve(model, mappings, affixes)
     }
 
     /// ノード名列と対応表から対応付ける。
@@ -718,47 +859,98 @@ impl HumanoidBones {
         names: &[&str],
         mappings: &[HumanBoneMapping],
     ) -> Result<(Self, Vec<String>), VrmExportError> {
-        Self::resolve_names(names, mappings)
+        Self::resolve_names_strict(names, mappings, &[])
+    }
+
+    /// ノード名列と対応表・接頭辞/接尾辞から対応付ける。
+    ///
+    /// [`detect_with_mapping_names`](Self::detect_with_mapping_names) の接頭辞/接尾辞対応版である。
+    ///
+    /// # Errors
+    ///
+    /// 対応先ノードの欠落や重複・同じ骨や同じノードへの複数対応付け・
+    /// 名前推測の重複・必須骨の欠落の場合に返す。
+    pub fn detect_with_mapping_names_and_affixes(
+        names: &[&str],
+        mappings: &[HumanBoneMapping],
+        affixes: &[BoneNameAffix],
+    ) -> Result<(Self, Vec<String>), VrmExportError> {
+        Self::resolve_names_strict(names, mappings, affixes)
+    }
+
+    /// 必須骨が揃わない衣装や小物向けに、解決できた範囲だけの対応表と警告を返す。
+    ///
+    /// メタの対応欠落・競合や名前推測の重複は失敗にせず警告して除外し、
+    /// 必須 15 骨が欠けていても取得できた対応付けをそのまま返す。
+    pub fn detect_partial_with_mapping(
+        model: &VrmModel,
+        mappings: &[HumanBoneMapping],
+        affixes: &[BoneNameAffix],
+    ) -> (Self, Vec<String>) {
+        let names: Vec<&str> = model.nodes.iter().map(|node| node.name.as_str()).collect();
+        Self::resolve_names_partial(&names, mappings, affixes)
+    }
+
+    /// ノード名列から必須骨を要求しない部分対応付けと警告を返す。
+    pub fn detect_partial_with_mapping_names(
+        names: &[&str],
+        mappings: &[HumanBoneMapping],
+        affixes: &[BoneNameAffix],
+    ) -> (Self, Vec<String>) {
+        Self::resolve_names_partial(names, mappings, affixes)
     }
 
     /// 対応表と名前推測で対応付ける共通処理。
-    ///
-    /// 空の対応表では名前推測だけになり、[`detect`](Self::detect) と同じ結果になる。
-    /// ロック済みの骨に対する名前候補は複数あっても無視し、
-    /// メタの確定を名前の曖昧さで失敗させない。
-    /// 未充足の同一骨に同順位の候補が複数ある場合は推測せず失敗する。
     fn resolve(
         model: &VrmModel,
         mappings: &[HumanBoneMapping],
+        affixes: &[BoneNameAffix],
     ) -> Result<(Self, Vec<String>), VrmExportError> {
         let names: Vec<&str> = model.nodes.iter().map(|node| node.name.as_str()).collect();
-        Self::resolve_names(&names, mappings)
+        Self::resolve_names_strict(&names, mappings, affixes)
     }
 
-    /// 対応表と名前推測で対応付ける名前列版の共通処理。
-    ///
-    /// 空の対応表では名前推測だけになり、[`detect`](Self::detect) と同じ結果になる。
-    /// ロック済みの骨に対する名前候補は複数あっても無視し、
-    /// メタの確定を名前の曖昧さで失敗させない。
-    /// 未充足の同一骨に同順位の候補が複数ある場合は推測せず失敗する。
-    fn resolve_names(
+    /// 厳密モードの名前解決。エラーは即座に呼び出し側へ返す。
+    fn resolve_names_strict(
         names: &[&str],
         mappings: &[HumanBoneMapping],
+        affixes: &[BoneNameAffix],
+    ) -> Result<(Self, Vec<String>), VrmExportError> {
+        Self::resolve_names_inner(names, mappings, affixes, true)
+    }
+
+    /// 部分許容モードの名前解決。競合・欠落を警告してスキップし、失敗しない。
+    fn resolve_names_partial(
+        names: &[&str],
+        mappings: &[HumanBoneMapping],
+        affixes: &[BoneNameAffix],
+    ) -> (Self, Vec<String>) {
+        // 部分モードでは `resolve_names_inner(..., false)` は常に `Ok` を返す。
+        match Self::resolve_names_inner(names, mappings, affixes, false) {
+            Ok(result) => result,
+            Err(_) => (Self::new(), Vec::new()),
+        }
+    }
+
+    /// 対応表解決と 2 パス名前推測の共通本体。
+    fn resolve_names_inner(
+        names: &[&str],
+        mappings: &[HumanBoneMapping],
+        affixes: &[BoneNameAffix],
+        strict: bool,
     ) -> Result<(Self, Vec<String>), VrmExportError> {
         let mut warnings = Vec::new();
         let mut warned: BTreeSet<String> = BTreeSet::new();
-        // ノード名から索引を引く。完全一致で突き合わせる。
         let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
         for (index, name) in names.iter().enumerate() {
             by_name.entry(*name).or_default().push(index);
         }
         let mut bones = Self::new();
         let mut used: BTreeSet<usize> = BTreeSet::new();
-        // メタの有効な対応を解決・確定する。
+        // 1. メタの有効な対応を解決・確定する。
         for mapping in mappings {
             let normalized = normalize_unity_bone_name(&mapping.human_name);
             let Some(mapped) = unity_bone_to_vrm(&normalized) else {
-                // 未知・未対応の `humanName` は警告して無視する。
                 if warned.insert(format!("unknown:{normalized}")) {
                     warnings.push(format!(
                         "未知のhumanNameのため対応を省く: {}",
@@ -768,7 +960,6 @@ impl HumanoidBones {
                 continue;
             };
             let Some(bone) = mapped else {
-                // VRMに対応が無い既知名（`Jaw`）は警告して省く。
                 if warned.insert(format!("unsupported:{normalized}")) {
                     warnings.push(format!(
                         "VRMのhumanoidに対応が無いため省く: {}",
@@ -783,91 +974,127 @@ impl HumanoidBones {
                 .unwrap_or(&[]);
             let &[node] = candidates else {
                 if candidates.is_empty() {
-                    return Err(VrmExportError::missing_bone(
-                        bone,
-                        format!(
-                            "metaの対応先ノードが無い: {} -> {}",
-                            mapping.human_name, mapping.bone_name
-                        ),
-                    ));
+                    let message = format!(
+                        "metaの対応先ノードが無い: {} -> {}",
+                        mapping.human_name, mapping.bone_name
+                    );
+                    if strict {
+                        return Err(VrmExportError::missing_bone(bone, message));
+                    }
+                    if warned.insert(format!("meta-missing:{normalized}")) {
+                        warnings.push(message);
+                    }
+                    continue;
                 }
-                return Err(VrmExportError::duplicate_bone(
-                    bone,
-                    candidates[0],
-                    format!("metaの対応先ノードが重複する: {}", mapping.bone_name),
-                ));
+                let message = format!("metaの対応先ノードが重複する: {}", mapping.bone_name);
+                if strict {
+                    return Err(VrmExportError::duplicate_bone(bone, candidates[0], message));
+                }
+                if warned.insert(format!("meta-dup-node:{normalized}")) {
+                    warnings.push(message);
+                }
+                continue;
             };
             if let Some(existing) = bones.get(bone) {
-                // 同一対応の反復は重複排除して許容する。
                 if existing == node {
                     continue;
                 }
-                return Err(VrmExportError::duplicate_bone(
-                    bone,
-                    node,
-                    format!(
-                        "metaで同じ骨に複数のノードが対応する: {}",
-                        mapping.human_name
-                    ),
-                ));
+                let message = format!(
+                    "metaで同じ骨に複数のノードが対応する: {}",
+                    mapping.human_name
+                );
+                if strict {
+                    return Err(VrmExportError::duplicate_bone(bone, node, message));
+                }
+                if warned.insert(format!("meta-dup-bone:{normalized}")) {
+                    warnings.push(message);
+                }
+                continue;
             }
             if used.contains(&node) {
-                return Err(VrmExportError::duplicate_bone(
-                    bone,
-                    node,
-                    format!(
-                        "metaで同じノードに複数の骨が対応する: {}",
-                        mapping.bone_name
-                    ),
-                ));
+                let message = format!(
+                    "metaで同じノードに複数の骨が対応する: {}",
+                    mapping.bone_name
+                );
+                if strict {
+                    return Err(VrmExportError::duplicate_bone(bone, node, message));
+                }
+                if warned.insert(format!("meta-used-node:{node}")) {
+                    warnings.push(message);
+                }
+                continue;
             }
             bones.set(bone, node);
             used.insert(node);
         }
         // メタで確定した骨をロックし、メタで使用済みのノードを名前検出から除外する。
         let locked: BTreeSet<HumanoidBone> = bones.iter().map(|(bone, _)| bone).collect();
-        // 未充足の骨だけ正確名で補完する。
+        let mut ambiguous: BTreeSet<HumanoidBone> = BTreeSet::new();
         let mut consumed = used;
+        // 2. 未充足の骨だけ正確名で補完する。
         for (index, name) in names.iter().enumerate() {
             if consumed.contains(&index) {
                 continue;
             }
-            let Some(bone) = match_bone(name) else {
+            let Some(bone) = match_bone_with_affixes(name, affixes) else {
                 continue;
             };
-            if locked.contains(&bone) {
+            if locked.contains(&bone) || ambiguous.contains(&bone) {
                 consumed.insert(index);
                 continue;
             }
             if bones.get(bone).is_some() {
-                return Err(VrmExportError::duplicate_bone(
-                    bone,
-                    index,
-                    "同じ骨に複数のノードが一致した",
-                ));
+                if strict {
+                    return Err(VrmExportError::duplicate_bone(
+                        bone,
+                        index,
+                        "同じ骨に複数のノードが一致した",
+                    ));
+                }
+                bones.bones.remove(&bone);
+                ambiguous.insert(bone);
+                consumed.insert(index);
+                if warned.insert(format!("ambiguous:{}", bone.name())) {
+                    warnings.push(format!(
+                        "同じ骨に複数のノードが一致したため省く: {}",
+                        bone.name()
+                    ));
+                }
+                continue;
             }
             bones.set(bone, index);
             consumed.insert(index);
         }
-        // さらに未充足の骨だけ別名で補完する。
+        // 3. さらに未充足の骨だけ別名で補完する。
         let mut alias_filled: BTreeSet<HumanoidBone> = BTreeSet::new();
         for (index, name) in names.iter().enumerate() {
             if consumed.contains(&index) {
                 continue;
             }
-            let Some(bone) = match_alias_bone(name) else {
+            let Some(bone) = match_alias_bone_with_affixes(name, affixes) else {
                 continue;
             };
-            if locked.contains(&bone) {
+            if locked.contains(&bone) || ambiguous.contains(&bone) {
                 continue;
             }
             if bones.get(bone).is_some() {
                 if alias_filled.contains(&bone) {
-                    return Err(VrmExportError::duplicate_bone(
-                        bone,
-                        index,
-                        "同じ骨に複数の別名ノードが一致した",
-                    ));
+                    if strict {
+                        return Err(VrmExportError::duplicate_bone(
+                            bone,
+                            index,
+                            "同じ骨に複数の別名ノードが一致した",
+                        ));
+                    }
+                    bones.bones.remove(&bone);
+                    alias_filled.remove(&bone);
+                    ambiguous.insert(bone);
+                    if warned.insert(format!("ambiguous-alias:{}", bone.name())) {
+                        warnings.push(format!(
+                            "同じ骨に複数の別名ノードが一致したため省く: {}",
+                            bone.name()
+                        ));
+                    }
                 }
                 // 正確名で埋まった枠への別名は無視し、正確名が勝つ。
                 continue;
@@ -875,13 +1102,45 @@ impl HumanoidBones {
             bones.set(bone, index);
             alias_filled.insert(bone);
         }
-        for bone in HumanoidBone::all() {
-            if bone.is_required() && bones.get(bone).is_none() {
-                return Err(VrmExportError::missing_bone(bone, "必須のhumanoid骨が無い"));
+        if strict {
+            for bone in HumanoidBone::all() {
+                if bone.is_required() && bones.get(bone).is_none() {
+                    return Err(VrmExportError::missing_bone(bone, "必須のhumanoid骨が無い"));
+                }
             }
         }
         Ok((bones, warnings))
     }
+}
+
+/// 元の名前、または接頭辞/接尾辞を取り除いた名前で正確名の骨を求める。
+fn match_bone_with_affixes(name: &str, affixes: &[BoneNameAffix]) -> Option<HumanoidBone> {
+    if let Some(bone) = match_bone(name) {
+        return Some(bone);
+    }
+    for affix in affixes {
+        if let Some(stripped) = affix.strip(name)
+            && let Some(bone) = match_bone(stripped)
+        {
+            return Some(bone);
+        }
+    }
+    None
+}
+
+/// 元の名前、または接頭辞/接尾辞を取り除いた名前で別名の骨を求める。
+fn match_alias_bone_with_affixes(name: &str, affixes: &[BoneNameAffix]) -> Option<HumanoidBone> {
+    if let Some(bone) = match_alias_bone(name) {
+        return Some(bone);
+    }
+    for affix in affixes {
+        if let Some(stripped) = affix.strip(name)
+            && let Some(bone) = match_alias_bone(stripped)
+        {
+            return Some(bone);
+        }
+    }
+    None
 }
 
 /// ノード名から正確名の骨を求める。一致しない場合は `None` である。
@@ -1618,5 +1877,157 @@ PrefabInstance:
         // 索引に無いGUIDの場合はフォールバックを返す。
         let fallback = resolve_animator_humanoid_meta(&mod_file, &index, &fallback_meta);
         assert_eq!(fallback.guid().as_str(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    }
+
+    #[test]
+    fn merge_armatureから有効な接頭辞と接尾辞だけを抽出する() {
+        use crate::unity::ParseOptions;
+
+        let yaml = "\
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11401
+MonoBehaviour:
+  m_GameObject: {fileID: 100}
+  m_Enabled: 1
+  m_Script: {fileID: 11500000, guid: 1111111111111111111111111111111a, type: 3}
+  m_Name:
+  mergeTarget:
+    referencePath: Armature
+  prefix: \"Dress_\"
+  suffix: \"_Outfit\"
+--- !u!114 &11402
+MonoBehaviour:
+  m_GameObject: {fileID: 101}
+  m_Enabled: 0
+  m_Script: {fileID: 11500000, guid: 1111111111111111111111111111111a, type: 3}
+  m_Name:
+  mergeTarget:
+    referencePath: Armature
+  prefix: \"Disabled_\"
+  suffix: \"\"
+--- !u!114 &11403
+MonoBehaviour:
+  m_GameObject: {fileID: 102}
+  m_Enabled: 1
+  m_Script: {fileID: 11500000, guid: 1111111111111111111111111111111a, type: 3}
+  m_Name:
+  mergeTarget:
+    referencePath: Armature
+  prefix: \"\"
+  suffix: \"\"
+--- !u!114 &11404
+MonoBehaviour:
+  m_GameObject: {fileID: 103}
+  m_Enabled: 1
+  m_Script: {fileID: 11500000, guid: 2222222222222222222222222222222b, type: 3}
+  m_Name:
+  prefix: \"Other_\"
+  suffix: \"\"
+--- !u!114 &11405
+MonoBehaviour:
+  m_GameObject: {fileID: 104}
+  m_Enabled: 1
+  m_Script: {fileID: 11500000, guid: 1111111111111111111111111111111a, type: 3}
+  m_Name:
+  mergeTarget:
+    referencePath: Armature
+  prefix: \"Dress_\"
+  suffix: \"_Outfit\"
+--- !u!114 &11406
+MonoBehaviour:
+  m_GameObject: {fileID: 105}
+  m_Enabled: 1
+  m_Script: {fileID: 11500000, guid: 1111111111111111111111111111111a, type: 3}
+  m_Name:
+  mergeTarget:
+    referencePath: Armature
+  prefix: \"\"
+  suffix: \"_Alt\"
+";
+        let file = SerializedFile::parse(yaml.as_bytes(), &ParseOptions::new()).expect("読める");
+        let affixes = extract_merge_armature_affixes(&file);
+        assert_eq!(
+            affixes,
+            vec![
+                BoneNameAffix::new("Dress_", "_Outfit"),
+                BoneNameAffix::new("", "_Alt"),
+            ],
+            "有効・非空・MergeArmature相当の組だけを出現順かつ重複なしで抽出する"
+        );
+        assert_eq!(affixes[0].strip("Dress_Hips_Outfit"), Some("Hips"));
+        assert_eq!(
+            affixes[0].strip("Dress__Outfit"),
+            None,
+            "本体が空なら除外する"
+        );
+    }
+
+    #[test]
+    fn 接頭辞と接尾辞を外して全身humanoid骨を検出できる() {
+        let affixes = vec![
+            BoneNameAffix::new("Dress_", ""),
+            BoneNameAffix::new("", "_Outfit"),
+        ];
+        let names = [
+            "Dress_Hips",
+            "Spine_Outfit",
+            "Head_Outfit",
+            "Dress_LeftUpperArm",
+            "Dress_LeftLowerArm",
+            "Dress_LeftHand",
+            "Dress_RightUpperArm",
+            "Dress_RightLowerArm",
+            "Dress_RightHand",
+            "LeftUpperLeg_Outfit",
+            "LeftLowerLeg_Outfit",
+            "LeftFoot_Outfit",
+            "RightUpperLeg_Outfit",
+            "RightLowerLeg_Outfit",
+            "RightFoot_Outfit",
+        ];
+        let (bones, warnings) =
+            HumanoidBones::detect_with_mapping_names_and_affixes(&names, &[], &affixes)
+                .expect("接頭辞・接尾辞を外せば必須15骨が揃う");
+        assert!(warnings.is_empty(), "警告は無いはず: {warnings:?}");
+        assert!(bones.has_required_bones(), "必須15骨をすべて満たす");
+        assert_eq!(bones.len(), 15);
+        assert_eq!(bones.get(HumanoidBone::Hips), Some(0));
+        assert_eq!(bones.get(HumanoidBone::Spine), Some(1));
+        assert_eq!(bones.get(HumanoidBone::RightFoot), Some(14));
+    }
+
+    #[test]
+    fn 部分humanoid検出は必須骨不足や重複があっても失敗せず解決分と警告を返す() {
+        let affixes = vec![BoneNameAffix::new("Skirt_", "")];
+        let names = [
+            "Skirt_Hips",
+            "Skirt_LeftUpperLeg",
+            "Skirt_RightUpperLeg",
+            "Head",
+            "Head",
+            "RibbonA",
+        ];
+        let mappings = vec![HumanBoneMapping {
+            human_name: "Jaw".to_owned(),
+            bone_name: "JawNode".to_owned(),
+        }];
+        let (bones, warnings) =
+            HumanoidBones::detect_partial_with_mapping_names(&names, &mappings, &affixes);
+        assert!(!bones.has_required_bones(), "必須15骨は揃っていない");
+        assert_eq!(bones.len(), 3, "重複したHeadは除外され3骨だけ残る");
+        assert_eq!(bones.get(HumanoidBone::Hips), Some(0));
+        assert_eq!(bones.get(HumanoidBone::LeftUpperLeg), Some(1));
+        assert_eq!(bones.get(HumanoidBone::RightUpperLeg), Some(2));
+        assert_eq!(bones.get(HumanoidBone::Head), None);
+        assert!(
+            warnings.iter().any(|w| w.contains("head")),
+            "重複したHeadの警告が出る: {warnings:?}"
+        );
+
+        let (empty_bones, empty_warnings) =
+            HumanoidBones::detect_partial_with_mapping_names(&["HatRoot"], &[], &[]);
+        assert!(empty_bones.is_empty(), "一致無しの小物でも空で返る");
+        assert!(empty_warnings.is_empty());
     }
 }

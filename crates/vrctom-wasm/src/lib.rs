@@ -76,7 +76,7 @@ impl WebPackage {
 
     /// 選んだPrefabを変換し、VRMバイト列とレポートJSONを持つ [`Converted`] を返す。
     ///
-    /// `options_json` は `{"name","authors","expressions","baseline","physics","morphTargets"}` のJSONである。
+    /// `options_json` は `{"name","authors","expressions","baseline","physics","tpose","morphTargets"}` のJSONである。
     /// 失敗は既存の `to_js_error` でJSの `Error` へ写す。
     #[wasm_bindgen(js_name = convertPrefab)]
     pub fn convert_prefab(
@@ -95,7 +95,7 @@ impl WebPackage {
 
     /// 選んだPrefabを `VRMC_vrm` なしの汎用 GLB へ変換し、バイト列とレポートJSONを持つ [`Converted`] を返す。
     ///
-    /// `options_json` は `{"baseline","physics","morphTargets"}` のJSONである。
+    /// `options_json` は `{"baseline","physics","tpose","morphTargets"}` のJSONである。
     #[wasm_bindgen(js_name = convertPrefabGlb)]
     pub fn convert_prefab_glb(
         &self,

@@ -634,6 +634,7 @@ fn 変換設定(expressions: PrefabExpressions, physics: PrefabPhysics) -> Prefa
         expressions,
         baseline: false,
         physics,
+        tpose: true,
         material_options: MaterialOptions::new(),
         limits: PrefabConversionLimits::new(),
     }

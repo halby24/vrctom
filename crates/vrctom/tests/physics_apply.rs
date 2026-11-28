@@ -477,3 +477,46 @@ fn humanoid無しの物理適用でも解決失敗時はモデルを変更しな
     assert_eq!(モデル.nodes.len(), もとノード数);
     assert!(モデル.spring_bones.springs.is_empty());
 }
+
+#[test]
+fn t_poseを無効にして物理適用するとhumanoidがあってもrest姿勢を保つ() {
+    let fbxバイト列 = b"fake-fbx";
+    let mut モデル = 書き出し可能モデルを作る();
+    let 元の姿勢 = モデル.nodes[0].local;
+    let 文 = 髪sidecarを作る(fbxバイト列, &モデル);
+    let mut 値: serde_json::Value = serde_json::from_str(&文).expect("合成sidecarは読める");
+    値["humanoid"] = serde_json::json!({
+        "isHuman": true,
+        "bones": [
+            {
+                "bone": "Hips",
+                "nodeId": "n:0",
+                "tPose": {
+                    "position": [0.0, 0.0, 0.0],
+                    "rotation": [0.0, 0.7071067811865475, 0.0, 0.7071067811865475],
+                    "scale": [1.0, 1.0, 1.0]
+                }
+            }
+        ],
+    });
+    let sidecar =
+        PhysicsSidecar::from_json(&値.to_string(), &PhysicsLimits::new()).expect("書式は通る");
+    let 対応 = 対応付けを作る();
+    let 適用設定 = vrctom::vrm::PhysicsApplyOptions::new()
+        .with_apply_tpose(false)
+        .with_resolve_look_at(false);
+    let 報告 = vrctom::vrm::apply_physics_sidecar_with_options(
+        &mut モデル,
+        &sidecar,
+        fbxバイト列,
+        Some(&対応),
+        &SpringCompileOptions::new(),
+        &適用設定,
+    )
+    .expect("tPose無効でも適用できる");
+    assert_eq!(報告.tpose_applied, 0);
+    assert!(報告.tpose_skipped.is_empty());
+    assert!(報告.look_at.is_none());
+    assert_eq!(報告.spring_count, 1);
+    assert_eq!(モデル.nodes[0].local, 元の姿勢, "rest姿勢を上書きしない");
+}

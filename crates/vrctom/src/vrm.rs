@@ -42,8 +42,9 @@ pub use export::{
     VrmExportErrorKind, VrmExportOptions, VrmMeta, VrmModification,
 };
 pub use humanoid::{
-    HUMANOID_BONE_NAMES, HumanoidBone, HumanoidBones, is_known_humanoid_bone_name,
-    resolve_animator_avatar_guid, resolve_animator_humanoid_meta,
+    BoneNameAffix, HUMANOID_BONE_NAMES, HumanoidBone, HumanoidBones,
+    extract_merge_armature_affixes, is_known_humanoid_bone_name, resolve_animator_avatar_guid,
+    resolve_animator_humanoid_meta,
 };
 pub use look_at::{
     LookAtReport, SidecarEyePose, SidecarLookAt, VrmLookAt, VrmLookAtRange, resolve_look_at,
@@ -71,7 +72,8 @@ pub use physics::{
 };
 pub use physics_apply::{
     LookAtAppliedSummary, LookAtRangeSummary, LostNodeSummary, PhysicsApplyError,
-    PhysicsApplyReport, SkippedBoneSummary, TposeSkippedEntry, apply_physics_sidecar,
+    PhysicsApplyOptions, PhysicsApplyReport, SkippedBoneSummary, TposeSkippedEntry,
+    apply_physics_sidecar, apply_physics_sidecar_with_options,
     apply_physics_sidecar_without_humanoid,
 };
 pub use physics_prefab::{

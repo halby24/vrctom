@@ -17,17 +17,21 @@
 //!     assign --> export[VRM書き出し]
 //! ```
 
+use std::collections::BTreeMap;
+
 use crate::fbx::{FbxError, FbxFile, FbxOptions};
 use crate::unity::{
-    AssetIndex, AssetMeta, AssetSource, ExternalObjectEntry, ParseOptions, SerializedFile,
+    AssetIndex, AssetMeta, AssetSource, ExternalObjectEntry, HumanBoneMapping, ParseOptions,
+    SerializedFile,
 };
 use crate::vrm::{
-    GlbExportOptions, HumanoidBones, MaterialError, MaterialErrorKind, MaterialOptions,
-    NestedPrefabInput, NestedPrefabLimits, PhysicsLimits, PhysicsSidecar, PrefabMeshView,
-    PrefabMode, PrefabTargetState, SpringCompileOptions, VrmExportError, VrmExportOptions,
-    VrmMaterials, VrmModel, VrmOptions, apply_nested_prefab_meshes, apply_physics_sidecar,
-    apply_physics_sidecar_without_humanoid, apply_prefab_plan, derive_physics_sidecar_with,
-    expressions_from_avatar_descriptor, load_renderer_materials_from, plan_prefab_assignment,
+    BoneNameAffix, GlbExportOptions, HumanoidBones, MaterialError, MaterialErrorKind,
+    MaterialOptions, NestedPrefabInput, NestedPrefabLimits, PhysicsApplyOptions, PhysicsLimits,
+    PhysicsSidecar, PrefabMeshView, PrefabMode, PrefabTargetState, SpringCompileOptions,
+    VrmExportError, VrmExportOptions, VrmMaterials, VrmModel, VrmOptions,
+    apply_nested_prefab_meshes, apply_physics_sidecar_with_options, apply_prefab_plan,
+    derive_physics_sidecar_with, expressions_from_avatar_descriptor,
+    extract_merge_armature_affixes, load_renderer_materials_from, plan_prefab_assignment,
     prefab_base_materials, prefab_baseline_weights, prefab_hierarchy_paths,
     prepare_nested_prefab_meshes, resolve_prefab_pool_paths, resolve_prefab_target,
 };
@@ -141,6 +145,8 @@ pub struct PrefabConversionOptions {
     pub baseline: bool,
     /// 物理の選択指定。
     pub physics: PrefabPhysics,
+    /// Humanoid 骨へ物理 sidecar の T-pose を適用するかどうか。既定は真である。
+    pub tpose: bool,
     /// 材質読み取りの資源上限。
     pub material_options: MaterialOptions,
     /// 資源上限。
@@ -153,6 +159,7 @@ impl Default for PrefabConversionOptions {
             expressions: PrefabExpressions::None,
             baseline: false,
             physics: PrefabPhysics::None,
+            tpose: true,
             material_options: MaterialOptions::new(),
             limits: PrefabConversionLimits::new(),
         }
@@ -161,13 +168,15 @@ impl Default for PrefabConversionOptions {
 
 /// Prefab汎用 GLB 変換の選択肢。
 ///
-/// 衣装やアクセサリなど Humanoid・表情を持たないモデルを書き出す際に使う。
+/// 衣装やアクセサリなど VRM 必須拡張を持たないモデルを書き出す際に使う。
 #[derive(Debug, Clone)]
 pub struct PrefabGlbConversionOptions {
     /// 基準姿勢の焼き込みを行うかどうか。
     pub baseline: bool,
     /// 物理の選択指定。
     pub physics: PrefabPhysics,
+    /// Humanoid 骨へ物理 sidecar の T-pose を適用するかどうか。既定は偽である。
+    pub tpose: bool,
     /// 材質読み取りの資源上限。
     pub material_options: MaterialOptions,
     /// 資源上限。
@@ -179,10 +188,20 @@ impl Default for PrefabGlbConversionOptions {
         Self {
             baseline: false,
             physics: PrefabPhysics::None,
+            tpose: false,
             material_options: MaterialOptions::new(),
             limits: PrefabConversionLimits::new(),
         }
     }
+}
+
+/// Prefab変換で解決した Humanoid 骨1件の記録。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefabHumanoidBone {
+    /// 出力モデル内のノード索引。
+    pub node: usize,
+    /// 出力モデル内のノード名。
+    pub name: String,
 }
 
 /// 物理適用の構造化報告。
@@ -235,6 +254,10 @@ pub struct PrefabConversionReport {
     pub expressions: usize,
     /// 全メッシュ合計のモーフターゲット数。
     pub morph_targets: usize,
+    /// 解決した Humanoid 骨（VRM 骨名 → 出力ノード）の対応表。
+    pub humanoid_bones: BTreeMap<String, PrefabHumanoidBone>,
+    /// Prefab の `ModularAvatarMergeArmature` から抽出した接頭辞・接尾辞列。
+    pub merge_armature_affixes: Vec<BoneNameAffix>,
     /// 物理適用の報告。
     pub physics: PrefabPhysicsReport,
     /// 診断の警告文。本文だけを持ち、見出しは呼び出し側が付ける。
@@ -415,15 +438,8 @@ pub fn convert_prefab(
     let limits = &options.limits;
     let mut ctx =
         prepare_prefab_context(source, index, prefab_path, fbx_bytes, fbx_options, limits)?;
-    // Humanoid対応表はPrefabのAnimator参照を優先し、無ければ対象FBX自身の.fbx.metaを使う。
-    let humanoid_meta =
-        crate::vrm::resolve_animator_humanoid_meta(&ctx.prefab_file, index, ctx.fbx_meta);
-    let mappings = humanoid_meta.human_bone_mappings().map_err(|error| {
-        PrefabConversionError::Prefab(crate::vrm::VrmError::new(
-            crate::vrm::VrmErrorKind::InvalidPrefab,
-            format!("humanoidの対応表を読めない: {error}"),
-        ))
-    })?;
+    let mappings = resolve_prefab_humanoid_mappings(&ctx, index)?;
+    let affixes = extract_merge_armature_affixes(&ctx.prefab_file);
 
     // 表情・基準姿勢を中間モデル生成前に解決して `VrmOptions` へ反映する。
     let mut owned_vrm_options = vrm_options.clone();
@@ -436,13 +452,15 @@ pub fn convert_prefab(
             .iter()
             .map(|model| model.name.as_str())
             .collect();
-        let humanoid_eyes = match HumanoidBones::detect_with_mapping_names(&names, &mappings) {
-            Ok((bones, _)) => {
-                bones.get(crate::vrm::HumanoidBone::LeftEye).is_some()
-                    && bones.get(crate::vrm::HumanoidBone::RightEye).is_some()
-            }
-            Err(_) => false,
-        };
+        let humanoid_eyes =
+            match HumanoidBones::detect_with_mapping_names_and_affixes(&names, &mappings, &affixes)
+            {
+                Ok((bones, _)) => {
+                    bones.get(crate::vrm::HumanoidBone::LeftEye).is_some()
+                        && bones.get(crate::vrm::HumanoidBone::RightEye).is_some()
+                }
+                Err(_) => false,
+            };
         let plan = expressions_from_avatar_descriptor(
             &ctx.prefab_file,
             prefab_path,
@@ -474,11 +492,13 @@ pub fn convert_prefab(
     ctx.warnings.extend(report.warnings.iter().cloned());
 
     // humanoidを確定する。物理の補助ノード追加前に確定する。
-    let (humanoid, humanoid_warnings) = HumanoidBones::detect_with_mapping(&model, &mappings)
-        .map_err(PrefabConversionError::Export)?;
+    let (humanoid, humanoid_warnings) =
+        HumanoidBones::detect_with_mapping_and_affixes(&model, &mappings, &affixes)
+            .map_err(PrefabConversionError::Export)?;
     ctx.warnings.extend(humanoid_warnings.iter().cloned());
 
     // 物理を適用する。
+    let physics_apply_options = PhysicsApplyOptions::new().with_apply_tpose(options.tpose);
     let physics_report = derive_and_apply_prefab_physics(
         source,
         index,
@@ -489,6 +509,7 @@ pub fn convert_prefab(
         &ctx.fbx_asset_path,
         options.physics,
         Some(&humanoid),
+        &physics_apply_options,
         limits,
         &mut model,
         &mut ctx.warnings,
@@ -512,6 +533,7 @@ pub fn convert_prefab(
     )?;
 
     // VRMバイト列を作る。呼び出し側のmeta・権限は保つ。
+    let report_humanoid = humanoid.clone();
     let export_options = export_options
         .with_humanoid(humanoid)
         .with_materials(applied.materials)
@@ -523,6 +545,8 @@ pub fn convert_prefab(
         prefab_path,
         ctx,
         &model,
+        &report_humanoid,
+        affixes,
         report.baseline_meshes,
         report.baseline_shapes,
         physics_report,
@@ -540,9 +564,11 @@ pub fn convert_prefab(
 
 /// Prefabを入口に `VRMC_vrm` を含まない汎用 GLB バイト列と構造化報告を作る。
 ///
-/// 衣装やアクセサリなど Humanoid 骨や表情を持たないモデルの変換に使う。
+/// 衣装やアクセサリなど VRM 必須拡張を持たないモデルの変換に使う。
 /// 非スキン FBX かつ `BindPose` が無いモデルも rest 姿勢で読み込み、
 /// `options.physics` が [`PrefabPhysics::Derive`] の場合は警告を残して物理を飛ばす。
+/// `.fbx.meta` や `ModularAvatarMergeArmature`・ボーン名から解決できた Humanoid 対応は
+/// 部分的であっても glTF `extras` とレポートへ出力する。
 ///
 /// # Errors
 ///
@@ -563,6 +589,9 @@ pub fn convert_prefab_glb(
     let limits = &options.limits;
     let mut ctx =
         prepare_prefab_context(source, index, prefab_path, fbx_bytes, fbx_options, limits)?;
+    let mappings = resolve_prefab_humanoid_mappings(&ctx, index)?;
+    let affixes = extract_merge_armature_affixes(&ctx.prefab_file);
+
     let mut owned_vrm_options = vrm_options.clone().with_allow_rest_without_bind_pose(true);
     if options.baseline {
         let weights =
@@ -576,6 +605,19 @@ pub fn convert_prefab_glb(
         VrmModel::from_fbx(&ctx.file, &owned_vrm_options).map_err(PrefabConversionError::Model)?;
     ctx.warnings.extend(report.warnings.iter().cloned());
 
+    let (humanoid, humanoid_warnings) =
+        HumanoidBones::detect_partial_with_mapping(&model, &mappings, &affixes);
+    ctx.warnings.extend(humanoid_warnings);
+
+    let physics_apply_options = PhysicsApplyOptions::new()
+        .with_apply_tpose(options.tpose)
+        .with_resolve_look_at(false);
+    let physics_humanoid = if options.tpose && !humanoid.is_empty() && !ctx.file.skins().is_empty()
+    {
+        Some(&humanoid)
+    } else {
+        None
+    };
     let physics_report = derive_and_apply_prefab_physics(
         source,
         index,
@@ -585,7 +627,8 @@ pub fn convert_prefab_glb(
         &ctx.prefab_file,
         &ctx.fbx_asset_path,
         options.physics,
-        None,
+        physics_humanoid,
+        &physics_apply_options,
         limits,
         &mut model,
         &mut ctx.warnings,
@@ -607,9 +650,13 @@ pub fn convert_prefab_glb(
         &mut ctx.warnings,
     )?;
 
-    let export_options = export_options
+    let mut export_options = export_options
         .with_materials(applied.materials)
         .with_max_output_bytes(limits.max_output_bytes);
+    if export_options.humanoid.is_none() && !humanoid.is_empty() {
+        export_options = export_options.with_humanoid(humanoid.clone());
+    }
+    let report_humanoid = export_options.humanoid.as_ref().unwrap_or(&humanoid);
     let glb_bytes = model
         .to_glb(&export_options)
         .map_err(PrefabConversionError::Export)?;
@@ -617,6 +664,8 @@ pub fn convert_prefab_glb(
         prefab_path,
         ctx,
         &model,
+        report_humanoid,
+        affixes,
         report.baseline_meshes,
         report.baseline_shapes,
         physics_report,
@@ -630,6 +679,21 @@ pub fn convert_prefab_glb(
         glb_bytes.len(),
     );
     Ok((glb_bytes, report))
+}
+
+/// PrefabのAnimator参照先またはFBX自身の `.fbx.meta` から Humanoid 対応表を読む。
+fn resolve_prefab_humanoid_mappings(
+    ctx: &PreparedPrefabContext<'_, '_>,
+    index: &AssetIndex,
+) -> Result<Vec<HumanBoneMapping>, PrefabConversionError> {
+    let humanoid_meta =
+        crate::vrm::resolve_animator_humanoid_meta(&ctx.prefab_file, index, ctx.fbx_meta);
+    humanoid_meta.human_bone_mappings().map_err(|error| {
+        PrefabConversionError::Prefab(crate::vrm::VrmError::new(
+            crate::vrm::VrmErrorKind::InvalidPrefab,
+            format!("humanoidの対応表を読めない: {error}"),
+        ))
+    })
 }
 
 /// 対象解決・`.fbx.meta` 取得・Prefab 解析・FBX 解析・旧 fileID 読み替えを行う。
@@ -800,6 +864,7 @@ fn derive_and_apply_prefab_physics(
     fbx_asset_path: &str,
     physics: PrefabPhysics,
     humanoid: Option<&HumanoidBones>,
+    apply_options: &PhysicsApplyOptions,
     limits: &PrefabConversionLimits,
     model: &mut VrmModel,
     warnings: &mut Vec<String>,
@@ -819,7 +884,7 @@ fn derive_and_apply_prefab_physics(
     }
     // 非スキン小物などスキンを持たない GLB 変換では `select_bind` が失敗するため、
     // 物理導出をスキップして警告を残す。
-    if humanoid.is_none() && file.skins().is_empty() {
+    if !apply_options.resolve_look_at && file.skins().is_empty() {
         warnings.push("スキンが無いためPrefab由来の物理を適用しない".to_owned());
         return Ok(empty);
     }
@@ -854,21 +919,14 @@ fn derive_and_apply_prefab_physics(
     }
     let sidecar = PhysicsSidecar::parse(&derived.json, &PhysicsLimits::new())
         .map_err(PrefabConversionError::Physics)?;
-    let applied = match humanoid {
-        Some(humanoid) => apply_physics_sidecar(
-            model,
-            &sidecar,
-            fbx_bytes,
-            humanoid,
-            &SpringCompileOptions::new(),
-        ),
-        None => apply_physics_sidecar_without_humanoid(
-            model,
-            &sidecar,
-            fbx_bytes,
-            &SpringCompileOptions::new(),
-        ),
-    }
+    let applied = apply_physics_sidecar_with_options(
+        model,
+        &sidecar,
+        fbx_bytes,
+        humanoid,
+        &SpringCompileOptions::new(),
+        apply_options,
+    )
     .map_err(PrefabConversionError::PhysicsApply)?;
     for skipped in &applied.tpose_skipped {
         warnings.push(format!(
@@ -993,6 +1051,8 @@ fn build_prefab_report(
     prefab_path: &str,
     ctx: PreparedPrefabContext<'_, '_>,
     model: &VrmModel,
+    humanoid: &HumanoidBones,
+    merge_armature_affixes: Vec<BoneNameAffix>,
     baseline_meshes: usize,
     baseline_shapes: usize,
     physics: PrefabPhysicsReport,
@@ -1006,6 +1066,18 @@ fn build_prefab_report(
     bytes: usize,
 ) -> PrefabConversionReport {
     let morph_targets = model.meshes.iter().map(|mesh| mesh.targets.len()).sum();
+    let mut humanoid_bones = BTreeMap::new();
+    for (bone, node_index) in humanoid.iter() {
+        if let Some(node) = model.nodes.get(node_index) {
+            humanoid_bones.insert(
+                bone.name().to_owned(),
+                PrefabHumanoidBone {
+                    node: node_index,
+                    name: node.name.clone(),
+                },
+            );
+        }
+    }
     PrefabConversionReport {
         prefab: prefab_path.to_owned(),
         fbx: ctx.fbx_asset_path,
@@ -1020,6 +1092,8 @@ fn build_prefab_report(
         baseline_shapes,
         expressions: model.expressions.preset.len(),
         morph_targets,
+        humanoid_bones,
+        merge_armature_affixes,
         physics,
         warnings: ctx.warnings,
         nodes: model.nodes.len(),
@@ -1421,6 +1495,7 @@ mod tests {
             expressions,
             baseline,
             physics,
+            tpose: true,
             material_options: MaterialOptions::new(),
             limits: PrefabConversionLimits::new(),
         }
@@ -1911,6 +1986,7 @@ mod tests {
         let options = PrefabGlbConversionOptions {
             baseline: true,
             physics: PrefabPhysics::Derive,
+            tpose: false,
             material_options: MaterialOptions::new(),
             limits: PrefabConversionLimits::new(),
         };
@@ -1965,6 +2041,7 @@ mod tests {
         let options = PrefabGlbConversionOptions {
             baseline: true,
             physics: PrefabPhysics::Derive,
+            tpose: false,
             material_options: MaterialOptions::new(),
             limits: PrefabConversionLimits::new(),
         };
@@ -2115,6 +2192,232 @@ mod tests {
         assert_eq!(
             json["extensions"]["VRMC_vrm"]["expressions"]["preset"]["aa"]["morphTargetBinds"][0]["index"],
             serde_json::json!(1)
+        );
+    }
+
+    #[test]
+    fn convert_prefabでma接頭辞付きgeneric衣装をtpose無しvrm1として変換できる() {
+        // 必須15骨すべてに `MA_` 接頭辞を付けた Generic 衣装 FBX と、
+        // `ModularAvatarMergeArmature` + `VRCPhysBone` 付き Prefab。
+        let bones: Vec<(i64, String, Option<i64>)> = 必須骨モデル列()
+            .into_iter()
+            .map(|(id, name, parent)| {
+                if name == "Owner" {
+                    (id, "DressMesh".to_owned(), None)
+                } else {
+                    (id, format!("MA_{name}"), parent)
+                }
+            })
+            .collect();
+        let mut objs: Vec<TNode> = bones
+            .iter()
+            .map(|(id, name, _)| {
+                let subtype = if name == "DressMesh" {
+                    "Mesh"
+                } else {
+                    "LimbNode"
+                };
+                model(*id, name, subtype)
+            })
+            .collect();
+        objs.push(geometry(
+            100,
+            "DressGeo",
+            vec![
+                vertices_node(&[0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.2, 0.0]),
+                pvi_node(&[0, 1, -3]),
+            ],
+        ));
+        objs.push({
+            let mut sp = Props::default();
+            sp.l(400);
+            sp.s(b"Skin\x00\x01Deformer");
+            sp.s(b"Skin");
+            TNode::leaf(b"Deformer", sp)
+        });
+        for (cid, cname, idx_slice, wt_slice) in [
+            (
+                401i64,
+                b"C1\x00\x01SubDeformer".as_slice(),
+                [0, 1, 2].as_slice(),
+                [1.0, 1.0, 1.0].as_slice(),
+            ),
+            (
+                402i64,
+                b"C2\x00\x01SubDeformer".as_slice(),
+                [].as_slice(),
+                [].as_slice(),
+            ),
+        ] {
+            let mut cp = Props::default();
+            cp.l(cid);
+            cp.s(cname);
+            cp.s(b"Cluster");
+            let mut tr = Props::default();
+            tr.d_raw(&bind_matrix(0.0, 0.0, 0.0));
+            let mut trl = Props::default();
+            trl.d_raw(&bind_matrix(0.0, 0.0, 0.0));
+            let mut children = Vec::new();
+            if !idx_slice.is_empty() {
+                let mut ip = Props::default();
+                ip.i_raw(idx_slice);
+                let mut wp = Props::default();
+                wp.d_raw(wt_slice);
+                children.push(TNode::leaf(b"Indexes", ip));
+                children.push(TNode::leaf(b"Weights", wp));
+            }
+            children.push(TNode::leaf(b"Transform", tr));
+            children.push(TNode::leaf(b"TransformLink", trl));
+            objs.push(TNode::branch(b"Deformer", cp, children));
+        }
+        let mut pose_props = Props::default();
+        pose_props.l(200);
+        pose_props.s(b"Bind\x00\x01Pose");
+        pose_props.s(b"BindPose");
+        let pose_nodes = bones
+            .iter()
+            .map(|(id, _, _)| pose_node(*id, &bind_matrix(0.0, 0.0, 0.0)))
+            .collect();
+        objs.push(TNode::branch(b"Pose", pose_props, pose_nodes));
+        let mut conns: Vec<TNode> = bones
+            .iter()
+            .filter_map(|(id, _, parent)| parent.map(|parent| conn(*id, parent)))
+            .collect();
+        conns.push(conn(100, 16));
+        conns.push(conn(1, 0));
+        conns.push(conn(16, 0));
+        conns.push(conn(400, 100));
+        conns.push(conn(401, 400));
+        conns.push(conn(402, 400));
+        conns.push(conn(1, 401));
+        conns.push(conn(2, 402));
+        let fbx_bytes = file(vec![objects(objs), connections(conns)]);
+
+        let phys_guid = "2a2c05204084d904aa4945ccff20d8e5";
+        let ma_guid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let hips_go = crate::unity::game_object_file_id("MA_Hips");
+        let spine_tr = crate::unity::transform_file_id("MA_Hips/MA_Spine");
+        let empty_curve = "{m_Curve: [], m_PreInfinity: 2, m_PostInfinity: 2}";
+        let prefab_body = format!(
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n\
+--- !u!1001 &100\nPrefabInstance:\n  m_Modification:\n    m_TransformParent: {{fileID: 0}}\n    m_Modifications: []\n    m_AddedComponents:\n    - targetCorrespondingSourceObject: {{fileID: {hips_go}, guid: {FBX_GUID}, type: 3}}\n      insertIndex: -1\n      addedObject: {{fileID: 5001}}\n    - targetCorrespondingSourceObject: {{fileID: {hips_go}, guid: {FBX_GUID}, type: 3}}\n      insertIndex: -1\n      addedObject: {{fileID: 5002}}\n  m_SourcePrefab: {{fileID: 100100000, guid: {FBX_GUID}, type: 3}}\n\
+--- !u!1 &1001 stripped\nGameObject:\n  m_CorrespondingSourceObject: {{fileID: {hips_go}, guid: {FBX_GUID}, type: 3}}\n  m_PrefabInstance: {{fileID: 100}}\n  m_PrefabAsset: {{fileID: 0}}\n\
+--- !u!4 &1002 stripped\nTransform:\n  m_CorrespondingSourceObject: {{fileID: {spine_tr}, guid: {FBX_GUID}, type: 3}}\n  m_PrefabInstance: {{fileID: 100}}\n  m_PrefabAsset: {{fileID: 0}}\n\
+--- !u!114 &5001\nMonoBehaviour:\n  m_GameObject: {{fileID: 1001}}\n  m_Enabled: 1\n  m_Script: {{fileID: 11500000, guid: {ma_guid}, type: 3}}\n  m_Name: \n  mergeTarget:\n    referencePath: Armature\n  prefix: \"MA_\"\n  suffix: \"\"\n\
+--- !u!114 &5002\nMonoBehaviour:\n  m_GameObject: {{fileID: 1001}}\n  m_Enabled: 1\n  m_Name: \n  m_Script: {{fileID: 1661641543, guid: {phys_guid}, type: 3}}\n  version: 0\n  integrationType: 0\n  rootTransform: {{fileID: 1002}}\n  ignoreTransforms: []\n  endpointPosition: {{x: 0, y: 0, z: 0}}\n  multiChildType: 0\n  pull: 0.2\n  pullCurve: {empty_curve}\n  spring: 0.3\n  springCurve: {empty_curve}\n  stiffness: 0.1\n  stiffnessCurve: {empty_curve}\n  gravity: 0.0\n  gravityCurve: {empty_curve}\n  gravityFalloff: 0.0\n  gravityFalloffCurve: {empty_curve}\n  immobileType: 0\n  immobile: 0.0\n  immobileCurve: {empty_curve}\n  radius: 0.02\n  radiusCurve: {empty_curve}\n  allowCollision: 1\n  colliders: []\n  limitType: 0\n  maxAngleX: 0.0\n  maxAngleXCurve: {empty_curve}\n  maxAngleZ: 0.0\n  maxAngleZCurve: {empty_curve}\n  limitRotation: {{x: 0, y: 0, z: 0}}\n  limitRotationXCurve: {empty_curve}\n  limitRotationYCurve: {empty_curve}\n  limitRotationZCurve: {empty_curve}\n  isAnimated: 0\n"
+        );
+        // `.fbx.meta` は Generic（animationType: 2・human 空）。
+        let (index, 読み手) = 索引と読み手を作る(&[
+            ("Dress.fbx", メタを作る(FBX_GUID), None),
+            (
+                "Dress.prefab",
+                prefabメタを作る(AVATAR_GUID),
+                Some(prefab_body.into_bytes()),
+            ),
+        ]);
+        let options = PrefabConversionOptions {
+            expressions: PrefabExpressions::None,
+            baseline: false,
+            physics: PrefabPhysics::Derive,
+            tpose: false,
+            material_options: MaterialOptions::new(),
+            limits: PrefabConversionLimits::new(),
+        };
+        let (vrm, 報告) = convert_prefab(
+            &読み手,
+            &index,
+            "Assets/Dress.prefab",
+            &fbx_bytes,
+            &FbxOptions::new(),
+            &VrmOptions::new(),
+            書き出し設定を作る(),
+            &options,
+        )
+        .expect("MA接頭辞付きGeneric衣装でもVRM変換できる");
+        assert_eq!(&vrm[..4], b"glTF");
+        assert_eq!(報告.physics.tpose_applied, 0, "tpose: false で適用しない");
+        assert_eq!(
+            報告.merge_armature_affixes,
+            vec![BoneNameAffix::new("MA_", "")]
+        );
+        assert_eq!(
+            報告.humanoid_bones.get("hips").map(|b| b.name.as_str()),
+            Some("MA_Hips")
+        );
+        assert_eq!(報告.humanoid_bones.len(), 15);
+    }
+
+    #[test]
+    fn convert_prefab_glbで部分ボーン衣装のhumanoid対応がextrasと報告に出る() {
+        // Hips と LeftUpperLeg のみを持つ部分ボーン衣装 FBX。
+        let objs = vec![
+            model(1, "Dress_Hips", "LimbNode"),
+            model(2, "Dress_LeftUpperLeg", "LimbNode"),
+            model(10, "SkirtMesh", "Mesh"),
+            geometry(
+                100,
+                "SkirtGeo",
+                vec![
+                    vertices_node(&[0.0, 0.0, 0.0, 0.2, 0.0, 0.0, 0.0, 0.2, 0.0]),
+                    pvi_node(&[0, 1, -3]),
+                ],
+            ),
+        ];
+        let conns = vec![conn(1, 0), conn(2, 1), conn(10, 0), conn(100, 10)];
+        let fbx_bytes = file(vec![objects(objs), connections(conns)]);
+        let hips_go = crate::unity::game_object_file_id("Dress_Hips");
+        let ma_guid = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let prefab_body = format!(
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n\
+--- !u!1001 &100\nPrefabInstance:\n  m_Modification:\n    m_TransformParent: {{fileID: 0}}\n    m_Modifications: []\n    m_AddedComponents:\n    - targetCorrespondingSourceObject: {{fileID: {hips_go}, guid: {FBX_GUID}, type: 3}}\n      insertIndex: -1\n      addedObject: {{fileID: 5001}}\n  m_SourcePrefab: {{fileID: 100100000, guid: {FBX_GUID}, type: 3}}\n\
+--- !u!1 &1001 stripped\nGameObject:\n  m_CorrespondingSourceObject: {{fileID: {hips_go}, guid: {FBX_GUID}, type: 3}}\n  m_PrefabInstance: {{fileID: 100}}\n  m_PrefabAsset: {{fileID: 0}}\n\
+--- !u!114 &5001\nMonoBehaviour:\n  m_GameObject: {{fileID: 1001}}\n  m_Enabled: 1\n  m_Script: {{fileID: 11500000, guid: {ma_guid}, type: 3}}\n  m_Name: \n  mergeTarget:\n    referencePath: Armature\n  prefix: \"Dress_\"\n  suffix: \"\"\n"
+        );
+        let (index, 読み手) = 索引と読み手を作る(&[
+            ("Skirt.fbx", メタを作る(FBX_GUID), None),
+            (
+                "Skirt.prefab",
+                prefabメタを作る(AVATAR_GUID),
+                Some(prefab_body.into_bytes()),
+            ),
+        ]);
+        let options = PrefabGlbConversionOptions::default();
+        let (glb, 報告) = convert_prefab_glb(
+            &読み手,
+            &index,
+            "Assets/Skirt.prefab",
+            &fbx_bytes,
+            &FbxOptions::new(),
+            &VrmOptions::new(),
+            GlbExportOptions::new(),
+            &options,
+        )
+        .expect("部分ボーン衣装はGLB変換できる");
+        assert_eq!(報告.humanoid_bones.len(), 2);
+        assert_eq!(
+            報告.humanoid_bones.get("hips").map(|b| b.name.as_str()),
+            Some("Dress_Hips")
+        );
+        assert_eq!(
+            報告
+                .humanoid_bones
+                .get("leftUpperLeg")
+                .map(|b| b.name.as_str()),
+            Some("Dress_LeftUpperLeg")
+        );
+        let json_len = u32::from_le_bytes(glb[12..16].try_into().expect("長さ")) as usize;
+        let json: serde_json::Value =
+            serde_json::from_slice(&glb[20..20 + json_len]).expect("JSONは読める");
+        assert_eq!(
+            json["extras"]["vrctom"]["humanoid"]["humanBones"]["hips"]["name"],
+            serde_json::json!("Dress_Hips")
+        );
+        let hips_idx = json["extras"]["vrctom"]["humanoid"]["humanBones"]["hips"]["node"]
+            .as_u64()
+            .expect("node索引") as usize;
+        assert_eq!(
+            json["nodes"][hips_idx]["extras"]["vrctomHumanoidBone"],
+            serde_json::json!("hips")
         );
     }
 }

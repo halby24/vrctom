@@ -287,21 +287,26 @@ impl VrmExportOptions {
 
 /// 汎用 GLB 書き出しの設定。
 ///
-/// `VRMC_vrm` 拡張（meta・humanoid・expressions・lookAt）を含めず、
+/// `VRMC_vrm` 拡張（meta・expressions・lookAt 等）を含めず、
 /// 材質（`VRMC_materials_mtoon` 等）・スプリング（`VRMC_springBone`）・
 /// ノード制約（`VRMC_node_constraint`）だけを載せて GLB バイト列を組み立てる。
+/// `humanoid` を指定した場合は glTF の `extras`（ルートおよび対応ノード）へ
+/// 部分または全体の Humanoid 対応表を書き出す。
 #[derive(Debug, Clone)]
 pub struct GlbExportOptions {
     /// Unityの `.mat` から作った材質。`None` の場合は灰色PBR材質を書く。
     pub materials: Option<VrmMaterials>,
+    /// glTF `extras` へ載せる Humanoid の対応付け（部分または全体）。`None` の場合は書かない。
+    pub humanoid: Option<HumanoidBones>,
     max_output_bytes: usize,
 }
 
 impl GlbExportOptions {
-    /// 設定を作る。材質は灰色PBR、出力上限は既定値になる。
+    /// 設定を作る。材質は灰色PBR、Humanoid `extras` なし、出力上限は既定値になる。
     pub fn new() -> Self {
         Self {
             materials: None,
+            humanoid: None,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         }
     }
@@ -309,6 +314,12 @@ impl GlbExportOptions {
     /// Unityから読み取った材質を使う。
     pub fn with_materials(mut self, materials: VrmMaterials) -> Self {
         self.materials = Some(materials);
+        self
+    }
+
+    /// 汎用 GLB の `extras` へ書き出す Humanoid 対応付けを設定する。
+    pub fn with_humanoid(mut self, humanoid: HumanoidBones) -> Self {
+        self.humanoid = Some(humanoid);
         self
     }
 
@@ -456,20 +467,26 @@ impl VrmModel {
 
     /// `VRMC_vrm` 拡張を持たない汎用 GLB バイト列を作る。
     ///
-    /// meta と humanoid の検証は行わず、全身ボーンを持たない衣装・アクセサリでも書き出せる。
+    /// 必須 15 骨の有無や親子・拡大率は検証せず、部分的な骨だけの衣装・アクセサリでも書き出せる。
+    /// `options.humanoid` を指定した場合は索引範囲・重複割当を検証したうえで、
+    /// 対応表を glTF の `extras`（ルートおよび各ノード）へ出力する。
     /// 材質（`VRMC_materials_mtoon`）・スプリング（`VRMC_springBone`）・
     /// ノード制約（`VRMC_node_constraint`）はモデルと設定に応じて書き出す。
     ///
     /// # Errors
     ///
-    /// 構造の不整合・材質値の不正・スプリングや制約の検証失敗・
-    /// 出力上限の超過の場合に返す。
+    /// `options.humanoid` の索引範囲外や重複割当・構造の不整合・材質値の不正・
+    /// スプリングや制約の検証失敗・出力上限の超過の場合に返す。
     pub fn to_glb(&self, options: &GlbExportOptions) -> Result<Vec<u8>, VrmExportError> {
+        let bones = match &options.humanoid {
+            Some(humanoid) => validate_partial_humanoid(self, humanoid)?,
+            None => Vec::new(),
+        };
         let mut writer = GlbWriter::new(
             self,
             options.materials.as_ref(),
             options.max_output_bytes,
-            ExportProfile::Glb,
+            ExportProfile::Glb { bones: &bones },
         );
         writer.build()
     }
@@ -487,22 +504,17 @@ type NodeMeshMap = HashMap<
     ),
 >;
 
-/// humanoidを検証し、骨の列挙順の対応付けを返す。
-///
-/// 明示指定でも名前検出と同じ検証を行い、必須の存在・索引範囲・重複割当・
-/// 最も近いhumanoid祖先・ローカル行列の拡大率を確かめる。
-/// 任意骨が無い場合はその検証を飛ばす。
-/// 書き出すキーがVRM 1.0の骨名55件のいずれかであることも確かめ、
-/// 未知のキーは書式違反として失敗する。
-fn validate_humanoid(
+/// humanoid の各骨について、必須条件の有無に応じて存在・索引範囲・重複・既知骨名を検査する。
+fn collect_validated_bones(
     model: &VrmModel,
     humanoid: &HumanoidBones,
+    require_required_bones: bool,
 ) -> Result<ResolvedBones, VrmExportError> {
     let mut bones: ResolvedBones = Vec::new();
     let mut node_to_bone: HashMap<usize, HumanoidBone> = HashMap::new();
     for bone in HumanoidBone::all() {
         let Some(node) = humanoid.get(bone) else {
-            if bone.is_required() {
+            if require_required_bones && bone.is_required() {
                 return Err(VrmExportError::missing_bone(bone, "必須のhumanoid骨が無い"));
             }
             continue;
@@ -535,6 +547,31 @@ fn validate_humanoid(
         }
         bones.push((bone, node));
     }
+    Ok(bones)
+}
+
+/// 汎用 GLB 向けの humanoid 対応表を検証する（必須骨・親子・拡大率は強制しない）。
+fn validate_partial_humanoid(
+    model: &VrmModel,
+    humanoid: &HumanoidBones,
+) -> Result<ResolvedBones, VrmExportError> {
+    collect_validated_bones(model, humanoid, false)
+}
+
+/// humanoidを検証し、骨の列挙順の対応付けを返す。
+///
+/// 明示指定でも名前検出と同じ検証を行い、必須の存在・索引範囲・重複割当・
+/// 最も近いhumanoid祖先・ローカル行列の拡大率を確かめる。
+/// 任意骨が無い場合はその検証を飛ばす。
+/// 書き出すキーがVRM 1.0の骨名55件のいずれかであることも確かめ、
+/// 未知のキーは書式違反として失敗する。
+fn validate_humanoid(
+    model: &VrmModel,
+    humanoid: &HumanoidBones,
+) -> Result<ResolvedBones, VrmExportError> {
+    let bones = collect_validated_bones(model, humanoid, true)?;
+    let node_to_bone: HashMap<usize, HumanoidBone> =
+        bones.iter().map(|&(bone, node)| (node, bone)).collect();
     for (bone, node) in &bones {
         let ancestor = nearest_humanoid_ancestor(model, &node_to_bone, *node)?;
         let allowed = allowed_parents_for(*bone);
@@ -622,7 +659,8 @@ enum ExportProfile<'a> {
         bones: &'a ResolvedBones,
     },
     /// 汎用 GLB（`VRMC_vrm` と `skin.skeleton` を書かず、材質・物理拡張のみ書く）。
-    Glb,
+    /// `bones` が非空のときは glTF `extras` へ Humanoid 対応表を載せる。
+    Glb { bones: &'a ResolvedBones },
 }
 
 /// GLB組み立ての作業領域。バッファ・JSON・対応表を持つ。
@@ -1070,7 +1108,7 @@ impl<'a> GlbWriter<'a> {
                 .iter()
                 .find(|(bone, _)| *bone == HumanoidBone::Hips)
                 .map(|(_, node)| *node),
-            ExportProfile::Glb => None,
+            ExportProfile::Glb { .. } => None,
         };
         for skin in &self.model.skins {
             if skin.joints.len() != skin.inverse_bind_matrices.len() {
@@ -1137,6 +1175,13 @@ impl<'a> GlbWriter<'a> {
         for constraint in &self.model.node_constraints {
             constraint_at.entry(constraint.node).or_insert(constraint);
         }
+        // 汎用 GLB で対応するノードには `extras.vrctomHumanoidBone` を付ける。
+        let mut humanoid_at: HashMap<usize, HumanoidBone> = HashMap::new();
+        if let ExportProfile::Glb { bones } = self.profile {
+            for &(bone, node_index) in bones {
+                humanoid_at.insert(node_index, bone);
+            }
+        }
         let mut nodes = Vec::with_capacity(self.model.nodes.len());
         for (index, node) in self.model.nodes.iter().enumerate() {
             if let Some(parent) = node.parent
@@ -1175,6 +1220,20 @@ impl<'a> GlbWriter<'a> {
             } else {
                 node.local
             };
+            let extras = if let Some(bone) = humanoid_at.get(&index) {
+                let raw = serde_json::value::to_raw_value(&serde_json::json!({
+                    "vrctomHumanoidBone": bone.name(),
+                }))
+                .map_err(|error| {
+                    VrmExportError::new(
+                        VrmExportErrorKind::InvalidStructure,
+                        format!("ノードのhumanoid extrasのシリアライズに失敗した: {error}"),
+                    )
+                })?;
+                Some(raw)
+            } else {
+                Default::default()
+            };
             nodes.push(gltf::json::Node {
                 matrix: if effective == matrix::IDENTITY {
                     None
@@ -1193,6 +1252,7 @@ impl<'a> GlbWriter<'a> {
                     constraint_at.get(&index).copied(),
                     self.model.nodes.len(),
                 )?,
+                extras,
                 ..Default::default()
             });
         }
@@ -1281,6 +1341,39 @@ impl<'a> GlbWriter<'a> {
             let vrmc = self.build_vrmc_vrm_json(meta, bones)?;
             others.insert("VRMC_vrm".to_string(), serde_json::Value::Object(vrmc));
             used.push("VRMC_vrm".to_string());
+        } else if let ExportProfile::Glb { bones } = self.profile
+            && !bones.is_empty()
+        {
+            let mut human_bones = serde_json::Map::new();
+            for &(bone, node_index) in bones {
+                let node_name = self
+                    .model
+                    .nodes
+                    .get(node_index)
+                    .map(|node| node.name.as_str())
+                    .unwrap_or("");
+                human_bones.insert(
+                    bone.name().to_string(),
+                    serde_json::json!({
+                        "node": node_index,
+                        "name": node_name,
+                    }),
+                );
+            }
+            let raw = serde_json::value::to_raw_value(&serde_json::json!({
+                "vrctom": {
+                    "humanoid": {
+                        "humanBones": human_bones,
+                    }
+                }
+            }))
+            .map_err(|error| {
+                VrmExportError::new(
+                    VrmExportErrorKind::InvalidStructure,
+                    format!("ルートのhumanoid extrasのシリアライズに失敗した: {error}"),
+                )
+            })?;
+            self.root.extras = Some(raw);
         }
         if self.wrote_mtoon {
             used.push("VRMC_materials_mtoon".to_string());

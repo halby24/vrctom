@@ -297,6 +297,46 @@ impl From<PhysicsApplyError> for VrmError {
     }
 }
 
+/// 物理 sidecar 適用時の振る舞い設定。
+///
+/// T-pose 上書きと視線解決の実行有無を切り替える。
+/// 既定値は VRM 変換向けの「両方有効」である。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhysicsApplyOptions {
+    /// Humanoid 骨へ sidecar の T-pose を適用するかどうか。
+    pub apply_tpose: bool,
+    /// sidecar の視線設定を解決するかどうか。
+    pub resolve_look_at: bool,
+}
+
+impl PhysicsApplyOptions {
+    /// 既定の設定（T-pose と視線の両方を有効）を作る。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// T-pose を適用するかどうかを変更する。
+    pub fn with_apply_tpose(mut self, apply_tpose: bool) -> Self {
+        self.apply_tpose = apply_tpose;
+        self
+    }
+
+    /// 視線解決を行うかどうかを変更する。
+    pub fn with_resolve_look_at(mut self, resolve_look_at: bool) -> Self {
+        self.resolve_look_at = resolve_look_at;
+        self
+    }
+}
+
+impl Default for PhysicsApplyOptions {
+    fn default() -> Self {
+        Self {
+            apply_tpose: true,
+            resolve_look_at: true,
+        }
+    }
+}
+
 /// 解決段階の見出し。CLIの従来文面と同じである。
 const RESOLVE_STAGE: &str = "物理sidecarの解決に失敗した";
 /// T-pose段階の見出し。CLIの従来文面と同じである。
@@ -329,7 +369,14 @@ pub fn apply_physics_sidecar(
     humanoid: &HumanoidBones,
     options: &SpringCompileOptions,
 ) -> Result<PhysicsApplyReport, PhysicsApplyError> {
-    apply_with_rollback(model, sidecar, fbx_bytes, Some(humanoid), options)
+    apply_with_rollback(
+        model,
+        sidecar,
+        fbx_bytes,
+        Some(humanoid),
+        options,
+        &PhysicsApplyOptions::default(),
+    )
 }
 
 /// Humanoid 情報を使わずに物理sidecarを中間モデルへ適用し、構造化報告を返す。
@@ -348,7 +395,45 @@ pub fn apply_physics_sidecar_without_humanoid(
     fbx_bytes: &[u8],
     options: &SpringCompileOptions,
 ) -> Result<PhysicsApplyReport, PhysicsApplyError> {
-    apply_with_rollback(model, sidecar, fbx_bytes, None, options)
+    apply_with_rollback(
+        model,
+        sidecar,
+        fbx_bytes,
+        None,
+        options,
+        &PhysicsApplyOptions {
+            apply_tpose: false,
+            resolve_look_at: false,
+        },
+    )
+}
+
+/// T-pose と視線の適用可否を指定して物理sidecarを中間モデルへ適用する。
+///
+/// `humanoid` が `None` のときは `apply_options` に関わらず T-pose と視線をスキップする。
+/// `humanoid` が `Some` で `apply_options.apply_tpose == false` のときは、
+/// T-pose による姿勢上書きを飛ばして rest 姿勢を保ったままスプリングと視線を適用する。
+///
+/// # Errors
+///
+/// 対応解決・T-pose適用・視線解決・スプリング生成のいずれかが失敗した場合に返す。
+/// この場合モデルのノード列と制約列は呼び出し前の状態に戻す。
+pub fn apply_physics_sidecar_with_options(
+    model: &mut VrmModel,
+    sidecar: &PhysicsSidecar,
+    fbx_bytes: &[u8],
+    humanoid: Option<&HumanoidBones>,
+    spring_options: &SpringCompileOptions,
+    apply_options: &PhysicsApplyOptions,
+) -> Result<PhysicsApplyReport, PhysicsApplyError> {
+    apply_with_rollback(
+        model,
+        sidecar,
+        fbx_bytes,
+        humanoid,
+        spring_options,
+        apply_options,
+    )
 }
 
 /// 失敗時のノード・制約復元を共通化した物理適用の入口。
@@ -358,12 +443,13 @@ fn apply_with_rollback(
     fbx_bytes: &[u8],
     humanoid: Option<&HumanoidBones>,
     options: &SpringCompileOptions,
+    apply_options: &PhysicsApplyOptions,
 ) -> Result<PhysicsApplyReport, PhysicsApplyError> {
     // 失敗時の部分更新を戻すため、変更し得る列だけを退避する。
     // メッシュ・スキン・表情は触らないため複製しない。
     let backup_nodes = model.nodes.clone();
     let backup_constraints = model.node_constraints.clone();
-    let result = apply_inner(model, sidecar, fbx_bytes, humanoid, options);
+    let result = apply_inner(model, sidecar, fbx_bytes, humanoid, options, apply_options);
     if result.is_err() {
         model.nodes = backup_nodes;
         model.node_constraints = backup_constraints;
@@ -378,6 +464,7 @@ fn apply_inner(
     fbx_bytes: &[u8],
     humanoid: Option<&HumanoidBones>,
     options: &SpringCompileOptions,
+    apply_options: &PhysicsApplyOptions,
 ) -> Result<PhysicsApplyReport, PhysicsApplyError> {
     let resolution = model
         .resolve_physics_sidecar(sidecar, fbx_bytes)
@@ -392,8 +479,9 @@ fn apply_inner(
         .iter()
         .map(|aux| aux.name.clone())
         .collect();
-    // Humanoid がある経路では T-pose と視線を適用する。無い経路（衣装等）では飛ばす。
-    let (tpose_applied, tpose_skipped, look_at) = if let Some(humanoid) = humanoid {
+    let (tpose_applied, tpose_skipped) = if let Some(humanoid) = humanoid
+        && apply_options.apply_tpose
+    {
         // humanoidのrest姿勢はsidecarのT-poseを優先する。無い骨は
         // ノードの姿勢のまま残す。視線の測定とスプリングの生成より前に適用する。
         // 書き出しに使う解決済み対応を渡し、不一致は適用前に失敗させる。
@@ -406,7 +494,7 @@ fn apply_inner(
                     tpose_skipped: Vec::new(),
                 }
             })?;
-        let tpose_skipped: Vec<TposeSkippedEntry> = pose
+        let skipped: Vec<TposeSkippedEntry> = pose
             .skipped
             .iter()
             .map(|skipped| TposeSkippedEntry {
@@ -415,24 +503,25 @@ fn apply_inner(
                 reason: skipped.reason.to_string(),
             })
             .collect();
-        // 視線の解決。sidecarに視線記録が無い旧形式では何もしない。
-        // 測定も既定もここで確定する。モデルは変更しないため、
-        // 失敗時に部分更新は起きない。humanoidは解決より前に検出したものを
-        // 使い、補助ノードの影響を受けない。
-        let look_at = match sidecar.look_at.as_ref() {
-            Some(_) => resolve_look_at(sidecar, model, &resolution, humanoid).map_err(|error| {
-                PhysicsApplyError {
-                    stage: LOOK_AT_STAGE,
-                    error,
-                    auxiliary_node_names: auxiliary_node_names.clone(),
-                    tpose_skipped: tpose_skipped.clone(),
-                }
-            })?,
-            None => None,
-        };
-        (pose.applied.len(), tpose_skipped, look_at)
+        (pose.applied.len(), skipped)
     } else {
-        (0, Vec::new(), None)
+        (0, Vec::new())
+    };
+    let look_at = if let Some(humanoid) = humanoid
+        && apply_options.resolve_look_at
+        && sidecar.look_at.is_some()
+    {
+        // 視線の解決。測定も既定もここで確定する。
+        resolve_look_at(sidecar, model, &resolution, humanoid).map_err(|error| {
+            PhysicsApplyError {
+                stage: LOOK_AT_STAGE,
+                error,
+                auxiliary_node_names: auxiliary_node_names.clone(),
+                tpose_skipped: tpose_skipped.clone(),
+            }
+        })?
+    } else {
+        None
     };
     let compiled = compile_springs(sidecar, model, &resolution, options).map_err(|error| {
         PhysicsApplyError {
